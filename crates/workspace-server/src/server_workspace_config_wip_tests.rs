@@ -1526,7 +1526,7 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
             .await
             .unwrap()
     });
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {

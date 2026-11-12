@@ -16,7 +16,7 @@ impl Fixture {
         let path = dir.path().join("workspace.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE workspaces (workspace_id TEXT PRIMARY KEY, owner_account_id TEXT NOT NULL, state TEXT NOT NULL); INSERT INTO workspaces VALUES('w','owner','active'),('other','owner','active');").unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(CURRENT_SCHEMA).unwrap();
         Self {
             _dir: dir,
             path,
@@ -92,7 +92,7 @@ fn grant(p: &WorkerLaunchPolicy, id: &str) -> CoreWorkerExecutionGrant {
         issuance_ceiling: Some(vec![PermissionKey::parse("worker.create").unwrap()]),
         source: CoreWorkerGrantSource::LaunchPolicy {
             policy_id: p.policy_id.clone(),
-            policy_revision: p.authorization_revision,
+            policy_authorization_key: p.authorization_key.clone(),
             parent: CoreWorkerGrantParent::SubjectBody {
                 subject_id: "s".into(),
                 source_change_id: "subject-v1".into(),
@@ -161,8 +161,8 @@ fn owner_cas_replay_and_rename_history_survive_reopen_without_reauthorization() 
     );
     let renamed = f.change(&rename);
     assert_eq!(
-        renamed.policy.authorization_revision,
-        initial.policy.authorization_revision
+        renamed.policy.authorization_key,
+        initial.policy.authorization_key
     );
     assert_eq!(
         renamed.policy.usage_key().unwrap(),
@@ -236,7 +236,7 @@ fn authorization_replacement_revoke_delete_and_revert_never_revive_old_grants() 
             },
         ))
         .policy;
-    assert!(replaced.authorization_revision > initial.authorization_revision);
+    assert!(replaced.authorization_key != initial.authorization_key);
     assert!(validate_policy_lineage(&f.conn, &child).is_err());
     // Exact binding replay is historical, never permission to dispatch.
     assert_eq!(bind_core_grant(&f.conn, &child).unwrap(), child);
@@ -269,7 +269,7 @@ fn authorization_replacement_revoke_delete_and_revert_never_revive_old_grants() 
             &f.conn,
             "w",
             "coder",
-            active.authorization_revision,
+            &active.authorization_key,
             "project:coder"
         )
         .is_err()
@@ -279,7 +279,7 @@ fn authorization_replacement_revoke_delete_and_revert_never_revive_old_grants() 
             &f.conn,
             "other",
             "coder",
-            active.authorization_revision,
+            &active.authorization_key,
             "builtin:coder"
         )
         .is_err()

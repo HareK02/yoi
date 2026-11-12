@@ -229,9 +229,9 @@ pub(super) fn recover_releases(api: &WorkspaceApi) -> Result<()> {
                 // race its archive publication or revive a second recording drain.
                 if let Some(prepared) = api
                     .config_store
-                    .recover_worker_removal_execution(api.workspace_id(), &progress.worker)
+                    .recover_worker_removal_plan(api.workspace_id(), &progress.worker)
                     .map_err(|error| Error::Store(error.to_string()))?
-                    && let Some(removal) = api.store.get_journal_removal(&prepared)?
+                    && let Some(removal) = api.store.get_journal_removal_for_plan(&prepared)?
                     && let Some(recording) = &removal.metadata.retained_recording
                 {
                     if removal.metadata.binding.subject_id != progress.recording.binding.subject_id

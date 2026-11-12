@@ -5,9 +5,10 @@
 //! scripted; this is not live-model or real Host integration evidence. Runtime
 //! directories must be isolated as required by the shared connected harness.
 //!
-//! Frozen Ticket grants derive only linked MRs and the assigned Coder's own
-//! Internal children, without post-hoc IDs or wildcard grants. The full scenario
-//! contrasts valid approval/published-target evidence with authority refusals.
+//! Operation assignments are frozen within the Subject's delegation ceiling;
+//! Ticket ownership, Workdir attachments and trusted Reviewer capabilities remain
+//! separate checks. The full scenario contrasts valid approval/published-target
+//! evidence with authority refusals.
 //! Git adoption runs in a separate generic Coder's explicitly granted temp clone;
 //! it never replaces the implementation assignment or touches the real Host refs.
 use super::*;
@@ -417,8 +418,8 @@ async fn ordinary_subject_default_coder_review_publishes_mr_and_preserves_unrevi
         created_policy.delegation,
         server_api::authorization::subject_default_delegation_assignment()
     );
-    // Enroll the unchanged creation defaults in canonical configuration. The
-    // actual child grant below remains bounded to its Workdir and Ticket.
+    // Configuration adoption leaves creation defaults unchanged. The child
+    // selects operation keys; Ticket targets and attachments bound its Workdir.
     super::super::chat_tests::adopt_chat_defaults(&h.api, &h.owner).await;
     let policy = subjects.current_subject_policy(&subject).unwrap();
     let body_path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/body");
@@ -444,28 +445,19 @@ async fn ordinary_subject_default_coder_review_publishes_mr_and_preserves_unrevi
         "operation_id":"mr-connected-chat","subject_id":subject}),
     )
     .await;
-    let mut permissions: Vec<_> = ["filesystem.read", "filesystem.write", "bash.execute"]
-        .into_iter()
-        .map(|operation| ScopedPermission {
-            operation: operation.into(),
-            resource: PermissionResource::Workdir {
-                working_directory_id: wd.clone(),
-                path: ".".into(),
-                recursive: true,
-            },
-        })
-        .collect();
-    permissions.extend([
-        ticket_permission(&ticket, "ticket.read"),
-        ticket_permission(&ticket, "ticket.relation.read"),
-        ticket_permission(&ticket, "ticket.implementation_result.write"),
-        ticket_permission(&ticket, "merge_request.open"),
-    ]);
+    let assignment = standalone_assignment(
+        r#"{ namespaces = [
+            { namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; },
+            { namespace = "bash"; keys = ["bash.execute"]; },
+            { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; },
+            { namespace = "merge_request"; keys = ["merge_request.open"]; }
+        ]; }"#,
+    );
     let spawn = json!({"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
         "orchestrator_assignment_id":assigned["assignment"]["assignment_id"],
         "initial_request":format!("{CODER}{}",json!({"ticket":ticket})),
         "workdir_attachments":[{"alias":"checkout","working_directory_id":wd}],
-        "execution_grant":{"permissions":permissions,"redelegation":[]}});
+        "authorization":{"kind":"assignment","assignment":assignment}});
     assert!(spawn.get("flow").is_none());
     let sent = ok(&h, "POST", &format!("/api/w/{TEST_WORKSPACE_ID}/chat/conversations/{}/messages",conversation["id"].as_str().unwrap()), json!({
         "operation_id":"mr-connected-request", "text":format!("{BODY}{}",json!({"subject":subject,"ticket":ticket,"before":before,"spawn":spawn}))})).await;
@@ -1533,21 +1525,25 @@ fn shell_quote(value: &str) -> String {
 
 async fn body_idle_now(h: &ConnectedWorkerHarness, worker: &RuntimeWorkerRef) {
     let mut observed = h.runtime.subscribe_worker_observation().unwrap();
-    if h.api.runtime.worker(worker).unwrap().state == "idle" {
-        return;
-    }
+    let source = worker_runtime::identity::WorkerRef::try_from(worker).unwrap();
     tokio::time::timeout(LIMIT, async {
         loop {
+            // The Backend projection can still say idle after a notification
+            // started a new turn. Policy controls require the execution owner's
+            // current snapshot, not a delayed projection or an older idle event.
+            if matches!(
+                h.runtime.worker_observation_snapshot(&source).unwrap(),
+                protocol::Event::Snapshot { state, .. }
+                    if state.state == protocol::WorkerState::Idle
+            ) {
+                break;
+            }
             let event = observed.recv().await.expect("real body observation");
             if event.worker_ref.worker_id.to_string() != worker.worker_id {
                 continue;
             }
             match event.payload {
-                protocol::Event::WorkerState { snapshot }
-                    if snapshot.state == protocol::WorkerState::Idle =>
-                {
-                    break;
-                }
+                protocol::Event::WorkerState { .. } => {}
                 protocol::Event::Error { code, message } => {
                     panic!("body failed before controls: {code:?} {message}")
                 }
@@ -1631,19 +1627,6 @@ async fn temp_workdir(h: &ConnectedWorkerHarness, key: &str) -> (String, PathBuf
         .root()
         .to_owned();
     (id, root)
-}
-fn workdir_permissions(id: &str) -> Vec<ScopedPermission> {
-    ["filesystem.read", "filesystem.write", "bash.execute"]
-        .into_iter()
-        .map(|operation| ScopedPermission {
-            operation: operation.into(),
-            resource: PermissionResource::Workdir {
-                working_directory_id: id.into(),
-                path: ".".into(),
-                recursive: true,
-            },
-        })
-        .collect()
 }
 fn permission_for_complete(mr: &str) -> Value {
     json!({"operation":"merge_request.complete","resource":{
@@ -1815,57 +1798,38 @@ async fn full_mr_scenario(replace_body: bool) {
         "operation_id":"full-r2-chat","subject_id":subject}),
     )
     .await;
-    let mut coder_permissions = workdir_permissions(&coder_wd);
-    // Frozen Ticket contexts derive only this Ticket's
-    // linked MRs from these frozen Ticket
-    // contexts. There is no future MR ID, allocated Worker ID or wildcard here.
-    for operation in [
-        "ticket.read",
-        "ticket.relation.read",
-        "ticket.implementation_result.write",
-        "merge_request.open",
-        "merge_request.read",
-        "merge_request.readiness",
-        "merge_request.review",
-    ] {
-        coder_permissions.push(ticket_permission(&ticket, operation));
-    }
-    coder_permissions.push(collection("worker.list"));
-    let reviewer_redelegation: Vec<_> = coder_permissions
-        .iter()
-        .filter(|permission| {
-            matches!(
-                permission.operation.as_str(),
-                "filesystem.read"
-                    | "filesystem.write"
-                    | "bash.execute"
-                    | "ticket.read"
-                    | "ticket.relation.read"
-                    | "merge_request.read"
-                    | "merge_request.review"
-            )
-        })
-        .cloned()
-        .collect();
+    // Internal Reviewer access uses the parent's current operation ceiling,
+    // scoped Workdir broker and trusted exact-source review capability. The
+    // public creation contract does not accept a separate redelegation vector.
+    let coder_assignment = standalone_assignment(
+        r#"{ namespaces = [
+            { namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; },
+            { namespace = "bash"; keys = ["bash.execute"]; },
+            { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; },
+            { namespace = "merge_request"; keys = ["merge_request.open", "merge_request.read", "merge_request.readiness", "merge_request.review"]; },
+            { namespace = "worker"; keys = ["worker.list"]; }
+        ]; }"#,
+    );
     let spawn = json!({"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
         "orchestrator_assignment_id":assignment["assignment"]["assignment_id"],
         "initial_request":format!("{FULL_CODER}{}",json!({"ticket":ticket})),
         "workdir_attachments":[{"alias":"checkout","working_directory_id":coder_wd}],
-        "execution_grant":{"permissions":coder_permissions,"redelegation":reviewer_redelegation}});
+        "authorization":{"kind":"assignment","assignment":coder_assignment}});
     assert!(
         spawn.get("flow").is_none(),
         "default builtin coder-review is selected by omission"
     );
-    let mut adopter_permissions = workdir_permissions(&adopt_wd);
-    adopter_permissions.extend([
-        ticket_permission(&ticket, "ticket.read"),
-        ticket_permission(&ticket, "ticket.relation.read"),
-        ticket_permission(&ticket, "ticket.implementation_result.write"),
-    ]);
+    let adopter_assignment = standalone_assignment(
+        r#"{ namespaces = [
+            { namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; },
+            { namespace = "bash"; keys = ["bash.execute"]; },
+            { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; }
+        ]; }"#,
+    );
     let adoption_spawn = json!({"runtime_id":CONNECTED_RUNTIME,"working_directory_id":adopt_wd,
         "operation_id":"full-r2-generic-adopter","profile":"builtin:coder","ticket_id":null,
         "display_name":"Bounded isolated exact-source Git adopter","initial_submit":[],
-        "execution_grant":{"permissions":adopter_permissions,"redelegation":[]}});
+        "authorization":{"kind":"assignment","assignment":adopter_assignment}});
     let input = json!({"subject":subject,"ticket":ticket,"spawn":spawn,"adoption_spawn":adoption_spawn,
         "before":before,"origin":h._dir.path().display().to_string(),"body_worker":target(&owner_worker)});
     let sent = ok(
@@ -1968,6 +1932,39 @@ async fn full_mr_scenario(replace_body: bool) {
         false,
     )
     .await;
+    // Exercise revocation while the original body turn is quiescent, before
+    // reassignment notifications start new turns. Revoking all input supply
+    // during those turns correctly cancels execution and is not an MR denial.
+    body_idle_now(&h, &owner_worker).await;
+    super::super::chat_tests::adopt_subject_policy(&h.api,&h.owner,&subject,
+        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "worker"; keys = ["worker.create", "worker.observe", "worker.messaging"]; }, { namespace = "merge_request"; keys = ["merge_request.read", "merge_request.readiness", "merge_request.complete"]; }]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,FULL_DELEGATION).await;
+    completion_denied(
+        &h,
+        &owner_worker,
+        completion,
+        "full-r2-current-body-revoked-denied",
+        false,
+    )
+    .await;
+    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject, "{}", "{}").await;
+    completion_denied(
+        &h,
+        &owner_worker,
+        completion,
+        "full-r2-current-body-empty-denied",
+        false,
+    )
+    .await;
+    // Canonical restoration does not resurrect any old child grant. No child is
+    // asked to perform further effects: result/review/adoption already committed.
+    super::super::chat_tests::adopt_subject_policy(
+        &h.api,
+        &h.owner,
+        &subject,
+        FULL_EXECUTION,
+        FULL_DELEGATION,
+    )
+    .await;
     let rows = h
         .api
         .store
@@ -2047,41 +2044,13 @@ async fn full_mr_scenario(replace_body: bool) {
         restored["assignment"]["assignment_id"],
         old_row["assignment_id"]
     );
-    super::super::chat_tests::adopt_subject_policy(&h.api,&h.owner,&subject,
-        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "worker"; keys = ["worker.create", "worker.observe", "worker.messaging"]; }, { namespace = "merge_request"; keys = ["merge_request.read", "merge_request.readiness", "merge_request.complete"]; }]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,FULL_DELEGATION).await;
-    completion_denied(
-        &h,
-        &owner_worker,
-        completion,
-        "full-r2-current-body-revoked-denied",
-        false,
-    )
-    .await;
-    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject, "{}", "{}").await;
-    completion_denied(
-        &h,
-        &owner_worker,
-        completion,
-        "full-r2-current-body-empty-denied",
-        false,
-    )
-    .await;
-    // Canonical restoration does not resurrect any old child grant. No child is
-    // asked to perform further effects: result/review/adoption already committed.
-    super::super::chat_tests::adopt_subject_policy(
-        &h.api,
-        &h.owner,
-        &subject,
-        FULL_EXECUTION,
-        FULL_DELEGATION,
-    )
-    .await;
     assert_eq!(
         serde_json::to_value(&mr_store.get_by_id(TEST_WORKSPACE_ID, mr_id).unwrap().thread)
             .unwrap(),
         before_events,
         "none of the refused valid-evidence completion attempts creates an event"
     );
+    body_idle_now(&h, &owner_worker).await;
     let continued = ok(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/chat/conversations/{}/messages",conversation["id"].as_str().unwrap()),json!({
         "operation_id":"full-r2-continue-after-refusal-controls","text":format!("FULL_R2_COMPLETION_CONTINUE:{ticket}")})).await;
     assert_eq!(continued["delivery"]["state"], "accepted", "{continued}");

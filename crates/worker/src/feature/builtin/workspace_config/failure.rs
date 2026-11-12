@@ -36,9 +36,10 @@ impl ConfigFailureOperation {
     }
     pub(super) fn authorization(self) -> &'static str {
         match self {
-            Self::Current => "workspace_config.current",
+            // Current attachment lookup observes metadata; it does not create
+            // a connection or read source. Use the declared observation key.
+            Self::Current | Self::Observe => "workspace_config.observe",
             Self::Attach => "workspace_config.attach",
-            Self::Observe => "workspace_config.observe",
             Self::Read => "workspace_config.read",
             Self::Commit => "workspace_config.commit",
             Self::Post => "workspace_config.post",

@@ -1433,10 +1433,36 @@ pub(super) fn persist_reply_grant(
 ) -> ApiResult<()> {
     let authority = WorkerAuthorityView::from(api);
     authority.require_not_deleted(child)?;
-    let Some(bound) = authority.live_child_grant(child)? else {
-        return Ok(()); // Ordinary Workers do not acquire reverse control.
+    let origin = if let Some(bound) = authority.live_core_grant(child)? {
+        use server_api::authorization::{CoreWorkerGrantParent, CoreWorkerGrantSource};
+        let parent = match &bound.source {
+            CoreWorkerGrantSource::LaunchPolicy { parent, .. }
+            | CoreWorkerGrantSource::Delegation { parent } => parent,
+            CoreWorkerGrantSource::Account { .. } => return Ok(()),
+        };
+        let (runtime_id, worker_id) = match parent {
+            CoreWorkerGrantParent::SubjectBody {
+                runtime_id,
+                worker_id,
+                ..
+            }
+            | CoreWorkerGrantParent::LegacySubjectGrant {
+                runtime_id,
+                worker_id,
+                ..
+            }
+            | CoreWorkerGrantParent::WorkerGrant {
+                runtime_id,
+                worker_id,
+                ..
+            } => (runtime_id, worker_id),
+        };
+        RuntimeWorkerRef::new(runtime_id, worker_id)
+    } else if let Some(bound) = authority.live_child_grant(child)? {
+        RuntimeWorkerRef::new(&bound.origin_runtime_id, &bound.origin_worker_id)
+    } else {
+        return Ok(()); // Unbound Workers do not acquire reverse control.
     };
-    let origin = RuntimeWorkerRef::new(&bound.origin_runtime_id, &bound.origin_worker_id);
     if &origin != controller {
         return Err(denied(
             "reply grant origin does not match authenticated spawn source",

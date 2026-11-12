@@ -8,6 +8,14 @@ schema変更では、既存の順序付きmigrationへ新しい処理を追加�
 
 古いbaselineの対応終了は、対象となる保存データを移行または明示的に破棄する判断を含め、独立にレビューする。残す最古のschema、移行・破棄の責任、影響するテストを明記する。所有storeのmigration経路と検証を共用し、起動・管理操作ごとに別のDDL判定を増やさない。
 
+## 起動policyの認可identity移行
+
+認可identityは権限内容のdigestでも増分値でもなく、認可を設定・置換・失効した操作のキーに結び付ける。表示名変更はidentityを維持し、CASには別の `last_operation_key` を使う。同じ権限内容への置換や巻戻しでも以前のgrantは復活しない。
+
+保存変換はpolicy・履歴・操作入力／receipt・発行済みgrantを同じtransactionで更新する。旧identityに対応する認可変更操作が見つからない場合は推測せずrollbackする。旧形式を通常のAPI decoderで受け付ける互換経路は置かない。
+
+既存Workerの作成operation、caller fingerprint、Runtimeのcreate fingerprint、凍結Profile bundleは書き換えない。caller fingerprintの完全な入力は保存されていないため、新形式の起動要求を旧要求の再送とみなしてhashを付け替えない。旧形式のpublic要求は受理されず、新形式で旧operationを再利用しても入力不一致となる。これは実行失敗や未実行の証明ではなく、不明な作成結果に新operationを自動発行してはならない。発行済みgrantの現在認可と、作成要求の再送可能性は別に検証する。
+
 ## Session履歴の移行
 
 旧Host compactionのoriginはSession storeのversioned migrationで永続的に更新する。通常復元やpublic readerでは文字列markerによる読み替えを行わない。本文・logical entry ID・derivationを維持し、位置由来のRun boundary IDは書換え前のoffsetから保存する。StandaloneのSessionも同じ変換を使う。

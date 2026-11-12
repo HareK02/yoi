@@ -517,11 +517,20 @@ pub(super) async fn start(
         let subject_record = require_subject(&create_api, &create_subject)?;
         // An exact creation retry uses the same ordinary reservation, including its
         // original Runtime. It never changes an unknown request into a new launch.
-        let reserved_runtime = create_api
+        let mut reserved_runtime = create_api
             .config_store
             .reserved_worker_create_runtime(&create_workspace, &operation)?;
-        if reserved_runtime.is_none() {
-            require_expected(&create_api, &create_subject, None)?;
+        if reserved_runtime.is_none()
+            && let Err(error) = require_expected(&create_api, &create_subject, None)
+        {
+            // A concurrent exact retry can publish the reservation and singleton
+            // between these reads. Only that same operation may reuse the body.
+            reserved_runtime = create_api
+                .config_store
+                .reserved_worker_create_runtime(&create_workspace, &operation)?;
+            if reserved_runtime.is_none() {
+                return Err(error);
+            }
         }
         let runtime_id = match reserved_runtime {
             Some(runtime) => runtime,

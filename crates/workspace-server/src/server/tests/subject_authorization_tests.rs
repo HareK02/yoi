@@ -2,7 +2,9 @@
 //! Router authentication, Host creation/reservation, Subject policy storage, Worker
 //! Feature installation and Ticket SQLite writes are real. Launch policies are
 //! explicit owner-checked Store setup; their management HTTP router is outside
-//! this suite. Subject policy edits and signed Worker creation use real routers.
+//! this suite. Subject policy edits and current signed Worker creation use real
+//! routers. Migrated scoped-policy child fixtures seed retained grants separately;
+//! they do not claim that the current API can issue legacy resource capabilities.
 //! The original boundary
 //! cases substitute WorkdirlessFixtureRuntime. The connected regression below also
 //! runs a real ProfileRuntimeWorkerFactory/Controller and materialized Workdir;
@@ -241,7 +243,7 @@ fn policy_create_request(
 ) -> Value {
     json!({"runtime_id":runtime, "display_name":"Policy-bound editor", "profile":policy.allowed_profiles[0],
         "initial_submit":[], "workdir_attachments":[], "feature_connections":{}, "control_operation_id":operation,
-        "authorization":{"kind":"policy", "policy_id":policy.policy_id, "policy_revision":policy.authorization_revision}})
+        "authorization":{"kind":"policy", "policy_id":policy.policy_id, "policy_authorization_key":policy.authorization_key}})
 }
 
 struct Fixture {
@@ -594,9 +596,23 @@ impl Fixture {
         })
     }
     fn child_request(&self, operation: &str, permissions: Vec<ScopedPermission>) -> Value {
+        // Current issuance selects operation keys, not resource capabilities. Never
+        // silently discard an exact legacy target; those fixtures use the retained
+        // grant seed below rather than the public creation API.
+        assert!(permissions.iter().all(|permission| matches!(
+            &permission.resource,
+            PermissionResource::Workspace { workspace_id }
+                | PermissionResource::WorkerOperation { workspace_id }
+                if workspace_id == TEST_WORKSPACE_ID
+        )));
+        let keys: Vec<_> = permissions
+            .iter()
+            .map(|permission| permission.operation.as_str())
+            .collect();
         json!({"runtime_id":self.source.runtime_id,"display_name":"Ordinary delegated editor",
             "profile":"builtin:coder","initial_submit":[],"workdir_attachments":[],"feature_connections":{},
-            "control_operation_id":operation,"execution_grant":{"permissions":permissions,"redelegation":[]}})
+            "control_operation_id":operation,
+            "authorization":{"kind":"assignment","assignment":key_assignment(&keys)}})
     }
     async fn spawn(&self, source: &RuntimeWorkerRef, body: Value) -> (StatusCode, Value) {
         response(
@@ -612,6 +628,16 @@ impl Fixture {
         .await
     }
     async fn child(&self, operation: &str, permissions: Vec<ScopedPermission>) -> RuntimeWorkerRef {
+        let policy = self
+            .api
+            .config_store
+            .current_subject_permission_policy(TEST_WORKSPACE_ID, &self.subject)
+            .unwrap();
+        if policy.is_some_and(|policy| policy.legacy_constraints.is_some()) {
+            // assign/seed_saved_policy explicitly model migrated scoped authority.
+            // Its children are retained data, NOT successful current API issuance.
+            return self.seed_retained_child(operation, permissions);
+        }
         let (status, body) = self
             .spawn(&self.source, self.child_request(operation, permissions))
             .await;
@@ -620,6 +646,82 @@ impl Fixture {
             body["runtime_id"].as_str().unwrap(),
             body["worker_id"].as_str().unwrap(),
         )
+    }
+    fn seed_retained_child(
+        &self,
+        operation: &str,
+        permissions: Vec<ScopedPermission>,
+    ) -> RuntimeWorkerRef {
+        // This component Runtime does not execute controllers. Seed an already
+        // retained identity and its historical scoped grant without calling spawn,
+        // issuing a core grant, changing the Subject policy, or claiming a body.
+        // The retained-grant binder still checks the exact delegation ceiling and
+        // source change ID, so invalid fixture grants fail rather than widening it.
+        let child = RuntimeWorkerRef::new(&self.source.runtime_id, Uuid::now_v7().to_string());
+        let grant = subject_authorization::prepare_delegation(
+            &self.api,
+            &self.source,
+            Some(&server_api::authorization::WorkerDelegationRequest {
+                permissions,
+                redelegation: vec![],
+            }),
+            &child.runtime_id,
+            "builtin:coder",
+            "fixture-retained-coder-digest",
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        subject_authorization::bind_reserved_grant(&self.api, &grant, &child.worker_id).unwrap();
+        let now = now_registry_timestamp();
+        self.api
+            .store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: child.clone(),
+                display_name: operation.into(),
+                profile: Some("builtin:coder".into()),
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+        let mut summary = self.api.runtime.worker(&self.source).unwrap();
+        summary.worker = child.clone();
+        summary.display_name = operation.into();
+        summary.label = operation.into();
+        summary.profile = Some("builtin:coder".into());
+        summary.singleton_key = None;
+        self.runtime.workers.lock().unwrap().push(summary);
+        core_worker_creation::persist_spawn_control(
+            &self.api,
+            &self.source,
+            &child,
+            &format!("fixture-retained:{operation}"),
+            &child.worker_id,
+            false,
+        )
+        .unwrap();
+        assert!(
+            self.api
+                .config_store
+                .core_worker_execution_grant(TEST_WORKSPACE_ID, &child.runtime_id, &child.worker_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            self.api
+                .store
+                .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &child)
+                .unwrap()
+                .is_none()
+        );
+        child
     }
     async fn policy_child(
         &self,
@@ -806,6 +908,106 @@ impl WorkspaceClient for RouterClient {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixture_assignment_child_uses_current_issuance_and_rejects_excess_before_spawn() {
+    let f = Fixture::new().await;
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }]; }"#,
+        r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.query"]; }]; }"#,
+    )
+    .await;
+    let child = f
+        .child("fixture-current-assignment", vec![query_permission()])
+        .await;
+    let grant = f.core_grant(&child);
+    assert_eq!(grant.assignment, key_assignment(&["ticket.query"]));
+    assert!(matches!(
+        &grant.source,
+        server_api::authorization::CoreWorkerGrantSource::Delegation {
+            parent: server_api::authorization::CoreWorkerGrantParent::SubjectBody { subject_id, .. }
+        } if subject_id == &f.subject
+    ));
+    assert!(
+        open_subjektiv_store(&f.api)
+            .unwrap()
+            .worker_execution_grant(&child.runtime_id, &child.worker_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.check(&child, &query_permission()).await.0, StatusCode::OK);
+    assert_eq!(
+        f.check(&child, &create_permission()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let records = creation_record_counts(&f);
+    let calls = f.runtime.spawn_requests().len();
+    let (status, body) = f
+        .spawn(
+            &f.source,
+            f.child_request("fixture-excess-assignment", vec![create_permission()]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(creation_record_counts(&f), records);
+    assert_eq!(f.runtime.spawn_requests().len(), calls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixture_retained_child_preserves_exact_scope_without_current_api_issuance() {
+    let f = Fixture::new().await;
+    let allowed = seed_resource_ticket(&f, "Retained child target", "retained-child-target");
+    let other = seed_resource_ticket(&f, "Other child target", "other-child-target");
+    let permission = ticket_read_permission(&allowed[0]);
+    let policy = f
+        .assign(
+            vec![workspace_operation("worker.create")],
+            vec![permission.clone()],
+        )
+        .await;
+    let calls = f.runtime.spawn_requests().len();
+    let records = creation_record_counts(&f);
+    let (status, body) = f
+        .spawn(
+            &f.source,
+            f.child_request("legacy-cannot-issue-assignment", vec![]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(creation_record_counts(&f), records);
+    assert_eq!(f.runtime.spawn_requests().len(), calls);
+
+    let child = f
+        .child("retained-exact-child", vec![permission.clone()])
+        .await;
+    assert_eq!(
+        f.runtime.spawn_requests().len(),
+        calls,
+        "seed is not a Runtime launch"
+    );
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let saved = store
+        .worker_execution_grant(&child.runtime_id, &child.worker_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.permissions, vec![permission.clone()]);
+    assert!(saved.redelegation.is_empty());
+    assert_eq!(saved.source_change_id, policy.change_id);
+    assert_eq!(store.subject_permissions(&f.subject).unwrap(), Some(policy));
+    assert_eq!(f.check(&child, &permission).await.0, StatusCode::OK);
+    assert_eq!(
+        f.check(&child, &ticket_read_permission(&other[0])).await.0,
+        StatusCode::FORBIDDEN
+    );
+    f.assign(vec![], vec![]).await;
+    assert_eq!(f.check(&child, &permission).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        store
+            .worker_execution_grant(&child.runtime_id, &child.worker_id)
+            .unwrap(),
+        Some(saved)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canonical_owner_adoption_authorizes_signed_ticket_effects_and_revocation_without_id_grants()
  {
     let f = Fixture::new().await;
@@ -947,7 +1149,7 @@ async fn canonical_delegation_freezes_child_operations_and_rechecks_parent_curre
         saved.source,
         CoreWorkerGrantSource::LaunchPolicy {
             policy_id: policy.policy_id.clone(),
-            policy_revision: policy.authorization_revision,
+            policy_authorization_key: policy.authorization_key.clone(),
             parent: CoreWorkerGrantParent::SubjectBody {
                 subject_id: f.subject.clone(),
                 source_change_id: source.change_id,
@@ -1440,10 +1642,6 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
         "owner assignment does not grant another operation"
     );
     let mut without_create = f.child_request("worker-without-create-operation", vec![]);
-    without_create
-        .as_object_mut()
-        .unwrap()
-        .remove("execution_grant");
     without_create["authorization"] = json!({"kind":"assignment", "assignment":null});
     let (status, _) = f.spawn(&legacy, without_create).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -2564,7 +2762,6 @@ async fn generic_create_routes_refuse_body_and_child_delegation_before_any_creat
 async fn generic_create_routes_accept_owner_and_require_worker_control_path() {
     let f = Fixture::new().await;
     let mut request = f.child_request("unused-on-generic-route", vec![]);
-    request.as_object_mut().unwrap().remove("execution_grant");
     request["authorization"] = json!({"kind":"assignment", "assignment":null});
     request["control_operation_id"] = json!("generic-owner-once");
     for path in [
@@ -2762,7 +2959,7 @@ async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_o
         grant.source,
         server_api::authorization::CoreWorkerGrantSource::LaunchPolicy {
             policy_id: policy.policy_id.clone(),
-            policy_revision: policy.authorization_revision,
+            policy_authorization_key: policy.authorization_key.clone(),
             parent: server_api::authorization::CoreWorkerGrantParent::SubjectBody {
                 subject_id: f.subject.clone(),
                 source_change_id: source_policy.change_id,
@@ -2950,12 +3147,20 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
         f.check(&current, &query_permission()).await.0,
         StatusCode::OK
     );
+    let current_grant = f.core_grant(&current);
+    subject_authorization::revalidate_core_grant(&f.api, &current_grant).unwrap();
     f.release_source_lease();
+    let revoked = subject_authorization::revalidate_core_grant(&f.api, &current_grant).unwrap_err();
+    assert!(
+        matches!(&revoked.error, Error::WorkspacePermissionDenied(_)),
+        "core lineage must reject the released origin: {revoked:?}"
+    );
     assert_eq!(
         f.check(&current, &query_permission()).await.0,
-        StatusCode::CONFLICT,
-        "the captured source lease is no longer current"
+        StatusCode::FORBIDDEN,
+        "the core grant rejects a released origin as authorization denial, not a lease CAS conflict"
     );
+    assert_eq!(f.core_grant(&current), current_grant);
     assert_eq!(
         f.check(&f.source, &query_permission()).await.0,
         StatusCode::UNAUTHORIZED,
@@ -4432,7 +4637,7 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
         control_operation_id: Some("connected-authorization-child-once".into()),
         authorization: server_api::launch_policy::WorkerCreationAuthorization::Policy {
             policy_id: policy.policy_id.clone(),
-            policy_revision: policy.authorization_revision,
+            policy_authorization_key: policy.authorization_key.clone(),
         },
     };
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
@@ -4852,7 +5057,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
             "initial_submit":[{"kind":"text", "content":format!("connected-ticket-case:{}", json!({"ticket":ticket.id,"content":content}))}],
             "workdir_attachments":[{"alias":"workdir", "working_directory_id":workdir}],
             "feature_connections":{}, "control_operation_id":format!("parallel-{label}-control"),
-            "authorization":{"kind":"policy", "policy_id":launch.policy_id, "policy_revision":launch.authorization_revision}});
+            "authorization":{"kind":"policy", "policy_id":launch.policy_id, "policy_authorization_key":launch.authorization_key}});
         cases.push(Case {
             subject,
             ticket: ticket.id,

@@ -2,6 +2,40 @@
 // substituted by the existing shared fixture; no live Workspace data is used.
 use super::*;
 
+async fn parent_link_source(api: &WorkspaceApi) -> RuntimeWorkerRef {
+    register_test_runtime(api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+    api.runtime
+        .register_or_replace(WorkdirlessFixtureRuntime::default());
+    let Json(created) = create_workspace_worker_as_owner(
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
+            display_name: "Parent link fixture".into(),
+            singleton_key: None,
+            profile: Some("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: Default::default(),
+            control_operation_id: Some(Uuid::now_v7().to_string()),
+            authorization: test_worker_operation_authorization(&[(
+                "ticket",
+                &[
+                    "ticket.read",
+                    "ticket.list",
+                    "ticket.relation.read",
+                    "ticket.relation.record",
+                    "ticket.relation.remove",
+                ],
+            )]),
+        }),
+    )
+    .await
+    .unwrap();
+    RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+}
+
 fn parent_request(
     expected: serde_json::Value,
     parent: Option<&str>,
@@ -14,9 +48,9 @@ fn parent_request(
 async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_authorities() {
     let dir = tempfile::tempdir().unwrap();
     let (mut api, _execution) = test_api_with_recording_backend(dir.path()).await;
-    let identity = RuntimeIdentityMaterial::generate("runtime-parents").unwrap();
-    configure_runtime_request_auth(&mut api, &identity, "runtime-parents");
-    seed_worker_source_member(&api, "runtime-parents", "linker");
+    let source = parent_link_source(&api).await;
+    let identity = RuntimeIdentityMaterial::generate(&source.runtime_id).unwrap();
+    configure_runtime_request_auth(&mut api, &identity, &source.runtime_id);
     let backend = browser_ticket_backend(&api).unwrap();
     let a = backend.create(ticket::NewTicket::new("A")).unwrap().id;
     let b = backend.create(ticket::NewTicket::new("B")).unwrap().id;
@@ -42,7 +76,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     let first = runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "PUT",
         &parent_path(&b),
         first_request.clone(),
@@ -59,7 +93,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "PUT",
         &parent_path(&c),
         parent_request(absent.clone(), Some(&b), "c-b"),
@@ -69,7 +103,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "PUT",
         &parent_path(&a),
         parent_request(absent.clone(), Some(&c), "cycle"),
@@ -87,7 +121,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     let moved = runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "PUT",
         &parent_path(&b),
         parent_request(first["observation"].clone(), Some(&d), "b-d"),
@@ -97,7 +131,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "PUT",
         &parent_path(&b),
         parent_request(first["observation"].clone(), None, "stale"),
@@ -108,7 +142,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
         runtime_tag_json(
             app.clone(),
             &identity,
-            "linker",
+            &source.worker_id,
             "PUT",
             &parent_path(&b),
             first_request,
@@ -120,7 +154,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     let reread = runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "GET",
         &parent_path(&b),
         json!(null),
@@ -132,7 +166,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     let query = runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "POST",
         &query_path,
         json!({"parent":{"kind":"parent","ticket":d}}),
@@ -144,7 +178,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     let roots = runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "POST",
         &query_path,
         json!({"parent":{"kind":"none"}}),
@@ -161,7 +195,7 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
     runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "PUT",
         &parent_path(&b),
         parent_request(moved["observation"].clone(), None, "unlink"),
@@ -184,9 +218,9 @@ async fn signed_parent_routes_replay_reparent_query_and_preserve_independent_aut
 async fn signed_parent_routes_reject_missing_wire_and_scoped_cursor_without_partial_writes() {
     let dir = tempfile::tempdir().unwrap();
     let (mut api, _execution) = test_api_with_recording_backend(dir.path()).await;
-    let identity = RuntimeIdentityMaterial::generate("runtime-parents").unwrap();
-    configure_runtime_request_auth(&mut api, &identity, "runtime-parents");
-    seed_worker_source_member(&api, "runtime-parents", "linker");
+    let source = parent_link_source(&api).await;
+    let identity = RuntimeIdentityMaterial::generate(&source.runtime_id).unwrap();
+    configure_runtime_request_auth(&mut api, &identity, &source.runtime_id);
     let backend = browser_ticket_backend(&api).unwrap();
     let parent = backend.create(ticket::NewTicket::new("Parent")).unwrap().id;
     let other = backend
@@ -220,7 +254,7 @@ async fn signed_parent_routes_reject_missing_wire_and_scoped_cursor_without_part
             .clone()
             .oneshot(runtime_source_request(
                 &identity,
-                Some("linker"),
+                Some(&source.worker_id),
                 "PUT",
                 &path,
                 serde_json::to_vec(&body).unwrap(),
@@ -235,7 +269,7 @@ async fn signed_parent_routes_reject_missing_wire_and_scoped_cursor_without_part
     let page = runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "GET",
         &page_path,
         json!(null),
@@ -252,7 +286,7 @@ async fn signed_parent_routes_reject_missing_wire_and_scoped_cursor_without_part
     runtime_tag_json(
         app.clone(),
         &identity,
-        "linker",
+        &source.worker_id,
         "GET",
         &wrong_scope,
         json!(null),
@@ -279,9 +313,7 @@ async fn signed_parent_routes_reject_missing_wire_and_scoped_cursor_without_part
 
 #[tokio::test]
 async fn parent_reparent_requires_existing_record_and_remove_grants_on_actual_endpoints() {
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-    };
+    use server_api::authorization::{PermissionResource, ScopedPermission};
     let workspace = tempfile::tempdir().unwrap();
     let mut api = test_api(workspace.path()).await;
     register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
@@ -294,7 +326,7 @@ async fn parent_reparent_requires_existing_record_and_remove_grants_on_actual_en
             "Link work decomposition".into(),
         )
         .unwrap();
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -332,18 +364,8 @@ async fn parent_reparent_requires_existing_record_and_remove_grants_on_actual_en
         },
     };
     let set_raw = |permissions: Vec<ScopedPermission>| {
-        let previous = store.current_subject_policy(&subject.id).unwrap();
-        store
-            .set_subject_permissions(
-                &subject.id,
-                &SubjectPermissionsUpdate {
-                    operation_id: Uuid::now_v7().to_string(),
-                    expected_change_id: previous.map(|policy| policy.change_id),
-                    execution: permissions,
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        let policy = seed_test_subject_legacy_constraints(&api, &subject.id, permissions, vec![]);
+        set_test_subject_policy_as_owner(&api, &subject.id, policy.execution, policy.delegation);
     };
     let set = |mut permissions: Vec<ScopedPermission>| {
         permissions.extend([

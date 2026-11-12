@@ -72,36 +72,19 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
                 crate::subjektiv::SubjectRole::new(format!("companion-{index}")).unwrap(),
             )
             .unwrap();
-        subjektiv
-            .set_subject_permissions(
-                &subject.id,
-                &server_api::authorization::SubjectPermissionsUpdate {
-                    operation_id: format!("subject-callback-grant-{index}"),
-                    expected_change_id: Some(
-                        subjektiv
-                            .current_subject_policy(&subject.id)
-                            .unwrap()
-                            .unwrap()
-                            .change_id,
-                    ),
-                    execution: [
-                        "memory.resident.read",
-                        "session.record",
-                        "journal.startup.read",
-                    ]
-                    .into_iter()
-                    .map(|operation| server_api::authorization::ScopedPermission {
-                        operation: operation.into(),
-                        resource: server_api::authorization::PermissionResource::Subject {
-                            workspace_id: TEST_WORKSPACE_ID.into(),
-                            subject_id: subject.id.clone(),
-                        },
-                    })
-                    .collect(),
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        set_test_subject_policy_as_owner(
+            &api,
+            &subject.id,
+            test_operation_assignment(
+                &api,
+                &[
+                    "memory.resident.read",
+                    "session.record",
+                    "journal.startup.read",
+                ],
+            ),
+            Default::default(),
+        );
         let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
         let reserved = api
             .config_store
@@ -531,14 +514,27 @@ async fn unpublished_recovery_fixture(
     (api, backend, subject.id, old)
 }
 
-fn recovery_spawn_request(subject: &str) -> WorkerSpawnRequest {
-    serde_json::from_value(json!({
+fn recovery_spawn_request(api: &WorkspaceApi, subject: &str) -> WorkerSpawnRequest {
+    let bundle = test_internal_builtin_profile_bundle(api, "builtin:companion");
+    let profile = crate::profile_settings::resolve_profile_manifest_from_config_bundle(
+        &bundle,
+        "builtin:companion",
+    )
+    .unwrap();
+    let attachment = open_subjektiv_store(api)
+        .unwrap()
+        .authorize_worker_attachment(subject, &profile)
+        .unwrap();
+    let mut request: WorkerSpawnRequest = serde_json::from_value(json!({
         "intent": WorkerSpawnIntent::WorkspaceCompanion,
         "acceptance": WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments: 0 },
         "profile": worker_runtime::catalog::ProfileSelector::Builtin("builtin:companion".into()),
-        "singleton_key": crate::subjektiv::subject_worker_singleton_key(subject).unwrap(),
+        "singleton_key": attachment.singleton_key,
     }))
-    .unwrap()
+    .unwrap();
+    request.resolved_config_bundle = Some(bundle);
+    request.resolved_subjektiv_attached = true;
+    request
 }
 
 #[tokio::test]
@@ -563,7 +559,7 @@ async fn unpublished_create_recovery_retries_same_fence_then_creates_new_worker(
     }));
     *backend.recovery_failure.lock().unwrap() = Some("unconfirmed execution absence".into());
     assert!(
-        api.spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject))
+        api.spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&api, &subject))
             .is_err()
     );
     assert!(
@@ -586,7 +582,7 @@ async fn unpublished_create_recovery_retries_same_fence_then_creates_new_worker(
     );
 
     let replacement = api
-        .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject))
+        .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&api, &subject))
         .unwrap();
     assert_eq!(replacement.state, InternalWorkerOperationState::Accepted);
     let replacement = replacement.worker.unwrap().worker;
@@ -645,7 +641,7 @@ async fn unpublished_create_recovery_refuses_any_attribution_or_orphan_writer() 
                 .unwrap();
         }
         assert!(
-            api.spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject))
+            api.spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&api, &subject))
                 .is_err()
         );
         assert!(backend.recovery_requests.lock().unwrap().is_empty());
@@ -711,15 +707,18 @@ async fn failed_subject_spawn_releases_occupancy_only_after_runtime_proof() {
             .create_subject(crate::subjektiv::SubjectRole::new("failed-spawn").unwrap())
             .unwrap();
         let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
-        *backend.spawn_failure.lock().unwrap() =
-            Some("Session registration failed before publication".into());
+        *backend.typed_spawn_failure.lock().unwrap() = Some(cause_startup_result());
         if uncertain {
             *backend.recovery_failure.lock().unwrap() = Some("Runtime absence unconfirmed".into());
         }
         let rejected = api
-            .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
+            .spawn_workspace_worker(
+                EMBEDDED_RUNTIME_ID,
+                recovery_spawn_request(&api, &subject.id),
+            )
             .unwrap();
-        assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
+        assert_eq!(rejected.state, InternalWorkerOperationState::Unknown);
+        assert!(rejected.failure.is_some(), "startup cause must be retained");
         let retained = api
             .config_store
             .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
@@ -743,7 +742,10 @@ async fn failed_subject_spawn_releases_occupancy_only_after_runtime_proof() {
             );
         }
         let result = api
-            .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
+            .spawn_workspace_worker(
+                EMBEDDED_RUNTIME_ID,
+                recovery_spawn_request(&api, &subject.id),
+            )
             .unwrap();
         assert_eq!(result.state, InternalWorkerOperationState::Accepted);
         let current = api

@@ -192,7 +192,7 @@ mod core_worker_creation_tests {
                 &api,
                 source,
                 &policy.policy_id,
-                policy.authorization_revision,
+                &policy.authorization_key,
                 WorkdirlessFixtureRuntime::RUNTIME_ID,
                 "builtin:companion",
                 "fixture-profile-digest",

@@ -299,7 +299,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     assert!(api.accept_backend_job_result(worker, &forged).is_err());
     seed_worker_session_for_cleanup(dir.path(), worker);
     let accepted = api.accept_backend_job_result(worker, &submission).unwrap();
-    assert_eq!(accepted.job.state, BackendJobState::Completed);
+    assert_eq!(accepted.job.state, BackendJobState::Finalizing);
     assert_eq!(
         store.resident_surface(&subject.id).unwrap().availability,
         SurfaceAvailability::Failed
@@ -319,14 +319,14 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
         BackendJobWorkerCleanupState::Completed,
     )
     .await;
-    assert!(
-        api.store
-            .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
-            .unwrap()
-            .unwrap()
-            .result
-            .is_some()
-    );
+    wait_for_backend_job_completion(&api, &job.request.job_id).await;
+    let completed = api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, BackendJobState::Completed);
+    assert!(completed.result.is_some());
     let next = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
@@ -373,6 +373,7 @@ async fn dirty_consolidation_survives_owner_tick_and_recovers_same_attempt_termi
     assert_eq!(started.status, "started");
     let job = resource(&api, &subject.id);
     let attempt = current_attempt(&api, &job);
+    seed_worker_session_for_cleanup(dir.path(), attempt.worker.as_ref().unwrap());
     let gate = api.backend_job_recovery.dispatch_gate(&attempt.attempt_id);
     let observed = api
         .backend_job_recovery
@@ -410,7 +411,10 @@ async fn dirty_consolidation_survives_owner_tick_and_recovers_same_attempt_termi
                 .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
                 .unwrap()
                 .unwrap();
-            if saved.state != BackendJobState::Pending {
+            if !matches!(
+                saved.state,
+                BackendJobState::Pending | BackendJobState::Finalizing
+            ) {
                 break saved;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

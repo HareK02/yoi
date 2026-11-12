@@ -221,12 +221,13 @@ async fn remove_worker(
         )?;
         return Ok(());
     }
-    // Replay the canonical child even when physical removal already happened:
-    // its retained receipt can finish the Backend catalog midpoint. The Runtime
-    // fence above also prevents an older create from arriving after that removal.
+    // A completed canonical receipt can finish the Backend catalog midpoint
+    // without reconstructing purged source metadata or replaying Runtime work.
+    // Unfinished children still require their exact executable request. The
+    // Runtime fence above prevents an older create from arriving after removal.
     if api
         .config_store
-        .recover_worker_removal_execution(api.workspace_id(), worker)
+        .recover_worker_removal_plan(api.workspace_id(), worker)
         .map_err(|error| Error::Store(error.to_string()))?
         .is_some()
     {

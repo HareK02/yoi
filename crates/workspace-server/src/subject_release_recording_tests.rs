@@ -218,7 +218,7 @@ fn release_recording_migration_preserves_old_receipt_and_rolls_back_failed_publi
     };
     assert_eq!(fresh.with_conn(trigger).unwrap(), trigger(&conn).unwrap());
     assert_eq!(shape(&conn).unwrap().len(), 2);
-    storage_formats::verify_history(&conn, LATEST_SCHEMA_VERSION).unwrap();
+    storage_formats::verify_history(&conn, 135).unwrap();
     drop(conn);
     let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     assert!(

@@ -126,9 +126,9 @@ fn retained_recording(
     // registry absence nor a finished Job is evidence of physical source removal.
     if let Some(prepared) = api
         .config_store
-        .recover_worker_removal_execution(api.workspace_id(), &worker)
+        .recover_worker_removal_plan(api.workspace_id(), &worker)
         .map_err(|error| Error::Store(error.to_string()))?
-        && let Some(progress) = api.store.get_journal_removal(&prepared)?
+        && let Some(progress) = api.store.get_journal_removal_for_plan(&prepared)?
         && let Some(recording) = progress.metadata.retained_recording
         && progress.metadata.binding.subject_id == subject
         && progress.metadata.binding.database == identity

@@ -698,6 +698,7 @@ struct WorkerSpawnInput {
     /// Stable caller-chosen intent ID. Exact retries retain this ID and full input.
     operation_id: String,
     /// Omit for the shared Worker default, or select an explicit assignment or launch policy.
+    /// Policy selection carries the exact observed string authorization identity.
     #[serde(default)]
     authorization: server_api::launch_policy::WorkerCreationAuthorization,
     profile: String,
@@ -2516,7 +2517,7 @@ mod tests {
             control: test_control(client.clone()),
             runtime_worker_control: true,
         };
-        let mut input = serde_json::json!({"runtime_id":"runtime-1", "profile":"builtin:coder", "authorization":{"kind":"policy", "policy_id":"policy-1", "policy_revision":1}});
+        let mut input = serde_json::json!({"runtime_id":"runtime-1", "profile":"builtin:coder", "authorization":{"kind":"policy", "policy_id":"policy-1", "policy_authorization_key":"auth-key"}});
         assert!(
             tool.execute(&input.to_string(), ToolExecutionContext::direct())
                 .await
@@ -2539,7 +2540,11 @@ mod tests {
             serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["control_operation_id"], "ordinary-intent-1");
         assert_eq!(body["authorization"]["policy_id"], "policy-1");
-        assert_eq!(body["authorization"]["policy_revision"], 1);
+        assert_eq!(
+            body["authorization"]["policy_authorization_key"],
+            "auth-key"
+        );
+        assert!(body["authorization"].get("policy_revision").is_none());
         assert!(
             body.get("execution_grant")
                 .is_none_or(serde_json::Value::is_null)
@@ -2569,7 +2574,9 @@ mod tests {
                 "grants":[{"kind":"set", "value":"conversation"}],
                 "exclusions":[], "revoked":true
             }})),
-            Some(serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":3})),
+            Some(
+                serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key"}),
+            ),
         ] {
             let mut input = serde_json::json!({
                 "runtime_id":"runtime-1", "operation_id":"spawn-selection",
@@ -2646,10 +2653,14 @@ mod tests {
             serde_json::Value::Null,
             serde_json::json!({"kind":"human", "assignment":null}),
             serde_json::json!({"kind":"policy", "policy_id":"coder"}),
-            serde_json::json!({"kind":"policy", "policy_revision":1}),
-            serde_json::json!({"kind":"policy", "policy_id":"", "policy_revision":1}),
-            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":0}),
-            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":9_007_199_254_740_992_u64}),
+            serde_json::json!({"kind":"policy", "policy_authorization_key":"auth-key"}),
+            serde_json::json!({"kind":"policy", "policy_id":"", "policy_authorization_key":"auth-key"}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key", "policy_revision":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":""}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"é".repeat(257)}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"bad\u{85}key"}),
             serde_json::json!({"kind":"assignment", "policy_id":"coder"}),
         ] {
             let mut input = valid.clone();
@@ -2713,6 +2724,21 @@ mod tests {
         assert!(schema["properties"].get("authorization").is_some());
         assert!(schema["properties"].get("policy_id").is_none());
         assert!(schema["properties"].get("policy_revision").is_none());
+        assert!(text.contains("policy_authorization_key"));
+        assert!(!text.contains("policy_revision"));
+        let mut input = serde_json::json!({
+            "runtime_id":"runtime-1", "operation_id":"schema-test", "profile":"builtin:coder",
+            "authorization":{"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key"}
+        });
+        assert!(jsonschema::is_valid(&schema, &input));
+        for key in [
+            serde_json::json!(1),
+            serde_json::json!(""),
+            serde_json::json!("x".repeat(513)),
+        ] {
+            input["authorization"]["policy_authorization_key"] = key;
+            assert!(!jsonschema::is_valid(&schema, &input));
+        }
         assert!(text.contains("initial_submit"));
         assert!(text.contains("ticket_id"));
         assert!(text.contains("selector"));

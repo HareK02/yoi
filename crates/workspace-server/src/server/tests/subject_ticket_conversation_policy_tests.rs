@@ -40,7 +40,7 @@ async fn conversation_only_policy_exposes_but_refuses_coder_delegation() {
         &h.api,
         &h.owner,
         subject,
-        r#"{ sets = ["conversation"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.read", "ticket.assignment.query"]; }]; exclude_namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }, { namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,
+        r#"{ sets = ["conversation"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.assignment.query"]; }]; exclude_namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }, { namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,
         "{}",
     )
     .await;
@@ -73,7 +73,7 @@ async fn conversation_only_policy_exposes_but_refuses_coder_delegation() {
     let input = json!({"subject":subject,"ticket":ticket,"deny":true,"content":"must not edit",
         "spawn":{"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder","flow":null,
             "orchestrator_assignment_id":assigned["assignment"]["assignment_id"],"initial_request":"must not execute",
-            "execution_grant":{"permissions":[],"redelegation":[]}}});
+            "authorization":{"kind":"assignment","assignment":standalone_assignment("{}")}}});
     send(
         &h,
         conversation["id"].as_str().unwrap(),

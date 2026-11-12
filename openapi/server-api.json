@@ -23485,20 +23485,19 @@
                 "const": "policy",
                 "type": "string"
               },
-              "policy_id": {
+              "policy_authorization_key": {
+                "maxLength": 512,
+                "minLength": 1,
                 "type": "string"
               },
-              "policy_revision": {
-                "format": "uint64",
-                "maximum": 9007199254740991,
-                "minimum": 1,
-                "type": "integer"
+              "policy_id": {
+                "type": "string"
               }
             },
             "required": [
               "kind",
               "policy_id",
-              "policy_revision"
+              "policy_authorization_key"
             ],
             "type": "object"
           },
@@ -26646,7 +26645,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:b574de18161ec4865b6b79da85b5442b8ae95f27c046f1514d1db3d469ac15cd"
+    "x-yoi-source-digest": "sha256:089b4f18ba38306a75a39ccf9d35d2f10d9728c2f93095006f93b74549c17ebc"
   },
   "openapi": "3.1.0",
   "paths": {

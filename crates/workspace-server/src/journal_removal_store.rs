@@ -171,6 +171,10 @@ fn validate_prepared(conn: &Connection, prepared: &PreparedWorkerRemoval) -> Res
     {
         return Err(invalid("Journal removal prepared scope mismatch"));
     }
+    validate_plan(conn, plan)
+}
+
+fn validate_plan(conn: &Connection, plan: &crate::retention::WorkerRemovalPlan) -> Result<()> {
     let exact: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM worker_removal_operations
          WHERE plan_id=?1 AND operation_id=?2 AND input_fingerprint=?3
@@ -231,6 +235,18 @@ fn save(conn: &Connection, operation_id: &str, metadata: &JournalRemovalMetadata
 }
 
 impl SqliteWorkspaceStore {
+    /// Read retained recording progress without reconstructing an executable
+    /// request from Worker metadata which may have been intentionally purged.
+    pub fn get_journal_removal_for_plan(
+        &self,
+        plan: &crate::retention::WorkerRemovalPlan,
+    ) -> Result<Option<JournalRemovalProgress>> {
+        self.with_conn(|conn| {
+            validate_plan(conn, plan)?;
+            load(conn, &plan.operation_id)
+        })
+    }
+
     pub fn get_journal_removal(
         &self,
         prepared: &PreparedWorkerRemoval,

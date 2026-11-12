@@ -1968,9 +1968,9 @@ pub(super) fn drain_after_completion(api: &WorkspaceApi, request: &BackendJobReq
             let target = RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id);
             if let Some(prepared) = api
                 .config_store
-                .recover_worker_removal_execution(api.workspace_id(), &target)
+                .recover_worker_removal_plan(api.workspace_id(), &target)
                 .map_err(|error| Error::Store(error.to_string()))?
-                && api.store.get_journal_removal(&prepared)?.is_some()
+                && api.store.get_journal_removal_for_plan(&prepared)?.is_some()
             {
                 // The removal parent owns selection from its fixed union. Normal
                 // live drain must not replace its scope or bypass the saved end.
@@ -2809,11 +2809,11 @@ fn release_completed_source(
     let target = RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id);
     if let Some(prepared) = api
         .config_store
-        .recover_worker_removal_execution(api.workspace_id(), &target)
+        .recover_worker_removal_plan(api.workspace_id(), &target)
         .map_err(|error| Error::Store(error.to_string()))?
         && api
             .store
-            .get_journal_removal(&prepared)?
+            .get_journal_removal_for_plan(&prepared)?
             .is_some_and(|progress| progress.metadata.retained_recording.is_some())
     {
         // The frozen-scope owner releases pins after every original is reflected.

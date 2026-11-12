@@ -159,7 +159,9 @@ pub(crate) use subject_release_recording_store::{
     ReleaseJournalRecording, ReleaseJournalRecordingProgress,
 };
 
-const LATEST_SCHEMA_VERSION: i64 = 135;
+#[path = "launch_policy_identity_migration.rs"]
+mod launch_policy_identity_migration;
+const LATEST_SCHEMA_VERSION: i64 = 136;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -610,6 +612,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 135,
         name: subject_release_recording_store::MIGRATION_NAME,
         apply: subject_release_recording_store::migrate,
+    },
+    Migration {
+        version: 136,
+        name: launch_policy_identity_migration::MIGRATION_NAME,
+        apply: launch_policy_identity_migration::migrate,
     },
 ];
 
@@ -1749,6 +1756,18 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
             "Worker retention authority is unavailable".to_string(),
         ))
     }
+    /// Observe the canonical plan without requiring Runtime execution source metadata.
+    fn recover_worker_removal_plan(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> std::result::Result<
+        Option<crate::retention::WorkerRemovalPlan>,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (workspace_id, worker);
+        Ok(None)
+    }
     fn recover_worker_removal_execution(
         &self,
         workspace_id: &str,
@@ -1798,6 +1817,15 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         prepared: &crate::retention::PreparedWorkerRemoval,
     ) -> Result<Option<JournalRemovalProgress>> {
         let _ = prepared;
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn get_journal_removal_for_plan(
+        &self,
+        plan: &crate::retention::WorkerRemovalPlan,
+    ) -> Result<Option<JournalRemovalProgress>> {
+        let _ = plan;
         Err(Error::InvalidInput(
             "Journal removal persistence unavailable".into(),
         ))
@@ -7025,6 +7053,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         )
     }
 
+    fn recover_worker_removal_plan(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> std::result::Result<
+        Option<crate::retention::WorkerRemovalPlan>,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::recover_worker_removal_plan(self, workspace_id, worker)
+    }
+
     fn recover_worker_removal_execution(
         &self,
         workspace_id: &str,
@@ -7065,6 +7104,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         prepared: &crate::retention::PreparedWorkerRemoval,
     ) -> Result<Option<JournalRemovalProgress>> {
         SqliteWorkspaceStore::get_journal_removal(self, prepared)
+    }
+    fn get_journal_removal_for_plan(
+        &self,
+        plan: &crate::retention::WorkerRemovalPlan,
+    ) -> Result<Option<JournalRemovalProgress>> {
+        SqliteWorkspaceStore::get_journal_removal_for_plan(self, plan)
     }
     fn init_journal_removal(
         &self,
@@ -17396,7 +17441,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
     conn.execute_batch(crate::subject_policy::SCHEMA)?;
-    conn.execute_batch(crate::launch_policy::SCHEMA)?;
+    conn.execute_batch(crate::launch_policy::CURRENT_SCHEMA)?;
     conn.execute_batch(include_str!("core_worker_launch.sql"))?;
     conn.execute_batch(backend_job_recovery_store::SCHEMA)?;
     conn.execute_batch(backend_job_reference_migration::SCHEMA)?;
@@ -22076,6 +22121,18 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 133,
                 name: crate::subject_policy::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 134,
+                name: backend_job_finalizing::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 135,
+                name: subject_release_recording_store::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 136,
+                name: launch_policy_identity_migration::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -22221,6 +22278,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (130, backend_job_current::MIGRATION_NAME.into()),
 (131, crate::launch_policy::MIGRATION_NAME.into()),
 (133, crate::subject_policy::MIGRATION_NAME.into()),
+(134, backend_job_finalizing::MIGRATION_NAME.into()),
+(135, subject_release_recording_store::MIGRATION_NAME.into()),
+                    (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);

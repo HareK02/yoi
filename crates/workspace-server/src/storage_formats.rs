@@ -371,6 +371,7 @@ impl FailureTail {
         tail.push((133, crate::subject_policy::MIGRATION_NAME));
         tail.push((134, super::backend_job_finalizing::MIGRATION_NAME));
         tail.push((135, super::subject_release_recording_store::MIGRATION_NAME));
+        tail.push((136, super::launch_policy_identity_migration::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -1405,6 +1406,9 @@ mod failure_format_tests {
     use super::*;
     use rusqlite::params;
 
+    // The registered tail is not a contiguous integer range: it excludes 132.
+    const CURRENT_TAIL: &[i64] = &[124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136];
+
     fn apply(conn: &Connection, version: i64) -> Result<()> {
         let migration = store::MIGRATIONS
             .iter()
@@ -1493,7 +1497,8 @@ mod failure_format_tests {
             Stage::Converged(121),
         ] {
             let conn = fixture_123(stage);
-            for current in 123..=store::LATEST_SCHEMA_VERSION {
+            assert_eq!(CURRENT_TAIL.last(), Some(&store::LATEST_SCHEMA_VERSION));
+            for current in std::iter::once(123).chain(CURRENT_TAIL.iter().copied()) {
                 if current > 123 {
                     apply(&conn, current).unwrap();
                 }
@@ -1507,7 +1512,10 @@ mod failure_format_tests {
                         .iter()
                         .map(|step| (step.version, step.name.as_str()))
                         .collect::<Vec<_>>(),
-                    ((current + 1)..=store::LATEST_SCHEMA_VERSION)
+                    CURRENT_TAIL
+                        .iter()
+                        .copied()
+                        .filter(|version| *version > current)
                         .map(|version| (version, tail_migration_name(version).unwrap()))
                         .collect::<Vec<_>>()
                 );
@@ -1520,9 +1528,13 @@ mod failure_format_tests {
         }
         // Fresh composition has the Base shape, not fabricated published-family
         // receipts. Each supported additive intermediate is a real baseline.
-        for current in 123..=store::LATEST_SCHEMA_VERSION {
+        for current in std::iter::once(123).chain(CURRENT_TAIL.iter().copied()) {
             let conn = fixture_123(Stage::Base);
-            for version in 124..=current {
+            for version in CURRENT_TAIL
+                .iter()
+                .copied()
+                .filter(|version| *version <= current)
+            {
                 apply(&conn, version).unwrap();
             }
             conn.execute("DELETE FROM __yoi_schema_migrations", [])
@@ -1798,22 +1810,45 @@ mod failure_format_tests {
                 store::table_columns(&conn, "ticket_schema_migrations").unwrap(),
             )]),
         );
+        // Finalization moves result-only completion back to Finalizing until
+        // cleanup is proven. Check that one intentional change separately.
+        old_columns
+            .get_mut("backend_jobs")
+            .unwrap()
+            .retain(|column| column != "state");
         let retained = values(&conn, &old_columns);
-        for version in 124..=store::LATEST_SCHEMA_VERSION {
+        let mut previous = 123;
+        for &version in CURRENT_TAIL {
             conn.execute_batch(&format!("CREATE TRIGGER inject_failure_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version={version} BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")).unwrap();
             let before = snapshot(&conn).unwrap();
             let rollback_columns = columns(&conn);
             let before_rows = values(&conn, &rollback_columns);
             assert!(apply(&conn, version).is_err());
-            assert_eq!(store::current_schema_version(&conn).unwrap(), version - 1);
+            assert_eq!(store::current_schema_version(&conn).unwrap(), previous);
             assert_eq!(snapshot(&conn).unwrap(), before);
             assert_eq!(values(&conn, &rollback_columns), before_rows);
-            verify_history(&conn, version - 1).unwrap();
+            verify_history(&conn, previous).unwrap();
             conn.execute_batch("DROP TRIGGER inject_failure_receipt")
                 .unwrap();
             apply(&conn, version).unwrap();
             verify_history(&conn, version).unwrap();
             assert_eq!(values(&conn, &old_columns), retained);
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM backend_jobs WHERE job_id='saved-job'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                if version >= 134 {
+                    "finalizing"
+                } else {
+                    "completed"
+                }
+            );
+            previous = version;
             let component = values(
                 &conn,
                 &BTreeMap::from([(
@@ -2513,7 +2548,11 @@ fn verify_launch_policy_shape(conn: &Connection, current: i64) -> Result<()> {
         return Err(invalid("launch policy schema before its migration receipt"));
     }
     let reference = Connection::open_in_memory()?;
-    reference.execute_batch(crate::launch_policy::SCHEMA)?;
+    reference.execute_batch(if current >= 136 {
+        crate::launch_policy::CURRENT_SCHEMA
+    } else {
+        crate::launch_policy::SCHEMA
+    })?;
     reference.execute_batch(include_str!("core_worker_launch.sql"))?;
     if actual != select(snapshot(&reference)?) {
         return Err(invalid("launch policy physical schema mismatch"));

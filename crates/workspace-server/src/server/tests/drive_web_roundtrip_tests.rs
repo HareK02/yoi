@@ -170,26 +170,32 @@ impl RealDriveFixture {
             ("Drive reader", "read_only"),
             ("Drive writer", "read_write"),
         ] {
-            let Json(created) = create_workspace_worker(
-                State(self.api.clone()),
-                HeaderMap::new(),
-                Json(CreateWorkspaceWorkerRequest {
-                    runtime_id: runtime_id.into(),
-                    display_name: name.into(),
-                    singleton_key: None,
-                    profile: Some("builtin:coder".into()),
-                    ticket_assignment: None,
-                    initial_submit: vec![],
-                    workdir_attachments: vec![],
-                    feature_connections: Default::default(),
-                    control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                    authorization:
-                        server_api::launch_policy::WorkerCreationAuthorization::Assignment {
-                            assignment: None,
-                        },
-                }),
+            let created: BrowserCreateWorkerResponse = serde_json::from_value(
+                self.user(
+                    reqwest::Method::POST,
+                    &format!("/api/w/{}/workers", self.api.workspace_id()),
+                    Some(
+                        serde_json::to_value(CreateWorkspaceWorkerRequest {
+                            runtime_id: runtime_id.into(),
+                            display_name: name.into(),
+                            singleton_key: None,
+                            profile: Some("builtin:coder".into()),
+                            ticket_assignment: None,
+                            initial_submit: vec![],
+                            workdir_attachments: vec![],
+                            feature_connections: Default::default(),
+                            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                            authorization:
+                                server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                                    assignment: None,
+                                },
+                        })
+                        .unwrap(),
+                    ),
+                    StatusCode::OK,
+                )
+                .await,
             )
-            .await
             .unwrap();
             let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
             // The reusable fixture defaults to TEST_WORKSPACE_ID. Its runtime

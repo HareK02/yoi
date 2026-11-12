@@ -74,6 +74,7 @@ struct Context {
     spawned: Option<RuntimeWorkerRef>,
     ticket: Option<String>,
     denials: Vec<(String, Value, String)>,
+    spawn_refusals: std::collections::BTreeMap<String, (StatusCode, Value)>,
 }
 #[derive(Clone)]
 struct DelegationModel {
@@ -88,6 +89,29 @@ struct DelegationModel {
     lose_spawn_ack: bool,
 }
 impl DelegationModel {
+    fn assert_spawn_refusal(&self, error: bool, text: &str, operation: &str, reason: &str) {
+        assert!(error, "public {operation} must refuse: {text}");
+        let public: Value = serde_json::from_str(text).expect("public control failure JSON");
+        let context = self.context.lock().unwrap();
+        let (status, response) = context
+            .spawn_refusals
+            .get(operation)
+            .unwrap_or_else(|| panic!("missing Backend refusal for {operation}"));
+        assert!(
+            status.is_client_error(),
+            "{operation}: {status}: {response}"
+        );
+        assert_eq!(public["result"]["status"], status.as_u16(), "{text}");
+        // The Tool does not redisclose legacy Backend prose. Check the intended
+        // domain fence at the real HTTP boundary, without rewriting its response.
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|text| text.contains(reason)),
+            "{operation} must exercise {reason}, not another fence: {response}"
+        );
+    }
+
     fn spawn(&self, page: &Value, request: &agen::llm_client::Request) -> Value {
         let c = self.context.lock().unwrap();
         let message = page["conversation"]["last_user_message_id"]
@@ -97,7 +121,7 @@ impl DelegationModel {
             "operation_id":format!("chat:{}:{message}", c.a),
             "display_name":"Bounded background chat work",
             "initial_submit":[{"kind":"text","content":format!("{CHILD}; conversation={}; message={message}", c.a)}],
-            "authorization":{"kind":"policy","policy_id":c.policy.as_ref().unwrap().policy_id,"policy_revision":c.policy.as_ref().unwrap().authorization_revision}});
+            "authorization":{"kind":"policy","policy_id":c.policy.as_ref().unwrap().policy_id,"policy_authorization_key":c.policy.as_ref().unwrap().authorization_key}});
         if let Some(id) = &c.workdir {
             input["working_directory_id"] = json!(id);
         }
@@ -193,10 +217,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                 let mut next = None;
                 for (id, overrides, reason) in denials {
                     if let Some((error, text)) = output(&request, &id) {
-                        assert!(
-                            error && text.contains(&reason),
-                            "public chat {id} must exercise {reason}, not another fence: {text}"
-                        );
+                        self.assert_spawn_refusal(error, &text, &id, &reason);
                     } else {
                         let mut input = self.spawn(&value(&request, "origin-read"), &request);
                         for (name, value) in overrides.as_object().unwrap() {
@@ -246,9 +267,11 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     != initial["assignment_tracking"][0]["assignment_id"]
                 {
                     if let Some((error, text)) = output(&request, "old-report-spawn") {
-                        assert!(
-                            error && text.contains("assignment"),
-                            "old report cannot authorize a new Ticket execution: {text}"
+                        self.assert_spawn_refusal(
+                            error,
+                            &text,
+                            "old-ticket-report-new-attempt",
+                            "assignment",
                         );
                         self.body_phase.fetch_add(1, Ordering::SeqCst);
                         self.completed.try_send(()).unwrap();
@@ -500,7 +523,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
     }
 }
 
-fn publish_profiles(api: &WorkspaceApi) {
+async fn publish_profiles(api: &WorkspaceApi, owner: &str) {
     let state = api
         .config_store
         .load_workspace_config(TEST_WORKSPACE_ID)
@@ -527,7 +550,12 @@ fn publish_profiles(api: &WorkspaceApi) {
             content: content.into(),
         }],
     };
-    let owner = test_owner_actor().account_id;
+    let headers = human_request(owner, "GET", "/", None).headers().clone();
+    let owner = resolve_actor(&ServerAuthApi::from(api), &headers)
+        .await
+        .unwrap()
+        .unwrap()
+        .account_id;
     let registry = api.permission_registry.read().unwrap();
     api.config_store
         .adopt_configuration(
@@ -607,20 +635,49 @@ async fn connected_chat_delegation(scenario: Scenario) {
     let body_phase = model.body_phase.clone();
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dropped_response = dropped.clone();
-    let h = ConnectedWorkerHarness::start_with_layer(model,move |router| router.layer(axum::middleware::from_fn(
-        move |request:axum::extract::Request,next:axum::middleware::Next| {
-            let dropped = dropped_response.clone();
-            async move {
-                let spawn = request.method() == axum::http::Method::POST && request.uri().path() == format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
-                let response = next.run(request).await;
-                if spawn && response.status().is_success() && lose_spawn_ack && !dropped.swap(true,Ordering::SeqCst) {
-                    // Discard only the response after real registry/grant persistence.
-                    (StatusCode::GATEWAY_TIMEOUT,Json(json!({"error":"Gateway Timeout","message":"spawn outcome unknown; retry original operation and input","diagnostics":[]}))).into_response()
-                } else {response}
-            }
-        }
-    ))).await;
-    publish_profiles(&h.api);
+    let observed = context.clone();
+    let h = ConnectedWorkerHarness::start_with_layer(model, move |router| {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let dropped = dropped_response.clone();
+                let observed = observed.clone();
+                async move {
+                    let spawn = request.method() == axum::http::Method::POST
+                        && request.uri().path()
+                            == format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
+                    if !spawn {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                    let input: Value = serde_json::from_slice(&bytes).unwrap();
+                    let response = next
+                        .run(Request::from_parts(parts, Body::from(bytes)))
+                        .await;
+                    if response.status().is_client_error() {
+                        let (parts, body) = response.into_parts();
+                        let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                        observed.lock().unwrap().spawn_refusals.insert(
+                            input["control_operation_id"].as_str().unwrap().into(),
+                            (parts.status, serde_json::from_slice(&bytes).unwrap()),
+                        );
+                        return Response::from_parts(parts, Body::from(bytes));
+                    }
+                    if response.status().is_success()
+                        && lose_spawn_ack
+                        && !dropped.swap(true, Ordering::SeqCst)
+                    {
+                        // Discard only the response after real registry/grant persistence.
+                        (StatusCode::GATEWAY_TIMEOUT,Json(json!({"error":"Gateway Timeout","message":"spawn outcome unknown; retry original operation and input","diagnostics":[]}))).into_response()
+                    } else {
+                        response
+                    }
+                }
+            },
+        ))
+    })
+    .await;
+    publish_profiles(&h.api, &h.owner).await;
     let mut child_permissions = vec![
         operation("worker.messaging", false),
         operation("worker.list", true),
@@ -979,7 +1036,7 @@ async fn connected_chat_delegation(scenario: Scenario) {
         grant.source,
         server_api::authorization::CoreWorkerGrantSource::LaunchPolicy {
             policy_id: policy.policy_id,
-            policy_revision: policy.authorization_revision,
+            policy_authorization_key: policy.authorization_key,
             parent: server_api::authorization::CoreWorkerGrantParent::SubjectBody {
                 subject_id: subject.clone(),
                 source_change_id: original_policy.change_id.clone(),

@@ -1,5 +1,41 @@
 use super::*;
 
+async fn operation_controller(api: &WorkspaceApi) -> RuntimeWorkerRef {
+    register_test_runtime(api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+    api.runtime
+        .register_or_replace(WorkdirlessFixtureRuntime::default());
+    let Json(created) = create_workspace_worker_as_owner(
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
+            display_name: "Control admission fixture".into(),
+            singleton_key: None,
+            profile: Some("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: Default::default(),
+            control_operation_id: Some(Uuid::now_v7().to_string()),
+            authorization: test_worker_operation_authorization(&[(
+                "worker",
+                &[
+                    "worker.restore",
+                    "worker.stop",
+                    "worker.cancel",
+                    "worker.send_input",
+                    "worker.messaging",
+                    "worker.remove",
+                    "worker.observe",
+                ],
+            )]),
+        }),
+    )
+    .await
+    .unwrap();
+    RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+}
+
 fn operation_input(kind: WorkerInputKind) -> WorkerInputRequest {
     WorkerInputRequest {
         source: None,
@@ -319,11 +355,9 @@ async fn offline_handle_can_pin_but_deleted_handle_cannot_mutate_or_connect() {
 async fn worker_control_handle_rechecks_revoked_grants_for_each_operation() {
     let workspace = tempfile::tempdir().unwrap();
     let api = test_api(workspace.path()).await;
-    let controller = RuntimeWorkerRef::new("offline-runtime", "controller");
+    let controller = operation_controller(&api).await;
     let subject = RuntimeWorkerRef::new("offline-runtime", "subject");
-    for identity in [&controller, &subject] {
-        seed_worker_source_member(&api, &identity.runtime_id, &identity.worker_id);
-    }
+    seed_worker_source_member(&api, &subject.runtime_id, &subject.worker_id);
     api.store
         .create_worker_control_grant(&WorkerControlGrantRecord {
             workspace_id: TEST_WORKSPACE_ID.into(),
@@ -351,7 +385,23 @@ async fn worker_control_handle_rechecks_revoked_grants_for_each_operation() {
         .unwrap();
     let handle = WorkspaceWorker::resolve(&api, &subject.runtime_id, &subject.worker_id).unwrap();
     let context = WorkerOperationContext::WorkerControl { controller };
-    handle.set_pinned(&context, true).await.unwrap();
+    // Pinning is not a declared Worker capability; a directional grant alone
+    // cannot authorize it. Establish admission for every supported operation.
+    for permission in [
+        "restore",
+        "stop",
+        "cancel",
+        "send_input",
+        "notify",
+        "remove",
+    ] {
+        drop(
+            handle
+                .authorize_operation(&context, permission)
+                .await
+                .unwrap(),
+        );
+    }
     api.store
         .revoke_worker_control_grant(
             TEST_WORKSPACE_ID,
@@ -366,7 +416,6 @@ async fn worker_control_handle_rechecks_revoked_grants_for_each_operation() {
         "cancel",
         "send_input",
         "notify",
-        "pin",
         "remove",
     ] {
         assert!(
@@ -422,7 +471,10 @@ async fn worker_control_handle_rechecks_revoked_grants_for_each_operation() {
     }
     assert!(matches!(
         handle.set_pinned(&context, false).await.unwrap_err().error,
-        Error::UnknownWorker { .. }
+        Error::RuntimeControlFailed {
+            cause: protocol::control_failure::RuntimeControlCause::AuthorizationFailed,
+            ..
+        }
     ));
     assert!(matches!(
         handle
@@ -438,7 +490,7 @@ async fn worker_control_handle_rechecks_revoked_grants_for_each_operation() {
             .unwrap()
             .unwrap()
             .retention_state,
-        "pinned"
+        "normal"
     );
 }
 
@@ -808,11 +860,9 @@ fn uncertain_unary_input_preserves_typed_disposition_without_claiming_acceptance
 async fn grant_replacement_while_admission_waits_cannot_use_another_grants_lock() {
     let workspace = tempfile::tempdir().unwrap();
     let api = test_api(workspace.path()).await;
-    let controller = RuntimeWorkerRef::new("offline-runtime", "controller");
+    let controller = operation_controller(&api).await;
     let subject = RuntimeWorkerRef::new("offline-runtime", "subject");
-    for identity in [&controller, &subject] {
-        seed_worker_source_member(&api, &identity.runtime_id, &identity.worker_id);
-    }
+    seed_worker_source_member(&api, &subject.runtime_id, &subject.worker_id);
     let grant = |id: &str| WorkerControlGrantRecord {
         workspace_id: TEST_WORKSPACE_ID.into(),
         grant_id: id.into(),
@@ -820,7 +870,7 @@ async fn grant_replacement_while_admission_waits_cannot_use_another_grants_lock(
         subject: subject.clone(),
         relation: "spawned".into(),
         origin: "test".into(),
-        permissions: vec!["pin".into()],
+        permissions: vec!["notify".into()],
         operation_id: id.into(),
         created_at: now_registry_timestamp(),
         revoked_at: None,
@@ -835,7 +885,7 @@ async fn grant_replacement_while_admission_waits_cannot_use_another_grants_lock(
     let context = WorkerOperationContext::WorkerControl {
         controller: controller.clone(),
     };
-    let admission = handle.set_pinned(&context, true);
+    let admission = handle.authorize_operation(&context, "notify");
     tokio::pin!(admission);
     // The first poll can now be waiting for the offloaded authority read, not
     // the held grant lock. Drain this fixture's actual SQL, then poll its saved

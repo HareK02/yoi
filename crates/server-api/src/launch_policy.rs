@@ -7,24 +7,24 @@ use feature_permissions::{PermissionAssignment, PermissionKey};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Authorization identity changes must remain exactly representable by JSON clients.
-/// This identity is independent of display-name edits and never resets on content
-/// reversion. Exhaustion fails closed instead of reusing an issued identity.
-pub const MAX_AUTHORIZATION_REVISION: u64 = 9_007_199_254_740_991;
-
-pub fn validate_authorization_revision(value: u64) -> Result<(), String> {
-    if !(1..=MAX_AUTHORIZATION_REVISION).contains(&value) {
-        return Err("policy authorization revision must be a positive JSON safe integer".into());
+/// Opaque authorization identity, independent of display-name edits and the
+/// operation key used for mutation CAS. Content reversion must not reuse an identity.
+pub fn validate_authorization_key(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(
+            "policy authorization key must contain 1..512 UTF-8 bytes and no control characters"
+                .into(),
+        );
     }
     Ok(())
 }
 
 /// Shared wire decoder for API requests, persisted grants and model Tool inputs.
-pub fn deserialize_authorization_revision<'de, D: serde::Deserializer<'de>>(
+pub fn deserialize_authorization_key<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<u64, D::Error> {
-    let value = u64::deserialize(deserializer)?;
-    validate_authorization_revision(value).map_err(serde::de::Error::custom)?;
+) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    validate_authorization_key(&value).map_err(serde::de::Error::custom)?;
     Ok(value)
 }
 
@@ -43,14 +43,14 @@ pub enum WorkerLaunchPolicyState {
 pub struct WorkerLaunchPolicy {
     pub policy_id: String,
     pub name: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    #[serde(deserialize_with = "crate::launch_policy::deserialize_authorization_revision")]
-    pub authorization_revision: u64,
+    #[schemars(length(min = 1, max = 512))]
+    #[serde(deserialize_with = "crate::launch_policy::deserialize_authorization_key")]
+    pub authorization_key: String,
     pub state: WorkerLaunchPolicyState,
     pub allowed_profiles: Vec<String>,
     pub child_permissions: PermissionAssignment,
     pub reference_encoding: PermissionReferenceEncoding,
+    /// Mutation CAS identity, changed by rename even when authorization is unchanged.
     pub last_operation_key: String,
 }
 
@@ -58,10 +58,9 @@ pub struct WorkerLaunchPolicy {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLaunchPolicyObservation {
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    #[serde(deserialize_with = "crate::launch_policy::deserialize_authorization_revision")]
-    pub authorization_revision: u64,
+    #[schemars(length(min = 1, max = 512))]
+    #[serde(deserialize_with = "crate::launch_policy::deserialize_authorization_key")]
+    pub authorization_key: String,
     pub last_operation_key: String,
 }
 
@@ -73,7 +72,7 @@ impl WorkerLaunchPolicy {
 
     pub fn observation(&self) -> WorkerLaunchPolicyObservation {
         WorkerLaunchPolicyObservation {
-            authorization_revision: self.authorization_revision,
+            authorization_key: self.authorization_key.clone(),
             last_operation_key: self.last_operation_key.clone(),
         }
     }
@@ -95,8 +94,8 @@ pub enum WorkerLaunchPolicyAction {
     Rename {
         name: String,
     },
-    /// Every replacement advances the authorization revision, even for identical
-    /// content. A revoked revision is never reactivated by reverting content.
+    /// Every replacement issues a new authorization identity, even for identical
+    /// content. A revoked identity is never reactivated by reverting content.
     ReplaceAuthorization {
         allowed_profiles: Vec<String>,
         child_permissions: PermissionAssignment,
@@ -133,10 +132,9 @@ pub struct WorkerLaunchPolicyReceipt {
 pub enum WorkerCreationAuthorization {
     Policy {
         policy_id: String,
-        #[cfg_attr(feature = "typescript", ts(type = "number"))]
-        #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-        #[serde(deserialize_with = "crate::launch_policy::deserialize_authorization_revision")]
-        policy_revision: u64,
+        #[schemars(length(min = 1, max = 512))]
+        #[serde(deserialize_with = "crate::launch_policy::deserialize_authorization_key")]
+        policy_authorization_key: String,
     },
     Assignment {
         assignment: Option<PermissionAssignment>,
@@ -191,7 +189,7 @@ impl WorkerLaunchPolicyMutation {
     pub fn validate(&self) -> Result<(), String> {
         validate_policy_id(&self.policy_id)?;
         if let Some(expected) = &self.expected {
-            validate_authorization_revision(expected.authorization_revision)?;
+            validate_authorization_key(&expected.authorization_key)?;
         }
         if self.operation_key.trim().is_empty()
             || self.operation_key.len() > 256
@@ -220,7 +218,9 @@ impl WorkerLaunchPolicyMutation {
         if !matches!(self.action, WorkerLaunchPolicyAction::Create { .. })
             && self.expected.is_none()
         {
-            return Err("policy mutation requires observed revision and operation key".into());
+            return Err(
+                "policy mutation requires observed authorization identity and operation key".into(),
+            );
         }
         Ok(())
     }
@@ -284,24 +284,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn worker_creation_wire_requires_policy_revision_and_rejects_arbitrary_grants() {
+    fn worker_creation_wire_requires_authorization_key_and_rejects_legacy_fields() {
         for input in [
             json!({"kind":"policy", "policy_id":"coder"}),
-            json!({"kind":"policy", "policy_id":"coder", "policy_revision":1, "execution_grant":{}}),
+            json!({"kind":"policy", "policy_id":"coder", "policy_revision":1}),
+            json!({"kind":"policy", "policy_id":"coder", "policy_revision":"auth-key"}),
+            json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key", "policy_revision":1}),
+            json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key", "execution_grant":{}}),
             json!({"kind":"human", "assignment":null}),
             json!({"kind":"assignment", "redelegation":[]}),
         ] {
             assert!(serde_json::from_value::<WorkerCreationAuthorization>(input).is_err());
         }
         let parsed: WorkerCreationAuthorization = serde_json::from_value(
-            json!({"kind":"policy", "policy_id":"coder", "policy_revision":1}),
+            json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key"}),
         )
         .unwrap();
         assert_eq!(
             parsed,
             WorkerCreationAuthorization::Policy {
                 policy_id: "coder".into(),
-                policy_revision: 1
+                policy_authorization_key: "auth-key".into(),
             }
         );
     }
@@ -331,35 +334,154 @@ mod tests {
         );
     }
 
+    fn policy_wire(authorization_key: serde_json::Value) -> serde_json::Value {
+        json!({
+            "policy_id":"coder", "name":"Coder", "authorization_key":authorization_key,
+            "state":"active", "allowed_profiles":["builtin:coder"],
+            "child_permissions":{"grants":[], "exclusions":[], "revoked":false},
+            "reference_encoding":"feature_sets_v2", "last_operation_key":"create"
+        })
+    }
+
     #[test]
-    fn policy_authorization_wire_bounds_match_schema_and_saved_observations() {
-        for value in [0, MAX_AUTHORIZATION_REVISION + 1, u64::MAX] {
-            assert!(
-                serde_json::from_value::<WorkerCreationAuthorization>(json!({
-                    "kind":"policy", "policy_id":"coder", "policy_revision":value
-                }))
-                .is_err()
-            );
-            assert!(
-                serde_json::from_value::<WorkerLaunchPolicyObservation>(json!({
-                    "authorization_revision":value, "last_operation_key":"create"
-                }))
-                .is_err()
-            );
-        }
-        for value in [1, MAX_AUTHORIZATION_REVISION] {
-            let request = json!({"kind":"policy", "policy_id":"coder", "policy_revision":value});
+    fn policy_authorization_keys_validate_utf8_bytes_and_preserve_exact_identity() {
+        for key in [
+            "auth-key".to_owned(),
+            "1".to_owned(),
+            " key ".to_owned(),
+            "x".repeat(512),
+            "é".repeat(256),
+            "🔑".repeat(128),
+        ] {
+            validate_authorization_key(&key).unwrap();
+            let request =
+                json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":key});
             let parsed: WorkerCreationAuthorization =
                 serde_json::from_value(request.clone()).unwrap();
             assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+            let raw = policy_wire(json!(key));
+            let policy: WorkerLaunchPolicy = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&policy).unwrap(), raw);
+            let observation = policy.observation();
+            assert_eq!(observation.authorization_key, key);
+            let saved = serde_json::to_value(&observation).unwrap();
+            assert_eq!(
+                serde_json::from_value::<WorkerLaunchPolicyObservation>(saved).unwrap(),
+                observation
+            );
+        }
+        for key in [
+            "".to_owned(),
+            "x".repeat(513),
+            "é".repeat(257),
+            "🔑".repeat(129),
+            "bad\nkey".to_owned(),
+            "bad\0key".to_owned(),
+            "bad\u{7f}key".to_owned(),
+            "bad\u{85}key".to_owned(),
+        ] {
+            assert!(validate_authorization_key(&key).is_err());
+            assert_invalid_authorization_key(json!(key));
+        }
+        for value in [json!(1), json!(null), json!(false), json!([]), json!({})] {
+            assert_invalid_authorization_key(value);
+        }
+    }
+
+    fn assert_invalid_authorization_key(value: serde_json::Value) {
+        assert!(
+            serde_json::from_value::<WorkerCreationAuthorization>(json!({
+                "kind":"policy", "policy_id":"coder", "policy_authorization_key":value
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkerLaunchPolicyObservation>(json!({
+                "authorization_key":value, "last_operation_key":"create"
+            }))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<WorkerLaunchPolicy>(policy_wire(value)).is_err());
+    }
+
+    #[test]
+    fn policy_and_observation_reject_old_fields_even_with_current_identity() {
+        for old_value in [json!(1), json!("auth-key")] {
+            for include_current in [false, true] {
+                let mut policy = policy_wire(json!("auth-key"));
+                let mut observation =
+                    json!({"authorization_key":"auth-key", "last_operation_key":"create"});
+                for value in [&mut policy, &mut observation] {
+                    if !include_current {
+                        value.as_object_mut().unwrap().remove("authorization_key");
+                    }
+                    value["authorization_revision"] = old_value.clone();
+                }
+                assert!(serde_json::from_value::<WorkerLaunchPolicy>(policy).is_err());
+                assert!(
+                    serde_json::from_value::<WorkerLaunchPolicyObservation>(observation).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn policy_authorization_key_schema_exposes_string_bounds() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(WorkerLaunchPolicy)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(WorkerLaunchPolicyObservation)).unwrap(),
+        ] {
+            let key = &schema["properties"]["authorization_key"];
+            assert_eq!(key["type"], "string");
+            assert_eq!(key["minLength"], 1);
+            assert_eq!(key["maxLength"], 512);
+            assert!(schema["properties"].get("authorization_revision").is_none());
         }
         let schema =
-            serde_json::to_value(schemars::schema_for!(WorkerLaunchPolicyObservation)).unwrap();
-        assert_eq!(schema["properties"]["authorization_revision"]["minimum"], 1);
-        assert_eq!(
-            schema["properties"]["authorization_revision"]["maximum"],
-            MAX_AUTHORIZATION_REVISION
-        );
+            serde_json::to_value(schemars::schema_for!(WorkerCreationAuthorization)).unwrap();
+        let policy = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]
+                    .get("policy_authorization_key")
+                    .is_some()
+            })
+            .unwrap();
+        let key = &policy["properties"]["policy_authorization_key"];
+        assert_eq!(key["type"], "string");
+        assert_eq!(key["minLength"], 1);
+        assert_eq!(key["maxLength"], 512);
+        assert!(policy["properties"].get("policy_revision").is_none());
+    }
+
+    #[test]
+    fn rename_observation_retains_distinct_authorization_and_operation_keys() {
+        let mut policy: WorkerLaunchPolicy =
+            serde_json::from_value(policy_wire(json!("auth-key"))).unwrap();
+        let before = policy.observation();
+        policy.name = "Renamed".into();
+        policy.last_operation_key = "rename".into();
+        let after = policy.observation();
+        assert_eq!(before.authorization_key, after.authorization_key);
+        assert_ne!(before.last_operation_key, after.last_operation_key);
+        let mut mutation = WorkerLaunchPolicyMutation {
+            operation_key: "rename-again".into(),
+            policy_id: "coder".into(),
+            expected: Some(after),
+            action: WorkerLaunchPolicyAction::Rename {
+                name: "Coder".into(),
+            },
+        };
+        mutation.validate().unwrap();
+        mutation
+            .expected
+            .as_mut()
+            .unwrap()
+            .authorization_key
+            .clear();
+        assert!(mutation.validate().is_err());
     }
 
     #[test]

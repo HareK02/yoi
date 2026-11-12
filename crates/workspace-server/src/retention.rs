@@ -517,11 +517,14 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub fn recover_worker_removal_execution(
+    /// Observe the selected canonical plan without reconstructing a Runtime request.
+    /// Completed metadata Purge receipts remain observable without a tombstone;
+    /// observing a plan does not authorize execution or invent source identity.
+    pub fn recover_worker_removal_plan(
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
-    ) -> Result<Option<PreparedWorkerRemoval>, WorkerRetentionError> {
+    ) -> Result<Option<WorkerRemovalPlan>, WorkerRetentionError> {
         bounded("workspace", workspace_id, 160)?;
         let plan = self.with_conn(|conn| {
             conn.query_row(
@@ -557,6 +560,17 @@ impl SqliteWorkspaceStore {
         };
         self.with_conn(|conn| require_current_subject_deletion_plan(conn, &plan))
             .map_err(map_error)?;
+        Ok(Some(plan))
+    }
+
+    pub fn recover_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<PreparedWorkerRemoval>, WorkerRetentionError> {
+        let Some(plan) = self.recover_worker_removal_plan(workspace_id, worker)? else {
+            return Ok(None);
+        };
         let prior_failure_category = plan.failure_category.clone();
         if let Some(reconciliation) = self.subject_deletion_removal(workspace_id, &plan.worker)?
             && reconciliation.request.operation_id == plan.operation_id
@@ -3616,6 +3630,172 @@ mod tests {
             .unwrap();
         assert!(s.worker_tombstone("w", &p.worker).unwrap().is_none());
     }
+    #[test]
+    fn metadata_purge_plan_observation_preserves_pinned_receipt_and_repairs_catalog() {
+        let store = setup();
+        let request = req();
+        let policy = store.worker_retention_policy("w").unwrap().unwrap();
+        store
+            .update_worker_retention_policy(
+                "w",
+                &policy.policy_digest,
+                &WorkerRetentionPolicyUpdate {
+                    policy_id: "purge".into(),
+                    session_disposition: SessionDisposition::Purge,
+                    metadata_disposition: MetadataDisposition::Purge,
+                    archive_retention: ArchiveRetention::Forever,
+                    diagnostics_disposition: DiagnosticsDisposition::Purge,
+                    diagnostics_retention_seconds: None,
+                },
+            )
+            .unwrap();
+        let plan = store.plan_worker_removal(&request, &inv()).unwrap();
+        let mut alternative_request = request.clone();
+        alternative_request.reason = "different removal intent".into();
+        let alternative = store
+            .plan_worker_removal(&alternative_request, &inv())
+            .unwrap();
+        assert_ne!(alternative.operation_id, plan.operation_id);
+        let authority: &dyn ControlPlaneStore = &store;
+        authority
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        let result = WorkerRetentionExecutionResult {
+            operation_id: plan.operation_id.clone(),
+            input_fingerprint: plan.input_fingerprint.clone(),
+            worker_id: worker_id(),
+            session_disposition: SessionDisposition::Purge,
+            diagnostics_disposition: DiagnosticsDisposition::Purge,
+            archive: None,
+            source_removed: true,
+            diagnostics_retained: false,
+        };
+        let committed = authority
+            .commit_worker_removal("w", &plan.operation_id, &plan.input_fingerprint, &result)
+            .unwrap();
+        assert_eq!(committed.plan.state, WorkerRemovalPlanState::Succeeded);
+        assert_eq!(
+            committed.plan.metadata_disposition,
+            MetadataDisposition::Purge
+        );
+        assert!(
+            store
+                .get_worker_registry("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .worker_tombstone("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            authority
+                .recover_worker_removal_plan("w", &request.worker)
+                .unwrap(),
+            Some(committed.plan.clone())
+        );
+        assert!(matches!(
+            authority.recover_worker_removal_execution("w", &request.worker),
+            Err(WorkerRetentionError::StalePlan { plan_id, reason })
+                if plan_id == plan.plan_id
+                    && reason == "completed removal has no matching Worker tombstone"
+        ));
+        assert!(
+            authority
+                .recover_worker_removal_plan("other", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            authority
+                .recover_worker_removal_plan(
+                    "w",
+                    &RuntimeWorkerRef::new("r", WorkerId::from_legacy_u64(2).to_string()),
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        // Subject deletion pins this exact successful receipt, even though its
+        // Purge policy differs from a newly planned Subject body removal.
+        store
+            .prepare_subject_deletion(
+                "w",
+                "subject",
+                "delete",
+                std::slice::from_ref(&request.worker),
+            )
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                assert!(crate::store::subject_deletion_prior_removal_matches(
+                    conn, "w", &request.worker, &plan.operation_id,
+                )?);
+                // Simulate a later receipt and a pre-atomic catalog projection gap.
+                // Neither may replace the receipt pinned at Subject deletion.
+                conn.execute(
+                    "UPDATE worker_removal_operations SET state='succeeded',created_at='9999-01-01T00:00:00Z' WHERE operation_id=?1",
+                    [&alternative.operation_id],
+                )?;
+                conn.execute(
+                    "DELETE FROM worker_registry_projection_removals WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                    [&request.worker.worker_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            authority
+                .recover_worker_removal_plan("w", &request.worker)
+                .unwrap(),
+            Some(committed.plan.clone())
+        );
+        assert!(matches!(
+            authority.recover_worker_removal_execution("w", &request.worker),
+            Err(WorkerRetentionError::StalePlan { plan_id, reason })
+                if plan_id == plan.plan_id
+                    && reason == "completed removal has no matching Worker tombstone"
+        ));
+        let repaired = authority
+            .recover_succeeded_worker_removal_catalog("w", &request.worker)
+            .unwrap();
+        assert!(matches!(
+            repaired.changes.as_slice(),
+            [WorkerCatalogChange::Removed(worker)] if worker == &request.worker
+        ));
+        store
+            .with_conn(|conn| {
+                let fences: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM worker_registry_projection_removals WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                    [&request.worker.worker_id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(fences, 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            authority
+                .recover_worker_removal_plan("w", &request.worker)
+                .unwrap(),
+            Some(committed.plan)
+        );
+        assert!(
+            store
+                .get_worker_registry("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .worker_tombstone("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn terminal_catalog_failure_rolls_back_removal_projection_and_operation() {
         let store = setup();

@@ -412,6 +412,7 @@ async fn captured_subject_job_result_cannot_deliver_after_domain_fence() {
             &now,
         )
         .unwrap();
+    let captured = finalize_notification_test_job(&api, captured);
     let delivery = crate::backend_job::delivery_id(&request.job_id, attempt);
     assert!(
         api.store
@@ -1134,6 +1135,15 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subject_deletion() {
+    body_archive_subject_deletion(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_metadata_purge_removal_allows_subject_deletion_without_tombstone() {
+    body_archive_subject_deletion(true).await;
+}
+
+async fn body_archive_subject_deletion(completed_metadata_purge: bool) {
     let dir = tempfile::tempdir().unwrap();
     init_clean_git_workspace(dir.path());
     let (api, execution) = test_api_with_recording_backend(dir.path()).await;
@@ -1186,6 +1196,28 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
         .unwrap()
         .clone();
     let stops_before = execution.stops.lock().unwrap().clone();
+    if completed_metadata_purge {
+        let policy = api
+            .config_store
+            .worker_retention_policy(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        api.config_store
+            .update_worker_retention_policy(
+                TEST_WORKSPACE_ID,
+                &policy.policy_digest,
+                &crate::retention::WorkerRetentionPolicyUpdate {
+                    policy_id: "completed-metadata-purge".into(),
+                    session_disposition: worker_runtime::retention::SessionDisposition::Archive,
+                    metadata_disposition: crate::retention::MetadataDisposition::Purge,
+                    archive_retention: crate::retention::ArchiveRetention::Forever,
+                    diagnostics_disposition:
+                        worker_runtime::retention::DiagnosticsDisposition::Purge,
+                    diagnostics_retention_seconds: None,
+                },
+            )
+            .unwrap();
+    }
     let inventory = api.runtime.worker_retention_inventory(&worker).unwrap();
     let old = api
         .config_store
@@ -1207,6 +1239,88 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
         .runtime
         .execute_worker_retention(&worker, saved.runtime_request.clone())
         .unwrap();
+    if completed_metadata_purge {
+        let committed = api
+            .config_store
+            .commit_worker_removal(
+                TEST_WORKSPACE_ID,
+                &old.operation_id,
+                &old.input_fingerprint,
+                &result,
+            )
+            .unwrap();
+        assert_eq!(
+            committed.plan.state,
+            crate::retention::WorkerRemovalPlanState::Succeeded
+        );
+        assert!(
+            api.config_store
+                .worker_tombstone(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_none()
+        );
+        let mut reopened = api.clone();
+        let reopened_store =
+            Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
+        reopened.config_store = reopened_store.clone();
+        reopened.store = reopened_store;
+        let owner =
+            seed_test_workspace_owner_token(reopened.store.as_ref(), "completed-purge-delete")
+                .await;
+        let (status, done) = delete_request(
+            &reopened,
+            &subject.id,
+            "completed-purge-delete",
+            Some(&owner),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+        assert_eq!(done["completed"], true, "{done}");
+        let retained = reopened
+            .config_store
+            .recover_worker_removal_plan(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained, committed.plan,
+            "prior success must not be rewritten"
+        );
+        assert!(
+            reopened
+                .config_store
+                .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_none(),
+            "completed prior removal is not an unfinished executable child"
+        );
+        assert_eq!(*execution.stops.lock().unwrap(), stops_before);
+        let archive = result.archive.as_ref().unwrap();
+        assert!(
+            dir.path()
+                .join(".test-embedded-runtime-store/archives/workers")
+                .join(&archive.archive_id)
+                .join("session")
+                .is_dir()
+        );
+        let (status, replay) = delete_request(
+            &reopened,
+            &subject.id,
+            "completed-purge-delete",
+            Some(&owner),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay, done);
+        return;
+    }
     // Simulate a lost result before canonical Backend commit. Deletion must pin an
     // unfinished request, not retrospectively classify its archive as a prior success.
     *execution.subject_delete_failure.lock().unwrap() = Some("unknown shutdown".into());

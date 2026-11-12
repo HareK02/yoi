@@ -28,3 +28,32 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         },
     ],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::super::failure::ConfigFailureOperation as Operation;
+    use super::*;
+
+    #[test]
+    fn public_client_operations_use_declared_permissions() {
+        for operation in [
+            Operation::Current,
+            Operation::Attach,
+            Operation::Observe,
+            Operation::Read,
+            Operation::Commit,
+        ] {
+            assert!(
+                DECLARATION
+                    .operations
+                    .iter()
+                    .any(|declared| declared.key == operation.authorization()),
+                "{operation:?}"
+            );
+        }
+        assert_eq!(
+            Operation::Current.authorization(),
+            "workspace_config.observe"
+        );
+    }
+}

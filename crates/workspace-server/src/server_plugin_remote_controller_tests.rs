@@ -160,6 +160,7 @@ mod plugin_remote_controller_tests {
                 &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
                 json!({"runtime_id":CONNECTED_RUNTIME, "display_name":"Remote Plugin controller",
                 "profile":PROFILE, "initial_submit":[], "workdir_attachments":[],
+                "control_operation_id":"remote-plugin-controller-create",
                 "feature_connections":{}}),
             ),
         )

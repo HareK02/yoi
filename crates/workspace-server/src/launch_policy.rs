@@ -16,6 +16,7 @@ use server_api::launch_policy::*;
 use crate::{Error, Result};
 
 pub(crate) const SCHEMA: &str = include_str!("launch_policy.sql");
+pub(crate) const CURRENT_SCHEMA: &str = include_str!("launch_policy_current.sql");
 pub(crate) const MIGRATION_NAME: &str = "Workspace launch policies and core Worker grant issuance";
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -101,15 +102,9 @@ pub(crate) fn mutate(
     let previous = policy(conn, workspace, &request.policy_id)?;
     if previous.as_ref().map(WorkerLaunchPolicy::observation) != request.expected {
         return Err(invalid(
-            "Launch policy CAS conflict; reread revision and operation key",
+            "Launch policy CAS conflict; reread authorization key and operation key",
         ));
     }
-    let next_revision = |p: &WorkerLaunchPolicy| -> Result<u64> {
-        p.authorization_revision
-            .checked_add(1)
-            .filter(|v| *v <= MAX_AUTHORIZATION_REVISION)
-            .ok_or_else(|| invalid("Launch policy revision exhausted"))
-    };
     let mut next = match (&request.action, previous) {
         (
             WorkerLaunchPolicyAction::Create {
@@ -121,7 +116,7 @@ pub(crate) fn mutate(
         ) => WorkerLaunchPolicy {
             policy_id: request.policy_id.clone(),
             name: name.clone(),
-            authorization_revision: 1,
+            authorization_key: format!("operation:{}", request.operation_key),
             state: WorkerLaunchPolicyState::Active,
             allowed_profiles: allowed_profiles.clone(),
             child_permissions: child_permissions.clone(),
@@ -144,17 +139,17 @@ pub(crate) fn mutate(
                     allowed_profiles,
                     child_permissions,
                 } => {
-                    p.authorization_revision = next_revision(&p)?;
+                    p.authorization_key = format!("operation:{}", request.operation_key);
                     p.state = WorkerLaunchPolicyState::Active;
                     p.allowed_profiles = allowed_profiles.clone();
                     p.child_permissions = child_permissions.clone();
                 }
                 WorkerLaunchPolicyAction::Revoke => {
-                    p.authorization_revision = next_revision(&p)?;
+                    p.authorization_key = format!("operation:{}", request.operation_key);
                     p.state = WorkerLaunchPolicyState::Revoked;
                 }
                 WorkerLaunchPolicyAction::Delete => {
-                    p.authorization_revision = next_revision(&p)?;
+                    p.authorization_key = format!("operation:{}", request.operation_key);
                     p.state = WorkerLaunchPolicyState::Deleted;
                 }
                 WorkerLaunchPolicyAction::Create { .. } => unreachable!(),
@@ -169,9 +164,9 @@ pub(crate) fn mutate(
         WorkerLaunchPolicyState::Deleted => "deleted",
     };
     let raw = encode(&next)?;
-    conn.execute("INSERT INTO worker_launch_policies(workspace_id,policy_id,authorization_revision,state,policy_json,last_operation_key) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(workspace_id,policy_id) DO UPDATE SET authorization_revision=excluded.authorization_revision,state=excluded.state,policy_json=excluded.policy_json,last_operation_key=excluded.last_operation_key",
-        params![workspace,next.policy_id,next.authorization_revision,state,raw,next.last_operation_key])?;
-    conn.execute("INSERT INTO worker_launch_policy_history(workspace_id,policy_id,operation_key,authorization_revision,policy_json) VALUES(?1,?2,?3,?4,?5)",params![workspace,next.policy_id,request.operation_key,next.authorization_revision,raw])?;
+    conn.execute("INSERT INTO worker_launch_policies(workspace_id,policy_id,authorization_key,state,policy_json,last_operation_key) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(workspace_id,policy_id) DO UPDATE SET authorization_key=excluded.authorization_key,state=excluded.state,policy_json=excluded.policy_json,last_operation_key=excluded.last_operation_key",
+        params![workspace,next.policy_id,next.authorization_key,state,raw,next.last_operation_key])?;
+    conn.execute("INSERT INTO worker_launch_policy_history(workspace_id,policy_id,operation_key,authorization_key,policy_json) VALUES(?1,?2,?3,?4,?5)",params![workspace,next.policy_id,request.operation_key,next.authorization_key,raw])?;
     let receipt = WorkerLaunchPolicyReceipt {
         policy: next,
         operation_key: request.operation_key.clone(),
@@ -184,15 +179,15 @@ pub(crate) fn require_current_policy(
     conn: &Connection,
     workspace: &str,
     id: &str,
-    revision: u64,
+    authorization_key: &str,
     profile: &str,
 ) -> Result<WorkerLaunchPolicy> {
     validate_canonical_profile(profile).map_err(invalid)?;
     let p = policy(conn, workspace, id)?
         .ok_or_else(|| invalid("Launch policy not found in this Workspace"))?;
-    if p.state != WorkerLaunchPolicyState::Active || p.authorization_revision != revision {
+    if p.state != WorkerLaunchPolicyState::Active || p.authorization_key != authorization_key {
         return Err(invalid(
-            "Launch policy is revoked, deleted or has a different authorization revision",
+            "Launch policy is revoked, deleted or has a different authorization key",
         ));
     }
     if !p.allowed_profiles.iter().any(|s| s == profile) {
@@ -261,23 +256,26 @@ pub(crate) fn bind_core_grant(
             "Core Worker grant identity/operation already bound to different full input",
         ));
     }
-    let (policy_id, policy_revision) = match &grant.source {
+    let (policy_id, policy_authorization_key) = match &grant.source {
         CoreWorkerGrantSource::LaunchPolicy {
             policy_id,
-            policy_revision,
+            policy_authorization_key,
             ..
         } => {
             let p = require_current_policy(
                 conn,
                 &grant.workspace_id,
                 policy_id,
-                *policy_revision,
+                policy_authorization_key,
                 &grant.profile,
             )?;
             if p.effective_child_permissions() != grant.effective_assignment() {
                 return Err(invalid("Grant assignment differs from launch policy"));
             }
-            (Some(policy_id.as_str()), Some(*policy_revision))
+            (
+                Some(policy_id.as_str()),
+                Some(policy_authorization_key.as_str()),
+            )
         }
         CoreWorkerGrantSource::Account { account_id } => {
             require_owner(conn, &grant.workspace_id, account_id)?;
@@ -288,7 +286,7 @@ pub(crate) fn bind_core_grant(
     // The row is inserted only after lineage validation. Its own record need not
     // exist to validate a newly reserved child's parent chain.
     validate_policy_lineage(conn, grant)?;
-    conn.execute("INSERT INTO core_worker_execution_grants(workspace_id,grant_id,creation_operation_id,runtime_id,worker_id,grant_json,policy_id,policy_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![grant.workspace_id,grant.grant_id,grant.creation_operation_id,grant.runtime_id,grant.worker_id,encode(grant)?,policy_id,policy_revision])?;
+    conn.execute("INSERT INTO core_worker_execution_grants(workspace_id,grant_id,creation_operation_id,runtime_id,worker_id,grant_json,policy_id,policy_authorization_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![grant.workspace_id,grant.grant_id,grant.creation_operation_id,grant.runtime_id,grant.worker_id,encode(grant)?,policy_id,policy_authorization_key])?;
     Ok(grant.clone())
 }
 
@@ -318,14 +316,14 @@ pub(crate) fn validate_policy_lineage(
             CoreWorkerGrantSource::Delegation { parent } => parent,
             CoreWorkerGrantSource::LaunchPolicy {
                 policy_id,
-                policy_revision,
+                policy_authorization_key,
                 parent,
             } => {
                 let p = require_current_policy(
                     conn,
                     &cursor.workspace_id,
                     policy_id,
-                    *policy_revision,
+                    policy_authorization_key,
                     &cursor.profile,
                 )?;
                 if p.effective_child_permissions() != cursor.effective_assignment() {

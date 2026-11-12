@@ -2088,6 +2088,7 @@ async fn two_subjects_signed_assignment_isolates_current_subjects_and_stale_rece
                 format!("Own only {name}'s Ticket."),
             )
             .unwrap();
+        set_test_subject_policy_as_owner(&api, &subject.id, Default::default(), Default::default());
         let mut input = ticket::NewTicket::new(name);
         set_test_ticket_target(&mut input, "test-repository", branch);
         let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
@@ -2169,14 +2170,30 @@ async fn two_subjects_signed_assignment_isolates_current_subjects_and_stale_rece
     let (subject_a, ticket_a, body_a, current_a) = &cases[0];
     let (subject_b, ticket_b, body_b, current_b) = &cases[1];
     let update_a = tracking_update(current_a, "a-result");
-    // Exact operation grant is required even for a live body of another Subject.
+    // Operation authority and the assigned Subject are separate checks. Revoke
+    // the operation itself, rather than relying on obsolete per-Ticket grants.
+    let policy_b = api
+        .config_store
+        .current_subject_permission_policy(api.workspace_id(), subject_b)
+        .unwrap()
+        .unwrap();
+    let mut denied_execution = policy_b.execution.clone();
+    denied_execution
+        .exclusions
+        .extend(test_operation_assignment(&api, &["ticket.assignment.update"]).grants);
+    set_test_subject_policy_as_owner(
+        &api,
+        subject_b,
+        denied_execution,
+        policy_b.delegation.clone(),
+    );
     tracking_response(
         app.clone(),
         signed_tracking_update(&identity, Some(&body_b.worker_id), ticket_a, &update_a),
         StatusCode::FORBIDDEN,
     )
     .await;
-    grant_test_assignment_ticket(&api, subject_b, ticket_a);
+    set_test_subject_policy_as_owner(&api, subject_b, policy_b.execution, policy_b.delegation);
     // Granting the operation still cannot impersonate the assigned Subject.
     tracking_response(
         app.clone(),

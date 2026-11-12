@@ -70,7 +70,7 @@ fn assert_native_denial(error: &agen::tool::ToolError) {
 async fn wip_scoped_read_returns_allowed_content_denies_other_path_and_rechecks_revocation() {
     let client = Router::new();
     client.state.lock().unwrap().permissions = Some(vec![
-        grant("current", "", false),
+        grant("observe", "", false),
         grant("attach", "", false),
         grant("observe", A, false),
         grant("observe", B, false),
@@ -221,8 +221,8 @@ async fn current_authorization_denial_is_distinct_from_authority_outage_without_
             state
                 .authorizations
                 .iter()
-                .all(|request| request.operation == "workspace_config.current"
-                    && request.resource == grant("current", "", false).resource)
+                .all(|request| request.operation == "workspace_config.observe"
+                    && request.resource == grant("observe", "", false).resource)
         );
     }
 }

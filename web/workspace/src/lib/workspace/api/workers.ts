@@ -1024,13 +1024,25 @@ function creationAuthorization(value: unknown): WorkerCreationAuthorization {
     };
   }
   if (item.kind === "policy") {
-    exact(item, ["kind", "policy_id", "policy_revision"], "authorization");
+    exact(item, ["kind", "policy_id", "policy_authorization_key"], "authorization");
     const policyId = string(item.policy_id, "policy_id");
     if (!/^[a-z][a-z0-9_-]{0,95}$/.test(policyId)) throw new Error("invalid policy_id");
-    const observed = number(item.policy_revision, "policy_revision");
-    if (observed < 1) throw new Error("policy_revision must be positive");
-    return { kind: "policy", policy_id: policyId,
-      policy_revision: observed as Extract<WorkerCreationAuthorization, { kind: "policy" }>["policy_revision"],
+    const authorizationKey = string(
+      item.policy_authorization_key,
+      "policy_authorization_key",
+    );
+    if (
+      authorizationKey.length === 0 ||
+      new TextEncoder().encode(authorizationKey).byteLength > 512 ||
+      /\p{Cc}/u.test(authorizationKey)
+    ) {
+      throw new Error("policy_authorization_key must contain 1..512 UTF-8 bytes and no control characters");
+    }
+    return {
+      kind: "policy", policy_id: policyId,
+      policy_authorization_key: authorizationKey as Extract<
+        WorkerCreationAuthorization, { kind: "policy" }
+      >["policy_authorization_key"],
     };
   }
   throw new Error("authorization.kind must be assignment or policy");

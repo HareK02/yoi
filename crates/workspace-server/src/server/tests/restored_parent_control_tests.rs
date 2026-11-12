@@ -224,7 +224,7 @@ impl Resources {
 }
 
 async fn spawn_pair_member(api: &WorkspaceApi, name: &str) -> RuntimeWorkerRef {
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -580,7 +580,12 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             )
             .await;
         let error = refused.expect_err("revoked grant must reject the next public input");
-        assert!(error.to_string().contains("unknown worker"), "{error}");
+        let agen::tool::ToolError::ExecutionFailure(output) = error else {
+            panic!("revoked control must return a typed public failure");
+        };
+        let failure: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(failure["failure"]["domain"], "runtime_control");
+        assert_eq!(failure["failure"]["reason"], "worker_missing");
         let after = factory.retained_session_snapshot(&child_ref).unwrap();
         assert_eq!(
             serde_json::to_value(&after.snapshot).unwrap(),

@@ -1,8 +1,6 @@
-//! T778's Ticket consumer on the selected T803 public delegation contract.
-//! Only the external model is scripted. Shared signed Backend/Runtime harness,
-//! Controllers, public Tools, policy/grant ledgers, Workdirs and results are real.
-//! Acceptance alone is not execution: completion requires Read/Write/Read/result
-//! and an actual public Notify reply observed by the originating model.
+//! Connected Ticket delegation: current positive scenarios live in the child modules.
+//! Retained resource-scoped authority must not mint key-only all-target grants.
+//! The external model is scripted; public Tools, signed routing and stores are real.
 use super::*;
 #[path = "subject_ticket_normal_connected_tests.rs"]
 mod ordinary_subject;
@@ -13,11 +11,6 @@ use agen::llm_client::{
     types::{ContentPart, Item},
 };
 use worker_runtime::worker_backend::RuntimeWorkerFactory;
-
-const ORIGIN: &str = "t778-public-origin:";
-const CHILD: &str = "t778-public-child:";
-const REPLY: &str = "T778_PUBLIC_REPLY:";
-const REVOCATION: &str = "t778-public-revocation:";
 
 fn operation(name: &str) -> ScopedPermission {
     ScopedPermission {
@@ -140,267 +133,6 @@ fn notifications(snapshot: &protocol::SessionSnapshot) -> Vec<&str> {
         .collect()
 }
 
-#[derive(Clone)]
-struct PublicTicketModel {
-    admission: Arc<tokio::sync::Barrier>,
-    overlap: Arc<tokio::sync::Barrier>,
-    replied: Arc<Mutex<std::collections::BTreeMap<String, Arc<tokio::sync::Notify>>>>,
-    completed: tokio::sync::mpsc::Sender<Value>,
-    recorded: Arc<Mutex<std::collections::BTreeSet<String>>>,
-}
-impl PublicTicketModel {
-    async fn origin(&self, request: &agen::llm_client::Request, input: Value) -> Vec<Event> {
-        let ticket = input["ticket"].as_str().unwrap();
-        // These are ordinary public Tool calls. No signed helper substitutes for
-        // the subject Controller's Spawn authorization or WorkerNotify dispatch.
-        for denial in input["denials"].as_array().unwrap() {
-            let id = denial["id"].as_str().unwrap();
-            if !refused(request, id) {
-                return call(request, id, "WorkerSpawn", denial["input"].clone());
-            }
-            if let Some(reason) = denial["reason"].as_str() {
-                assert!(
-                    tool_result(request, id).unwrap().1.contains(reason),
-                    "{id} must exercise the intended {reason} fence, not another refusal: {:?}",
-                    tool_result(request, id)
-                );
-            }
-        }
-        let Some(spawn) = success(request, "public-ticket-spawn") else {
-            // Neither peer may acquire its valid Ticket execution assignment
-            // before both wrong-assignee probes reach the intended Subject fence.
-            tokio::time::timeout(std::time::Duration::from_secs(40), self.admission.wait())
-                .await
-                .expect("both public refusal sequences completed");
-            return call(
-                request,
-                "public-ticket-spawn",
-                "WorkerSpawn",
-                input["spawn"].clone(),
-            );
-        };
-        let Some(replay) = success(request, "public-ticket-replay") else {
-            // Exact same caller intent and full public input, not a new operation.
-            return call(
-                request,
-                "public-ticket-replay",
-                "WorkerSpawn",
-                input["spawn"].clone(),
-            );
-        };
-        assert_eq!(spawn["runtime_id"], replay["runtime_id"]);
-        assert_eq!(spawn["worker_id"], replay["worker_id"]);
-        for (id, subject) in [
-            ("public-cross-subject-notify", input["other_origin"].clone()),
-            (
-                "public-invalid-target-notify",
-                json!({"kind":"runtime_worker", "runtime_id":CONNECTED_RUNTIME,"worker_id":"t778-unknown-target"}),
-            ),
-        ] {
-            if !refused(request, id) {
-                return call(
-                    request,
-                    id,
-                    "WorkerNotify",
-                    json!({"subject":subject,"content":"T778_MUST_NOT_ACCEPT_FOREIGN_NOTIFY"}),
-                );
-            }
-        }
-        let messages = request
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Message { content, .. } => Some(serde_json::to_string(content).unwrap()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if let Some(reply) = config(request, REPLY) {
-            assert_eq!(
-                reply["ticket"], ticket,
-                "another Ticket's reply cannot finish this body"
-            );
-            let Some(evaluated) = success(request, "public-origin-evaluate-result") else {
-                return call(
-                    request,
-                    "public-origin-evaluate-result",
-                    "TicketImplementationResultQuery",
-                    json!({"ticket":ticket,"result_id":reply["result_id"]}),
-                );
-            };
-            assert_eq!(evaluated["ticket_id"], ticket);
-            assert_eq!(evaluated["result_id"], reply["result_id"]);
-            assert_eq!(
-                evaluated["request"]["body"],
-                format!(
-                    "Public tools verified {}",
-                    input["child"]["content"].as_str().unwrap()
-                )
-            );
-            if self.recorded.lock().unwrap().insert(ticket.into()) {
-                self.completed
-                    .try_send(
-                        json!({"ticket":ticket,"spawn":spawn,"replay":replay,"messages":messages,"evaluated":evaluated}),
-                    )
-                    .unwrap();
-            }
-            return done();
-        }
-        if let Some(ping) = success(request, "public-ticket-ping") {
-            assert_eq!(ping["state"], "accepted", "{ping}");
-            let signal = self.replied.lock().unwrap().get(ticket).unwrap().clone();
-            tokio::time::timeout(std::time::Duration::from_secs(40), signal.notified())
-                .await
-                .expect("real child public reply result");
-            return done();
-        }
-        call(
-            request,
-            "public-ticket-ping",
-            "WorkerNotify",
-            json!({
-                "subject":{"kind":"runtime_worker", "runtime_id":spawn["runtime_id"],"worker_id":spawn["worker_id"]},
-                "content":format!("{CHILD}{}",input["child"])
-            }),
-        )
-    }
-    async fn child(&self, request: &agen::llm_client::Request, input: Value) -> Vec<Event> {
-        let ticket = input["ticket"].as_str().unwrap();
-        if let Some(reply) = success(request, "public-child-reply") {
-            assert_eq!(reply["state"], "accepted", "{reply}");
-            self.replied
-                .lock()
-                .unwrap()
-                .get(ticket)
-                .unwrap()
-                .notify_one();
-            return done();
-        }
-        if let Some(receipt) = success(request, "public-child-result") {
-            if !refused(request, "public-child-foreign-result") {
-                return call(
-                    request,
-                    "public-child-foreign-result",
-                    "TicketImplementationResult",
-                    json!({"ticket":input["other_ticket"],"kind":"result","body":"T778_MUST_NOT_SAVE_FOREIGN_RESULT"}),
-                );
-            }
-            if !refused(request, "public-child-foreign-notify") {
-                return call(
-                    request,
-                    "public-child-foreign-notify",
-                    "WorkerNotify",
-                    json!({"subject":input["other_origin"],"content":"T778_MUST_NOT_ACCEPT_FOREIGN_NOTIFY"}),
-                );
-            }
-            return call(
-                request,
-                "public-child-reply",
-                "WorkerNotify",
-                json!({"subject":input["origin"],"content":format!("{REPLY}{}",json!({"ticket":ticket,"result_id":receipt["result_id"]}))}),
-            );
-        }
-        if let Some((error, reread)) = tool_result(request, "public-child-reread") {
-            assert!(!error, "post-write Read: {reread}");
-            assert!(
-                reread.contains(input["content"].as_str().unwrap()),
-                "{reread}"
-            );
-            return call(
-                request,
-                "public-child-result",
-                "TicketImplementationResult",
-                json!({"ticket":ticket,"kind":"result","body":format!("Public tools verified {}",input["content"].as_str().unwrap())}),
-            );
-        }
-        if let Some((error, content)) = tool_result(request, "public-child-write") {
-            assert!(!error, "real Write: {content}");
-            return call(
-                request,
-                "public-child-reread",
-                "Read",
-                json!({"target_workdir":"workdir","file_path":"README.md"}),
-            );
-        }
-        if let Some((error, read)) = tool_result(request, "public-child-read") {
-            assert!(
-                !error && read.contains("clean"),
-                "actual initial Read: {read}"
-            );
-            tokio::time::timeout(std::time::Duration::from_secs(40), self.overlap.wait())
-                .await
-                .expect("two public delegated Controllers overlap after Read");
-            return call(
-                request,
-                "public-child-write",
-                "Write",
-                json!({"target_workdir":"workdir","file_path":"README.md","content":input["content"]}),
-            );
-        }
-        if !refused(request, "public-child-private-read") {
-            return call(
-                request,
-                "public-child-private-read",
-                "Read",
-                json!({"target_workdir":"workdir","file_path":"private.txt"}),
-            );
-        }
-        call(
-            request,
-            "public-child-read",
-            "Read",
-            json!({"target_workdir":"workdir","file_path":"README.md"}),
-        )
-    }
-}
-#[async_trait::async_trait]
-impl agen::llm_client::LlmClient for PublicTicketModel {
-    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
-        Box::new(self.clone())
-    }
-    async fn stream(
-        &self,
-        request: agen::llm_client::Request,
-    ) -> std::result::Result<agen::llm_client::client::ResponseStream, agen::llm_client::ClientError>
-    {
-        let events = if let Some(input) = config(&request, REVOCATION) {
-            if !refused(&request, "revoked-public-spawn") {
-                call(
-                    &request,
-                    "revoked-public-spawn",
-                    "WorkerSpawn",
-                    input["spawn"].clone(),
-                )
-            } else if !refused(&request, "revoked-public-notify") {
-                call(
-                    &request,
-                    "revoked-public-notify",
-                    "WorkerNotify",
-                    json!({
-                        "subject":input["child"],"content":"T778_MUST_NOT_ACCEPT_REVOKED_NOTIFY"
-                    }),
-                )
-            } else {
-                let key = format!("revocation:{}", input["ticket"].as_str().unwrap());
-                if self.recorded.lock().unwrap().insert(key) {
-                    self.completed
-                        .try_send(json!({"revocation":input["ticket"]}))
-                        .unwrap();
-                }
-                done()
-            }
-        } else if let Some(input) = config(&request, ORIGIN) {
-            self.origin(&request, input).await
-        } else if let Some(input) = config(&request, CHILD) {
-            self.child(&request, input).await
-        } else {
-            // Normal startup/assignment lifecycle input is not the child script.
-            done()
-        };
-        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
-    }
-}
-
 fn install_public_ticket_profiles(api: &WorkspaceApi) {
     let state = api
         .config_store
@@ -450,108 +182,65 @@ fn install_public_ticket_profiles(api: &WorkspaceApi) {
         .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn public_two_subject_ticket_spawn_notify_edit_result_retry_and_fences() {
-    use worker_runtime::working_directory::WorkingDirectoryMaterializer;
-    struct Case {
-        subject: String,
-        ticket: String,
-        assignment: String,
-        branch: String,
-        workdir: String,
-        root: PathBuf,
-        origin: RuntimeWorkerRef,
-        permissions: Vec<ScopedPermission>,
-        execution: Vec<ScopedPermission>,
-        change: String,
-        spawn: Value,
-        content: String,
+#[derive(Clone)]
+struct LegacyScopeModel {
+    completed: tokio::sync::mpsc::Sender<()>,
+}
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for LegacyScopeModel {
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
     }
-    let (completed, mut completion) = tokio::sync::mpsc::channel(2);
-    let replied = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-    let harness = ConnectedWorkerHarness::start(PublicTicketModel {
-        admission: Arc::new(tokio::sync::Barrier::new(2)),
-        overlap: Arc::new(tokio::sync::Barrier::new(2)),
-        replied: replied.clone(),
-        completed,
-        recorded: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-    })
-    .await;
-    let api = &harness.api;
-    install_public_ticket_profiles(api);
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> std::result::Result<agen::llm_client::client::ResponseStream, agen::llm_client::ClientError>
+    {
+        let events = if let Some(input) = config(&request, "legacy-scope-probe:") {
+            if let Some((error, content)) = tool_result(&request, "legacy-spawn") {
+                assert!(
+                    error,
+                    "legacy resource bounds must not become all-target keys"
+                );
+                let failure: Value = serde_json::from_str(&content).unwrap();
+                assert_eq!(failure["result"]["status"], 403, "{failure}");
+                self.completed.try_send(()).unwrap();
+                done()
+            } else {
+                call(&request, "legacy-spawn", "WorkerSpawn", input)
+            }
+        } else {
+            done()
+        };
+        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn public_ticket_spawn_refuses_legacy_scoped_authority_without_broadening_or_allocating() {
+    // New key-only delegation cannot preserve old Ticket/path restrictions.
+    // Current positive two-Subject execution and MR flows live in the child modules;
+    // this retained-policy case must refuse rather than reintroduce scoped issuance.
+    let (completed, mut completion) = tokio::sync::mpsc::channel(4);
+    let h = ConnectedWorkerHarness::start(LegacyScopeModel { completed }).await;
+    install_public_ticket_profiles(&h.api);
+    let api = &h.api;
     let subjects = open_subjektiv_store(api).unwrap();
-    // Deliberately permitted resource, but wrong Ticket branch. This separates a
-    // target rejection from generic delegation-scope rejection.
-    let (status, wrong) = harness.human(reqwest::Method::POST,
-        &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
-        json!({"runtime_id":CONNECTED_RUNTIME,"repository_key":"test-repository","selector":"HEAD","operation_id":"public-ticket-wrong-target-workdir"})).await;
-    assert_eq!(status, StatusCode::CREATED, "{wrong}");
-    let wrong_workdir = wrong["item"]["working_directory_id"]
-        .as_str()
+    let subject = subjects
+        .create_subject(crate::subjektiv::SubjectRole::new("retained-scoped-origin").unwrap())
         .unwrap()
-        .to_owned();
-    let mut cases = Vec::new();
-    for label in ["alpha", "beta"] {
-        let branch = format!("public-ticket-{label}");
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(harness._dir.path())
-                .args(["branch", &branch])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let (status, created) = harness.human(reqwest::Method::POST,
-            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
-            json!({"runtime_id":CONNECTED_RUNTIME,"repository_key":"test-repository","selector":branch,"operation_id":format!("public-{label}-workdir")})).await;
-        assert_eq!(status, StatusCode::CREATED, "{created}");
-        let workdir = created["item"]["working_directory_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let root = harness
-            .materializer
-            .bind_working_directory(&workdir, None)
-            .unwrap()
-            .root()
-            .to_path_buf();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(["switch", "-c", &branch])
-                .status()
-                .unwrap()
-                .success()
-        );
-        fs::write(root.join("private.txt"), "PRIVATE_MUST_NOT_READ\n").unwrap();
-        let subject = subjects
-            .create_subject(
-                crate::subjektiv::SubjectRole::new(format!("public-ticket-{label}")).unwrap(),
-            )
-            .unwrap()
-            .id;
-        let mut input = NewTicket::new(format!("Public connected {label} Ticket"));
-        set_test_ticket_target(&mut input, "test-repository", &branch);
-        let ticket = browser_ticket_backend(api)
-            .unwrap()
-            .create(input)
-            .unwrap()
-            .id;
-        replied
-            .lock()
-            .unwrap()
-            .insert(ticket.clone(), Arc::new(tokio::sync::Notify::new()));
-        let mut permissions = file_permissions(&workdir);
-        permissions.extend([
-            ticket_permission(&ticket, "ticket.read"),
-            ticket_permission(&ticket, "ticket.implementation_result.write"),
-            operation("worker.messaging"),
-        ]);
-        let mut delegation = permissions.clone();
-        delegation.extend(file_permissions(&wrong_workdir));
-        let mut execution: Vec<_> = [
+        .id;
+    let ticket = browser_ticket_backend(api)
+        .unwrap()
+        .create(NewTicket::new("Legacy scoped creation refusal"))
+        .unwrap()
+        .id;
+    let mut execution = vec![
+        collection("worker.create"),
+        ticket_permission(&ticket, "ticket.assignment.assign"),
+    ];
+    execution.extend(
+        [
             "session.record",
             "memory.resident.read",
             "memory.resident.supply",
@@ -559,472 +248,92 @@ async fn public_two_subject_ticket_spawn_notify_edit_result_retry_and_fences() {
             "journal.startup.supply",
         ]
         .into_iter()
-        .map(|name| subject_permission(&subject, name))
-        .collect();
-        execution.extend([
-            collection("worker.create"),
-            operation("worker.messaging"),
-            ticket_permission(&ticket, "ticket.assignment.assign"),
-            ticket_permission(&ticket, "ticket.read"),
-            ticket_permission(&ticket, "ticket.implementation_result.read"),
-        ]);
-        // This legacy consumer suite keeps exact Ticket and Workdir domains.
-        // Select an explicit empty scoped source by current-policy CAS before
-        // the real owner API assigns only the narrowly listed permissions.
-        subjects
-            .set_subject_permissions(
-                &subject,
-                &SubjectPermissionsUpdate {
-                    operation_id: format!("legacy-public-{label}-fixture"),
-                    expected_change_id: subjects
-                        .current_subject_policy(&subject)
-                        .unwrap()
-                        .map(|policy| policy.change_id),
-                    execution: vec![],
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
-        let (status, policy) = harness.human(reqwest::Method::POST,
-            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
-            json!({"operation_id":format!("public-{label}-policy"),"expected_change_id":subjects.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":delegation})).await;
-        assert_eq!(status, StatusCode::OK, "{policy}");
-        let change = subjects
-            .subject_permissions(&subject)
-            .unwrap()
-            .unwrap()
-            .change_id;
-        let (status, source) = harness.human(reqwest::Method::POST,
-            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
-            json!({"runtime_id":CONNECTED_RUNTIME,"display_name":format!("{label} Ticket Subject"),"profile":"project:public-ticket-origin","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{source}; Runtime: {:?}",
-            harness.runtime_errors.lock().unwrap()
-        );
-        let origin = RuntimeWorkerRef::new(
-            source["runtime_id"].as_str().unwrap(),
-            source["worker_id"].as_str().unwrap(),
-        );
-        let (status, assigned) = harness.human(reqwest::Method::PUT,
-            &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
-            json!({"operation_id":format!("public-{label}-assign"),"expected_assignment_id":null,"principal":{"kind":"subject","subject_id":subject}})).await;
-        assert_eq!(status, StatusCode::OK, "{assigned}");
-        let assignment = assigned["assignment"]["assignment_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let content = format!("public connected {label} verified\n");
-        let spawn = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:public-ticket-editor","operation_id":format!("public-{label}-spawn"),
-            "display_name":format!("{label} public Ticket editor"),"ticket_id":ticket,"orchestrator_assignment_id":assignment,
-            "working_directory_id":workdir,"initial_submit":[],"execution_grant":{"permissions":permissions,"redelegation":[]}});
-        cases.push(Case {
-            subject,
-            ticket,
-            assignment,
-            branch,
-            workdir,
-            root,
-            origin,
-            permissions,
-            execution,
-            change,
-            spawn,
-            content,
-        });
-    }
-    assert_ne!(cases[0].subject, cases[1].subject);
-    assert_ne!(cases[0].ticket, cases[1].ticket);
-    assert_ne!(cases[0].workdir, cases[1].workdir);
-    assert_ne!(cases[0].root, cases[1].root);
-    // Permit the generic start operation on the peer Ticket as well. Its current
-    // assigned Subject must STILL refuse this caller, independently of operation
-    // permission and the caller's valid explicit child execution grant.
-    for i in 0..2 {
-        let peer_ticket = cases[1 - i].ticket.clone();
-        let case = &mut cases[i];
-        case.execution
-            .push(ticket_permission(&peer_ticket, "ticket.assignment.assign"));
-        let previous = subjects
-            .subject_permissions(&case.subject)
-            .unwrap()
-            .unwrap();
-        let (status, body) = harness.human(reqwest::Method::POST,
-            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions", case.subject),
-            json!({"operation_id":format!("public-peer-start-operation-{i}"), "expected_change_id":previous.change_id,
-                "execution":case.execution,"delegation":previous.delegation})).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        case.change = subjects
-            .subject_permissions(&case.subject)
-            .unwrap()
-            .unwrap()
-            .change_id;
-    }
-    for (i, case) in cases.iter().enumerate() {
-        let other = &cases[1 - i];
-        let mut assignee = case.spawn.clone();
-        assignee["operation_id"] = json!(format!("public-denied-assignee-{i}"));
-        assignee["ticket_id"] = json!(other.ticket);
-        assignee["orchestrator_assignment_id"] = json!(other.assignment);
-        let mut wrong_target = case.spawn.clone();
-        wrong_target["operation_id"] = json!(format!("public-denied-target-{i}"));
-        wrong_target["working_directory_id"] = json!(wrong_workdir);
-        let mut wrong_permissions = case.permissions[2..].to_vec();
-        wrong_permissions.extend(file_permissions(&wrong_workdir));
-        wrong_target["execution_grant"]["permissions"] = json!(wrong_permissions);
-        let mut resource = case.spawn.clone();
-        resource["operation_id"] = json!(format!("public-denied-resource-{i}"));
-        let mut cross_permissions = case.permissions.clone();
-        cross_permissions.extend(file_permissions(&other.workdir));
-        resource["execution_grant"]["permissions"] = json!(cross_permissions);
-        let input = json!({"ticket":case.ticket,"spawn":case.spawn,"other_origin":target(&other.origin),
-            "denials":[{"id":"public-wrong-assignee-spawn","input":assignee,"reason":"target Subject"},
-                {"id":"public-wrong-target-spawn","input":wrong_target,"reason":"selector"},
-                {"id":"public-cross-resource-spawn","input":resource}],
-            "child":{"ticket":case.ticket,"other_ticket":other.ticket,"content":case.content,
-                "origin":target(&case.origin),"other_origin":target(&other.origin)}});
-        // Human Notify only starts the already-created Subject body (also safe
-        // while assignment attention is Busy). Child creation, retry, messaging
-        // and editing below occur through public Tools.
-        let (status, body) = harness
-            .human(
-                reqwest::Method::POST,
-                &format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{}/input",
-                    case.origin.runtime_id, case.origin.worker_id
-                ),
-                json!({"kind":"notify","content":format!("{ORIGIN}{input}")}),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-    }
-    let mut observed = std::collections::BTreeMap::new();
-    for _ in 0..2 {
-        let value = tokio::time::timeout(std::time::Duration::from_secs(90), completion.recv())
-            .await
-            .expect("two real public Ticket roundtrips")
-            .expect("model completion evidence");
-        let ticket = value["ticket"].as_str().unwrap().to_owned();
-        assert!(observed.insert(ticket, value).is_none());
-    }
-    assert_eq!(
-        harness.runtime.list_workers().unwrap().len(),
-        4,
-        "two bodies + exactly two children; public replay and refusals allocate no extra child"
+        .map(|name| subject_permission(&subject, name)),
     );
-    let saved = api.config_store.with_conn(|conn| {
-        let mut statement = conn.prepare("SELECT ticket_id,worker_id,result_id FROM ticket_implementation_results WHERE workspace_id=?1 ORDER BY ticket_id")?;
-        Ok(statement.query_map([TEST_WORKSPACE_ID],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?)
-    }).unwrap();
-    assert_eq!(
-        saved.len(),
-        2,
-        "foreign public result requests must not persist"
+    let mut delegation = file_permissions("retained-workdir");
+    delegation.push(ticket_permission(&ticket, "ticket.read"));
+    let policy = seed_test_subject_legacy_constraints(api, &subject, execution, delegation);
+    set_test_subject_policy_as_owner(api, &subject, policy.execution, policy.delegation);
+    let before_policy = subjects.current_subject_policy(&subject).unwrap().unwrap();
+    assert!(before_policy.legacy_constraints.is_some());
+    let (status, source) = h.human(reqwest::Method::POST, &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+        json!({"runtime_id":CONNECTED_RUNTIME,"display_name":"Retained scoped source","profile":"project:public-ticket-origin",
+            "initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    assert_eq!(status, StatusCode::OK, "{source}");
+    let origin = RuntimeWorkerRef::new(
+        source["runtime_id"].as_str().unwrap(),
+        source["worker_id"].as_str().unwrap(),
     );
-    let mut children = Vec::new();
-    for (i, case) in cases.iter().enumerate() {
-        let spawn = &observed[&case.ticket]["spawn"];
-        let child = RuntimeWorkerRef::new(
-            spawn["runtime_id"].as_str().unwrap(),
-            spawn["worker_id"].as_str().unwrap(),
-        );
-        let grant = subjects
-            .worker_execution_grant(&child.runtime_id, &child.worker_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(grant.subject_id, case.subject);
-        assert_eq!(grant.origin_worker_id, case.origin.worker_id);
-        assert_eq!(grant.source_change_id, case.change);
-        assert_eq!(grant.permissions, case.permissions);
-        assert!(grant.redelegation.is_empty());
-        let forward = api
-            .store
-            .get_active_worker_control_grant(TEST_WORKSPACE_ID, &case.origin, &child)
-            .unwrap()
-            .unwrap();
-        assert!(forward.permissions.contains(&"notify".into()));
-        let reverse = api
-            .store
-            .get_active_worker_control_grant(TEST_WORKSPACE_ID, &child, &case.origin)
-            .unwrap()
-            .unwrap();
-        assert_eq!(reverse.permissions, vec!["notify".to_owned()]);
-        assert!(
-            api.store
-                .get_active_worker_control_grant(TEST_WORKSPACE_ID, &child, &cases[1 - i].origin)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            api.store
-                .list_worker_workdir_links(TEST_WORKSPACE_ID, &case.origin)
-                .unwrap()
-                .is_empty()
-        );
-        let links = api
-            .store
-            .list_worker_workdir_links(TEST_WORKSPACE_ID, &child)
-            .unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].workdir_id, case.workdir);
-        assert_eq!(
-            api.store
-                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &case.ticket)
-                .unwrap()
-                .unwrap()
-                .worker,
-            child
-        );
-        assert_eq!(
-            fs::read_to_string(case.root.join("README.md")).unwrap(),
-            case.content
-        );
-        assert_eq!(
-            fs::read_to_string(case.root.join("private.txt")).unwrap(),
-            "PRIVATE_MUST_NOT_READ\n"
-        );
-        let branch = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&case.root)
-            .args(["branch", "--show-current"])
-            .output()
-            .unwrap();
-        assert!(branch.status.success());
-        assert_eq!(
-            String::from_utf8(branch.stdout).unwrap().trim(),
-            case.branch
-        );
-        let row = saved.iter().find(|row| row.0 == case.ticket).unwrap();
-        assert_eq!(
-            observed[&case.ticket]["evaluated"]["result_id"], row.2,
-            "origin evaluated the same canonical result that the child persisted"
-        );
-        assert_eq!(row.1, child.worker_id);
-        let receipt = api
-            .config_store
-            .implementation_result(TEST_WORKSPACE_ID, &case.ticket, &row.2)
-            .unwrap();
-        assert_eq!(
-            receipt.request.body,
-            format!("Public tools verified {}", case.content)
-        );
-        let current = api
-            .store
-            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &case.ticket)
-            .unwrap()
-            .remove(0);
-        assert_eq!(current.assignment_id, case.assignment);
-        assert_eq!(
-            current.principal,
-            ticket::TicketAssignmentPrincipalSnapshot::Subject {
-                subject_id: case.subject.clone()
-            }
-        );
-        assert_eq!(
-            current.tracking.unwrap().status,
-            ticket::TicketAssignmentTrackingStatus::Waiting,
-            "result is not Subject handling or case closure"
-        );
-        assert_eq!(
-            api.authority.ticket(&case.ticket).unwrap().state,
-            server_api::BrowserTicketState::Open
-        );
-        let worker = worker_runtime::identity::WorkerRef::try_from(&child).unwrap();
-        let snapshot = harness.factory.retained_session_snapshot(&worker).unwrap();
-        let history = serde_json::to_string(&snapshot.snapshot).unwrap();
-        let incoming = notifications(&snapshot.snapshot);
-        assert!(
-            incoming.iter().any(|content| content.contains(CHILD)),
-            "real Idle Notify reached canonical notification history"
-        );
-        assert!(
-            incoming
-                .iter()
-                .all(|content| !content.contains("T778_MUST_NOT_ACCEPT_FOREIGN_NOTIFY")),
-            "foreign Notify must not become an incoming notification"
-        );
-        let origin_ref = worker_runtime::identity::WorkerRef::try_from(&case.origin).unwrap();
-        let origin_snapshot = harness
-            .factory
-            .retained_session_snapshot(&origin_ref)
-            .unwrap();
-        let origin_incoming = notifications(&origin_snapshot.snapshot);
-        assert!(
-            origin_incoming
-                .iter()
-                .any(|content| content.contains(REPLY)),
-            "reply reached the origin's canonical notification history"
-        );
-        assert!(
-            origin_incoming
-                .iter()
-                .all(|content| !content.contains("T778_MUST_NOT_ACCEPT_FOREIGN_NOTIFY"))
-        );
-        assert!(
-            !history.contains("PRIVATE_MUST_NOT_READ"),
-            "denied private Read leaked no file bytes"
-        );
-        for kind in ["assignee", "resource"] {
-            assert!(
-                api.store
-                    .get_ticket_assignment_operation(
-                        TEST_WORKSPACE_ID,
-                        &format!("public-denied-{kind}-{i}")
+    let (status, assigned) = h.human(reqwest::Method::PUT, &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
+        json!({"operation_id":"legacy-probe-assign","expected_assignment_id":null,"principal":{"kind":"subject","subject_id":subject}})).await;
+    assert_eq!(status, StatusCode::OK, "{assigned}");
+    let assignment = assigned["assignment"]["assignment_id"].clone();
+    let authorization = test_worker_operation_authorization(&[("ticket", &["ticket.read"])]);
+    let spawn = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:public-ticket-editor",
+        "operation_id":"legacy-public-spawn","display_name":"Must not allocate",
+        "ticket_id":ticket,"orchestrator_assignment_id":assignment,
+        "initial_submit":[],"authorization":authorization});
+    let counts = || {
+        api.config_store
+            .with_conn(|conn| {
+                Ok([
+                    "worker_create_reservations",
+                    "core_worker_execution_grants",
+                    "ticket_assignment_operations",
+                ]
+                .map(|table| {
+                    conn.query_row(
+                        &format!("SELECT count(*) FROM {table} WHERE workspace_id=?1"),
+                        [TEST_WORKSPACE_ID],
+                        |r| r.get::<_, i64>(0),
                     )
                     .unwrap()
-                    .is_none(),
-                "public refused authority must not reserve Ticket operation"
-            );
-        }
-        let failed = api
-            .store
-            .get_ticket_assignment_operation(
-                TEST_WORKSPACE_ID,
-                &format!("public-denied-target-{i}"),
-            )
+                }))
+            })
             .unwrap()
-            .expect("target validation follows durable start admission");
-        assert_eq!(failed.claim_state, "failed");
-        assert!(failed.assignment_id.is_none());
-        assert!(
-            failed.worker.is_none(),
-            "target refusal precedes Runtime allocation"
-        );
-        children.push(child);
-    }
-    assert_ne!(children[0], children[1]);
-    assert_eq!(
-        fs::read_to_string(harness._dir.path().join("README.md")).unwrap(),
-        "clean\n"
-    );
-    // Complementary final-dispatch checks use the SAME production connection,
-    // after public end-to-end success. They are not sole public-tool evidence.
-    let alpha = &cases[0];
-    let child = &children[0];
-    let forward = api
-        .store
-        .get_active_worker_control_grant(TEST_WORKSPACE_ID, &alpha.origin, child)
-        .unwrap()
-        .unwrap();
-    api.store
-        .revoke_worker_control_grant(
-            TEST_WORKSPACE_ID,
-            &forward.grant_id,
-            &now_registry_timestamp(),
-        )
-        .unwrap();
-    let (status, body) = connected_authorization_post(
-        &harness.backend_url,
-        &harness.identity,
-        &alpha.origin,
-        &format!(
-            "/api/w/{TEST_WORKSPACE_ID}/worker-control/workers/{}/{}/input",
-            child.runtime_id, child.worker_id
-        ),
-        &json!({"kind":"notify","content":"T778_MUST_NOT_ACCEPT_REVOKED_NOTIFY"}),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "revoked directional control: {body}"
-    );
-    let worker = worker_runtime::identity::WorkerRef::try_from(child).unwrap();
-    assert!(
-        !serde_json::to_string(
-            &harness
-                .factory
-                .retained_session_snapshot(&worker)
-                .unwrap()
-                .snapshot
-        )
-        .unwrap()
-        .contains("T778_MUST_NOT_ACCEPT_REVOKED_NOTIFY")
-    );
-    let previous = subjects
-        .subject_permissions(&alpha.subject)
-        .unwrap()
-        .unwrap();
-    let (status, body) = harness.human(reqwest::Method::POST,
-        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",alpha.subject),
-        json!({"operation_id":"public-alpha-revoke-delegation","expected_change_id":previous.change_id,"execution":alpha.execution,"delegation":[]})).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let mut replay = json!({"runtime_id":CONNECTED_RUNTIME,"display_name":alpha.spawn["display_name"],"profile":alpha.spawn["profile"],
-        "ticket_assignment":{"ticket_id":alpha.ticket,"operation_id":alpha.spawn["operation_id"],"orchestrator_assignment_id":alpha.assignment},
-        "initial_submit":[],"workdir_attachments":[{"alias":"workdir","working_directory_id":alpha.workdir}],"feature_connections":{},
-        "control_operation_id":alpha.spawn["operation_id"],"execution_grant":alpha.spawn["execution_grant"]});
-    // Backend replay is exact to public serialization (relative_cwd defaults to null).
-    replay["workdir_attachments"][0]["relative_cwd"] = Value::Null;
-    let (status, body) = connected_authorization_post(
-        &harness.backend_url,
-        &harness.identity,
-        &alpha.origin,
-        &format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
-        &replay,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "saved successful receipt cannot refresh revoked delegation: {body}"
-    );
-    // Re-enter the real origin Controller after revocation as well: both public
-    // Spawn replay and Notify must consult current authority, not cached results.
-    let input = json!({"ticket":alpha.ticket,"spawn":alpha.spawn,"child":target(child)});
-    let (status, body) = harness
+    };
+    let before = counts();
+    let (status, body) = h
         .human(
             reqwest::Method::POST,
             &format!(
                 "/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{}/input",
-                alpha.origin.runtime_id, alpha.origin.worker_id
+                origin.runtime_id, origin.worker_id
             ),
-            json!({"kind":"notify","content":format!("{REVOCATION}{input}")}),
+            json!({"kind":"notify","content":format!("legacy-scope-probe:{spawn}")}),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let revoked = tokio::time::timeout(std::time::Duration::from_secs(45), completion.recv())
+    tokio::time::timeout(std::time::Duration::from_secs(45), completion.recv())
         .await
-        .expect("public current-authority re-evaluation")
-        .expect("public revocation evidence");
-    assert_eq!(revoked["revocation"], alpha.ticket);
-    assert!(
-        !serde_json::to_string(
-            &harness
-                .factory
-                .retained_session_snapshot(&worker)
-                .unwrap()
-                .snapshot
-        )
         .unwrap()
-        .contains("T778_MUST_NOT_ACCEPT_REVOKED_NOTIFY")
-    );
-    assert_eq!(harness.runtime.list_workers().unwrap().len(), 4);
+        .unwrap();
+    // Observe the specific refusal at its authoritative HTTP boundary as well as
+    // the sanitized public Tool status; no response text is rewritten for the model.
+    let (status, body) = connected_authorization_post(&h.backend_url, &h.identity, &origin,
+        &format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
+        &json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:public-ticket-editor","display_name":"Must not allocate",
+            "ticket_assignment":{"ticket_id":ticket,"operation_id":"legacy-backend-spawn","orchestrator_assignment_id":assignment},
+            "control_operation_id":"legacy-backend-spawn","authorization":authorization,
+            "initial_submit":[],"workdir_attachments":[],"feature_connections":{}})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
-        subjects
-            .worker_execution_grant(&child.runtime_id, &child.worker_id)
+        body["message"]
+            .as_str()
             .unwrap()
-            .is_some(),
-        "historical execution evidence retained, not current authority"
+            .contains("legacy scoped authority"),
+        "{body}"
     );
-    let calls = harness.authorizations.lock().unwrap();
-    for name in [
-        "worker.create",
-        "worker.messaging",
-        "filesystem.read",
-        "filesystem.write",
-    ] {
-        assert!(
-            calls
-                .iter()
-                .any(|(request, status)| request["operation"] == name && *status == StatusCode::OK),
-            "real common authorization {name}: {calls:?}"
-        );
-    }
+    assert_eq!(counts(), before);
+    assert_eq!(
+        subjects.current_subject_policy(&subject).unwrap().unwrap(),
+        before_policy
+    );
+    assert_eq!(h.runtime.list_workers().unwrap().len(), 1);
     assert!(
-        calls
-            .iter()
-            .filter(|(request, _)| request["operation"] == "worker.messaging")
-            .all(|(request, _)| request["resource"]["kind"] == "worker_operation")
+        api.store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
+            .unwrap()
+            .is_none()
     );
 }

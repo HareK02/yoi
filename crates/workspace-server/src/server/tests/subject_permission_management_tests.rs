@@ -1,8 +1,9 @@
-//! Management HTTP integration: real router/account authentication, catalog
-//! validation, Subject SQLite policy/receipts and deletion; no running service or
-//! model. The connected Ticket case also uses the signed Worker Host, real Tool
-//! and Ticket backend via the parent suite's isolated Runtime fixture.
+//! Management HTTP integration uses the canonical Host policy owner and current
+//! payload-free permission references. Real router/account authentication, SQLite
+//! CAS/receipts and signed Ticket Tool dispatch are retained; only Runtime execution
+//! is replaced by the parent suite's isolated workdirless fixture.
 use super::*;
+use feature_permissions::PermissionAssignment;
 
 struct ManagementFixture {
     api: WorkspaceApi,
@@ -21,23 +22,6 @@ impl ManagementFixture {
             .create_subject(crate::subjektiv::SubjectRole::new("permission-management").unwrap())
             .unwrap()
             .id;
-        // This suite exercises the retained pre-cutover scoped management API,
-        // not the new shared-set source/adoption surface.
-        let store = open_subjektiv_store(&api).unwrap();
-        store
-            .set_subject_permissions(
-                &subject,
-                &server_api::authorization::SubjectPermissionsUpdate {
-                    operation_id: "legacy-management-fixture".into(),
-                    expected_change_id: store
-                        .current_subject_policy(&subject)
-                        .unwrap()
-                        .map(|policy| policy.change_id),
-                    execution: vec![],
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
         Self {
             api,
             owner,
@@ -47,10 +31,7 @@ impl ManagementFixture {
     }
 
     fn path(&self) -> String {
-        format!(
-            "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
-            self.subject
-        )
+        policy_path(&self.subject)
     }
 
     async fn read(&self) -> Value {
@@ -66,7 +47,7 @@ impl ManagementFixture {
     async fn save(&self, update: Value) -> Value {
         let (status, body) = response(
             &self.api,
-            human_request(&self.owner, "POST", &self.path(), Some(update)),
+            human_request(&self.owner, "PUT", &self.path(), Some(update)),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -74,48 +55,48 @@ impl ManagementFixture {
     }
 
     fn assert_current(&self, expected: &Value) {
-        let saved = open_subjektiv_store(&self.api)
-            .unwrap()
-            .subject_permissions(&self.subject)
+        let saved = self
+            .api
+            .config_store
+            .current_subject_permission_policy(TEST_WORKSPACE_ID, &self.subject)
             .unwrap();
-        assert_eq!(serde_json::to_value(saved).unwrap(), *expected);
+        assert_eq!(serde_json::to_value(&saved).unwrap(), *expected);
+        assert_eq!(
+            open_subjektiv_store(&self.api)
+                .unwrap()
+                .current_subject_policy(&self.subject)
+                .unwrap(),
+            saved
+        );
     }
 }
 
-fn update(screen: &Value, operation: &str, execution: Value, delegation: Value) -> Value {
-    json!({"operation_id":operation,"expected_change_id":screen["permissions"]["change_id"],
-        "execution":execution,"delegation":delegation})
+fn policy_path(subject: &str) -> String {
+    format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permission-policy")
+}
+
+fn update(
+    screen: &Value,
+    operation: &str,
+    execution: PermissionAssignment,
+    delegation: PermissionAssignment,
+) -> Value {
+    json!({"operation_id":operation,"expected_change_id":screen["change_id"],
+        "action":{"kind":"replace","execution":execution,"delegation":delegation}})
 }
 
 #[tokio::test]
-async fn management_read_exposes_operation_use_without_duplicate_worker_target_grants() {
+async fn management_read_exposes_operation_keys_without_duplicate_worker_target_grants() {
     let f = ManagementFixture::new().await;
     let screen = f.read().await;
-    assert!(screen["permissions"]["change_id"].is_string());
-    assert_eq!(screen["permissions"]["delegation"], json!([]));
-    f.assert_current(&screen["permissions"]);
+    assert_eq!(screen["policy"], Value::Null);
+    f.assert_current(&screen["policy"]);
     assert_eq!(screen["can_manage"], true);
-    let operations = screen["operations"].as_array().expect("management catalog");
-    let create = operations
-        .iter()
-        .find(|entry| entry["operation"] == "ticket.create")
-        .unwrap();
-    assert_eq!(create["availability"]["kind"], "available");
-    assert!(
-        create["resource_kinds"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("workspace"))
-    );
-    assert!(!create["label"].as_str().unwrap().is_empty());
-    assert!(!create["description"].as_str().unwrap().is_empty());
-    let messaging = operations
-        .iter()
-        .find(|entry| entry["operation"] == "worker.messaging")
-        .unwrap();
-    assert_eq!(messaging["availability"]["kind"], "available");
-    for name in [
-        "worker.messaging",
+    let catalog: feature_permissions::PermissionCatalog =
+        serde_json::from_value(screen["catalog"].clone()).unwrap();
+    assert_eq!(catalog.workspace.as_str(), TEST_WORKSPACE_ID);
+    for operation in [
+        "ticket.create",
         "worker.send_input",
         "worker.cancel",
         "worker.stop",
@@ -123,19 +104,17 @@ async fn management_read_exposes_operation_use_without_duplicate_worker_target_g
         "worker.remove",
         "worker.observe",
     ] {
-        let operation = operations
+        let permission = catalog
+            .namespaces
             .iter()
-            .find(|entry| entry["operation"] == name)
+            .filter(|namespace| namespace.enabled)
+            .flat_map(|namespace| &namespace.declaration.permissions)
+            .find(|permission| permission.key.as_str() == operation)
             .unwrap();
-        assert_eq!(
-            operation["availability"]["kind"], "available",
-            "implemented Worker contracts: {operation}"
-        );
-        assert_eq!(
-            operation["resource_kinds"],
-            json!(["worker_operation"]),
-            "operation use must not offer duplicate target control grants"
-        );
+        assert!(!permission.description.is_empty());
+        let wire = serde_json::to_value(permission).unwrap();
+        assert!(wire.get("resource").is_none());
+        assert!(wire.get("resource_kinds").is_none());
     }
 }
 
@@ -148,28 +127,24 @@ async fn two_management_screens_conflict_without_overwriting_saved_execution_or_
         .save(update(
             &first,
             "screen-one",
-            json!([create_permission()]),
-            json!([query_permission()]),
+            test_operation_assignment(&f.api, &["ticket.create"]),
+            test_operation_assignment(&f.api, &["ticket.query"]),
         ))
         .await;
     let stale = update(
         &second,
         "screen-two",
-        json!([]),
-        json!([create_permission()]),
+        Default::default(),
+        test_operation_assignment(&f.api, &["ticket.create"]),
     );
     let (status, body) = response(
         &f.api,
-        human_request(&f.owner, "POST", &f.path(), Some(stale)),
+        human_request(&f.owner, "PUT", &f.path(), Some(stale)),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body["message"].is_string(),
-        "conflict must be visible: {body}"
-    );
-    assert_eq!(f.read().await["permissions"], saved["permissions"]);
-    f.assert_current(&saved["permissions"]);
+    assert_eq!(f.read().await["policy"], saved["policy"]);
+    f.assert_current(&saved["policy"]);
 }
 
 #[tokio::test]
@@ -178,16 +153,15 @@ async fn discarded_save_response_recovers_by_exact_replay_and_authoritative_rere
     let input = update(
         &f.read().await,
         "lost-save-response",
-        json!([create_permission()]),
-        json!([query_permission()]),
+        test_operation_assignment(&f.api, &["ticket.create"]),
+        test_operation_assignment(&f.api, &["ticket.query"]),
     );
-    // Commit through the real HTTP route, then discard the entire response. This
-    // models response loss, not process death or rollback of the committed save.
+    // Commit through HTTP, then discard its response; this is not a process-death test.
     drop(
         build_router(f.api.clone())
             .oneshot(human_request(
                 &f.owner,
-                "POST",
+                "PUT",
                 &f.path(),
                 Some(input.clone()),
             ))
@@ -195,18 +169,19 @@ async fn discarded_save_response_recovers_by_exact_replay_and_authoritative_rere
             .unwrap(),
     );
     let reread = f.read().await;
-    assert_eq!(reread["permissions"]["execution"], input["execution"]);
-    assert_eq!(reread["permissions"]["delegation"], input["delegation"]);
+    assert_eq!(reread["policy"]["execution"], input["action"]["execution"]);
+    assert_eq!(
+        reread["policy"]["delegation"],
+        input["action"]["delegation"]
+    );
     let replay = f.save(input.clone()).await;
-    assert_eq!(replay["permissions"], reread["permissions"]);
-    assert_eq!(replay["interruptions"], json!([]));
-    assert_eq!(f.read().await["permissions"], reread["permissions"]);
-    f.assert_current(&reread["permissions"]);
+    assert_eq!(replay["policy"], reread["policy"]);
+    assert_eq!(f.read().await["policy"], reread["policy"]);
     let mut changed = input;
-    changed["execution"] = json!([]);
+    changed["action"]["execution"] = serde_json::to_value(PermissionAssignment::default()).unwrap();
     let (status, body) = response(
         &f.api,
-        human_request(&f.owner, "POST", &f.path(), Some(changed)),
+        human_request(&f.owner, "PUT", &f.path(), Some(changed)),
     )
     .await;
     assert_eq!(
@@ -214,32 +189,24 @@ async fn discarded_save_response_recovers_by_exact_replay_and_authoritative_rere
         StatusCode::CONFLICT,
         "operation identity cannot be reused: {body}"
     );
-    f.assert_current(&reread["permissions"]);
+    f.assert_current(&reread["policy"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn historical_save_receipt_after_shrink_and_revoke_never_restores_current_authority() {
+async fn historical_save_receipt_after_shrink_and_remove_never_restores_current_authority() {
     let f = Fixture::new().await;
-    let (status, screen) = response(
-        &f.api,
-        human_request(&f.owner, "GET", &f.policy_path(), None),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let path = policy_path(&f.subject);
+    let (status, screen) = response(&f.api, human_request(&f.owner, "GET", &path, None)).await;
+    assert_eq!(status, StatusCode::OK, "{screen}");
     let original_input = update(
         &screen,
         "before-shrink",
-        json!([create_permission()]),
-        json!([create_permission()]),
+        test_operation_assignment(&f.api, &["ticket.create"]),
+        test_operation_assignment(&f.api, &["ticket.create"]),
     );
     let (status, original) = response(
         &f.api,
-        human_request(
-            &f.owner,
-            "POST",
-            &f.policy_path(),
-            Some(original_input.clone()),
-        ),
+        human_request(&f.owner, "PUT", &path, Some(original_input.clone())),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{original}");
@@ -247,36 +214,29 @@ async fn historical_save_receipt_after_shrink_and_revoke_never_restores_current_
         f.check(&f.source, &create_permission()).await.0,
         StatusCode::OK
     );
-    for delegation in [vec![create_permission()], vec![]] {
-        let current = f.assign(vec![], delegation).await;
+    let mut current = original.clone();
+    for (operation, action) in [
+        (
+            "shrink",
+            json!({"kind":"replace", "execution":PermissionAssignment::default(), "delegation":test_operation_assignment(&f.api, &["ticket.create"])}),
+        ),
+        ("remove", json!({"kind":"remove"})),
+    ] {
+        let (status, saved) = response(&f.api, human_request(&f.owner, "PUT", &path, Some(json!({"operation_id":operation,"expected_change_id":current["change_id"],"action":action})))).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        current = saved;
         let (status, replay) = response(
             &f.api,
-            human_request(
-                &f.owner,
-                "POST",
-                &f.policy_path(),
-                Some(original_input.clone()),
-            ),
+            human_request(&f.owner, "PUT", &path, Some(original_input.clone())),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "historical receipt: {replay}");
-        assert_eq!(replay["permissions"], original["permissions"]);
-        assert_eq!(replay["interruptions"], json!([]));
-        let (status, read) = response(
-            &f.api,
-            human_request(&f.owner, "GET", &f.policy_path(), None),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(read["permissions"], serde_json::to_value(&current).unwrap());
-        assert_ne!(read["permissions"], replay["permissions"]);
-        assert_eq!(
-            open_subjektiv_store(&f.api)
-                .unwrap()
-                .subject_permissions(&f.subject)
-                .unwrap(),
-            Some(current)
-        );
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay, original);
+        let (status, read) = response(&f.api, human_request(&f.owner, "GET", &path, None)).await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["policy"], current["policy"]);
+        assert_eq!(read["change_id"], current["change_id"]);
+        assert_ne!(read["change_id"], replay["change_id"]);
         assert_eq!(
             f.check(&f.source, &create_permission()).await.0,
             StatusCode::FORBIDDEN
@@ -287,20 +247,18 @@ async fn historical_save_receipt_after_shrink_and_revoke_never_restores_current_
 #[tokio::test]
 async fn subject_deletion_rejects_stale_screen_save_and_exact_receipt_replay_without_revival() {
     let f = ManagementFixture::new().await;
-    let screen = f.read().await;
     let initial_input = update(
-        &screen,
+        &f.read().await,
         "save-before-delete",
-        json!([create_permission()]),
-        json!([query_permission()]),
+        test_operation_assignment(&f.api, &["ticket.create"]),
+        test_operation_assignment(&f.api, &["ticket.query"]),
     );
     let saved = f.save(initial_input.clone()).await;
-    let stale_screen = json!({"permissions":saved["permissions"]});
     let late_input = update(
-        &stale_screen,
+        &saved,
         "late-screen-save",
-        json!([query_permission()]),
-        json!([]),
+        test_operation_assignment(&f.api, &["ticket.query"]),
+        Default::default(),
     );
     let (status, body) = response(
         &f.api,
@@ -320,7 +278,7 @@ async fn subject_deletion_rejects_stale_screen_save_and_exact_receipt_replay_wit
     for input in [late_input, initial_input] {
         let (status, body) = response(
             &f.api,
-            human_request(&f.owner, "POST", &f.path(), Some(input)),
+            human_request(&f.owner, "PUT", &f.path(), Some(input)),
         )
         .await;
         assert_eq!(
@@ -338,12 +296,6 @@ async fn subject_deletion_rejects_stale_screen_save_and_exact_receipt_replay_wit
     }
     let (status, body) = response(&f.api, human_request(&f.owner, "GET", &f.path(), None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert!(
-        open_subjektiv_store(&f.api)
-            .unwrap()
-            .subject_permissions(&f.subject)
-            .is_err()
-    );
 }
 
 #[tokio::test]
@@ -354,159 +306,78 @@ async fn read_only_account_cannot_save_or_replay_an_owner_permission_change() {
     let input = update(
         &initial,
         "owner-only-save",
-        json!([create_permission()]),
-        json!([]),
+        test_operation_assignment(&f.api, &["ticket.create"]),
+        Default::default(),
     );
     let (status, read) = response(&f.api, human_request(&account, "GET", &f.path(), None)).await;
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["can_manage"], false);
-    assert_eq!(read["permissions"], initial["permissions"]);
+    assert_eq!(read["policy"], initial["policy"]);
     let (status, body) = response(
         &f.api,
-        human_request(&account, "POST", &f.path(), Some(input.clone())),
+        human_request(&account, "PUT", &f.path(), Some(input.clone())),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    f.assert_current(&initial["permissions"]);
+    f.assert_current(&initial["policy"]);
     let saved = f.save(input.clone()).await;
     let (status, body) = response(
         &f.api,
-        human_request(&account, "POST", &f.path(), Some(input)),
+        human_request(&account, "PUT", &f.path(), Some(input)),
     )
     .await;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "exact owner receipt replay must still authorize the caller: {body}"
+        "owner replay still authenticates the caller: {body}"
     );
-    f.assert_current(&saved["permissions"]);
+    f.assert_current(&saved["policy"]);
 }
 
 #[tokio::test]
-async fn new_unknown_legacy_unavailable_and_operation_resource_mismatch_are_rejected_without_policy_write()
- {
+async fn unknown_keys_and_legacy_resource_payloads_are_rejected_without_policy_write() {
     let f = ManagementFixture::new().await;
     let screen = f.read().await;
-    let mut unknown = create_permission();
-    unknown.operation = "ticket.future_operation".into();
-    let mut mismatch = create_permission();
-    mismatch.resource = PermissionResource::Ticket {
-        workspace_id: TEST_WORKSPACE_ID.into(),
-        ticket_id: "not-a-collection".into(),
-    };
-    let mut unavailable = query_permission();
-    unavailable.operation = "worker.messaging".into();
-    for (name, permission) in [
+    let valid =
+        serde_json::to_value(test_operation_assignment(&f.api, &["ticket.create"])).unwrap();
+    let mut unknown = valid.clone();
+    unknown["grants"][0]["value"]["keys"] = json!(["ticket.future_operation"]);
+    let mut resource_payload = valid.clone();
+    resource_payload["grants"][0]["value"]["resource"] =
+        json!({"kind":"ticket","workspace_id":TEST_WORKSPACE_ID,"ticket_id":"another-ticket"});
+    for (name, assignment) in [
         ("unknown", unknown),
-        ("legacy", activation("ticket")),
-        ("resource-mismatch", mismatch),
-        ("unavailable", unavailable),
+        ("resource-payload", resource_payload),
+        ("legacy", json!([activation("ticket")])),
     ] {
         for lane in ["execution", "delegation"] {
             let mut input = update(
                 &screen,
                 &format!("reject-{name}-{lane}"),
-                json!([]),
-                json!([]),
+                Default::default(),
+                Default::default(),
             );
-            input[lane] = json!([permission]);
+            input["action"][lane] = assignment.clone();
             let (status, body) = response(
                 &f.api,
-                human_request(&f.owner, "POST", &f.path(), Some(input)),
+                human_request(&f.owner, "PUT", &f.path(), Some(input)),
             )
             .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}/{lane}: {body}");
-            assert!(body["message"].is_string(), "{body}");
-            f.assert_current(&screen["permissions"]);
-            assert_eq!(f.read().await["permissions"], screen["permissions"]);
+            assert_eq!(
+                status,
+                if name == "unknown" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    // Invalid DTO shape is rejected by the JSON extractor before
+                    // the domain can validate recognized permission references.
+                    StatusCode::UNPROCESSABLE_ENTITY
+                },
+                "{name}/{lane}: {body}"
+            );
+            f.assert_current(&screen["policy"]);
+            assert_eq!(f.read().await["change_id"], screen["change_id"]);
         }
     }
-}
-
-#[tokio::test]
-async fn unsupported_saved_entries_can_only_be_retained_in_the_same_lane_or_removed() {
-    let f = ManagementFixture::new().await;
-    let execution = vec![activation("ticket")];
-    let mut unknown = query_permission();
-    unknown.operation = "legacy.custom_operation".into();
-    let delegation = vec![unknown];
-    open_subjektiv_store(&f.api)
-        .unwrap()
-        .set_subject_permissions(
-            &f.subject,
-            &SubjectPermissionsUpdate {
-                operation_id: "seed-pre-catalog-policy".into(),
-                expected_change_id: Some(
-                    open_subjektiv_store(&f.api)
-                        .unwrap()
-                        .subject_permissions(&f.subject)
-                        .unwrap()
-                        .unwrap()
-                        .change_id,
-                ),
-                execution: execution.clone(),
-                delegation: delegation.clone(),
-            },
-        )
-        .unwrap();
-    let screen = f.read().await;
-    let saved = f
-        .save(update(
-            &screen,
-            "retain-existing",
-            json!([execution[0], create_permission()]),
-            json!(delegation),
-        ))
-        .await;
-    assert_eq!(
-        saved["permissions"]["execution"],
-        json!([execution[0], create_permission()])
-    );
-    assert_eq!(saved["permissions"]["delegation"], json!(delegation));
-    let screen = f.read().await;
-    for (name, execution, delegation) in [
-        (
-            "copy-legacy-lane",
-            json!([activation("ticket"), create_permission()]),
-            json!([activation("ticket")]),
-        ),
-        (
-            "copy-unknown-lane",
-            json!([delegation[0], create_permission()]),
-            json!(delegation),
-        ),
-    ] {
-        let (status, body) = response(
-            &f.api,
-            human_request(
-                &f.owner,
-                "POST",
-                &f.path(),
-                Some(update(&screen, name, execution, delegation)),
-            ),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "retention cannot expand into another lane: {body}"
-        );
-        f.assert_current(&saved["permissions"]);
-    }
-    let removed = f
-        .save(update(
-            &screen,
-            "remove-unsupported",
-            json!([create_permission()]),
-            json!([]),
-        ))
-        .await;
-    assert_eq!(
-        removed["permissions"]["execution"],
-        json!([create_permission()])
-    );
-    assert_eq!(removed["permissions"]["delegation"], json!([]));
-    f.assert_current(&removed["permissions"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -525,25 +396,38 @@ async fn management_saved_policy_controls_real_ticket_tool_and_raw_http_before_b
         "local registration is not authorization"
     );
     let backend = browser_ticket_backend(&f.api).unwrap();
-    for state in ["unset", "out-of-scope", "allowed", "revoked"] {
+    for state in ["unset", "other-operation", "allowed", "revoked"] {
         match state {
             "unset" => {}
-            "out-of-scope" => {
-                // Intentionally migrated, unsupported kind: management may retain
-                // this exact saved entry but it must never authorize collection creation.
-                let mut wrong_kind = create_permission();
-                wrong_kind.resource = PermissionResource::Ticket {
-                    workspace_id: TEST_WORKSPACE_ID.into(),
-                    ticket_id: "legacy-ticket-scope".into(),
-                };
-                f.seed_saved_policy(vec![wrong_kind.clone()], vec![]);
-                f.assign(vec![wrong_kind], vec![]).await;
+            "other-operation" => {
+                owner_subject_policy(
+                    &f.api,
+                    &f.owner,
+                    &f.subject,
+                    test_operation_assignment(&f.api, &["ticket.query"]),
+                )
+                .await;
             }
             "allowed" => {
-                f.assign(vec![create_permission()], vec![]).await;
+                owner_subject_policy(
+                    &f.api,
+                    &f.owner,
+                    &f.subject,
+                    test_operation_assignment(&f.api, &["ticket.create"]),
+                )
+                .await;
             }
             "revoked" => {
-                f.assign(vec![], vec![]).await;
+                owner_subject_policy(
+                    &f.api,
+                    &f.owner,
+                    &f.subject,
+                    PermissionAssignment {
+                        revoked: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
             }
             _ => unreachable!(),
         }
@@ -586,7 +470,7 @@ async fn management_saved_policy_controls_real_ticket_tool_and_raw_http_before_b
             assert_eq!(
                 status,
                 StatusCode::FORBIDDEN,
-                "{state}: direct Backend path also rechecks: {body}"
+                "{state}: raw Backend also rechecks: {body}"
             );
             assert_eq!(
                 backend.list(Default::default()).unwrap().len(),

@@ -470,6 +470,12 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
                 old_columns.remove("typed_ticket_orchestration_plans");
                 old_columns.remove("ticket_schema_migrations");
                 exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
+                // Result-only completion is intentionally reopened by schema134;
+                // every other retained value stays byte-for-byte identical.
+                old_columns
+                    .get_mut("backend_jobs")
+                    .unwrap()
+                    .retain(|column| column != "state" && column != "completed_at");
                 let retained = values(&conn, &old_columns);
                 drop(conn);
 
@@ -485,6 +491,7 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
                             );
                             assert_appended_receipts(conn, &old_receipts, &plan);
                             assert_obsolete_job_tables_removed(conn);
+                            assert_result_only_job_finalizing(conn);
                             assert_eq!(
                                 values(conn, &old_columns),
                                 retained,
@@ -961,15 +968,18 @@ fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_
             let mut retained_columns = columns.clone();
             retained_columns.remove("__yoi_schema_migrations");
             exclude_empty_obsolete_job_tables(&conn, &mut retained_columns);
+            retained_columns
+                .get_mut("backend_jobs")
+                .unwrap()
+                .retain(|column| column != "state" && column != "completed_at");
+            let retained = values(&conn, &retained_columns);
             apply_migrations(&conn).unwrap();
+            assert_result_only_job_finalizing(&conn);
             assert_eq!(
                 current_schema_version(&conn).unwrap(),
                 LATEST_SCHEMA_VERSION
             );
-            assert_eq!(
-                values(&conn, &retained_columns),
-                values_from_before(&before, &retained_columns)
-            );
+            assert_eq!(values(&conn, &retained_columns), retained);
             assert_appended_receipts(&conn, &retained_receipts, &plan);
             assert_obsolete_job_tables_removed(&conn);
             assert!(
@@ -994,10 +1004,8 @@ fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_
             reopened
                 .with_conn(|conn| {
                     assert_eq!(receipts(conn), final_receipts);
-                    assert_eq!(
-                        values(conn, &retained_columns),
-                        values_from_before(&before, &retained_columns)
-                    );
+                    assert_result_only_job_finalizing(conn);
+                    assert_eq!(values(conn, &retained_columns), retained);
                     Ok(())
                 })
                 .unwrap();
@@ -1005,9 +1013,13 @@ fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_
     }
 }
 
-fn values_from_before(saved: &SavedRows, columns: &Columns) -> SavedRows {
-    columns
-        .keys()
-        .map(|table| (table.clone(), saved[table].clone()))
-        .collect()
+fn assert_result_only_job_finalizing(conn: &Connection) {
+    assert_eq!(
+        rows(
+            conn,
+            "SELECT state, completed_at FROM backend_jobs WHERE job_id='saved-job'"
+        ),
+        vec![vec![Value::Text("finalizing".into()), Value::Null]],
+        "the old result is retained but completion waits for cleanup proof"
+    );
 }

@@ -189,13 +189,28 @@ impl RegistrationFixture {
                                     &api,
                                     &["session.record"],
                                 ).grants;
-                                replace_test_subject_policy_as_owner(
-                                    &api,
+                                // Inject the policy change at the signed callback boundary.
+                                // The public management handler also interrupts Workers;
+                                // waiting for that here would wait on this same startup.
+                                let registry = api.permission_registry.read().unwrap();
+                                let (change_id, _, _) = api.config_store
+                                    .subject_permission_policy_view(
+                                        TEST_WORKSPACE_ID, &subject, registry.host(),
+                                    ).unwrap();
+                                api.config_store.mutate_subject_permission_policy(
+                                    TEST_WORKSPACE_ID,
+                                    &test_owner_actor().account_id,
                                     &subject,
-                                    execution,
-                                    policy.delegation,
-                                )
-                                .await;
+                                    &server_api::subject_policy::SubjectPermissionPolicyMutation {
+                                        operation_id: Uuid::now_v7().to_string(),
+                                        expected_change_id: change_id,
+                                        action: server_api::subject_policy::SubjectPermissionPolicyAction::Replace {
+                                            execution,
+                                            delegation: policy.delegation,
+                                        },
+                                    },
+                                    registry.host(),
+                                ).unwrap();
                             }
                         }
                         let (parts, body) = request.into_parts();

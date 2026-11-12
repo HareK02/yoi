@@ -21,6 +21,12 @@ async fn subject_notification_recovery_drains_two_recipients_beyond_global_scan_
                 "Handle assigned Tickets; delivery does not prove processing.".into(),
             )
             .unwrap();
+        set_test_subject_policy_as_owner(
+            &api,
+            &subject.id,
+            server_api::authorization::subject_default_permission_assignment(),
+            Default::default(),
+        );
         // Normal Subject-connected creation, not a synthetic worker registry row
         // or a monkey-patched assigned_subject_body/candidate selector.
         let body = create_test_assignment_body(&api, EMBEDDED_WORKER_RUNTIME_ID, &subject.id).await;

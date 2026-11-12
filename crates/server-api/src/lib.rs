@@ -1663,6 +1663,7 @@ pub trait ServerApi {
     )]
     async fn memory_consolidation(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: MemoryConsolidateStagingRequest,
     ) -> Result<MemoryConsolidationResponse, RepositoryApiError>;

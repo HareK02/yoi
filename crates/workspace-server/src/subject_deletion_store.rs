@@ -835,6 +835,38 @@ mod tests {
             limits: Default::default(),
         }
     }
+    fn finalize_fixture_job(
+        store: &SqliteWorkspaceStore,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> BackendJobRecord {
+        assert_eq!(
+            store.get_backend_job("w", job_id).unwrap().unwrap().state,
+            BackendJobState::Finalizing
+        );
+        assert!(store.finalize_backend_job("w", job_id, NOW).is_err());
+        let (attempt, claimed) = store
+            .claim_backend_job_worker_cleanup("w", job_id, attempt_id, NOW)
+            .unwrap();
+        assert!(claimed);
+        // Substitute only external Controller/Host termination evidence. Exercise
+        // the normal cleanup and finalization transactions; execution release is
+        // not a physical Session/diagnostic purge receipt for Subject deletion.
+        super::super::backend_job_finalizing::record_fixture_fence(store, "w", &attempt);
+        store
+            .finish_backend_job_worker_cleanup(
+                "w",
+                job_id,
+                attempt_id,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                NOW,
+            )
+            .unwrap();
+        store.finalize_backend_job("w", job_id, NOW).unwrap()
+    }
+
     fn worker(n: u64) -> RuntimeWorkerRef {
         RuntimeWorkerRef::new("r", WorkerId::from_legacy_u64(n).to_string())
     }
@@ -1160,7 +1192,10 @@ mod tests {
             NOW,
         )
         .unwrap();
-        s.with_conn(|c| {c.execute("UPDATE backend_job_attempts SET worker_cleanup_state='completed' WHERE workspace_id='w'",[])?;Ok(())}).unwrap();
+        assert_eq!(
+            finalize_fixture_job(&s, "job", &first.attempt.attempt_id).state,
+            BackendJobState::Failed
+        );
         let second = s.reserve_backend_job_retry("w", "job", NOW).unwrap();
         s.claim_backend_job_attempt_dispatch("w", "job", &second.attempt.attempt_id, NOW)
             .unwrap();
@@ -1307,6 +1342,10 @@ mod tests {
         };
         s.accept_backend_job_result("w", &w, &submission, NOW)
             .unwrap();
+        assert_eq!(
+            finalize_fixture_job(&s, "job", &r.attempt.attempt_id).state,
+            BackendJobState::Completed
+        );
         let source = s
             .job_notification_source("w", "job", &r.attempt.attempt_id)
             .unwrap();
@@ -1623,18 +1662,16 @@ mod tests {
             Some(body_receipt.clone())
         );
         assert_eq!(
-            s.recover_worker_removal_execution("w", &jw)
+            s.recover_worker_removal_plan("w", &jw)
                 .unwrap()
                 .unwrap()
-                .plan
                 .operation_id,
             job_receipt
         );
         assert_eq!(
-            s.recover_worker_removal_execution("w", &body)
+            s.recover_worker_removal_plan("w", &body)
                 .unwrap()
                 .unwrap()
-                .plan
                 .operation_id,
             body_receipt
         );

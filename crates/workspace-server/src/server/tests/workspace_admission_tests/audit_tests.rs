@@ -68,11 +68,46 @@ impl ProviderProbe {
         else {
             panic!("expected write dispatch, received cancellation")
         };
-        self.dispatches += 1;
+        if !matches!(operation, WorkdirSessionOperation::AuthorizeScope(_)) {
+            self.dispatches += 1;
+        }
         (operation_id.as_str().to_owned(), operation, response)
     }
 
+    async fn receive_write_scope(&mut self, pending: &mut PendingHttpWrite) -> ProviderReply {
+        // The scoped write path authorizes its admission and its operation path
+        // before dispatching the mutation. Keep both provider checks real.
+        for check in 0..2 {
+            let (_, operation, response) = self.receive_operation(pending).await;
+            let WorkdirSessionOperation::AuthorizeScope(request) = operation else {
+                panic!("expected provider scope authorization, got {operation:?}")
+            };
+            assert_eq!(
+                request.path,
+                workdir::WorkdirPath::new(PATH_SECRET).unwrap()
+            );
+            assert_eq!(
+                request.permission,
+                workdir::WorkdirToolScopePermission::Write
+            );
+            assert_eq!(request.rules.len(), 1);
+            assert_eq!(request.rules[0].target, request.path);
+            assert_eq!(request.rules[0].permission, request.permission);
+            if check == 1 {
+                return response;
+            }
+            response
+                .send(Ok(WorkdirSessionOperationResult::AuthorizeScope))
+                .unwrap();
+        }
+        unreachable!()
+    }
+
     async fn receive_write(&mut self, pending: &mut PendingHttpWrite) -> (String, ProviderReply) {
+        self.receive_write_scope(pending)
+            .await
+            .send(Ok(WorkdirSessionOperationResult::AuthorizeScope))
+            .unwrap();
         let (operation_id, operation, response) = self.receive_operation(pending).await;
         let WorkdirSessionOperation::Write(request) = operation else {
             panic!("expected mutation, got {operation:?}")
@@ -202,6 +237,7 @@ impl AuditHttpFixture {
             .execute_batch(&format!(
                 "CREATE TRIGGER fail_operation_audit BEFORE INSERT ON audit_events \
                  WHEN NEW.action='external_workdir_operation' AND NEW.outcome {filter} 'requested' \
+                 AND instr(NEW.summary, 'operation_kind=write') > 0 \
                  BEGIN SELECT RAISE(FAIL, '{AUDIT_SECRET}'); END;"
             ))
             .unwrap();
@@ -254,7 +290,12 @@ impl AuditHttpFixture {
             if status.is_success() {
                 assert_eq!(content_type, "application/json");
             } else {
-                assert_eq!(content_type, error_contract::problem::PROBLEM_CONTENT_TYPE);
+                assert_eq!(
+                    content_type,
+                    error_contract::problem::PROBLEM_CONTENT_TYPE,
+                    "{status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
                 let decoded = server_api::WorkdirHttpApiError::decode_received(
                     status.as_u16(),
                     &content_type,
@@ -319,13 +360,14 @@ impl AuditHttpFixture {
             .prepare(
                 "SELECT request_id, outcome, summary FROM audit_events \
                  WHERE workspace_id=?1 AND action='external_workdir_operation' \
-                 AND target_id='external-1' ORDER BY rowid",
+                 AND target_id='external-1' AND instr(summary, ?2) > 0 ORDER BY rowid",
             )
             .unwrap();
         let rows: Vec<(String, String, String)> = statement
-            .query_map([TEST_WORKSPACE_ID], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_map(
+                rusqlite::params![TEST_WORKSPACE_ID, format!("operation_kind={operation}")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -545,9 +587,13 @@ async fn lost_write_response_after_audit_failure_stays_unknown_without_repeating
 async fn before_write_audit_failure_is_not_dispatched_and_has_no_provider_effect() {
     let (h, mut provider) = AuditHttpFixture::new().await;
     h.fail_audit(true);
-    let (body, events) = h
-        .finish(h.start_write(), StatusCode::SERVICE_UNAVAILABLE)
-        .await;
+    let mut pending = h.start_write();
+    provider
+        .receive_write_scope(&mut pending)
+        .await
+        .send(Ok(WorkdirSessionOperationResult::AuthorizeScope))
+        .unwrap();
+    let (body, events) = h.finish(pending, StatusCode::SERVICE_UNAVAILABLE).await;
     assert_eq!(
         body["yoi_failure"]["details"]["classification"],
         "not_dispatched"
@@ -574,10 +620,13 @@ async fn before_write_audit_failure_is_not_dispatched_and_has_no_provider_effect
 async fn rejected_write_send_with_audit_failure_is_not_dispatched_not_unknown() {
     let (h, mut provider) = AuditHttpFixture::new().await;
     h.fail_audit(false);
+    let mut pending = h.start_write();
+    let scope_reply = provider.receive_write_scope(&mut pending).await;
     provider.receiver.close();
-    let (body, events) = h
-        .finish(h.start_write(), StatusCode::SERVICE_UNAVAILABLE)
-        .await;
+    scope_reply
+        .send(Ok(WorkdirSessionOperationResult::AuthorizeScope))
+        .unwrap();
+    let (body, events) = h.finish(pending, StatusCode::SERVICE_UNAVAILABLE).await;
     assert_eq!(
         body["yoi_failure"]["details"]["classification"],
         "not_dispatched"
@@ -767,180 +816,56 @@ async fn provider_reported_unknown_preserves_received_response_and_unknown_effec
     h.assert_audits(&[(&dispatched_id, "requested")]);
 }
 
-#[derive(Clone, Copy, Debug)]
-enum CheckoutReplyFault {
-    WrongOperation,
-    WrongPath,
-    EmptyValidator,
-    WrongOutput,
-    ProviderUnavailable,
-    ProviderTransport,
-}
-
-async fn assert_checkout_unknown_audit(fault: CheckoutReplyFault, fail_completion: bool) {
-    let (h, mut provider) = AuditHttpFixture::new().await;
-    if fail_completion {
-        h.fail_audit(false);
-    }
-    let target = workdir::WorkdirPath::new(PATH_SECRET).unwrap();
-    let mut pending = h.start_operation(WorkdirSessionOperation::CheckoutExecute(
-        workdir::CheckoutRequest {
-            target: target.clone(),
-            validator: vec![1],
-            operation: workdir::CheckoutOperation::Write {
-                content: WRITE_SECRET.to_vec(),
-                expected_hash: [0; 32],
-            },
+// Checkout has no scoped Host resource mapping yet. The public signed route
+// must fail before provider/audit dispatch even with filesystem write authority.
+// Provider reply normalization itself is covered by the external-provider boundary
+// suite; it must not be tested here by bypassing this authorization refusal.
+#[tokio::test]
+async fn unmapped_checkout_refuses_before_external_dispatch_or_audit() {
+    let f = Fixture::new().await;
+    let mut provider = f.attach_audited_writer();
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+    let operation = WorkdirSessionOperation::CheckoutExecute(workdir::CheckoutRequest {
+        target: workdir::WorkdirPath::new(PATH_SECRET).unwrap(),
+        validator: vec![1],
+        operation: workdir::CheckoutOperation::Write {
+            content: WRITE_SECRET.to_vec(),
+            expected_hash: [0; 32],
         },
-    ));
-    let (operation_id, operation, reply) = provider.receive_operation(&mut pending).await;
-    let WorkdirSessionOperation::CheckoutExecute(request) = operation else {
-        panic!("expected checkout mutation, got {operation:?}");
-    };
-    assert_eq!(request.target, target);
-    assert_eq!(request.validator, vec![1]);
+    });
+    let body = serde_json::to_vec(&WorkspaceWorkdirSessionOperationRequest {
+        target_workdir: "attachment".into(),
+        operation,
+    })
+    .unwrap();
+    let reply = f
+        .app
+        .clone()
+        .oneshot(f.request(
+            Some("1"),
+            &path,
+            body,
+            START,
+            worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+        ))
+        .await
+        .unwrap();
+    let body = assert_json(reply, StatusCode::FORBIDDEN).await;
     assert!(
-        matches!(request.operation, workdir::CheckoutOperation::Write { ref content, .. } if content == WRITE_SECRET)
-    );
-    h.apply_provider_write();
-    let result = match fault {
-        CheckoutReplyFault::WrongOperation => Ok(write_result()),
-        CheckoutReplyFault::ProviderUnavailable => Err(WorkdirTransportError::from_workdir_error(
-            &workdir::WorkdirError::Unavailable(PROVIDER_SECRET.into()),
-        )),
-        CheckoutReplyFault::ProviderTransport => Err(WorkdirTransportError::from_workdir_error(
-            &workdir::WorkdirError::Transport(PROVIDER_SECRET.into()),
-        )),
-        _ => {
-            let mut result = workdir::CheckoutResult {
-                observation: workdir::CheckoutObservation {
-                    path: target,
-                    validator: vec![2],
-                    kind: workdir::EntryKind::File,
-                    size: WRITE_SECRET.len() as u64,
-                    capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
-                },
-                output: workdir::CheckoutOutput::Write(workdir::WriteResult {
-                    bytes_written: WRITE_SECRET.len(),
-                    created: false,
-                }),
-            };
-            match fault {
-                CheckoutReplyFault::WrongPath => {
-                    result.observation.path =
-                        workdir::WorkdirPath::new(PROVIDER_SECRET.trim_start_matches('/')).unwrap()
-                }
-                CheckoutReplyFault::EmptyValidator => result.observation.validator.clear(),
-                CheckoutReplyFault::WrongOutput => {
-                    result.output = workdir::CheckoutOutput::Edit(workdir::EditResult {
-                        replacements: 1,
-                        content_hash: [0; 32],
-                        bytes_written: 1,
-                    })
-                }
-                _ => unreachable!(),
-            }
-            Ok(WorkdirSessionOperationResult::CheckoutExecute(result))
-        }
-    };
-    reply.send(result).unwrap();
-    let (body, events) = h.finish(pending, StatusCode::INTERNAL_SERVER_ERROR).await;
-    assert_eq!(
-        body["yoi_failure"]["details"]["classification"], "outcome_unknown",
-        "{fault:?}: {body}"
-    );
-    assert_eq!(
-        events
-            .iter()
-            .find(|event| event["event"] == "api_error")
-            .unwrap()["message"],
-        "Workdir operation may have effects; inspect before retrying"
-    );
-    assert!(
-        body["detail"]
+        body["message"]
             .as_str()
             .unwrap()
-            .contains("do not automatically resend")
+            .contains("no scoped Subject resource mapping"),
+        "{body}"
     );
-    if !matches!(
-        fault,
-        CheckoutReplyFault::ProviderUnavailable | CheckoutReplyFault::ProviderTransport
-    ) {
-        assert_failure_reason(&events, "operation_result_mismatch", "response_validation");
-    }
-    if fail_completion {
-        assert_eq!(
-            body["audit_failures"],
-            json!([{
-                "operation_id": operation_id,
-                "stage": "response_received",
-                "reason": "audit_store_unavailable",
-                "operation_outcome": {"kind":"unknown"},
-            }]),
-            "{fault:?}: {body}"
-        );
-        let audit_logs: Vec<_> = events
-            .iter()
-            .filter(|e| e["event"] == "external_workdir_audit_failed")
-            .collect();
-        assert_eq!(audit_logs.len(), 1, "{events:?}");
-        let event = audit_logs[0];
-        assert_eq!(event["operation_id"], operation_id);
-        assert_eq!(event["operation"], "checkout_execute");
-        assert_eq!(event["audit_stage"], "ResponseReceived");
-        assert_eq!(event["operation_outcome"], "Unknown");
-        h.assert_operation_audits(&[(&operation_id, "requested")], "checkout_execute");
-    } else {
-        assert!(body.get("audit_failures").is_none(), "{body}");
-        assert!(
-            events
-                .iter()
-                .all(|e| e["event"] != "external_workdir_audit_failed")
-        );
-        h.assert_operation_audits(
-            &[
-                (&operation_id, "requested"),
-                (&operation_id, "outcome_unknown"),
-            ],
-            "checkout_execute",
-        );
-    }
-    assert_eq!(std::fs::read(h.effect_path()).unwrap(), WRITE_SECRET);
-    provider.assert_dispatches(1);
-}
-
-#[tokio::test]
-async fn checkout_invalid_reply_records_unknown_in_healthy_completion_audit() {
-    for fault in [
-        CheckoutReplyFault::WrongOperation,
-        CheckoutReplyFault::WrongPath,
-        CheckoutReplyFault::EmptyValidator,
-        CheckoutReplyFault::WrongOutput,
-    ] {
-        assert_checkout_unknown_audit(fault, false).await;
-    }
-}
-
-#[tokio::test]
-async fn checkout_invalid_reply_records_unknown_in_failed_completion_receipt_and_log() {
-    for fault in [
-        CheckoutReplyFault::WrongOperation,
-        CheckoutReplyFault::WrongPath,
-        CheckoutReplyFault::EmptyValidator,
-        CheckoutReplyFault::WrongOutput,
-    ] {
-        assert_checkout_unknown_audit(fault, true).await;
-    }
-}
-
-#[tokio::test]
-async fn checkout_uncertain_reply_normalization_matches_audit_outcome() {
-    for fault in [
-        CheckoutReplyFault::ProviderUnavailable,
-        CheckoutReplyFault::ProviderTransport,
-    ] {
-        for fail_completion in [false, true] {
-            assert_checkout_unknown_audit(fault, fail_completion).await;
-        }
-    }
+    provider.assert_dispatches(0);
+    let connection = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE action='external_workdir_operation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
 }

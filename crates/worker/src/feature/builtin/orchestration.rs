@@ -91,6 +91,7 @@ struct SpawnTicketWorkerInput {
     /// Source-qualified registered selector; Profile selection does not grant permissions.
     profile: String,
     /// Omit for the shared Worker default, or select an explicit assignment or launch policy.
+    /// Policy selection carries the exact observed string authorization identity.
     #[serde(default)]
     authorization: server_api::launch_policy::WorkerCreationAuthorization,
     /// Initial user request delivered through the normal typed submission path.
@@ -434,7 +435,7 @@ mod tests {
             serde_json::json!({"kind":"assignment", "assignment":{
                 "grants":[], "exclusions":[], "revoked":false
             }}),
-            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":3}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key"}),
         ] {
             let mut input = input();
             input["authorization"] = authorization.clone();
@@ -457,8 +458,13 @@ mod tests {
             serde_json::Value::Null,
             serde_json::json!({"kind":"human", "assignment":null}),
             serde_json::json!({"kind":"policy", "policy_id":"coder"}),
-            serde_json::json!({"kind":"policy", "policy_id":"bad.id", "policy_revision":1}),
-            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":0}),
+            serde_json::json!({"kind":"policy", "policy_id":"bad.id", "policy_authorization_key":"auth-key"}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key", "policy_revision":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":""}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"é".repeat(257)}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_authorization_key":"bad\u{85}key"}),
             serde_json::json!({"kind":"assignment", "assignment":{}}),
         ] {
             let mut input = input();
@@ -823,6 +829,22 @@ mod tests {
         assert_eq!(meta.name, "SpawnTicketWorker");
         let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketWorkerInput)).unwrap();
         assert_eq!(schema["additionalProperties"], false);
+        let text = schema.to_string();
+        assert!(text.contains("policy_authorization_key"));
+        assert!(!text.contains("policy_revision"));
+        let mut input = input();
+        input["authorization"] = serde_json::json!({
+            "kind":"policy", "policy_id":"coder", "policy_authorization_key":"auth-key"
+        });
+        assert!(jsonschema::is_valid(&schema, &input));
+        for key in [
+            serde_json::json!(1),
+            serde_json::json!(""),
+            serde_json::json!("x".repeat(513)),
+        ] {
+            input["authorization"]["policy_authorization_key"] = key;
+            assert!(!jsonschema::is_valid(&schema, &input));
+        }
         let required = schema["required"].as_array().unwrap();
         for field in ["ticket_id", "runtime_id", "initial_request", "profile"] {
             assert!(

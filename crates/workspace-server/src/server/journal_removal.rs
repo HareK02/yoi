@@ -58,12 +58,12 @@ pub(in crate::server) fn removal_observation(
 ) -> Result<Option<server_api::WorkerRemovalObservation>> {
     let Some(prepared) = api
         .config_store
-        .recover_worker_removal_execution(api.workspace_id(), worker)
+        .recover_worker_removal_plan(api.workspace_id(), worker)
         .map_err(|error| Error::Store(error.to_string()))?
     else {
         return Ok(None);
     };
-    let Some(progress) = api.store.get_journal_removal(&prepared)? else {
+    let Some(progress) = api.store.get_journal_removal_for_plan(&prepared)? else {
         return Ok(None);
     };
     if progress.metadata.phase == Phase::Completed {

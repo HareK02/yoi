@@ -455,28 +455,42 @@ async fn reviewer_reads_saved_related_tickets_by_key_and_id_and_pages_their_thre
         let related_before = backend.show(related.id.clone().into()).unwrap();
         let bound_key = bound.meta.resource_key.as_deref().unwrap();
         let related_key = related.resource_key.as_deref().unwrap();
-        // A relation and Reviewer profile do not grant access to its target.
-        // Exercise the signed denial first, then grant only the related read.
+        // Current operation grants are not per-Ticket ACLs. Remove the read
+        // operation explicitly: neither a relation nor Reviewer routing grants it.
+        let subject = ensure_test_assignment_subject(&api);
+        let policy = api
+            .config_store
+            .current_subject_permission_policy(api.workspace_id(), &subject)
+            .unwrap()
+            .unwrap();
+        set_test_subject_policy_as_owner(
+            &api,
+            &subject,
+            test_operation_assignment(&api, &["ticket.relation.read"]),
+            policy.delegation.clone(),
+        );
         let transport = ticket_client(&api, identity, &source);
         // One client must retain its review binding while following related Tickets.
         let client = reviewer_client(transport.clone(), &bound_id);
         let surface =
             TicketSurface::with_access(dir.path(), client, wip, TicketFeatureAccess::review())
                 .await;
-        let denied = surface
-            .call(
-                "ShowTicket",
-                serde_json::json!({"id": related_key}),
-                ToolExecutionContext::direct(),
-            )
-            .await
-            .unwrap_err();
-        assert!(denied.to_string().contains("403"), "{denied}");
-        grant_test_ticket_operations(
+        for reference in [bound_key, related_key] {
+            let denied = surface
+                .call(
+                    "ShowTicket",
+                    serde_json::json!({"id": reference}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap_err();
+            assert!(denied.to_string().contains("403"), "{denied}");
+        }
+        set_test_subject_policy_as_owner(
             &api,
-            &ensure_test_assignment_subject(&api),
-            &related.id,
-            &["ticket.read", "ticket.relation.read"],
+            &subject,
+            policy.execution.clone(),
+            policy.delegation.clone(),
         );
         for (reference, expected_key, expected_title, expected_body) in [
             (
@@ -514,7 +528,7 @@ async fn reviewer_reads_saved_related_tickets_by_key_and_id_and_pages_their_thre
                 .unwrap();
             assert_eq!(shown["ticket"], expected_key);
             assert_eq!(shown["title"], expected_title);
-            assert_eq!(shown["body"], expected_body);
+            assert_eq!(shown["initial_post"]["body"], expected_body);
             if expected_key == bound_key {
                 assert!(
                     shown["relations"]["outgoing"]
@@ -540,6 +554,18 @@ async fn reviewer_reads_saved_related_tickets_by_key_and_id_and_pages_their_thre
         let second = surface.call("ShowTicket", serde_json::json!({"id":related_key,"event_limit":1,"event_cursor":first["event_page"]["next_cursor"]}), ToolExecutionContext::direct()).await.unwrap();
         assert_eq!(second["thread"].as_array().unwrap().len(), 1);
         assert_eq!(second["thread"][0]["body"], "Earlier decision");
+        set_test_subject_policy_as_owner(&api, &subject, Default::default(), policy.delegation);
+        for reference in [bound_key, related_key] {
+            let denied = surface
+                .call(
+                    "ShowTicket",
+                    serde_json::json!({"id": reference}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap_err();
+            assert!(denied.to_string().contains("403"), "{denied}");
+        }
         assert_eq!(backend.show(bound_id.into()).unwrap(), bound);
         assert_eq!(backend.show(related.id.into()).unwrap(), related_before);
     }

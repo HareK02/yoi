@@ -454,7 +454,11 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .iter()
             .map(|m| m.version)
             .collect::<Vec<_>>(),
-        (92..=113).chain([122, 123, 124, 125, 126, 127, 128, 129, 130]).collect::<Vec<_>>()
+        (92..=113)
+            .chain([
+                122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136
+            ])
+            .collect::<Vec<_>>()
     );
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store
@@ -536,7 +540,12 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (127, journal_removal_store::MIGRATION_NAME.into()),
                     (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into()),
                     (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
-                    (130, backend_job_current::MIGRATION_NAME.into())
+                    (130, backend_job_current::MIGRATION_NAME.into()),
+                    (131, crate::launch_policy::MIGRATION_NAME.into()),
+                    (133, crate::subject_policy::MIGRATION_NAME.into()),
+                    (134, backend_job_finalizing::MIGRATION_NAME.into()),
+                    (135, subject_release_recording_store::MIGRATION_NAME.into()),
+                    (136, launch_policy_identity_migration::MIGRATION_NAME.into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

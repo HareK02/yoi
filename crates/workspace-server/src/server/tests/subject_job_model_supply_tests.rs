@@ -120,22 +120,16 @@ async fn job_fixture(
 }
 
 fn replace_policy(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
-    let store = open_subjektiv_store(api).unwrap();
-    let current = store.current_subject_policy(subject).unwrap();
-    store
-        .set_subject_permissions(
-            subject,
-            &SubjectPermissionsUpdate {
-                operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: current.map(|p| p.change_id),
-                execution: operations
-                    .iter()
-                    .map(|op| subject_permission(subject, op))
-                    .collect(),
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    // The connected native store is a policy reader, not an administration
+    // authority. Use the owner-checked Host policy writer with its current CAS.
+    // This fixture changes durable authorization only; Runtime interruption is
+    // deliberately separate from the model-supply guard under test.
+    set_test_subject_policy_as_owner(
+        api,
+        subject,
+        test_operation_assignment(api, operations),
+        Default::default(),
+    );
 }
 
 async fn model_worker(
@@ -248,7 +242,13 @@ async fn signed_job_host_policy_origin_and_attempt_fences_stop_frozen_input_mode
             replace_policy(
                 &api,
                 &subject,
-                &["memory.consolidation.supply", "journal.job.input.supply"],
+                &[
+                    "memory.consolidation.supply",
+                    "journal.job.input.read",
+                    "journal.job.input.supply",
+                    // Router startup reconciles the live Journal attempt too.
+                    "journal.finish",
+                ],
             );
             if mode == "missing-origin" {
                 // Retained pre-migration input through the real ledger. New
@@ -303,6 +303,28 @@ async fn signed_job_host_policy_origin_and_attempt_fences_stop_frozen_input_mode
                 },
             )
             .await;
+            if !matches!(mode, "outside-grant" | "missing-origin") {
+                let allowed = subject_authorization::authorize(
+                    &api,
+                    reservation.attempt.worker.as_ref().unwrap(),
+                    &server_api::authorization::OperationAuthorizationRequest {
+                        operation: if consolidation {
+                            "memory.consolidation.supply"
+                        } else {
+                            "journal.job.input.supply"
+                        }
+                        .into(),
+                        resource: PermissionResource::Subject {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            subject_id: subject.clone(),
+                        },
+                    },
+                );
+                assert!(
+                    allowed.is_ok(),
+                    "{mode} initial Job authorization: {allowed:?}"
+                );
+            }
             if mode == "late-hook" {
                 worker.add_pre_llm_request_hook(PolicyRevocation {
                     api: api.clone(),
@@ -369,13 +391,26 @@ async fn signed_job_host_policy_origin_and_attempt_fences_stop_frozen_input_mode
                 }
                 _ => unreachable!(),
             }
-            let error = worker.compact(0).await.unwrap_err();
-            assert!(error.to_string().contains("supply"), "{mode}: {error}");
-            assert_eq!(
-                model.calls.load(Ordering::SeqCst),
-                1,
-                "{mode}: frozen input reached compactor after revocation"
-            );
+            if mode == "origin" && !consolidation {
+                // Journal owns its frozen input independently of the former body.
+                // Releasing that body is not revocation of this active Job grant.
+                // The text-only model cannot submit a compaction summary; reaching
+                // that specific error and the model call proves supply was allowed.
+                assert!(matches!(
+                    worker.compact(0).await,
+                    Err(worker::WorkerError::CompactSummaryMissing)
+                ));
+                assert!(model.calls.load(Ordering::SeqCst) > 1);
+                assert!(model.input.lock().unwrap()[1].contains(&subject));
+            } else {
+                let error = worker.compact(0).await.unwrap_err();
+                assert!(error.to_string().contains("supply"), "{mode}: {error}");
+                assert_eq!(
+                    model.calls.load(Ordering::SeqCst),
+                    1,
+                    "{mode}: frozen input reached compactor after revocation"
+                );
+            }
             assert_eq!(
                 api.store
                     .get_backend_job(TEST_WORKSPACE_ID, &reservation.job.request.job_id)

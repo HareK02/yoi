@@ -689,7 +689,7 @@ async fn installed_worker_tools_register_without_authority_and_enforce_operation
         client.requests.lock().unwrap().is_empty(),
         "registration is local"
     );
-    let spawn = json!({"runtime_id":f.source.runtime_id,"operation_id":"public-spawn-denied","profile":"builtin:coder","execution_grant":{"permissions":[],"redelegation":[]}});
+    let spawn = json!({"runtime_id":f.source.runtime_id,"operation_id":"public-spawn-denied","profile":"builtin:coder","authorization":{"kind":"assignment","assignment":key_assignment(&[])}});
     for (name, args) in [("WorkerList", json!({})), ("WorkerSpawn", spawn)] {
         let before = effects(&f);
         assert!(
@@ -731,22 +731,44 @@ async fn installed_worker_tools_register_without_authority_and_enforce_operation
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn installed_public_spawn_notify_stop_and_child_reply_use_real_backend_grants() {
     let f = OperationFixture::new().await;
-    let reply = operation_permission("worker.messaging");
-    let mut permissions = control_permissions();
-    permissions.extend([
-        workspace_permission("worker.create"),
-        workspace_permission("worker.list"),
-    ]);
-    f.assign(permissions, vec![reply.clone()]).await;
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "worker"; keys = ["worker.create", "worker.list", "worker.messaging", "worker.send_input", "worker.cancel", "worker.stop", "worker.restore", "worker.remove", "worker.observe"]; }]; }"#,
+        r#"{ namespaces = [{ namespace = "worker"; keys = ["worker.messaging"]; }]; }"#,
+    ).await;
     let client = f.client(&f.source);
     let host = worker_tool_host(&f._dir.path().join("parent-tools"), client).await;
     let created = execute_tool(&host, "WorkerSpawn", json!({
         "runtime_id":f.source.runtime_id,"operation_id":"public-worker-child","profile":"builtin:coder",
-        "execution_grant":{"permissions":[reply],"redelegation":[]}
+        "authorization":{"kind":"assignment","assignment":key_assignment(&["worker.messaging"])}
     })).await;
     let child = RuntimeWorkerRef::new(
         created["runtime_id"].as_str().unwrap(),
         created["worker_id"].as_str().unwrap(),
+    );
+    let reply_grant = f
+        .api
+        .store
+        .get_active_worker_control_grant(TEST_WORKSPACE_ID, &child, &f.source)
+        .unwrap()
+        .expect("current delegated grants preserve the notify-only reply path");
+    assert_eq!(reply_grant.permissions, vec!["notify"]);
+    assert_eq!(reply_grant.relation, "reply");
+    let other_parent = RuntimeWorkerRef::new(&f.source.runtime_id, "not-the-parent");
+    assert!(
+        subject_authorization::persist_reply_grant(
+            &f.api,
+            &other_parent,
+            &child,
+            "foreign-parent-reply",
+        )
+        .is_err()
+    );
+    assert!(
+        f.api
+            .store
+            .get_active_worker_control_grant(TEST_WORKSPACE_ID, &child, &other_parent,)
+            .unwrap()
+            .is_none()
     );
     assert!(
         f.api
@@ -823,7 +845,7 @@ async fn installed_public_spawn_notify_stop_and_child_reply_use_real_backend_gra
         .unwrap();
     let replayed = execute_tool(&host, "WorkerSpawn", json!({
         "runtime_id":f.source.runtime_id,"operation_id":"public-worker-child","profile":"builtin:coder",
-        "execution_grant":{"permissions":[operation_permission("worker.messaging")],"redelegation":[]}
+        "authorization":{"kind":"assignment","assignment":key_assignment(&["worker.messaging"])}
     })).await;
     assert_eq!(replayed["worker_id"], created["worker_id"]);
     assert!(
@@ -943,7 +965,7 @@ async fn replaced_policy_and_body_never_revive_delegated_worker_control() {
         })
         .unwrap();
     f.release_source_lease();
-    let Json(replacement) = create_workspace_worker(
+    let Json(replacement) = create_workspace_worker_as_owner(
         State(f.api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {

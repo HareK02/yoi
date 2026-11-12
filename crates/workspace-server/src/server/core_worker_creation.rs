@@ -21,13 +21,13 @@ pub(super) fn resolve_core_creation_grant(
             Some(source),
             WorkerCreationAuthorization::Policy {
                 policy_id,
-                policy_revision,
+                policy_authorization_key,
             },
         ) => subject_authorization::prepare_core_policy_grant(
             api,
             source,
             policy_id,
-            *policy_revision,
+            policy_authorization_key,
             runtime,
             profile,
             &digest,

@@ -24,6 +24,24 @@ const SUBJECTS: &str = "/api/w/db-execution/subjektiv/subjects";
 const OBSERVE_LIMIT: StdDuration = StdDuration::from_secs(2);
 const WATCHDOG: StdDuration = StdDuration::from_secs(5);
 
+fn operation_assignment(
+    namespace: &str,
+    operations: &[&str],
+) -> feature_permissions::PermissionAssignment {
+    feature_permissions::PermissionAssignment {
+        grants: vec![feature_permissions::PermissionReference::Namespace(
+            feature_permissions::NamespacePermissions {
+                namespace: feature_permissions::NamespaceId::parse(namespace).unwrap(),
+                keys: operations
+                    .iter()
+                    .map(|operation| feature_permissions::PermissionKey::parse(*operation).unwrap())
+                    .collect(),
+            },
+        )],
+        ..Default::default()
+    }
+}
+
 #[track_caller]
 fn observed<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
     let caller = std::panic::Location::caller();
@@ -43,6 +61,7 @@ struct Fixture {
     executor: DbExecutor,
     host_executor: DbExecutor,
     store: Arc<SqliteWorkspaceStore>,
+    owner_account_id: String,
     _dir: tempfile::TempDir,
 }
 
@@ -89,6 +108,12 @@ impl Fixture {
         seed_test_registered_workspace(store.as_ref(), &config)
             .await
             .unwrap();
+        let owner_account_id = store
+            .get_workspace(WORKSPACE)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_account_id;
         for repository in &config.repositories {
             store
                 .upsert_repository(&crate::store::RepositoryRecord {
@@ -161,6 +186,7 @@ impl Fixture {
             executor,
             host_executor,
             store,
+            owner_account_id,
             _dir: dir,
         }
     }
@@ -204,6 +230,50 @@ impl Fixture {
             display_name: "Fixture user".into(),
             auth_method: ActorAuthMethod::BrowserSession,
         }))
+    }
+
+    // Policy setup uses the canonical Host owner and native lifecycle fence.
+    // Do not call the HTTP mutation's best-effort Worker interruption here: these
+    // tests deliberately hold the Runtime reply while changing local authority.
+    fn set_subject_execution(
+        &self,
+        subject: &str,
+        operation_id: &str,
+        execution: feature_permissions::PermissionAssignment,
+    ) {
+        let native = open_subjektiv_store(&self.api).unwrap();
+        let identity = native.database_identity().unwrap();
+        let saved = native
+            .with_permission_authority_guard(&identity, |authority| {
+                authority.require_subject(subject)?;
+                let registry = self.api.permission_registry.read().unwrap();
+                Ok(self.api.config_store.mutate_subject_permission_policy(
+                    WORKSPACE,
+                    &self.owner_account_id,
+                    subject,
+                    &server_api::subject_policy::SubjectPermissionPolicyMutation {
+                        operation_id: operation_id.into(),
+                        expected_change_id: self
+                            .api
+                            .config_store
+                            .subject_permission_policy_change_id(WORKSPACE, subject)
+                            .unwrap(),
+                        action:
+                            server_api::subject_policy::SubjectPermissionPolicyAction::Replace {
+                                execution,
+                                delegation: Default::default(),
+                            },
+                    },
+                    registry.host(),
+                ))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            native.current_subject_policy(subject).unwrap(),
+            saved.policy,
+            "Session authority must read the policy committed by the Host"
+        );
     }
 
     fn feature_database(&self) -> (crate::FeatureDatabase, PathBuf) {
@@ -1166,31 +1236,11 @@ async fn session_runtime_subject(
         "list" => Some("session.list"),
         _ => None,
     } {
-        open_subjektiv_store(&fixture.api)
-            .unwrap()
-            .set_subject_permissions(
-                &subject.id,
-                &server_api::authorization::SubjectPermissionsUpdate {
-                    operation_id: format!("session-wait-grant-{kind}"),
-                    expected_change_id: Some(
-                        open_subjektiv_store(&fixture.api)
-                            .unwrap()
-                            .current_subject_policy(&subject.id)
-                            .unwrap()
-                            .unwrap()
-                            .change_id,
-                    ),
-                    execution: vec![server_api::authorization::ScopedPermission {
-                        operation: operation.into(),
-                        resource: server_api::authorization::PermissionResource::Subject {
-                            workspace_id: WORKSPACE.into(),
-                            subject_id: subject.id.clone(),
-                        },
-                    }],
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        fixture.set_subject_execution(
+            &subject.id,
+            &format!("session-wait-grant-{kind}"),
+            operation_assignment("session", &[operation]),
+        );
     }
     let singleton = if kind == "legacy_scope" {
         format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id)
@@ -2124,19 +2174,11 @@ async fn session_runtime_reply_rechecks_policy_body_and_observation_before_deliv
             observed(reply.entered.take().unwrap()).await.unwrap();
             match change {
                 "policy" => {
-                    let store = open_subjektiv_store(&fixture.api).unwrap();
-                    let current = store.current_subject_policy(&subject).unwrap().unwrap();
-                    store
-                        .set_subject_permissions(
-                            &subject,
-                            &server_api::authorization::SubjectPermissionsUpdate {
-                                operation_id: "revoke-during-runtime-reply".into(),
-                                expected_change_id: Some(current.change_id),
-                                execution: vec![],
-                                delegation: vec![],
-                            },
-                        )
-                        .unwrap();
+                    fixture.set_subject_execution(
+                        &subject,
+                        "revoke-during-runtime-reply",
+                        Default::default(),
+                    );
                 }
                 "observe" => {
                     assert!(

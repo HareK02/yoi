@@ -2476,5 +2476,218 @@
         "count": 1
       }
     ]
+  },
+  {
+    "path": "crates/server-api/src/authorization/core_worker_grant.rs",
+    "kind": "rejection_test",
+    "reason": "旧数値認可identityと旧fieldの受理を拒否し、現行string keyのschema/Tool/Web送信に旧fieldが出ないことを検証する負例のみ。通常wire互換経路は設けない。",
+    "lines": [
+      {
+        "sha256": "5e53a5e3655088c7c1e140ad80832784075427594d5c2a934a805cdb3a11306b",
+        "count": 1
+      },
+      {
+        "sha256": "b15efd8ee7a7e7d39d3dda8b3d1b7f3c15947bb44854cbd456309bb34d096002",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/server-api/src/launch_policy.rs",
+    "kind": "rejection_test",
+    "reason": "旧数値認可identityと旧fieldの受理を拒否し、現行string keyのschema/Tool/Web送信に旧fieldが出ないことを検証する負例のみ。通常wire互換経路は設けない。",
+    "lines": [
+      {
+        "sha256": "1660127627640ef87b4d5817cd89d698cb374be4128bd30a106748527bfb3648",
+        "count": 1
+      },
+      {
+        "sha256": "7936dfa0a655fd17c87aa5c242fe4274fd63caf5a5a130aca77ebad26fff6100",
+        "count": 1
+      },
+      {
+        "sha256": "43a9743ed8b0cd2b6e15a71b9cf398456f378fc1ff295d3205520b2957a17d47",
+        "count": 1
+      },
+      {
+        "sha256": "a74fa25a55e3db91c05baa3fdf977b7ec156305cf3d68e0be26da9383ebfd633",
+        "count": 1
+      },
+      {
+        "sha256": "5ea437b3cc249bbf7bdf3526d62223ec7212a5749d501169f2537cfa8583343e",
+        "count": 1
+      },
+      {
+        "sha256": "b15efd8ee7a7e7d39d3dda8b3d1b7f3c15947bb44854cbd456309bb34d096002",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/worker/src/feature/builtin/manage_worker.rs",
+    "kind": "rejection_test",
+    "reason": "旧数値認可identityと旧fieldの受理を拒否し、現行string keyのschema/Tool/Web送信に旧fieldが出ないことを検証する負例のみ。通常wire互換経路は設けない。",
+    "lines": [
+      {
+        "sha256": "10071d54ca95fc16ff35ee8f19c06291654396efbadb5353ba02c80d37f6e460",
+        "count": 1
+      },
+      {
+        "sha256": "295cd61c2b4bf95fcd42fefbf596f0d12b30da6c0390fe55b5b50829e4bb5e1e",
+        "count": 1
+      },
+      {
+        "sha256": "18b6ef49c3be036d86e119776367951681ca09df38ddf6d82b4e06ebadb8b149",
+        "count": 1
+      },
+      {
+        "sha256": "059347b7b9a07efd03785e92f7bb0de3eda342332a213fca33b9e693c9305840",
+        "count": 1
+      },
+      {
+        "sha256": "3246288fe1cde2ea1e0770467658d0b03c873d76552e6ce883df5be35fc9943c",
+        "count": 1
+      },
+      {
+        "sha256": "f0c066d915b0aa2ae0c7af7ef71f2cba2c61b8a1bc166879f6006a0223888e7c",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/worker/src/feature/builtin/orchestration.rs",
+    "kind": "rejection_test",
+    "reason": "旧数値認可identityと旧fieldの受理を拒否し、現行string keyのschema/Tool/Web送信に旧fieldが出ないことを検証する負例のみ。通常wire互換経路は設けない。",
+    "lines": [
+      {
+        "sha256": "295cd61c2b4bf95fcd42fefbf596f0d12b30da6c0390fe55b5b50829e4bb5e1e",
+        "count": 1
+      },
+      {
+        "sha256": "18b6ef49c3be036d86e119776367951681ca09df38ddf6d82b4e06ebadb8b149",
+        "count": 1
+      },
+      {
+        "sha256": "a8623173783b7da39c9915670075c4a2ba1c506e05cbc2b71919bdb6fdf9ef27",
+        "count": 1
+      },
+      {
+        "sha256": "f0c066d915b0aa2ae0c7af7ef71f2cba2c61b8a1bc166879f6006a0223888e7c",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "web/workspace/src/lib/workspace/api/workers.test.ts",
+    "kind": "rejection_test",
+    "reason": "旧数値認可identityと旧fieldの受理を拒否し、現行string keyのschema/Tool/Web送信に旧fieldが出ないことを検証する負例のみ。通常wire互換経路は設けない。",
+    "lines": [
+      {
+        "sha256": "f97b44c05d9725fc0f1133fda5dcf345f300ecb75db71ccebb30df10edf1ead1",
+        "count": 1
+      },
+      {
+        "sha256": "b9834a3c75c9ce27a93e5857f7cdeb6993a333eb0078e6a8e96340d6065d3f71",
+        "count": 1
+      },
+      {
+        "sha256": "5f6142587e904480e5b5b89d982a6c631b8de56255ba40f79ec496f626502f8a",
+        "count": 1
+      },
+      {
+        "sha256": "ecd3bbc42948ad53f319cb91d509ab53bc78fa8f30f5150fbc9af1617e2c4144",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/launch_policy.sql",
+    "kind": "saved_data",
+    "reason": "公開済みschema131の固定DDL。schema136で認可変更operation identityへ保存移行する入力のみで、現行新規DBはlaunch_policy_current.sqlを使う。過去migrationを語彙目的で変更しない。",
+    "lines": [
+      {
+        "sha256": "8076f62cb54d304d24b5040f2485ed353af898f0d3f2acc29f72e25e7340b86b",
+        "count": 2
+      },
+      {
+        "sha256": "bbcf1cd3de3ef9ddc7aceb8de96683dee5b19c81030745dc53bc7fa37cb25917",
+        "count": 1
+      },
+      {
+        "sha256": "8dae82ffcd6c9867e2dc20783c5cfb8f9ea3c37b45e549ad89f001fbb0b0d53b",
+        "count": 1
+      },
+      {
+        "sha256": "87ddcf78388fa6901bd7eb591b18a4e7c6cc6ec197ff6c5e8c88cc621a36f89a",
+        "count": 1
+      },
+      {
+        "sha256": "66094f81bfc7673a0e5d6f9b60ed6c15b625150654c870362e66ad47c1dd8b7e",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/launch_policy_identity_migration.rs",
+    "kind": "saved_data",
+    "reason": "schema135保存列/JSONを既存の認可変更operationへ結び直す一度きりの移行と、その原形式・rollback検証。現行型と通常処理はoperation identityのみを受け付ける。",
+    "lines": [
+      {
+        "sha256": "339b21733e1780bc0b5561c1a85a2a0d908affe9d5ea22f5eedbdca8c64e1439",
+        "count": 2
+      },
+      {
+        "sha256": "1b6b2f436f188b84099290f49f848f4ad7d583817f710b01bec7a19146885ee9",
+        "count": 1
+      },
+      {
+        "sha256": "f226e660302caed06dab955740e80b8cc591f3b9abd52b6a88013ed9376b3adf",
+        "count": 1
+      },
+      {
+        "sha256": "ca36ee6e3941a59aa3bc311048f6fc8693562bfdd8382e8f635045e353d69bf7",
+        "count": 1
+      },
+      {
+        "sha256": "71490cce8fbd05c09172cce2925afe056ba351a1222ea27f8350d5404257b24b",
+        "count": 1
+      },
+      {
+        "sha256": "57671280f83cdc6feaa2aa636fd47fcb805606b320ada3404751ff0eef788e5a",
+        "count": 1
+      },
+      {
+        "sha256": "a8623173783b7da39c9915670075c4a2ba1c506e05cbc2b71919bdb6fdf9ef27",
+        "count": 1
+      },
+      {
+        "sha256": "bef8b199afcf59daf9acb6e90f3cad4be2e6acb3341305302ed0fd773aaa8f79",
+        "count": 1
+      },
+      {
+        "sha256": "0510a7a5ec322ed694701131302179e8f2b60ca509e83df6cdd26a99bc692ee2",
+        "count": 1
+      },
+      {
+        "sha256": "edcdea23aa80ee246951a96dc277619f684719e477917fb490345f3273e6a3eb",
+        "count": 1
+      },
+      {
+        "sha256": "b58eb16e69802bd9d525445aef97ca396197c11f8a3533af4e124dba81000fb1",
+        "count": 1
+      },
+      {
+        "sha256": "7be2c8837dcceab328e94d312396cd83607aba897d2ae785e550f8c1e5aef394",
+        "count": 1
+      },
+      {
+        "sha256": "2c6049cf860c43d4cfc2940f5b22c4eabab16405ad56a7d77ff8338e69f551e8",
+        "count": 1
+      },
+      {
+        "sha256": "f1da2d359b8dd5cbde61a1f03469e2802ffead00b4baa8fb6dd75bb24f680a9c",
+        "count": 1
+      }
+    ]
   }
 ]

@@ -26,6 +26,40 @@ impl Fixture {
         let runtime = WorkdirlessFixtureRuntime::default();
         for worker in ["1", "2"] {
             seed_worker_source_member(&api, WorkdirlessFixtureRuntime::RUNTIME_ID, worker);
+            // Runtime membership does not grant operation authority. Issue the
+            // fixture's bounded operations through the normal owner resolver.
+            let operation = WorkerControlOperation {
+                operation_id: format!("admission-worker-{worker}"),
+                input_fingerprint: format!("admission-worker-{worker}"),
+            };
+            let (_, _, _, grant) = core_worker_creation::resolve_creation_profile(
+                &api,
+                None,
+                Some(&test_owner_actor().account_id),
+                &server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                    assignment: Some(test_operation_assignment(
+                        &api,
+                        &[
+                            "filesystem.read",
+                            "filesystem.write",
+                            "ticket.create",
+                            "ticket.read",
+                            "ticket.query",
+                            "ticket.relation.read",
+                        ],
+                    )),
+                },
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                Some("builtin:coder".into()),
+                Some(&operation),
+                false,
+            )
+            .unwrap();
+            let mut grant = grant.unwrap();
+            grant.worker_id = worker.into();
+            api.config_store
+                .bind_core_worker_execution_grant(&grant)
+                .unwrap();
             runtime.workers.lock().unwrap().push(InternalWorkerSummary {
                 restore_observation_token: None,
                 worker: RuntimeWorkerRef::new(WorkdirlessFixtureRuntime::RUNTIME_ID, worker),
@@ -232,6 +266,28 @@ impl Fixture {
             if matches!(command, ExternalProviderCommand::Cancel { .. }) {
                 continue;
             }
+            if let ExternalProviderCommand::Operation {
+                operation: WorkdirSessionOperation::AuthorizeScope(request),
+                response,
+                ..
+            } = command
+            {
+                assert_eq!(
+                    request.path,
+                    workdir::WorkdirPath::new("visible.txt").unwrap()
+                );
+                assert_eq!(
+                    request.permission,
+                    workdir::WorkdirToolScopePermission::Read
+                );
+                assert_eq!(request.rules.len(), 1);
+                assert_eq!(request.rules[0].target, request.path);
+                assert_eq!(request.rules[0].permission, request.permission);
+                response
+                    .send(Ok(WorkdirSessionOperationResult::AuthorizeScope))
+                    .unwrap();
+                continue;
+            }
             break command;
         };
         let ExternalProviderCommand::Operation {
@@ -373,17 +429,38 @@ async fn same_worker_session_stays_exclusive_but_proof_is_verified_before_waitin
     reply.send(Ok(read_result())).unwrap();
     assert_json(first.await.unwrap(), StatusCode::OK).await;
     assert!(futures::poll!(&mut second).is_pending());
-    let Some(ExternalProviderCommand::Operation { response, .. }) =
-        tokio::time::timeout(BOUND, async {
-            tokio::select! {
-                command = a.recv() => command,
-                result = second.as_mut() => panic!("second read ended before provider dispatch: {:?}", result.unwrap().status()),
+    loop {
+        let Some(ExternalProviderCommand::Operation { operation, response, .. }) =
+            tokio::time::timeout(BOUND, async {
+                tokio::select! {
+                    command = a.recv() => command,
+                    result = second.as_mut() => panic!("second read ended before provider dispatch: {:?}", result.unwrap().status()),
+                }
+            }).await.unwrap()
+        else {
+            panic!("expected second read")
+        };
+        match operation {
+            WorkdirSessionOperation::AuthorizeScope(request) => {
+                assert_eq!(
+                    request.path,
+                    workdir::WorkdirPath::new("visible.txt").unwrap()
+                );
+                assert_eq!(
+                    request.permission,
+                    workdir::WorkdirToolScopePermission::Read
+                );
+                response
+                    .send(Ok(WorkdirSessionOperationResult::AuthorizeScope))
+                    .unwrap();
             }
-        }).await.unwrap()
-    else {
-        panic!("expected second read")
-    };
-    response.send(Ok(read_result())).unwrap();
+            WorkdirSessionOperation::Read(_) => {
+                response.send(Ok(read_result())).unwrap();
+                break;
+            }
+            other => panic!("unexpected second operation: {other:?}"),
+        }
+    }
     assert_json(
         tokio::time::timeout(BOUND, second).await.unwrap().unwrap(),
         StatusCode::OK,
@@ -821,29 +898,12 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
     let subject = subjektiv
         .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
         .unwrap();
-    subjektiv
-        .set_subject_permissions(
-            &subject.id,
-            &server_api::authorization::SubjectPermissionsUpdate {
-                operation_id: "session-callback-grant".into(),
-                expected_change_id: Some(
-                    subjektiv
-                        .current_subject_policy(&subject.id)
-                        .unwrap()
-                        .unwrap()
-                        .change_id,
-                ),
-                execution: vec![server_api::authorization::ScopedPermission {
-                    operation: "session.record".into(),
-                    resource: server_api::authorization::PermissionResource::Subject {
-                        workspace_id: TEST_WORKSPACE_ID.into(),
-                        subject_id: subject.id.clone(),
-                    },
-                }],
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    set_test_subject_policy_as_owner(
+        &f.api,
+        &subject.id,
+        test_operation_assignment(&f.api, &["session.record"]),
+        Default::default(),
+    );
     let (entered, mut entries) = mpsc::unbounded_channel();
     let (release, released) = std::sync::mpsc::channel();
     let released = Arc::new(Mutex::new(released));

@@ -803,8 +803,9 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
     let mut fixture = manual_worker_assignment_fixture().await;
     let root = tempfile::tempdir().unwrap();
     let provider_root = root.path().to_path_buf();
-    // Use an attachment-relative path so Host resource validation succeeds;
-    // the provider's narrower scope still owns this read refusal.
+    // Scoped forwarding asks the provider to authorize the attachment-relative
+    // path before reading. The provider's deny rule therefore reports an
+    // attachment-scope refusal, not a file-read PathOutOfScope classification.
     let provider_scope = manifest::Scope::writable(&provider_root)
         .unwrap()
         .with_added_deny_rules([manifest::ScopeRule {
@@ -842,14 +843,14 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
         (
             json!({"operation": "read", "request": {"path": "private/secret.txt", "offset": 0, "limit": 10, "max_bytes": 1024}}),
             "read",
-            "out_of_scope",
-            Reason::PathOutOfScope,
+            "denied",
+            Reason::AttachmentScopeExceeded,
         ),
         (
             json!({"operation": "write", "request": {"path": "secret.txt", "content": secret.as_bytes()}}),
             "write",
             "denied",
-            Reason::ScopedCapabilityDenied,
+            Reason::ParentCapabilityDenied,
         ),
         (
             json!({"operation": "command_start", "request": {"command": secret, "timeout_secs": 1, "transport_byte_budget": 1048576, "cwd": "", "tool_call_id": secret}}),

@@ -2894,9 +2894,9 @@ impl WorkerRemovalService {
         };
         let _workdir_session_guard = workdir_session_lock.lock().await;
 
-        let prepared = self
+        let recovered_plan = self
             .store
-            .recover_worker_removal_execution(&self.workspace_id, &target)
+            .recover_worker_removal_plan(&self.workspace_id, &target)
             .map_err(|error| match error {
                 crate::retention::WorkerRetentionError::Store(error) => {
                     WorkerRemovalFailure::from(error)
@@ -2915,18 +2915,51 @@ impl WorkerRemovalService {
             .transpose()?
             .flatten();
         if let Some((operation_id, fingerprint)) = expected_removal {
-            if !prepared.as_ref().is_some_and(|saved| {
-                saved.plan.workspace_id == self.workspace_id
-                    && saved.plan.worker == *target
-                    && saved.plan.operation_id == operation_id
-                    && saved.plan.input_fingerprint == fingerprint
-                    && saved.runtime_request.operation_id == operation_id
-                    && saved.runtime_request.input_fingerprint == fingerprint
+            if !recovered_plan.as_ref().is_some_and(|saved| {
+                saved.workspace_id == self.workspace_id
+                    && saved.worker == *target
+                    && saved.operation_id == operation_id
+                    && saved.input_fingerprint == fingerprint
             }) {
                 return Err(
                     "Retained Job cleanup removal operation changed or is unavailable".into(),
                 );
             }
+        }
+        if let Some(plan) = &recovered_plan
+            && plan.state == crate::retention::WorkerRemovalPlanState::Succeeded
+        {
+            // A committed result needs no executable request. Metadata Purge
+            // intentionally leaves neither a registry row nor a tombstone from
+            // which the old Runtime source identity could be reconstructed.
+            if let Some(owner) = job_cleanup_owner {
+                *owner
+                    .lock()
+                    .map_err(|_| "Job cleanup child owner poisoned".to_string())? =
+                    Some((plan.operation_id.clone(), plan.input_fingerprint.clone()));
+            }
+            self.worker_projection
+                .publish_ordered(|| {
+                    self.store
+                        .recover_succeeded_worker_removal_catalog(&self.workspace_id, target)
+                        .map(|commit| ((), commit))
+                })
+                .map_err(WorkerRemovalFailure::from)?;
+            return Ok(worker_remove_success_response(target));
+        }
+        let prepared = self
+            .store
+            .recover_worker_removal_execution(&self.workspace_id, target)
+            .map_err(|error| match error {
+                crate::retention::WorkerRetentionError::Store(error) => {
+                    WorkerRemovalFailure::from(error)
+                }
+                _ => WorkerRemovalFailure::Internal(
+                    "Worker removal recovery authority is unavailable".to_string(),
+                ),
+            })?;
+        if prepared.as_ref().map(|saved| &saved.plan) != recovered_plan.as_ref() {
+            return Err("Worker removal changed while recovering its execution request".into());
         }
         if let Some(prepared) = prepared {
             if let Some(owner) = job_cleanup_owner {
@@ -2950,16 +2983,6 @@ impl WorkerRemovalService {
                     prepared.plan.operation_id.clone(),
                     prepared.plan.input_fingerprint.clone(),
                 ));
-            }
-            if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
-                self.worker_projection
-                    .publish_ordered(|| {
-                        self.store
-                            .recover_succeeded_worker_removal_catalog(&self.workspace_id, target)
-                            .map(|commit| ((), commit))
-                    })
-                    .map_err(WorkerRemovalFailure::from)?;
-                return Ok(worker_remove_success_response(target));
             }
             let prepared = if matches!(
                 prepared.plan.state,
@@ -5854,14 +5877,14 @@ impl WorkspaceApi {
             if journal_job.is_some() {
                 let removal = self
                     .config_store
-                    .recover_worker_removal_execution(self.workspace_id(), &worker)
+                    .recover_worker_removal_plan(self.workspace_id(), &worker)
                     .map_err(|error| match error {
                         crate::retention::WorkerRetentionError::Store(error) => error,
                         error => Error::Store(error.to_string()),
                     })?;
                 if !removal.is_some_and(|p| {
-                    p.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded
-                        && p.runtime_request.session_disposition
+                    p.state == crate::retention::WorkerRemovalPlanState::Succeeded
+                        && p.session_disposition
                             == worker_runtime::retention::SessionDisposition::Purge
                 }) {
                     return fail(
@@ -10375,6 +10398,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn memory_consolidation(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::MemoryConsolidateStagingRequest,
     ) -> std::result::Result<server_api::MemoryConsolidationResponse, server_api::RepositoryApiError>
@@ -10382,6 +10406,7 @@ impl server_api::ServerApi for ServerApiContractService {
         scoped_memory_consolidation(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
+            context,
             Json(MemoryConsolidateStagingOperation {
                 force: request.force,
             }),
@@ -27756,21 +27781,66 @@ async fn start_subjektiv_staging_consolidation(
 async fn scoped_memory_consolidation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    context: server_api::ServerRequestContext,
     Json(operation): Json<MemoryConsolidateStagingOperation>,
 ) -> ApiResult<Json<MemoryConsolidationOutput>> {
+    let headers =
+        contract_request_headers(&context).map_err(|error| Error::Config(error.message))?;
+    let requester = if let Some(source) = authenticated_ticket_worker_source(&headers, &context)? {
+        MemoryConsolidationRequester::Worker(source)
+    } else {
+        let actor = subject_authorization::administration_actor(&context)?.clone();
+        require_workspace_owner(
+            &api,
+            &path.workspace_id,
+            &actor,
+            "Workspace Memory consolidation",
+        )
+        .await?;
+        MemoryConsolidationRequester::Owner(actor.account_id)
+    };
     api.host_executors
         .host()?
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            Ok(Json(start_memory_staging_consolidation(api, operation)?))
+            Ok(Json(start_memory_staging_consolidation(
+                api, operation, &requester,
+            )?))
         })
         .await
+}
+
+enum MemoryConsolidationRequester {
+    Owner(String),
+    Worker(RuntimeWorkerRef),
 }
 
 fn start_memory_staging_consolidation(
     api: WorkspaceApi,
     operation: MemoryConsolidateStagingOperation,
+    requester: &MemoryConsolidationRequester,
 ) -> ApiResult<MemoryConsolidationOutput> {
+    let (source, owner_account_id) = match requester {
+        MemoryConsolidationRequester::Owner(account_id) => {
+            api.config_store.with_conn(|conn| {
+                crate::launch_policy::require_owner(conn, api.workspace_id(), account_id)
+            })?;
+            (None, Some(account_id.as_str()))
+        }
+        MemoryConsolidationRequester::Worker(worker) => {
+            subject_authorization::authorize(
+                &api,
+                worker,
+                &server_api::authorization::OperationAuthorizationRequest {
+                    operation: "memory.consolidation.request".into(),
+                    resource: server_api::authorization::PermissionResource::Workspace {
+                        workspace_id: api.workspace_id().into(),
+                    },
+                },
+            )?;
+            (Some(worker), None)
+        }
+    };
     let backlog = memory_staging_backlog_from_authority(&api.authority)?;
     let candidate_count = backlog.candidate_count;
     let total_bytes = backlog.total_bytes;
@@ -27809,8 +27879,85 @@ fn start_memory_staging_consolidation(
         return Ok(output);
     }
 
-    let profile_selector = ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string());
-    let resolved_config_bundle = None;
+    // This fixed internal consumer still needs an explicit ordinary-Worker
+    // grant. Never turn its Profile or singleton name into execution authority.
+    let profile = format!(
+        "builtin:{}",
+        MEMORY_CONSOLIDATION_PROFILE
+            .strip_prefix("builtin:")
+            .unwrap_or(MEMORY_CONSOLIDATION_PROFILE)
+    );
+    let profile_selector = ProfileSelector::Builtin(profile.clone());
+    let config = api
+        .config_store
+        .load_workspace_config(api.workspace_id())?
+        .ok_or_else(|| Error::Config("Workspace configuration is unavailable".into()))?;
+    let projection = crate::profile_settings::project_profiles_from_workspace_config(
+        api.workspace_id(),
+        &config,
+    )?;
+    let bundle = crate::profile_settings::build_virtual_profile_config_bundle(
+        &projection,
+        &config,
+        api.workspace_id(),
+        &api.config.workspace_created_at,
+        &profile,
+    )?
+    .ok_or_else(|| Error::Config("Memory consolidation Profile bundle is unavailable".into()))?;
+    let authorization = server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+        assignment: Some(feature_permissions::PermissionAssignment {
+            grants: vec![feature_permissions::PermissionReference::Namespace(
+                feature_permissions::NamespacePermissions {
+                    namespace: feature_permissions::NamespaceId::parse("memory")
+                        .map_err(Error::Config)?,
+                    keys: [
+                        "memory.query",
+                        "memory.resident.read",
+                        "memory.staging.list",
+                        "memory.staging.read",
+                        "memory.document.read",
+                        "memory.document.update",
+                        "memory.audit.append",
+                        "memory.staging.close",
+                    ]
+                    .into_iter()
+                    .map(feature_permissions::PermissionKey::parse)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::Config)?,
+                },
+            )],
+            ..Default::default()
+        }),
+    };
+    let creation = WorkerControlOperation {
+        operation_id: Uuid::now_v7().to_string(),
+        input_fingerprint: format!(
+            "sha256:{}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    api.workspace_id(),
+                    &runtime_id,
+                    &profile,
+                    &authorization,
+                    &input_content
+                ))
+                .map_err(|error| Error::Store(error.to_string()))?
+            )
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+        ),
+    };
+    let grant = core_worker_creation::resolve_core_creation_grant(
+        &api,
+        source,
+        owner_account_id,
+        &authorization,
+        &runtime_id,
+        &profile,
+        &bundle,
+        &creation,
+    )?;
     let initial_submit = vec![Segment::text(input_content)];
     let result = api.spawn_workspace_worker(
         &runtime_id,
@@ -27827,16 +27974,16 @@ fn start_memory_staging_consolidation(
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle,
+            resolved_config_bundle: Some(bundle),
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
-            resolved_control_operation: None,
+            resolved_control_operation: Some(creation),
             resolved_execution_grant: None,
-            authorization: None,
-            resolved_core_execution_grant: None,
+            authorization: Some(authorization),
+            resolved_core_execution_grant: Some(grant),
         },
     )?;
     if result.state != InternalWorkerOperationState::Accepted {
@@ -27898,6 +28045,16 @@ fn try_reuse_memory_consolidation_worker(
             total_bytes,
         }));
     }
+    subject_authorization::authorize(
+        api,
+        &worker.worker,
+        &server_api::authorization::OperationAuthorizationRequest {
+            operation: "memory.document.update".into(),
+            resource: server_api::authorization::PermissionResource::Workspace {
+                workspace_id: api.workspace_id().into(),
+            },
+        },
+    )?;
     let input = api
         .runtime
         .send_input(
@@ -29659,12 +29816,9 @@ async fn scoped_start_workspace_orchestrator(
     request.resolved_control_operation = Some(operation);
     let result = api.spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, request)?;
     if result.state != InternalWorkerOperationState::Accepted || result.worker.is_none() {
-        return Err(ApiError::with_diagnostics(
-            Error::RuntimeOperationFailed {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                code: "workspace_orchestrator_spawn_rejected".to_string(),
-                message: "Embedded Runtime rejected Workspace Orchestrator launch".to_string(),
-            },
+        return Err(worker_create_not_accepted_error(
+            EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            result.failure,
             result.diagnostics,
         ));
     }
@@ -36063,7 +36217,7 @@ async fn create_workspace_worker_authenticated_on_host(
         api.config_store.with_conn(|connection| {
             crate::launch_policy::require_owner(connection, api.workspace_id(), account)
         })?;
-        None
+        resolved_control_operation
     } else {
         let account = account.as_deref().ok_or_else(|| {
             Error::WorkspacePermissionDenied(
@@ -42033,8 +42187,7 @@ mod tests {
         use super::*;
         use agen::tool::ToolExecutionContext;
         use server_api::authorization::{
-            BoundAuthorizationTarget, PermissionResource, ScopedPermission,
-            SubjectPermissionsUpdate,
+            BoundAuthorizationTarget, PermissionResource, ScopedPermission, SubjectPermissions,
         };
         use worker::{
             WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
@@ -42113,36 +42266,36 @@ mod tests {
             }
         }
         fn assign(api: &WorkspaceApi, subject: &str, resources: Vec<PermissionResource>) {
-            let store = open_subjektiv_store(api).unwrap();
-            let previous =
-                store
-                    .subject_policy_source(subject)
-                    .unwrap()
-                    .map(|policy| match policy {
-                        server_api::authorization::SubjectPolicySource::Feature(policy) => {
-                            policy.change_id
-                        }
-                        server_api::authorization::SubjectPolicySource::Legacy(policy) => {
-                            policy.change_id
-                        }
-                    });
-            store
-                .set_subject_permissions(
-                    subject,
-                    &SubjectPermissionsUpdate {
-                        operation_id: Uuid::now_v7().to_string(),
-                        expected_change_id: previous,
-                        execution: resources
-                            .into_iter()
-                            .map(|resource| ScopedPermission {
-                                operation: "notification.diagnostics.read".into(),
-                                resource,
-                            })
-                            .collect(),
-                        delegation: vec![],
-                    },
-                )
+            // Resource-bound permissions are retained migration constraints, not
+            // entries which the current operation-only management API can issue.
+            let current =
+                server_api::authorization::CurrentSubjectPolicy::from_legacy(SubjectPermissions {
+                    change_id: Uuid::now_v7().to_string(),
+                    execution: resources
+                        .into_iter()
+                        .map(|resource| ScopedPermission {
+                            operation: "notification.diagnostics.read".into(),
+                            resource,
+                        })
+                        .collect(),
+                    delegation: vec![],
+                })
                 .unwrap();
+            let saved = crate::policy_config::AdoptedSubjectPolicy::from_current(subject, &current);
+            api.config_store.with_immediate_transaction(|connection| {
+                connection.execute(
+                    "INSERT INTO workspace_configuration_policies(workspace_id,subject_id,policy_json) VALUES(?1,?2,?3) ON CONFLICT(workspace_id,subject_id) DO UPDATE SET policy_json=excluded.policy_json",
+                    rusqlite::params![api.workspace_id(), subject, serde_json::to_string(&saved).unwrap()],
+                )?;
+                Ok(())
+            }).unwrap();
+            assert_eq!(
+                open_subjektiv_store(api)
+                    .unwrap()
+                    .current_subject_policy(subject)
+                    .unwrap(),
+                Some(current)
+            );
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn notification_source_host_binding_denies_other_jobs_and_returns_actual_scope() {
@@ -42212,7 +42365,7 @@ mod tests {
                     .unwrap()
                     .attempt;
                 let worker =
-                    RuntimeWorkerRef::new(&workers[0].runtime_id, format!("notification-job-{id}"));
+                    RuntimeWorkerRef::new(&workers[0].runtime_id, Uuid::now_v7().to_string());
                 let mut registry = api
                     .store
                     .get_worker_registry(TEST_WORKSPACE_ID, &workers[1])
@@ -42238,7 +42391,8 @@ mod tests {
                         TEST_CREATED_AT,
                     )
                     .unwrap();
-                api.store
+                let acceptance = api
+                    .store
                     .accept_backend_job_result(
                         TEST_WORKSPACE_ID,
                         &worker,
@@ -42251,6 +42405,7 @@ mod tests {
                         TEST_CREATED_AT,
                     )
                     .unwrap();
+                finalize_notification_test_job(&api, acceptance);
                 events.push(crate::backend_job::delivery_id(id, &attempt.attempt_id));
             }
             api.config_store.with_conn(|conn| {
@@ -48583,10 +48738,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
-        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
-        let api = WorkspaceApi::new_with_execution_backend(
+        let api = WorkspaceApi::new_api_fixture(
             config,
-            Arc::new(store),
             Arc::new(DeterministicExecutionBackend::fail_first_spawn(
                 "provider setup rejected safe-root /tmp/private token=private-token session_id=private-session",
             )),
@@ -48603,26 +48756,28 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(
-                error.error,
-                Error::RuntimeOperationFailed {
-                    ref code,
-                    ..
-                } if code == "workspace_orchestrator_spawn_rejected"
-            ),
-            "unexpected Orchestrator startup failure: {:?}",
-            error.error
+        let Error::WorkerCreateFailed { failure, .. } = &error.error else {
+            panic!("Orchestrator startup must preserve the typed creation failure");
+        };
+        assert_eq!(
+            failure.operation().acceptance,
+            runtime_api::startup::CreationAcceptance::Unknown,
+            "an untyped executor error does not prove rejection"
         );
-        assert!(error.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "embedded_worker_execution_rejected"
-                && diagnostic
-                    .message
-                    .contains("provider setup rejected safe-root")
-                && !diagnostic.message.contains("/tmp/private")
-                && !diagnostic.message.contains("private-token")
-                && !diagnostic.message.contains("private-session")
-        }));
+        let response = error.into_response();
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(
+            response.into_body(),
+            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
+        )
+        .await
+        .unwrap();
+        let public = String::from_utf8(bytes.to_vec()).unwrap();
+        for secret in ["/tmp/private", "private-token", "private-session"] {
+            assert!(!public.contains(secret));
+        }
+        let problem: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(problem["yoi_startup"]["operation"]["acceptance"], "unknown");
         assert!(find_workspace_orchestrator(&api).is_none());
         assert!(!workspace_orchestrator_response(&api, "failed").online);
         let (reserved_creates, worker_resource_keys): (i64, i64) = api
@@ -48708,11 +48863,20 @@ mod tests {
                 })
                 .unwrap();
         }
-        let (controller_authorization, child_authorization) = test_worker_policy_authorizations(
+        let (mut controller_authorization, child_authorization) = test_worker_policy_authorizations(
             &api,
             "guarded-spawn",
             "builtin:coder",
             Default::default(),
+        );
+        let server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+            assignment: Some(assignment),
+        } = &mut controller_authorization
+        else {
+            unreachable!()
+        };
+        assignment.grants.extend(
+            test_operation_assignment(&api, &["worker.send_input", "worker.messaging"]).grants,
         );
         let Json(controller) = create_workspace_worker_as_owner(
             State(api.clone()),
@@ -53049,7 +53213,11 @@ mod tests {
                 resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
-                authorization: None,
+                authorization: Some(
+                    server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                        assignment: Some(Default::default()),
+                    },
+                ),
                 resolved_core_execution_grant: None,
             },
         )
@@ -55289,6 +55457,39 @@ mod tests {
         )
     }
 
+    async fn wait_for_backend_job_completion(api: &WorkspaceApi, job_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let job = api
+                    .store
+                    .get_backend_job(TEST_WORKSPACE_ID, job_id)
+                    .unwrap()
+                    .unwrap();
+                if job.state == BackendJobState::Completed {
+                    if job.request.notification_target.is_none() {
+                        break;
+                    }
+                    // Observe delivery; do not race the owner by dispatching a
+                    // second recovery notification from this test.
+                    let delivery = crate::backend_job::delivery_id(
+                        job_id, &crate::backend_job::attempt_id(job_id, job.current_attempt),
+                    );
+                    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+                    let settled: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM notification_decisions d WHERE d.workspace_id=?1 AND d.delivery_id=?2 AND (d.disposition='suppress' OR EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=d.workspace_id AND a.delivery_id=d.delivery_id)))",
+                        rusqlite::params![TEST_WORKSPACE_ID, delivery], |row| row.get(0),
+                    ).unwrap();
+                    if settled { break; }
+                } else {
+                    assert!(matches!(job.state, BackendJobState::Pending | BackendJobState::Finalizing), "{job_id}: {:?}", job.state);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Job must finish resource release before completion notification");
+    }
+
     #[tokio::test]
     async fn worker_ticket_create_returns_before_checker_and_delivers_grounded_advisory() {
         let temp = tempfile::tempdir().unwrap();
@@ -55368,8 +55569,17 @@ mod tests {
                 "suggestion": "Remove the writer-specific boundary from the active requirements."
             }]}),
         };
+        seed_worker_session_for_cleanup(temp.path(), &worker);
         let accepted = api.accept_backend_job_result(&worker, &submission).unwrap();
         assert_eq!(accepted.job.state, BackendJobState::Finalizing);
+        wait_for_backend_job_worker_cleanup(
+            &api,
+            &job.request.job_id,
+            &attempt.attempt_id,
+            BackendJobWorkerCleanupState::Completed,
+        )
+        .await;
+        wait_for_backend_job_completion(&api, &job.request.job_id).await;
         let notifications = execution.take_inputs();
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].0.worker_id.to_string(), source.worker_id);
@@ -55420,11 +55630,12 @@ mod tests {
         let job = ticket_check_job(&api, &reference.id);
         let attempt = wait_for_ticket_check_attempt(&api, &job).await;
         execution.take_inputs();
+        seed_worker_session_for_cleanup(temp.path(), attempt.worker.as_ref().unwrap());
         api.accept_backend_job_result(
             attempt.worker.as_ref().unwrap(),
             &BackendJobResultSubmission {
                 job_id: job.request.job_id.clone(),
-                attempt_id: attempt.attempt_id,
+                attempt_id: attempt.attempt_id.clone(),
                 input_digest: job.request.input_digest().unwrap(),
                 result: ticket_item_checker::test_support::FakeTicketCheckerModel::respond(
                     &job.request,
@@ -55432,6 +55643,14 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+        wait_for_backend_job_worker_cleanup(
+            &api,
+            &job.request.job_id,
+            &attempt.attempt_id,
+            BackendJobWorkerCleanupState::Completed,
+        )
+        .await;
+        wait_for_backend_job_completion(&api, &job.request.job_id).await;
         let notifications = execution.take_inputs();
         let advisories = notifications
             .iter()
@@ -55533,6 +55752,7 @@ mod tests {
                 if attempt.state == BackendJobAttemptState::Dispatched
                     && !completed.contains(&job.request.job_id)
                 {
+                    seed_worker_session_for_cleanup(temp.path(), attempt.worker.as_ref().unwrap());
                     api.accept_backend_job_result(
                         attempt.worker.as_ref().unwrap(),
                         &BackendJobResultSubmission {
@@ -55552,6 +55772,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(completed.len(), jobs.len());
+        for job in &jobs {
+            wait_for_backend_job_completion(&api, &job.request.job_id).await;
+        }
         assert!(jobs.iter().all(|job| {
             api.store
                 .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
@@ -55725,6 +55948,7 @@ mod tests {
         .expect("both checker inputs must be delivered before testing result notifications");
         execution.take_inputs();
 
+        seed_worker_session_for_cleanup(temp.path(), stale_attempt.worker.as_ref().unwrap());
         api.accept_backend_job_result(
             stale_attempt.worker.as_ref().unwrap(),
             &BackendJobResultSubmission {
@@ -55740,6 +55964,7 @@ mod tests {
             },
         )
         .unwrap();
+        wait_for_backend_job_completion(&api, &stale_job.request.job_id).await;
         let unexpected = execution.take_inputs();
         assert!(
             unexpected.is_empty(),
@@ -55752,6 +55977,7 @@ mod tests {
             ("suppress".into(), "stale_content".into(), false, None)
         );
 
+        seed_worker_session_for_cleanup(temp.path(), current_attempt.worker.as_ref().unwrap());
         api.accept_backend_job_result(
             current_attempt.worker.as_ref().unwrap(),
             &BackendJobResultSubmission {
@@ -55762,6 +55988,7 @@ mod tests {
             },
         )
         .unwrap();
+        wait_for_backend_job_completion(&api, &current_job.request.job_id).await;
         assert!(execution.take_inputs().is_empty());
         let clean_delivery_id = crate::backend_job::delivery_id(
             &current_job.request.job_id,
@@ -55784,6 +56011,7 @@ mod tests {
         .unwrap();
         let invalid_job = ticket_check_job(&api, &ticket_ref.id);
         let invalid_attempt = wait_for_ticket_check_attempt(&api, &invalid_job).await;
+        seed_worker_session_for_cleanup(temp.path(), invalid_attempt.worker.as_ref().unwrap());
         assert!(
             api.accept_backend_job_result(
                 invalid_attempt.worker.as_ref().unwrap(),
@@ -56571,7 +56799,7 @@ mod tests {
             deletion["blockers"][0]["kind"], "last_accessible_workspace",
             "{deletion}"
         );
-        let worker = request_json_authenticated(app.clone(), "POST", &format!("{scoped}/workers"), Some(json!({"runtime_id": "embedded-worker-runtime", "display_name": "Worker", "initial_submit": [], "feature_connections": {}})), &owner, StatusCode::OK).await;
+        let worker = request_json_authenticated(app.clone(), "POST", &format!("{scoped}/workers"), Some(json!({"runtime_id": "embedded-worker-runtime", "control_operation_id": "repository-free-worker", "authorization": {"kind": "assignment"}, "display_name": "Worker", "initial_submit": [], "feature_connections": {}})), &owner, StatusCode::OK).await;
         assert!(worker["worker_id"].is_string(), "{worker}");
         let detail = request_json_authenticated(
             app.clone(),
@@ -59976,15 +60204,7 @@ mod tests {
     #[tokio::test]
     async fn memory_consolidation_backlog_ignores_legacy_filesystem_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let config = test_server_config(dir.path());
-        let store = SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap();
-        let api = WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap();
+        let api = test_api(dir.path()).await;
         let legacy_staging_dir = dir.path().join(".yoi/memory/_staging");
         fs::create_dir_all(&legacy_staging_dir).unwrap();
         fs::write(
@@ -59996,6 +60216,7 @@ mod tests {
         let output = match start_memory_staging_consolidation(
             api,
             MemoryConsolidateStagingOperation { force: true },
+            &MemoryConsolidationRequester::Owner(test_owner_actor().account_id),
         ) {
             Ok(output) => output,
             Err(_) => panic!("unexpected ApiError from memory consolidation trigger"),
@@ -60007,17 +60228,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_memory_consolidation_checks_owner_at_the_http_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let owner = seed_test_workspace_owner_token(api.store.as_ref(), "memory-owner").await;
+        let reader = seed_test_api_token(api.store.as_ref(), "memory-reader");
+        let app = build_router(api.clone());
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/memory/consolidation");
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            &path,
+            Some(json!({"force":true})),
+            &reader,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        let accepted = request_json_authenticated(
+            app.clone(),
+            "POST",
+            &path,
+            Some(json!({"force":true})),
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(accepted["status"], "skipped_empty");
+        assert!(
+            api.store
+                .current_worker_singleton_owner(
+                    api.workspace_id(),
+                    MEMORY_CONSOLIDATION_SINGLETON_KEY
+                )
+                .unwrap()
+                .is_none()
+        );
+        api.authority
+            .upsert_memory_staging_record(
+                "00000000000000000000000001",
+                &memory_staging_record_json("00000000000000000000000001", "HTTP candidate"),
+                None,
+            )
+            .unwrap();
+        let started = request_json_authenticated(
+            app,
+            "POST",
+            &path,
+            Some(json!({"force":true})),
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(started["status"], "started");
+    }
+
+    #[tokio::test]
     async fn memory_consolidation_reuses_existing_idle_worker() {
         let dir = tempfile::tempdir().unwrap();
-        let config = test_server_config(dir.path());
-        let store = SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap();
-        let api = WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap();
+        let api = test_api(dir.path()).await;
         api.authority
             .upsert_memory_staging_record(
                 "00000000000000000000000001",
@@ -60029,6 +60297,7 @@ mod tests {
         let below_threshold = start_memory_staging_consolidation(
             api.clone(),
             MemoryConsolidateStagingOperation { force: false },
+            &MemoryConsolidationRequester::Owner(test_owner_actor().account_id),
         )
         .unwrap();
         assert_eq!(below_threshold.status, "skipped_below_threshold");
@@ -60094,6 +60363,10 @@ mod tests {
         let second = match start_memory_staging_consolidation(
             api.clone(),
             MemoryConsolidateStagingOperation { force: true },
+            &MemoryConsolidationRequester::Worker(RuntimeWorkerRef::new(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                &worker_id,
+            )),
         ) {
             Ok(output) => output,
             Err(_) => panic!("unexpected ApiError from second memory consolidation trigger"),
@@ -60135,9 +60408,36 @@ mod tests {
         let replacement = start_memory_staging_consolidation(
             api.clone(),
             MemoryConsolidateStagingOperation { force: true },
+            &MemoryConsolidationRequester::Owner(test_owner_actor().account_id),
         )
         .unwrap();
         assert_eq!(replacement.status, "started");
+        let owner = api
+            .store
+            .current_worker_singleton_owner(api.workspace_id(), MEMORY_CONSOLIDATION_SINGLETON_KEY)
+            .unwrap()
+            .unwrap();
+        for (operation, allowed) in [("memory.document.update", true), ("ticket.create", false)] {
+            let result = subject_authorization::authorize(
+                &api,
+                &owner.worker,
+                &server_api::authorization::OperationAuthorizationRequest {
+                    operation: operation.into(),
+                    resource: server_api::authorization::PermissionResource::Workspace {
+                        workspace_id: api.workspace_id().into(),
+                    },
+                },
+            );
+            assert_eq!(result.is_ok(), allowed, "{operation}: {result:?}");
+        }
+        assert!(
+            start_memory_staging_consolidation(
+                api.clone(),
+                MemoryConsolidateStagingOperation { force: true },
+                &MemoryConsolidationRequester::Owner("not-the-owner".into())
+            )
+            .is_err()
+        );
         let replacement_owner = api
             .store
             .current_worker_singleton_owner(
@@ -60432,61 +60732,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let (api, execution) = test_api_with_recording_backend(dir.path()).await;
-        let source_worker = api
-            .runtime
-            .spawn_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                test_create_binding(),
-                WorkerSpawnRequest {
-                    requested_worker_name: Some("notification-source".to_string()),
-                    intent: WorkerSpawnIntent::TicketRole {
-                        ticket_id: "notification-source".to_string(),
-                        role: TicketWorkerRole::Worker,
-                    },
-                    singleton_key: None,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: None,
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: Some(test_worker_workspace_api(
-                        EMBEDDED_WORKER_RUNTIME_ID,
-                    )),
-                    resolved_memory_settings: Some(test_worker_memory_settings()),
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let Json(source_worker) = create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+                display_name: "Notification Source".into(),
+                singleton_key: None,
+                profile: Some("builtin:coder".into()),
+                ticket_assignment: None,
+                initial_submit: vec![],
+                workdir_attachments: vec![],
+                feature_connections: Default::default(),
+                control_operation_id: Some("notification-source-create".into()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                    assignment: Some(test_operation_assignment(&api, &["ticket.read"])),
                 },
-            )
-            .unwrap()
-            .worker
-            .unwrap();
-        let source =
-            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, source_worker.worker.worker_id);
-        api.store
-            .upsert_worker_registry(&WorkerRegistryRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                worker: source.clone(),
-                display_name: "Notification Source".to_string(),
-                profile: Some("builtin:coder".to_string()),
-                retention_state: "normal".to_string(),
-                transcript_ref: None,
-                session_ref: None,
-                summary_ref: None,
-                diagnostics_ref: None,
-                created_at: TEST_CREATED_AT.to_string(),
-                updated_at: TEST_CREATED_AT.to_string(),
-            })
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
+        let source = RuntimeWorkerRef::new(source_worker.runtime_id, source_worker.worker_id);
         let source_headers = || {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -62804,12 +63070,9 @@ mod tests {
                 subject_consolidation_key,
             ),
         ] {
-            let error = scoped_create_runtime_worker(
+            let error = create_runtime_worker_as_owner(
                 State(api.clone()),
-                AxumPath(ScopedRuntimePath {
-                    workspace_id: TEST_WORKSPACE_ID.to_string(),
-                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                }),
+                AxumPath(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
                 Json(candidate),
             )
             .await
@@ -64278,7 +64541,7 @@ mod tests {
             test_worker_operation_authorization(&[("worker", &["worker.create", usage.as_str()])]),
             WorkerCreationAuthorization::Policy {
                 policy_id: policy.policy_id,
-                policy_revision: policy.authorization_revision,
+                policy_authorization_key: policy.authorization_key,
             },
         )
     }
@@ -64383,6 +64646,60 @@ mod tests {
         .unwrap()
         .policy
         .unwrap()
+    }
+
+    // Notification fixtures substitute execution-end receipts, not completion or
+    // delivery. Real Controller/Host cleanup is covered by backend_job_tests.
+    fn finalize_notification_test_job(
+        api: &WorkspaceApi,
+        mut acceptance: crate::backend_job::BackendJobResultAcceptance,
+    ) -> crate::backend_job::BackendJobResultAcceptance {
+        assert_eq!(acceptance.job.state, BackendJobState::Finalizing);
+        let job_id = &acceptance.job.request.job_id;
+        let attempt_id = &acceptance.attempt.attempt_id;
+        let now = Utc::now().to_rfc3339();
+        let (executing, _) = api
+            .store
+            .claim_backend_job_worker_cleanup(api.workspace_id(), job_id, attempt_id, &now)
+            .unwrap();
+        let host = crate::backend_job_host_effects::JobHostOwner::try_from(&executing).unwrap();
+        let controller = serde_json::json!({
+            "scope":"controller",
+            "worker_ref":{"worker_id":executing.worker.as_ref().unwrap().worker_id},
+            "stop_operation_id":Uuid::now_v7().to_string(),
+            "execution_id":Uuid::now_v7().to_string(),
+            "shutdown_command_id":1,
+            "submissions":[{"submission_request_id":executing.runtime_run_id,
+                "submission_id":"notification-fixture", "disposition":"started"}],
+            "feature_failures":[]
+        });
+        api.store
+            .record_backend_job_execution_fence(
+                api.workspace_id(),
+                &executing,
+                &controller.to_string(),
+                &serde_json::to_string(&host).unwrap(),
+                &now,
+            )
+            .unwrap();
+        acceptance.attempt = api
+            .store
+            .finish_backend_job_worker_cleanup(
+                api.workspace_id(),
+                job_id,
+                attempt_id,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                &now,
+            )
+            .unwrap();
+        acceptance.job = api
+            .store
+            .finalize_backend_job(api.workspace_id(), job_id, &now)
+            .unwrap();
+        assert_eq!(acceptance.job.state, BackendJobState::Completed);
+        acceptance
     }
 
     fn test_owner_actor() -> RequestActor {
@@ -69691,7 +70008,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            Error::UnknownWorker { worker } if worker == target
+            Error::RuntimeControlFailed {
+                runtime_id,
+                cause: protocol::control_failure::RuntimeControlCause::AuthorizationFailed,
+            } if runtime_id == target.runtime_id
         ));
 
         let after = api
@@ -69955,6 +70275,10 @@ mod tests {
             profile.strip_prefix("builtin:").unwrap_or(profile)
         ));
         let mut bundle = runtime_test_bundle();
+        bundle.metadata.id = format!(
+            "server-test-bundle-{}",
+            profile.strip_prefix("builtin:").unwrap_or(profile)
+        );
         bundle.metadata.workspace_id = api.workspace_id().into();
         bundle.profiles[0].selector = selector.clone();
         bundle.profiles[0].label = Some(profile.strip_prefix("builtin:").unwrap_or(profile).into());
@@ -70602,7 +70926,8 @@ mod tests {
     async fn scoped_worker_create_invalid_relative_cwd_returns_typed_diagnostic() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
-        let app = test_app(dir.path()).await;
+        let api = test_api(dir.path()).await;
+        let app = build_inner_router(api).layer(Extension(test_owner_actor()));
         let working_directory_id = "test-workdir";
 
         let response = request_json(
@@ -70614,6 +70939,8 @@ mod tests {
                 "display_name": "Coding Worker",
                 "profile": "builtin:coder",
                 "initial_submit": [],
+                "control_operation_id": "invalid-relative-cwd",
+                "authorization": {"kind": "assignment"},
                 "workdir_attachments": [{
                     "alias": "workdir",
                     "working_directory_id": working_directory_id,
@@ -71760,20 +72087,36 @@ mod tests {
     #[tokio::test]
     async fn browser_worker_create_uses_workspace_default_and_preserves_unsupported_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path()).await;
-        let created = post_json(
+        let api = test_api(dir.path()).await;
+        let owner =
+            seed_test_workspace_owner_token(api.store.as_ref(), "browser-worker-owner").await;
+        let app = build_router(api);
+        let created = request_json_authenticated(
             app.clone(),
-            "/api/workers",
-            serde_json::json!({
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            Some(serde_json::json!({
                 "runtime_id": "embedded-worker-runtime",
+                "control_operation_id": "browser-default-create",
+                "authorization": {"kind": "assignment"},
                 "display_name": "",
                 "initial_submit": [],
                 "feature_connections": {}
-            }),
+            })),
+            &owner,
+            StatusCode::OK,
         )
         .await;
         assert_eq!(created["runtime_id"], "embedded-worker-runtime");
-        let workers = get_json(app.clone(), "/api/workers").await;
+        let workers = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
         let worker = workers["items"]
             .as_array()
             .unwrap()
@@ -71789,8 +72132,15 @@ mod tests {
             .expect("Workspace Worker list must project a resource key");
         assert!(resource_key.starts_with("W-"));
 
-        let runtime_workers =
-            get_json(app.clone(), "/api/runtimes/embedded-worker-runtime/workers").await;
+        let runtime_workers = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/embedded-worker-runtime/workers"),
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
         let runtime_workers = serde_json::from_value::<
             server_api::ListResponse<server_api::WorkerSummary>,
         >(runtime_workers)
@@ -71802,11 +72152,19 @@ mod tests {
                 .any(|worker| worker.resource_key == resource_key)
         );
         let detail_path = format!(
-            "/api/runtimes/{}/workers/{}",
+            "/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{}",
             created["runtime_id"].as_str().unwrap(),
             created["worker_id"].as_str().unwrap()
         );
-        let detail = get_json(app.clone(), detail_path.as_str()).await;
+        let detail = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &detail_path,
+            None,
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
         assert_eq!(detail["label"], "Worker");
         assert_eq!(detail["worker_id"], created["worker_id"]);
         assert!(
@@ -71955,12 +72313,15 @@ mod tests {
     #[tokio::test]
     async fn runtime_worker_spawn_rejects_embedded_workdir_request() {
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path()).await;
+        let api = test_api(dir.path()).await;
+        let app = build_inner_router(api).layer(Extension(test_owner_actor()));
         let response = request_json(
             app,
             "POST",
             "/api/runtimes/embedded-worker-runtime/workers",
             Some(serde_json::json!({
+                "control_operation_id": "embedded-workdir-rejected",
+                "authorization": {"kind": "assignment"},
                 "intent": {
                     "kind": "ticket_role",
                     "ticket_id": "00001KVZSGT0Q",
@@ -73011,6 +73372,7 @@ mod tests {
                     "kind": "workspace_coding"
                 },
                 "requested_worker_name": "api-friendly-name",
+                "control_operation_id": "embedded-route-create",
                 "acceptance": {
                     "kind": "run_accepted",
                     "expected_segments": 0
@@ -75062,7 +75424,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         let forged = spawn_workspace_worker_as_owner(
             &api,
             EMBEDDED_WORKER_RUNTIME_ID,
-            spawn("companion", forged_key),
+            spawn("builtin:companion", forged_key),
         )
         .unwrap()
         .worker

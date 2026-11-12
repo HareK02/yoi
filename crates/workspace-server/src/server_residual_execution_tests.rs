@@ -728,7 +728,7 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
             .create(ticket::NewTicket::new("decision authority"))
             .unwrap();
         let mut reply = HeldRuntimeReply::new();
-        install_remote_fixture(
+        let binding = install_remote_fixture(
             &fixture,
             "orchestrator-runtime",
             &format!("http://{}", reply.address),
@@ -738,15 +738,44 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
             .store
             .get_workspace_memory_settings(WORKSPACE)
             .unwrap();
+        // Keep the legacy singleton to prove it cannot impersonate a Subject,
+        // but issue explicit ordinary-Worker authority through the current owner.
+        let creation = WorkerControlOperation {
+            operation_id: "orch-create".into(),
+            input_fingerprint: "orch-create-fingerprint".into(),
+        };
+        let (_, _, bundle, grant) = core_worker_creation::resolve_creation_profile(
+            &fixture.api,
+            None,
+            Some(&fixture.owner_account_id),
+            &server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                assignment: Some(operation_assignment(
+                    "ticket",
+                    &[if operation == "tracking" {
+                        "ticket.assignment.update"
+                    } else {
+                        "ticket.case.update"
+                    }],
+                )),
+            },
+            "orchestrator-runtime",
+            Some("builtin:coder".into()),
+            Some(&creation),
+            false,
+        )
+        .unwrap();
         let reservation = fixture
             .store
-            .reserve_worker_create(
+            .reserve_worker_create_with_core(
                 WORKSPACE,
                 "orchestrator-runtime",
-                "orch-create",
-                "orch-create-fingerprint",
+                &creation.operation_id,
+                &creation.input_fingerprint,
+                &creation.input_fingerprint,
                 Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY),
                 &memory,
+                &grant.unwrap(),
+                &bundle.unwrap(),
             )
             .unwrap();
         let source =
@@ -763,7 +792,7 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
             actor: None,
             worker_source: None,
             runtime_source: Some(server_api::ServerRuntimeSource {
-                authentication_binding_id: "verified-fixture-binding".into(),
+                authentication_binding_id: binding.binding_id,
                 runtime_id: source.runtime_id.clone(),
                 worker_id: Some(source.worker_id.clone()),
             }),
@@ -803,10 +832,10 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
                     .await
                     .map(|_| ())
                 } else {
-                    apply_ticket_case_update(
+                    scoped_ticket_case_update_with_context(
                         State(api),
-                        Some(source),
-                        None,
+                        HeaderMap::new(),
+                        &context,
                         AxumPath((WORKSPACE.into(), ticket_id)),
                         Json(ticket::TicketCaseUpdate {
                             expected_content_digest: ticket::ticket_content_digest(&before),
@@ -831,7 +860,8 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
         if operation == "tracking" {
             let error = outcome.unwrap_err();
             assert!(
-                error.error.to_string().contains("Subject body"),
+                matches!(&error.error, Error::WorkspacePermissionDenied(message)
+                    if message.contains("Subject body")),
                 "{error:?}"
             );
         } else {
@@ -871,13 +901,16 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
                 "tracking still requires live assignment authority"
             );
         } else {
-            // Case changes do not depend on a remote singleton lookup.
-            // The local assignment-only audit falls back to an ordinary Worker.
+            // Case authority is explicitly granted; neither permission nor audit
+            // attribution depends on a remote singleton lookup.
             assert_eq!(after.meta.workflow_state, ticket::TicketState::Closed);
+            let event = after.events.last().unwrap();
+            assert_eq!(event.attributes["source_actor_role"], "worker");
             assert_eq!(
-                after.events.last().unwrap().attributes["source_actor_role"],
-                "worker"
+                event.author.as_deref(),
+                Some(format!("worker:{}/{}", source.runtime_id, source.worker_id).as_str())
             );
+            assert!(!event.attributes.contains_key("source_assignment_id"));
             assert_eq!(
                 after.current_closure.unwrap().operation_key,
                 "case-operation"

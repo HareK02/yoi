@@ -87,12 +87,13 @@ impl WorkerLaunchPoliciesApi for ServerApiContractService {
                                 // This also projects launch keys through the worker
                                 // Feature's existing namespace handle. It sees the
                                 // uncommitted new row, allowing explicit self-use.
-                                api.config_store.sync_plugin_permission_registry_in_connection(
-                                    transaction,
-                                    &root,
-                                    &workspace_id,
-                                    candidate,
-                                )?;
+                                api.config_store
+                                    .sync_plugin_permission_registry_in_connection(
+                                        transaction,
+                                        &root,
+                                        &workspace_id,
+                                        candidate,
+                                    )?;
                                 validate_management_input(
                                     transaction,
                                     &workspace_id,
@@ -134,8 +135,8 @@ fn mutate_and_publish(
         rusqlite::params![workspace, request.operation_key],
         |row| row.get(0),
     )?;
-    let receipt = crate::launch_policy::mutate(&tx, workspace, account, request)
-        .map_err(mutation_error)?;
+    let receipt =
+        crate::launch_policy::mutate(&tx, workspace, account, request).map_err(mutation_error)?;
     if replay {
         tx.commit()?;
         return Ok(receipt);
@@ -191,11 +192,8 @@ fn validate_management_input(
         &state,
         state.contract.schema_bundle.clone(),
     )?;
-    let profiles = crate::profile_settings::project_profiles_from_evaluation(
-        workspace,
-        &state,
-        &evaluation,
-    )?;
+    let profiles =
+        crate::profile_settings::project_profiles_from_evaluation(workspace, &state, &evaluation)?;
     validate_registered_profiles(&profiles, allowed_profiles)?;
     // Reuse the existing Set/Namespace resolver, including exclusions and the
     // validation of references hidden by revoked=true. Do not persist expansion
@@ -215,7 +213,8 @@ fn validate_registered_profiles(
     for profile in profiles {
         server_api::launch_policy::validate_canonical_profile(profile)
             .map_err(Error::InvalidInput)?;
-        let selected = crate::profile_settings::selector_for_registered_profile(projection, profile);
+        let selected =
+            crate::profile_settings::selector_for_registered_profile(projection, profile);
         let exact = match selected {
             Some(ProfileSelector::Builtin(key) | ProfileSelector::Named(key)) => key == *profile,
             None => false,
@@ -266,7 +265,9 @@ mod tests {
                  INSERT INTO workspaces VALUES ('w','owner','active');",
             )
             .unwrap();
-        connection.execute_batch(crate::launch_policy::SCHEMA).unwrap();
+        connection
+            .execute_batch(crate::launch_policy::CURRENT_SCHEMA)
+            .unwrap();
         let registry = worker::feature::permissions::builtin_permission_registry(
             WorkspaceId::parse("w").unwrap(),
         )
@@ -287,7 +288,10 @@ mod tests {
         }
     }
 
-    fn sync(connection: &rusqlite::Connection, registry: &mut FeaturePermissionRegistry) -> Result<()> {
+    fn sync(
+        connection: &rusqlite::Connection,
+        registry: &mut FeaturePermissionRegistry,
+    ) -> Result<()> {
         sync_launch_policy_permissions(connection, "w", registry)
     }
 
@@ -366,7 +370,11 @@ mod tests {
         );
         assert!(failure.is_err());
         assert_eq!(registry.host().catalog(), before);
-        assert!(crate::launch_policy::policies(&connection, "w").unwrap().is_empty());
+        assert!(
+            crate::launch_policy::policies(&connection, "w")
+                .unwrap()
+                .is_empty()
+        );
         for table in [
             "worker_launch_policy_history",
             "worker_launch_policy_operations",
@@ -377,15 +385,28 @@ mod tests {
             assert_eq!(count, 0);
         }
         // The same key remains usable after a known transaction rollback.
-        mutate_and_publish(&mut connection, "w", "owner", &create(), &mut registry, sync).unwrap();
+        mutate_and_publish(
+            &mut connection,
+            "w",
+            "owner",
+            &create(),
+            &mut registry,
+            sync,
+        )
+        .unwrap();
     }
 
     #[test]
-    fn replay_skips_current_resolution_and_never_republishes_old_revision() {
+    fn replay_skips_current_resolution_and_never_republishes_old_authorization() {
         let (mut connection, mut registry) = fixture();
         let original = create();
         let receipt = mutate_and_publish(
-            &mut connection, "w", "owner", &original, &mut registry, sync,
+            &mut connection,
+            "w",
+            "owner",
+            &original,
+            &mut registry,
+            sync,
         )
         .unwrap();
         let revoke = WorkerLaunchPolicyMutation {
@@ -394,10 +415,9 @@ mod tests {
             expected: Some(receipt.policy.observation()),
             action: WorkerLaunchPolicyAction::Revoke,
         };
-        let revoked = mutate_and_publish(
-            &mut connection, "w", "owner", &revoke, &mut registry, sync,
-        )
-        .unwrap();
+        let revoked =
+            mutate_and_publish(&mut connection, "w", "owner", &revoke, &mut registry, sync)
+                .unwrap();
         let catalog = registry.host().catalog();
         let replay = mutate_and_publish(
             &mut connection,
@@ -405,7 +425,9 @@ mod tests {
             "owner",
             &original,
             &mut registry,
-            |_, _| panic!("replay must not resolve changed/deleted Profiles or permission references"),
+            |_, _| {
+                panic!("replay must not resolve changed/deleted Profiles or permission references")
+            },
         )
         .unwrap();
         assert_eq!(replay, receipt);
@@ -467,15 +489,31 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(registry.host().catalog(), before);
-        assert!(crate::launch_policy::policies(&connection, "w").unwrap().is_empty());
-        mutate_and_publish(&mut connection, "w", "owner", &create(), &mut registry, sync).unwrap();
+        assert!(
+            crate::launch_policy::policies(&connection, "w")
+                .unwrap()
+                .is_empty()
+        );
+        mutate_and_publish(
+            &mut connection,
+            "w",
+            "owner",
+            &create(),
+            &mut registry,
+            sync,
+        )
+        .unwrap();
     }
 
     fn profile_projection(source: &str) -> crate::profile_settings::ProfileConfigProjection {
         use crate::config_source::WorkspaceConfigSchemaProvider;
         let schema = config_source::WorkspaceConfigSchemaBundle::compose([
-            crate::profile_settings::ProfileConfigSchemaProvider.contribution().unwrap(),
-            crate::prompt_settings::PromptConfigSchemaProvider.contribution().unwrap(),
+            crate::profile_settings::ProfileConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            crate::prompt_settings::PromptConfigSchemaProvider
+                .contribution()
+                .unwrap(),
         ])
         .unwrap();
         let snapshot = config_source::ConfigTreeSnapshot::from_entries(vec![
@@ -536,7 +574,9 @@ mod tests {
         let (connection, registry) = fixture();
         // This fixture has no config tables: any accidental resolution fails.
         for action in [
-            WorkerLaunchPolicyAction::Rename { name: "Renamed".into() },
+            WorkerLaunchPolicyAction::Rename {
+                name: "Renamed".into(),
+            },
             WorkerLaunchPolicyAction::Revoke,
             WorkerLaunchPolicyAction::Delete,
         ] {

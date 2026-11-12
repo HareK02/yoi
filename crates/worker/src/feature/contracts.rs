@@ -30,11 +30,11 @@ pub(crate) fn validate_launch_selection(
 ) -> Result<(), String> {
     if let server_api::launch_policy::WorkerCreationAuthorization::Policy {
         policy_id,
-        policy_revision,
+        policy_authorization_key,
     } = authorization
     {
         server_api::launch_policy::validate_policy_id(policy_id)?;
-        server_api::launch_policy::validate_authorization_revision(*policy_revision)?;
+        server_api::launch_policy::validate_authorization_key(policy_authorization_key)?;
     }
     server_api::launch_policy::validate_canonical_profile(profile)
 }

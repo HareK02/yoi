@@ -133,6 +133,11 @@ impl NormalModel {
                         input["spawn"].clone(),
                     );
                 }
+                let denial = tool_result(request, "normal-no-delegation").unwrap().1;
+                assert!(
+                    denial.contains("403"),
+                    "visible SpawnTicketWorker must reach authorization, not input rejection: {denial}"
+                );
                 if self.seen.lock().unwrap().insert(format!("denied:{ticket}")) {
                     self.evaluated.send(json!({"denied":ticket})).await.unwrap();
                 }
@@ -514,30 +519,26 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
         )
         .await;
         let content = format!("normal {label} verified\n");
-        let mut permissions: Vec<_> = ["filesystem.read", "filesystem.write", "bash.execute"]
-            .into_iter()
-            .map(|operation| ScopedPermission {
-                operation: operation.into(),
-                resource: PermissionResource::Workdir {
-                    working_directory_id: wd.clone(),
-                    path: ".".into(),
-                    recursive: true,
-                },
-            })
-            .collect();
-        permissions.extend([
-            ticket_permission(&ticket, "ticket.read"),
-            ticket_permission(&ticket, "ticket.relation.read"),
-            ticket_permission(&ticket, "ticket.implementation_result.write"),
-        ]);
+        // Operation authority is separate from the selected Ticket and Workdir.
+        // The Host freezes the assignment within the current Subject delegation.
+        let mut assignment = standalone_assignment(
+            r#"{ namespaces = [
+                { namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; },
+                { namespace = "bash"; keys = ["bash.execute"]; },
+                { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; }
+            ]; }"#,
+        );
         if background_handling_control {
-            permissions.push(ticket_permission(&ticket, "ticket.assignment.update"));
+            let handling = standalone_assignment(
+                r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,
+            );
+            assignment.grants.extend(handling.grants);
         }
         let spawn = json!({"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder","flow":null,
             "orchestrator_assignment_id":assigned["assignment"]["assignment_id"],
             "initial_request":format!("{EDITOR}{}",json!({"ticket":ticket,"content":content})),
             "workdir_attachments":[{"alias":"checkout","working_directory_id":wd}],
-            "execution_grant":{"permissions":permissions,"redelegation":[]}});
+            "authorization":{"kind":"assignment","assignment":assignment}});
         let input = json!({"subject":subject,"ticket":ticket,"spawn":spawn,"content":content,"related":related});
         cases.push((
             input,
@@ -623,6 +624,42 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
                 rusqlite::params![TEST_WORKSPACE_ID,results[ticket]["result_id"].as_str().unwrap()],
                 |row| Ok(RuntimeWorkerRef::new(row.get::<_,String>(0)?, row.get::<_,String>(1)?))).map_err(Into::into)
         }).unwrap();
+        let grant = h
+            .api
+            .config_store
+            .core_worker_execution_grant(TEST_WORKSPACE_ID, &child.runtime_id, &child.worker_id)
+            .unwrap()
+            .expect("public spawn persists a current core grant");
+        assert_eq!(
+            serde_json::to_value(&grant.assignment).unwrap(),
+            input["spawn"]["authorization"]["assignment"]
+        );
+        assert!(grant.issuance_ceiling.is_some());
+        assert!(matches!(
+            &grant.source,
+            server_api::authorization::CoreWorkerGrantSource::Delegation {
+                parent: server_api::authorization::CoreWorkerGrantParent::SubjectBody {
+                    subject_id, runtime_id, worker_id, ..
+                }
+            } if subject_id == input["subject"].as_str().unwrap()
+                && runtime_id == &source.runtime_id && worker_id == &source.worker_id
+        ));
+        if background_handling_control {
+            let (status, permission) = connected_authorization_post(
+                &h.backend_url,
+                &h.identity,
+                &child,
+                &authorization_path(),
+                &json!({"operation":"ticket.assignment.update","resource":{
+                    "kind":"ticket","workspace_id":TEST_WORKSPACE_ID,"ticket_id":ticket}}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "tailored child has the operation; the handling refusal must exercise body ownership: {permission}"
+            );
+        }
         let tracking = persisted_tracking(&h, ticket);
         let mut denied = handling(
             ticket,

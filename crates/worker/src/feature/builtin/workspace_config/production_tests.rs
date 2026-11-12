@@ -1598,7 +1598,14 @@ async fn denied_config_operations_have_no_provider_access_or_attachment_effects(
         assert_eq!(state.authorizations.len(), 1);
         assert_eq!(
             state.authorizations[0].operation,
-            format!("workspace_config.{operation}")
+            format!(
+                "workspace_config.{}",
+                if operation == "current" {
+                    "observe"
+                } else {
+                    operation
+                }
+            )
         );
         assert_eq!(
             state.authorizations[0].resource,

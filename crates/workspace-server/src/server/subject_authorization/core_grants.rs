@@ -244,7 +244,7 @@ impl WorkerAuthorityView {
                 CoreWorkerGrantSource::Delegation { parent } => (parent, None),
                 CoreWorkerGrantSource::LaunchPolicy {
                     policy_id,
-                    policy_revision,
+                    policy_authorization_key,
                     parent,
                 } => {
                     let policy = self
@@ -252,15 +252,15 @@ impl WorkerAuthorityView {
                         .worker_launch_policy(&self.workspace_id, policy_id)?
                         .ok_or_else(|| denied("launch policy source no longer exists"))?;
                     if policy.state != WorkerLaunchPolicyState::Active
-                        || policy.authorization_revision != *policy_revision
+                        || policy.authorization_key != *policy_authorization_key
                     {
-                        return Err(denied("launch policy authorization revision is revoked"));
+                        return Err(denied("launch policy authorization key is revoked"));
                     }
                     if current.effective_assignment() != policy.effective_child_permissions()
                         || !policy.allowed_profiles.contains(&current.profile)
                     {
                         return Err(denied(
-                            "saved launch grant does not match its policy revision",
+                            "saved launch grant does not match its policy authorization key",
                         ));
                     }
                     (
@@ -407,7 +407,7 @@ pub(in crate::server) fn prepare_core_policy_grant(
     api: &WorkspaceApi,
     source: &RuntimeWorkerRef,
     policy_id: &str,
-    policy_revision: u64,
+    policy_authorization_key: &str,
     runtime_id: &str,
     profile: &str,
     profile_digest: &str,
@@ -435,9 +435,9 @@ pub(in crate::server) fn prepare_core_policy_grant(
         .worker_launch_policy(api.workspace_id(), policy_id)?
         .ok_or_else(|| denied("unknown launch policy"))?;
     if policy.state != WorkerLaunchPolicyState::Active
-        || policy.authorization_revision != policy_revision
+        || policy.authorization_key != policy_authorization_key
     {
-        return Err(denied("stale or inactive launch policy revision"));
+        return Err(denied("stale or inactive launch policy authorization key"));
     }
     if !policy
         .allowed_profiles
@@ -511,7 +511,7 @@ pub(in crate::server) fn prepare_core_policy_grant(
         issuance_ceiling: Some(ceiling),
         source: CoreWorkerGrantSource::LaunchPolicy {
             policy_id: policy_id.into(),
-            policy_revision,
+            policy_authorization_key: policy_authorization_key.to_owned(),
             parent,
         },
     })

@@ -10,7 +10,7 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
     init_clean_git_workspace(temp.path());
     let (api, execution) = test_api_with_recording_backend(temp.path()).await;
     execution.accept_restores();
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {

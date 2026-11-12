@@ -126,36 +126,53 @@ fn saved_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+// Explicit canonical tail: schema 132 has no registered migration. Keep this
+// expectation independent of published_plan and the production migration list.
+fn expected_published_tail() -> [(i64, &'static str); 14] {
+    [
+        (122, crate::config_adoption::MIGRATION_NAME),
+        (123, super::super::backend_job_upgrade::MIGRATION_NAME),
+        (124, super::super::WORKER_CREATE_FAILURE_MIGRATION_NAME),
+        (
+            125,
+            super::super::backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+        ),
+        (126, super::super::SERVICE_OUTCOME_MIGRATION_NAME),
+        (127, super::super::journal_removal_store::MIGRATION_NAME),
+        (128, super::super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME),
+        (
+            129,
+            super::super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME,
+        ),
+        (130, super::super::backend_job_current::MIGRATION_NAME),
+        (131, crate::launch_policy::MIGRATION_NAME),
+        (133, crate::subject_policy::MIGRATION_NAME),
+        (134, super::super::backend_job_finalizing::MIGRATION_NAME),
+        (
+            135,
+            super::super::subject_release_recording_store::MIGRATION_NAME,
+        ),
+        (
+            136,
+            super::super::launch_policy_identity_migration::MIGRATION_NAME,
+        ),
+    ]
+}
+
 fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     let rows = saved_rows(conn);
     let shape = snapshot(conn).unwrap();
     verify_history(conn, current).unwrap();
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
-        assert_eq!(plan.migrations.len(), 9);
-        assert_eq!(plan.migrations[0].version, 122);
+        assert_eq!(plan.current_schema_version, current);
+        assert_eq!(plan.target_schema_version, 136);
         assert_eq!(
-            plan.migrations[0].name,
-            crate::config_adoption::MIGRATION_NAME
-        );
-        assert_eq!(plan.migrations[1].version, 123);
-        assert_eq!(
-            plan.migrations[1].name,
-            super::super::backend_job_upgrade::MIGRATION_NAME
-        );
-        assert_eq!(
-            plan.target_schema_version,
-            super::super::LATEST_SCHEMA_VERSION
-        );
-        assert_eq!(
-            plan.migrations[6].name,
-            super::super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME
-        );
-        assert_eq!(plan.migrations[7].version, 129);
-        assert_eq!(plan.migrations[8].version, 130);
-        assert_eq!(
-            plan.migrations[7].name,
-            super::super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME
+            plan.migrations
+                .iter()
+                .map(|step| (step.version, step.name.as_str()))
+                .collect::<Vec<_>>(),
+            expected_published_tail()
         );
     }
     assert_eq!(rows, saved_rows(conn));
@@ -332,23 +349,9 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             0
         );
         let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
-        for version in [130, 129, 128, 127, 126, 125, 124] {
-            assert_eq!(
-                history.pop(),
-                Some((version, tail_migration_name(version).unwrap().into()))
-            );
+        for (version, name) in expected_published_tail().into_iter().rev() {
+            assert_eq!(history.pop(), Some((version, name.into())));
         }
-        assert_eq!(
-            history.pop(),
-            Some((
-                123,
-                super::super::backend_job_upgrade::MIGRATION_NAME.into()
-            ))
-        );
-        assert_eq!(
-            history.pop(),
-            Some((122, crate::config_adoption::MIGRATION_NAME.into()))
-        );
         assert_eq!(history, original_receipts);
         verify_history(&conn, super::super::LATEST_SCHEMA_VERSION).unwrap();
         let saved = saved_rows(&conn);

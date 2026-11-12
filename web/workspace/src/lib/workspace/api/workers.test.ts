@@ -351,18 +351,31 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
       authorization,
     );
   }
-  for (const policy_revision of [1, Number.MAX_SAFE_INTEGER]) {
-    const authorization = { kind: "policy", policy_id: "coder", policy_revision };
+  for (const policy_authorization_key of [
+    "auth-key", "1", " key ", "x".repeat(512), "é".repeat(256), "🔑".repeat(128),
+  ]) {
+    const authorization = { kind: "policy", policy_id: "coder", policy_authorization_key };
     assertEquals(parseCreateWorkspaceWorkerRequest({ ...request, authorization }).authorization, authorization);
   }
-  for (const policy_revision of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "1", null]) {
+  for (const policy_authorization_key of [
+    undefined, null, 1, false, {}, [], "", "x".repeat(513), "é".repeat(257),
+    "🔑".repeat(129), "bad\nkey", "bad\u0000key", "bad\u007fkey", "bad\u0085key",
+  ]) {
     assertThrows(() => parseCreateWorkspaceWorkerRequest({
-      ...request, authorization: { kind: "policy", policy_id: "coder", policy_revision },
-    }), Error, "policy_revision");
+      ...request, authorization: { kind: "policy", policy_id: "coder", policy_authorization_key },
+    }), Error, "policy_authorization_key");
+  }
+  for (const authorization of [
+    { kind: "policy", policy_id: "coder", policy_revision: 1 },
+    { kind: "policy", policy_id: "coder", policy_revision: "auth-key" },
+    { kind: "policy", policy_id: "coder", policy_authorization_key: "auth-key", policy_revision: 1 },
+  ]) {
+    assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, authorization }), Error,
+      "unknown field policy_revision");
   }
   for (const authorization of [null, { kind: "human", assignment: null }, { kind: "default" },
-    { kind: "policy", policy_id: "coder", policy_revision: 1, assignment: {} },
-    { kind: "policy", policy_id: "bad.id", policy_revision: 1 }]) {
+    { kind: "policy", policy_id: "coder", policy_authorization_key: "auth-key", assignment: {} },
+    { kind: "policy", policy_id: "bad.id", policy_authorization_key: "auth-key" }]) {
     assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, authorization }), Error,
       authorization && "policy_id" in authorization && authorization.policy_id === "bad.id"
         ? "policy_id" : "authorization");
