@@ -41,7 +41,7 @@ fn denied() -> JournalError {
 pub(super) fn check_writer(tx: &Connection, host: &JournalHostContext) -> JournalResult<()> {
     crate::require_subject_in_connection(tx, &host.subject_id)?;
     let attr = host.attribution.as_ref().ok_or_else(denied)?;
-    let binding = host.writer_binding_id.as_ref().ok_or_else(denied)?;
+    let binding = host.writer_binding_id().ok_or_else(denied)?;
     if !tx.query_row("SELECT EXISTS(SELECT 1 FROM journal_writer_bindings b JOIN journal_session_bindings s ON s.binding_id=b.binding_id WHERE b.binding_id=?1 AND b.subject_id=?2 AND b.runtime_id=?3 AND b.worker_id=?4 AND b.active=1 AND s.session_id=?5)", params![binding,host.subject_id,attr.runtime_id,attr.worker_id,attr.session_id], |r| r.get::<_,bool>(0))? {
         return Err(denied());
     }
@@ -57,15 +57,15 @@ pub(super) fn require_saved_position(tx: &Connection, generation: &str) -> Journ
 }
 
 impl SubjektivStore {
-    /// The last released body's most recently updated Journal Session, independent of source
-    /// retention. Session attachment order may differ from the order of recorded activity.
+    /// Select by producer lifetime and immutable Session attribution, never by
+    /// Journal update time: delayed recording must not reorder predecessor bodies.
     pub fn journal_predecessor_session(
         &self,
         binding: &JournalWriterBinding,
     ) -> JournalResult<Option<String>> {
         self.database.try_with_connection(|tx| {
             crate::require_subject_in_connection(tx, &binding.subject_id)?;
-            Ok(tx.query_row("SELECT j.source_session_id FROM journals j JOIN journal_session_bindings s ON s.session_id=j.source_session_id WHERE j.subject_id=?1 AND s.binding_id=(SELECT binding_id FROM journal_writer_bindings WHERE subject_id=?1 AND active=0 ORDER BY rowid DESC LIMIT 1) ORDER BY j.updated_at DESC,j.id DESC LIMIT 1", [&binding.subject_id], |r| r.get(0)).optional()?)
+            Ok(tx.query_row("SELECT j.source_session_id FROM journals j JOIN journal_session_bindings s ON s.session_id=j.source_session_id JOIN subject_session_attributions a ON a.session_id=j.source_session_id WHERE j.subject_id=?1 AND s.binding_id=(SELECT binding_id FROM journal_writer_bindings WHERE subject_id=?1 AND active=0 ORDER BY rowid DESC LIMIT 1) ORDER BY a.attributed_at DESC,a.session_id DESC LIMIT 1", [&binding.subject_id], |r| r.get(0)).optional()?)
         })
     }
 
@@ -176,7 +176,7 @@ impl SubjektivStore {
                 return Err(denied());
             }
             tx.execute("INSERT OR IGNORE INTO journal_session_bindings(session_id,binding_id) SELECT ?1,binding_id FROM journal_writer_bindings WHERE binding_id=?2 AND subject_id=?3 AND runtime_id=?4 AND worker_id=?5 AND active=1",params![attr.session_id,binding.binding_id,attr.subject_id,attr.runtime_id,attr.worker_id])?;
-            host.writer_binding_id = Some(binding.binding_id.clone());
+            host.authority = JournalHostAuthority::Session { binding_id: Some(binding.binding_id.clone()) };
             check_writer(tx,&host)?;
             Ok(host.clone())
         })
@@ -221,6 +221,29 @@ impl SubjektivStore {
             // successor. Retained unfinished history is not an active writer.
             tx.execute("INSERT OR IGNORE INTO journal_session_bindings(session_id,binding_id) SELECT session_id,?4 FROM subject_session_attributions WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3",params![host.subject_id,attr.runtime_id,attr.worker_id,binding])?;
             tx.execute("UPDATE journal_generations SET active=0 WHERE journal_id IN (SELECT j.id FROM journals j JOIN subject_session_attributions a ON a.session_id=j.source_session_id WHERE a.subject_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![host.subject_id,attr.runtime_id,attr.worker_id])?;
+            Ok(())
+        })
+    }
+
+    /// Release producer occupancy only after the Host has durably retained the
+    /// complete frozen originals and their recording responsibility. Job generations
+    /// and checkpoints remain unchanged; ordinary removal is not Session erasure.
+    pub fn release_retained_journal_writer(
+        &self,
+        binding: &JournalWriterBinding,
+    ) -> JournalResult<()> {
+        self.database.try_transaction(|tx| {
+            crate::require_subject_in_connection(tx, &binding.subject_id)?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM journal_writer_bindings WHERE binding_id=?1 AND subject_id=?2 AND runtime_id=?3 AND worker_id=?4)",
+                params![binding.binding_id, binding.subject_id, binding.runtime_id, binding.worker_id],
+                |r| r.get(0),
+            )?;
+            if !exists { return Err(denied()); }
+            tx.execute("INSERT OR IGNORE INTO journal_session_bindings(session_id,binding_id) SELECT session_id,?4 FROM subject_session_attributions WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3", params![binding.subject_id,binding.runtime_id,binding.worker_id,binding.binding_id])?;
+            let foreign: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_session_attributions a JOIN journal_session_bindings s ON s.session_id=a.session_id WHERE a.subject_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 AND s.binding_id<>?4)", params![binding.subject_id,binding.runtime_id,binding.worker_id,binding.binding_id], |r|r.get(0))?;
+            if foreign { return Err(JournalError::Conflict("retained Session belongs to a different body lifetime".into())); }
+            tx.execute("UPDATE journal_writer_bindings SET active=0 WHERE binding_id=?1", [&binding.binding_id])?;
             Ok(())
         })
     }

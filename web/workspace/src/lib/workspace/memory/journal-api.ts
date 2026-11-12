@@ -29,6 +29,19 @@ export type SourceStatus = {
   state: "missing" | "unavailable";
   history_href: string | null;
 };
+export type RetainedRecording = {
+  producer: "released" | "removing" | "removed";
+  completed: boolean;
+  cause:
+    | "recording_disabled"
+    | "source_unavailable"
+    | "ownership_unknown"
+    | "job_pending"
+    | "job_failed"
+    | "execution_unconfirmed"
+    | "storage_unavailable"
+    | null;
+};
 export type JournalPage<T> = { items: T[]; next: string | null };
 export type TextPage = {
   text: string;
@@ -67,6 +80,7 @@ export type JournalResponses = {
     {
       journal: JournalMetadata;
       unreflected_sources: boolean;
+      retained_recording: RetainedRecording | null;
       original_source: SourceStatus;
     }
   >;
@@ -221,6 +235,31 @@ function sourceStatus(value: unknown): SourceStatus {
     history_href: href,
   };
 }
+function retainedRecording(value: unknown): RetainedRecording | null {
+  if (value === null) return null;
+  const v = object(value);
+  const completed = boolean(v.completed);
+  const cause = v.cause === null ? null : choice(
+    v.cause,
+    [
+      "recording_disabled",
+      "source_unavailable",
+      "ownership_unknown",
+      "job_pending",
+      "job_failed",
+      "execution_unconfirmed",
+      "storage_unavailable",
+    ] as const,
+  );
+  if (completed && cause !== null) {
+    throw new Error("Completed recording has a pending cause");
+  }
+  return {
+    producer: choice(v.producer, ["released", "removing", "removed"]),
+    completed,
+    cause,
+  };
+}
 function page<T>(value: unknown, parse: (v: unknown) => T): JournalPage<T> {
   const v = object(value);
   return { items: array(v.items, parse), next: nullable(v.next, text) };
@@ -281,6 +320,7 @@ export function parseJournalResponse<K extends keyof JournalResponses>(
         return {
           journal,
           unreflected_sources: boolean(i.unreflected_sources),
+          retained_recording: retainedRecording(i.retained_recording),
           original_source: sourceStatus(i.original_source),
         };
       });
@@ -412,7 +452,9 @@ export function journalHref(
     if (value != null && value !== "") params.set(key, value);
   }
   const suffix = params.toString();
-  return `${subjectJournalHref(workspaceId, subjectId)}${suffix ? `?${suffix}` : ""}`;
+  return `${subjectJournalHref(workspaceId, subjectId)}${
+    suffix ? `?${suffix}` : ""
+  }`;
 }
 export function boundedParam(
   params: URLSearchParams,

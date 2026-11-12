@@ -369,6 +369,8 @@ impl FailureTail {
         tail.push((130, super::backend_job_current::MIGRATION_NAME));
         tail.push((131, crate::launch_policy::MIGRATION_NAME));
         tail.push((133, crate::subject_policy::MIGRATION_NAME));
+        tail.push((134, super::backend_job_finalizing::MIGRATION_NAME));
+        tail.push((135, super::subject_release_recording_store::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -1025,6 +1027,30 @@ fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
         shape.extend(extension_shape(
             crate::backend_job::INPUT_RETENTION_TRIGGERS,
         )?);
+    }
+    if current >= 134 {
+        let (_, _, fields) = shape
+            .get_mut("backend_jobs")
+            .ok_or_else(|| invalid("missing Job table"))?;
+        for (old, new) in [
+            (
+                "CHECK (state IN ('pending', 'completed', 'failed'))",
+                "CHECK (state IN ('pending', 'finalizing', 'completed', 'failed'))",
+            ),
+            (
+                "CHECK ((state = 'completed') = (result_json IS NOT NULL))",
+                "CHECK ((state = 'completed' AND result_json IS NOT NULL) OR (state = 'finalizing') OR (state IN ('pending','failed') AND result_json IS NULL))",
+            ),
+        ] {
+            let old = tokens(old)?;
+            let new = tokens(new)?;
+            let index = fields
+                .windows(old.len())
+                .position(|w| w == old)
+                .ok_or_else(|| invalid("missing old Job CHECK"))?;
+            fields.splice(index..index + old.len(), new);
+        }
+        *fields = declarations(fields.clone())?;
     }
     Ok(shape)
 }

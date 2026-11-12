@@ -55,6 +55,50 @@ const journal = {
   updated_at: entry.updated_at,
 };
 const original = { state: "missing", history_href: null };
+Deno.test("Journal retained recording does not infer completion from removal or admitted coverage", () => {
+  const response = (retained_recording: unknown) => ({
+    kind: "sessions",
+    value: {
+      items: [{
+        journal,
+        unreflected_sources: false,
+        original_source: original,
+        retained_recording,
+      }],
+      next: null,
+    },
+  });
+  for (const producer of ["released", "removing", "removed"]) {
+    const pending = { producer, completed: false, cause: "job_failed" };
+    assertEquals(
+      parseJournalResponse(response(pending), "sessions", "subject").items[0]
+        .retained_recording,
+      pending,
+    );
+    const completed = { producer, completed: true, cause: null };
+    assertEquals(
+      parseJournalResponse(response(completed), "sessions", "subject").items[0]
+        .retained_recording,
+      completed,
+    );
+  }
+  assertEquals(
+    parseJournalResponse(response(null), "sessions").items[0]
+      .retained_recording,
+    null,
+  );
+  for (
+    const invalid of [
+      undefined,
+      {},
+      { producer: "missing", completed: false, cause: null },
+      { producer: "removed", completed: true, cause: "job_failed" },
+      { producer: "released", completed: false, cause: "arbitrary_text" },
+    ]
+  ) {
+    assertThrows(() => parseJournalResponse(response(invalid), "sessions"));
+  }
+});
 Deno.test("Journal parser preserves missing originals independently of linked saved entries", () => {
   const value = {
     selector,

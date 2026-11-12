@@ -650,6 +650,14 @@ impl WorkspaceApi {
                 .host_executors
                 .cleanup()?
                 .run(move || {
+                    let job = api.store.get_backend_job(api.workspace_id(), &owner.job_id)?
+                        .ok_or_else(|| Error::Store("Cleanup Job disappeared".into()))?;
+                    if matches!(job.state, BackendJobState::Completed | BackendJobState::Failed) {
+                        return Ok(());
+                    }
+                    if job.state != BackendJobState::Finalizing {
+                        return Err(Error::RepositoryConflict("Job has no accepted outcome to finalize".into()));
+                    }
                     // Observe before preflight: a failure may diagnose only this
                     // exact row/history, never a successor or intervening progress.
                     let history = api
@@ -667,6 +675,11 @@ impl WorkspaceApi {
                         return Err(Error::RepositoryConflict(
                             "Cleanup execution owner changed before preflight".into(),
                         ));
+                    }
+                    // Cleanup completion is a validated recovery checkpoint; reopening
+                    // must not re-fence a released owner or require its removed Host resource.
+                    if observed.worker_cleanup_state == Some(BackendJobWorkerCleanupState::Completed) {
+                        return api.finish_backend_job_cleanup_retirement(&owner.job_id, &owner.attempt_id);
                     }
                     // Every cleanup caller, including its blocking descendants, holds
                     // the original admission resource exclusively through actual return.
@@ -1521,8 +1534,12 @@ impl WorkspaceApi {
             .store
             .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)?
             .ok_or_else(|| Error::Store("Cleaned Job attempt disappeared".into()))?;
-        self.require_backend_job_attempt_effects_ended(&current)?;
-        if current.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed) {
+        // Cleanup completion validates the exact fence at its commit boundary.
+        // Resume retirement from that checkpoint, including migrated history whose
+        // already released owners no longer have execution receipts.
+        if !current.state.terminal()
+            || current.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+        {
             return Err(Error::RepositoryConflict(
                 "Canonical Job cleanup not completed".into(),
             ));
@@ -1531,20 +1548,24 @@ impl WorkspaceApi {
             .store
             .get_backend_job(self.workspace_id(), job_id)?
             .ok_or_else(|| Error::Store("Cleaned Job disappeared".into()))?;
+        // The exact execution and Host effects have ended. Revoke recording
+        // ownership before retiring input or publishing whole-Job completion.
+        subjektiv_journal::close(self, &job.request, &current)?;
         if job.request.grants.subjektiv_journal.is_some()
-            && job.state == BackendJobState::Completed
+            && job.state == BackendJobState::Finalizing
             && job.current_attempt == current.attempt
             && current.state == BackendJobAttemptState::Completed
             && job.input_disposition != crate::backend_job::JobInputDisposition::Erased
         {
-            // Input retirement is later than execution termination and cleanup.
-            // Check every historical owner, not just the latest terminal result.
+            // Input retirement follows every owner's committed cleanup, just as
+            // common Job finalization does. Do not re-fence released history.
             for prior in self
                 .store
                 .list_backend_job_attempts(self.workspace_id(), job_id)?
             {
-                self.require_backend_job_attempt_effects_ended(&prior)?;
-                if prior.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed) {
+                if !prior.state.terminal()
+                    || prior.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+                {
                     return Err(Error::RepositoryConflict(
                         "Historical Job cleanup not completed".into(),
                     ));
@@ -1558,9 +1579,26 @@ impl WorkspaceApi {
                     crate::backend_job::JobInputRetirementReason::Completed,
                 )?;
             }
-            subjektiv_journal::drain_after_completion(self, &job.request);
+        }
+        let job = self.store.finalize_backend_job(
+            self.workspace_id(),
+            job_id,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        )?;
+        if job.state == BackendJobState::Completed {
+            notification_delivery::deliver_job_result(
+                self,
+                &crate::backend_job::BackendJobResultAcceptance {
+                    job: job.clone(),
+                    attempt: current.clone(),
+                    replayed: false,
+                },
+            );
         }
         if job.request.grants.subjektiv_journal.is_some() {
+            if job.state == BackendJobState::Completed {
+                subjektiv_journal::drain_after_completion(self, &job.request);
+            }
             subjektiv_journal::resume_after_execution_cleanup(self, &job, &current)?;
         }
         // Only after durable fences/retirement may live bookkeeping be forgotten.

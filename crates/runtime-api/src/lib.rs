@@ -1425,6 +1425,22 @@ pub struct SubjectReleaseRecordingScope {
     pub members: Vec<WorkerRemovalSessionMember>,
 }
 
+/// Bounded read from the saved live-source union of one exact Subject release.
+/// Reserved scopes may be read for validation; this is not release completion or
+/// permission to dispatch a recording Job. After Remove, use removal capture.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectReleaseSessionCaptureRequest {
+    pub workspace_id: String,
+    pub operation_id: String,
+    pub binding_id: String,
+    pub session_id: session_store::SessionId,
+    pub active_segment_id: Option<session_store::SegmentId>,
+    pub start: session_store::capture::RecordingPosition,
+    pub max_entries: usize,
+    pub max_serialized_bytes: usize,
+}
+
 /// Irreversibly fence an unpublished failed Subject create. Exact retries must retain
 /// all four fields; this is distinct from releasing an existing Subject Controller.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1518,6 +1534,17 @@ pub trait RuntimeApi {
         &self,
         #[body] request: SubjectReleaseRequest,
     ) -> Result<SubjectReleaseResponse, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/release-capture",
+        status = 200,
+        error_status = 400
+    )]
+    async fn capture_subject_release_session(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: SubjectReleaseSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError>;
 
     #[get("/v1/ping", status = 200, error_status = 400)]
     async fn ping(
@@ -1795,6 +1822,17 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[body] request: WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRemovalFreeze, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/archive",
+        status = 200,
+        error_status = 400
+    )]
+    async fn publish_worker_removal_archive(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerSessionArchiveManifest, RuntimeApiError>;
 
     #[post(
         "/v1/workers/{worker_id}/retention/capture",
@@ -2472,6 +2510,39 @@ mod tests {
             assert_eq!(_worker_id, _request.worker_id.to_string());
             Err(test_error(409))
         }
+        async fn publish_worker_removal_archive(
+            &self,
+            worker_id: String,
+            request: WorkerRetentionExecutionRequest,
+        ) -> Result<WorkerSessionArchiveManifest, RuntimeApiError> {
+            assert_eq!(worker_id, request.worker_id.to_string());
+            Err(test_error(409))
+        }
+        async fn capture_subject_release_session(
+            &self,
+            worker_id: String,
+            request: SubjectReleaseSessionCaptureRequest,
+        ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError> {
+            assert_eq!(worker_id, "release-worker");
+            assert_eq!(request.workspace_id, "workspace-a");
+            assert_eq!(request.operation_id, "release-operation");
+            assert_eq!(request.binding_id, "release-binding");
+            assert_eq!(request.start.canonical_order, 11);
+            assert_eq!(request.start.byte_offset, 3);
+            assert_eq!(request.max_entries, 3);
+            assert_eq!(request.max_serialized_bytes, 128 * 1024);
+            Ok(session_store::capture::RecordingCaptureSlice {
+                capture: session_store::capture::CaptureDto {
+                    version: 1,
+                    session_id: request.session_id.to_string(),
+                    segment_id: request.active_segment_id.unwrap().to_string(),
+                    view_entry_count: 11,
+                    entries: Vec::new(),
+                },
+                next: None,
+            })
+        }
+
         async fn capture_worker_removal_session(
             &self,
             _worker_id: String,
@@ -2567,6 +2638,16 @@ mod tests {
         assert!(
             matches!(freeze_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
         );
+        let archive_error = client
+            .publish_worker_removal_archive(
+                purge.removal.worker_id.to_string(),
+                purge.removal.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(archive_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
+        );
         let capture_error = client
             .capture_worker_removal_session(
                 purge.removal.worker_id.to_string(),
@@ -2588,6 +2669,39 @@ mod tests {
         assert!(
             matches!(capture_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
         );
+        let release_capture = SubjectReleaseSessionCaptureRequest {
+            workspace_id: "workspace-a".into(),
+            operation_id: "release-operation".into(),
+            binding_id: "release-binding".into(),
+            session_id: session_store::new_session_id(),
+            active_segment_id: Some(session_store::new_segment_id()),
+            start: session_store::capture::RecordingPosition {
+                canonical_order: 11,
+                byte_offset: 3,
+            },
+            max_entries: 3,
+            max_serialized_bytes: 128 * 1024,
+        };
+        let captured = client
+            .capture_subject_release_session("release-worker".into(), release_capture.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            captured.capture.session_id,
+            release_capture.session_id.to_string()
+        );
+        assert_eq!(
+            captured.capture.segment_id,
+            release_capture.active_segment_id.unwrap().to_string()
+        );
+        assert!(captured.next.is_none());
+        let mut wire = serde_json::to_value(&release_capture).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SubjectReleaseSessionCaptureRequest>(wire.clone()).unwrap(),
+            release_capture
+        );
+        wire["descriptors"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<SubjectReleaseSessionCaptureRequest>(wire).is_err());
         let summary = client.runtime_summary().await.unwrap();
         assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));
         let workers = client

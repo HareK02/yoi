@@ -146,7 +146,12 @@ pub(super) fn check_host(
             return Err(JournalError::PermissionDenied("Subject is retired".into()));
         }
         check_session_host(store, tx, host)?;
-        super::binding::check_writer(tx, host)?;
+        match &host.authority {
+            JournalHostAuthority::Session { .. } => super::binding::check_writer(tx, host)?,
+            JournalHostAuthority::RecordingSource | JournalHostAuthority::RecordingJob { .. } => {
+                super::lifecycle::reject_erased(tx, host)?;
+            }
+        }
     }
     Ok(())
 }
@@ -157,6 +162,13 @@ pub(super) fn journal(
     write: bool,
 ) -> JournalResult<Journal> {
     let j = tx.query_row("SELECT id, subject_id, source_session_id, title, current_position, process_order, process_byte, state_token, created_at, updated_at FROM journals WHERE id=?1 AND subject_id=?2", params![id, host.subject_id], |r| Ok(Journal { id:r.get(0)?, subject_id:r.get(1)?, source_session_id:r.get(2)?, title:r.get(3)?, current_position:r.get(4)?, process_order:r.get(5)?, process_byte:r.get(6)?, state_token:r.get(7)?, created_at:r.get(8)?, updated_at:r.get(9)? })).optional()?.ok_or_else(|| JournalError::NotFound(id.into()))?;
+    if let JournalHostAuthority::RecordingJob { journal_id, .. } = &host.authority {
+        if id != journal_id {
+            return Err(JournalError::PermissionDenied(
+                "different Host-bound Journal".into(),
+            ));
+        }
+    }
     if write
         && host.attribution.as_ref().map(|a| a.session_id.as_str())
             != Some(j.source_session_id.as_str())
@@ -370,6 +382,7 @@ fn generation(
     let raw:Option<(String,bool)>=tx.query_row("SELECT g.snapshot_json,g.active FROM journal_generations g JOIN journals j ON j.id=g.journal_id WHERE g.id=?1 AND j.subject_id=?2",params![id,host.subject_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let (raw, active) = raw.ok_or_else(|| JournalError::NotFound(id.into()))?;
     let snapshot: JournalGeneration = serde_json::from_str(&raw)?;
+    host.require_job_binding(&snapshot.job)?;
     journal(tx, host, &snapshot.journal_id, true)?;
     Ok((snapshot, active))
 }
@@ -559,6 +572,7 @@ impl SubjektivStore {
     ) -> JournalResult<JournalGeneration> {
         label(&binding.job_id)?;
         label(&binding.attempt_id)?;
+        host.require_job_binding(&binding)?;
         self.journal_transaction(|tx| {
             check_host(self,tx,host,true)?;let j=journal(tx,host,id,true)?;
             let request=serde_json::to_string(&selected_ranges)?;
@@ -582,6 +596,7 @@ impl SubjektivStore {
     ) -> JournalResult<JournalGeneration> {
         label(&binding.job_id)?;
         label(&binding.attempt_id)?;
+        host.require_job_binding(&binding)?;
         self.journal_transaction(|tx| {
             check_host(self, tx, host, false)?;
             check_session_host(self, tx, host)?;
@@ -638,6 +653,7 @@ impl SubjektivStore {
         generation_id: &str,
         binding: &JobAttemptBinding,
     ) -> JournalResult<()> {
+        host.require_job_binding(binding)?;
         self.journal_transaction(|tx| {
             check_host(self, tx, host, true)?;
             let (g, _) = generation(tx, host, generation_id)?;
@@ -661,6 +677,7 @@ impl SubjektivStore {
         id: &str,
         binding: &JobAttemptBinding,
     ) -> JournalResult<Option<JournalGeneration>> {
+        host.require_job_binding(binding)?;
         self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             check_session_host(self, tx, host)?;

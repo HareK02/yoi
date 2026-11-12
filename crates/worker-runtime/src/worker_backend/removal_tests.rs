@@ -257,9 +257,61 @@ fn removal_freezes_real_stopped_owner_captures_all_sessions_and_survives_reopen(
             )
             .unwrap();
 
+        assert!(
+            runtime
+                .publish_worker_removal_archive_scoped(&scope, &removal)
+                .is_err(),
+            "publication requires a persisted freeze and an archive disposition"
+        );
         let frozen = runtime
             .freeze_worker_removal_scoped(&scope, &removal)
             .unwrap();
+        let published = if disposition == SessionDisposition::Archive {
+            let manifest = runtime
+                .publish_worker_removal_archive_scoped(&scope, &removal)
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .publish_worker_removal_archive_scoped(&scope, &removal)
+                    .unwrap(),
+                manifest
+            );
+            assert!(
+                sources.worker_root().exists(),
+                "publication must not delete the producer"
+            );
+            assert_eq!(
+                crate::retention::runtime_session_retention(root.path())
+                    .pins(retained_session)
+                    .unwrap(),
+                vec![pin.clone()]
+            );
+            let archive_root = root
+                .path()
+                .join("archives/workers")
+                .join(&manifest.archive_id);
+            let manifest_path = archive_root.join("manifest.json");
+            let bytes = std::fs::read(&manifest_path).unwrap();
+            std::fs::write(&manifest_path, b"invalid archive manifest").unwrap();
+            assert!(
+                runtime
+                    .publish_worker_removal_archive_scoped(&scope, &removal)
+                    .is_err()
+            );
+            assert!(
+                sources.worker_root().exists(),
+                "a failed replay must preserve the original"
+            );
+            std::fs::write(manifest_path, bytes).unwrap();
+            Some(manifest)
+        } else {
+            assert!(
+                runtime
+                    .publish_worker_removal_archive_scoped(&scope, &removal)
+                    .is_err()
+            );
+            None
+        };
         assert_eq!(frozen.members.len(), 2);
         assert_eq!(
             runtime
@@ -300,6 +352,31 @@ fn removal_freezes_real_stopped_owner_captures_all_sessions_and_survives_reopen(
                 .is_err()
         );
         assert!(runtime.execute_worker_retention(&conflicting).is_err());
+        assert!(
+            runtime
+                .publish_worker_removal_archive_scoped(&scope, &conflicting)
+                .is_err()
+        );
+        let captures = frozen
+            .members
+            .iter()
+            .filter(|member| member.materialized)
+            .map(|member| {
+                let capture = runtime
+                    .capture_worker_removal_session_scoped(
+                        &scope,
+                        &removal.operation_id,
+                        worker.worker_id,
+                        member.session_id,
+                        member.active_segment_id,
+                        Default::default(),
+                        4096,
+                        4 * 1024 * 1024,
+                    )
+                    .unwrap();
+                (member.session_id, member.active_segment_id, capture)
+            })
+            .collect::<Vec<_>>();
         let mut position = Default::default();
         let mut body = String::new();
         loop {
@@ -359,21 +436,65 @@ fn removal_freezes_real_stopped_owner_captures_all_sessions_and_survives_reopen(
                 .unwrap(),
             frozen
         );
-        assert!(
-            reopened.execute_worker_retention(&removal).is_err(),
-            "originals must remain until consumer release, including Archive"
-        );
-        assert!(sources.worker_root().exists());
-        reopened
-            .release_session_public_source_pin_scoped(
-                &scope,
-                &source,
-                &retained_session.to_string(),
-                pin,
-            )
-            .unwrap();
+        if removal.session_disposition == SessionDisposition::Purge {
+            assert!(reopened.execute_worker_retention(&removal).is_err());
+            assert!(sources.worker_root().exists());
+            reopened
+                .release_session_public_source_pin_scoped(
+                    &scope,
+                    &source,
+                    &retained_session.to_string(),
+                    pin.clone(),
+                )
+                .unwrap();
+        }
         let done = reopened.execute_worker_retention(&removal).unwrap();
         if let Some(manifest) = &done.archive {
+            assert_eq!(
+                crate::retention::runtime_session_retention(root.path())
+                    .pins(retained_session)
+                    .unwrap(),
+                vec![pin.clone()]
+            );
+            assert!(
+                reopened
+                    .delete_session_public_source_scoped(
+                        &scope,
+                        &runtime_api::SessionPublicSource::Archived {
+                            archive_id: manifest.archive_id.clone()
+                        },
+                        &retained_session.to_string(),
+                        session_store::retention::SessionDeletionIntent::Ordinary,
+                    )
+                    .is_err(),
+                "ordinary GC must still respect the transferred recording pin"
+            );
+            assert_eq!(published.as_ref(), Some(manifest));
+            assert!(!sources.worker_root().exists());
+            assert_eq!(
+                reopened
+                    .publish_worker_removal_archive_scoped(&scope, &removal)
+                    .unwrap(),
+                *manifest
+            );
+            for (session, segment, capture) in &captures {
+                assert_eq!(
+                    reopened
+                        .capture_worker_removal_session_scoped(
+                            &scope,
+                            &removal.operation_id,
+                            worker.worker_id,
+                            *session,
+                            *segment,
+                            Default::default(),
+                            4096,
+                            4 * 1024 * 1024,
+                        )
+                        .unwrap(),
+                    *capture,
+                    "all frozen originals remain readable without the original Worker"
+                );
+            }
             assert_eq!(manifest.retained_sessions.len(), 1);
             let saved = root
                 .path()
@@ -401,6 +522,26 @@ fn removal_freezes_real_stopped_owner_captures_all_sessions_and_survives_reopen(
                 saved.exists(),
                 "erasing the primary Session must preserve unrelated retained Sessions"
             );
+            let retained_capture = captures
+                .iter()
+                .find(|(session, _, _)| *session == retained_session)
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .capture_worker_removal_session_scoped(
+                        &scope,
+                        &removal.operation_id,
+                        worker.worker_id,
+                        retained_session,
+                        Some(retained_segment),
+                        Default::default(),
+                        4096,
+                        4 * 1024 * 1024,
+                    )
+                    .unwrap(),
+                retained_capture.2,
+                "erasing another Session must not block this recording"
+            );
             // At the provider boundary, explicit whole-Subject erasure must
             // fence every archived Session, even after primary-only erasure.
             // The canonical removal/Stop receipt above is real and unchanged.
@@ -423,6 +564,26 @@ fn removal_freezes_real_stopped_owner_captures_all_sessions_and_survives_reopen(
                 Err(session_store::StoreError::SessionErased(id)) if id == retained_session
             ));
             assert!(retention.pins(retained_session).unwrap().is_empty());
+            assert!(
+                reopened
+                    .publish_worker_removal_archive_scoped(&scope, &removal)
+                    .is_err()
+            );
+            assert!(
+                reopened
+                    .capture_worker_removal_session_scoped(
+                        &scope,
+                        &removal.operation_id,
+                        worker.worker_id,
+                        retained_session,
+                        Some(retained_segment),
+                        Default::default(),
+                        4096,
+                        4 * 1024 * 1024,
+                    )
+                    .is_err(),
+                "explicit erasure must fence saved archive capture"
+            );
             // Explicit per-Session erasure remains idempotent after whole-owner
             // cleanup; ownership and the historical receipt remain resolvable.
             reopened
@@ -522,9 +683,13 @@ fn planned_retention_reopens_after_history_erasure_with_saved_stop() {
     archive.input_fingerprint = "archive-before-erasure-input".into();
     archive.session_disposition = SessionDisposition::Archive;
     archive.archive_id = Some("archive-before-erasure".into());
-    runtime.freeze_worker_removal_scoped(&scope, &archive).unwrap();
-    assert!(runtime.execute_worker_retention(&request).is_err(),
-        "ordinary policy changes cannot replace a frozen operation");
+    runtime
+        .freeze_worker_removal_scoped(&scope, &archive)
+        .unwrap();
+    assert!(
+        runtime.execute_worker_retention(&request).is_err(),
+        "ordinary policy changes cannot replace a frozen operation"
+    );
     runtime
         .delete_session_public_source_scoped(
             &scope,
@@ -633,7 +798,9 @@ fn check_pending_retention_erasure_recovery(restart: bool) {
         .pin_session_public_source_scoped(&scope, &source, &sibling.to_string(), pin)
         .unwrap();
     let request = removal_request(worker.worker_id);
-    runtime.freeze_worker_removal_scoped(&scope, &request).unwrap();
+    runtime
+        .freeze_worker_removal_scoped(&scope, &request)
+        .unwrap();
     // The real provider saves its pending receipt before ordinary deletion
     // encounters the consumer pin. No receipt or completion proof is fabricated.
     let error = runtime.execute_worker_retention(&request).unwrap_err();
@@ -662,8 +829,14 @@ fn check_pending_retention_erasure_recovery(restart: bool) {
             SessionDeletionIntent::ErasePermanently,
         )
         .unwrap();
-    runtime.delete_session_public_source_scoped(&scope, &source, &sibling.to_string(),
-        SessionDeletionIntent::ErasePermanently).unwrap();
+    runtime
+        .delete_session_public_source_scoped(
+            &scope,
+            &source,
+            &sibling.to_string(),
+            SessionDeletionIntent::ErasePermanently,
+        )
+        .unwrap();
     assert!(!owner.worker_root().join("session").exists());
     assert!(owner.worker_root().join("worker.json").exists());
     if !restart {
@@ -673,7 +846,8 @@ fn check_pending_retention_erasure_recovery(restart: bool) {
         let completed = runtime.execute_worker_retention(&request).unwrap();
         assert!(completed.source_removed);
         assert_eq!(completed.operation_id, request.operation_id);
-        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
         assert_eq!(saved["request"], pending["request"]);
         assert_eq!(saved["shutdown"], pending["shutdown"]);
         assert_eq!(saved["result"]["source_removed"], true);
@@ -700,9 +874,15 @@ fn check_pending_retention_erasure_recovery(restart: bool) {
     changed.input_fingerprint = "different-removal-input".into();
     assert!(reopened.execute_worker_retention(&changed).is_err());
     changed.operation_id = "replacement-must-not-reparent".into();
-    assert!(reopened.execute_worker_retention(&changed).is_err(),
-        "even full explicit erasure must preserve an issued original receipt");
-    assert_eq!(std::fs::read(&receipt_path).unwrap(), pending_bytes, "pending receipt must remain unchanged");
+    assert!(
+        reopened.execute_worker_retention(&changed).is_err(),
+        "even full explicit erasure must preserve an issued original receipt"
+    );
+    assert_eq!(
+        std::fs::read(&receipt_path).unwrap(),
+        pending_bytes,
+        "pending receipt must remain unchanged"
+    );
     assert!(owner.worker_root().exists());
     let completed = reopened.execute_worker_retention(&request).unwrap();
     assert!(completed.source_removed);
@@ -971,6 +1151,22 @@ impl ReleaseFixture {
     }
 }
 
+fn release_capture_request(
+    release: &runtime_api::SubjectReleaseRequest,
+    member: &runtime_api::WorkerRemovalSessionMember,
+) -> runtime_api::SubjectReleaseSessionCaptureRequest {
+    runtime_api::SubjectReleaseSessionCaptureRequest {
+        workspace_id: release.workspace_id.clone(),
+        operation_id: release.operation_id.clone(),
+        binding_id: release.binding_id.clone(),
+        session_id: member.session_id,
+        active_segment_id: member.active_segment_id,
+        start: Default::default(),
+        max_entries: 4096,
+        max_serialized_bytes: 4 * 1024 * 1024,
+    }
+}
+
 #[test]
 #[serial_test::serial(worker_allocation)]
 fn subject_release_scope_fixes_multiple_sessions_and_detached_branches_until_exact_cancel() {
@@ -1019,7 +1215,10 @@ fn subject_release_scope_fixes_multiple_sessions_and_detached_branches_until_exa
         .create_segment(
             session,
             branch,
-            &[seed(session, "retained detached original")],
+            &[seed(
+                session,
+                &"retained detached original UTF-8 🦀\\\"\n".repeat(6000),
+            )],
         )
         .unwrap();
     let mut request = fixture.request();
@@ -1056,6 +1255,138 @@ fn subject_release_scope_fixes_multiple_sessions_and_detached_branches_until_exa
         main.descriptors.len() >= 3,
         "active input/result and detached original must be present"
     );
+    // Reserved scopes support validation reads, not recording dispatch. Rebuild
+    // every canonical original through bounded pages, including detached branches.
+    for member in &scope.members {
+        let mut capture = release_capture_request(&request, member);
+        capture.max_entries = 1;
+        capture.max_serialized_bytes = 16 * 1024;
+        let mut bodies = vec![String::new(); member.descriptors.len()];
+        let mut pages = 0;
+        loop {
+            let slice = fixture
+                .runtime
+                .capture_subject_release_session_scoped(
+                    &fixture.scope,
+                    fixture.worker.worker_id,
+                    &capture,
+                )
+                .unwrap();
+            assert!(serde_json::to_vec(&slice).unwrap().len() <= capture.max_serialized_bytes);
+            assert!(slice.capture.entries.len() <= capture.max_entries);
+            assert_eq!(slice.capture.view_entry_count, member.end.canonical_order);
+            for entry in slice.capture.entries {
+                let session_store::capture::CaptureBody::CanonicalPublic {
+                    descriptor,
+                    byte_offset,
+                    text,
+                    ..
+                } = entry.body
+                else {
+                    panic!("release capture must preserve canonical originals");
+                };
+                let order = entry.order as usize;
+                assert_eq!(descriptor, member.descriptors[order]);
+                assert_eq!(byte_offset, bodies[order].len() as u64);
+                bodies[order].push_str(&text);
+            }
+            pages += 1;
+            assert!(pages < 1000, "bounded capture must make progress");
+            match slice.next {
+                Some(next) => {
+                    assert_ne!(next, capture.start);
+                    capture.start = next;
+                }
+                None => break,
+            }
+        }
+        use sha2::Digest;
+        for (body, descriptor) in bodies.iter().zip(&member.descriptors) {
+            assert_eq!(body.len() as u64, descriptor.total_bytes);
+            assert_eq!(
+                sha2::Sha256::digest(body.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+                descriptor.sha256
+            );
+        }
+        if member.session_id == session {
+            assert!(
+                pages > member.descriptors.len(),
+                "large originals must be byte-sliced"
+            );
+        }
+    }
+    let capture_request = release_capture_request(&request, retained);
+    let capture = |request: &runtime_api::SubjectReleaseSessionCaptureRequest| {
+        fixture.runtime.capture_subject_release_session_scoped(
+            &fixture.scope,
+            fixture.worker.worker_id,
+            request,
+        )
+    };
+    for changed in 0..10 {
+        let mut invalid = capture_request.clone();
+        match changed {
+            0 => invalid.workspace_id = "another-workspace".into(),
+            1 => invalid.operation_id = "another-operation".into(),
+            2 => invalid.binding_id = "another-binding".into(),
+            3 => invalid.session_id = session_store::new_session_id(),
+            4 => invalid.active_segment_id = Some(branch),
+            5 => invalid.active_segment_id = None,
+            6 => invalid.max_entries = 0,
+            7 => invalid.max_entries = 4097,
+            8 => invalid.max_serialized_bytes = 1023,
+            _ => invalid.max_serialized_bytes = 4 * 1024 * 1024 + 1,
+        }
+        assert!(
+            capture(&invalid).is_err(),
+            "changed capture field {changed}"
+        );
+    }
+    assert!(
+        fixture
+            .runtime
+            .capture_subject_release_session_scoped(
+                &fixture.scope,
+                WorkerId::now_v7(),
+                &capture_request,
+            )
+            .is_err()
+    );
+    // Tamper a real saved original outside the first requested page. The full
+    // union must be verified even when only one entry is requested.
+    for path in [
+        owner
+            .worker_root()
+            .join("session/segments")
+            .join(format!("{detached}.jsonl")),
+        owner
+            .retained_root()
+            .join(session.to_string())
+            .join(format!("{branch}.jsonl")),
+    ] {
+        let original = std::fs::read(&path).unwrap();
+        let changed = String::from_utf8(original.clone())
+            .unwrap()
+            .replace("detached original", "modified original");
+        assert_ne!(changed.as_bytes(), original.as_slice());
+        std::fs::write(&path, changed).unwrap();
+        let member = if path.starts_with(owner.retained_root()) {
+            retained
+        } else {
+            main
+        };
+        let mut invalid = release_capture_request(&request, member);
+        invalid.max_entries = 1;
+        assert!(matches!(
+            capture(&invalid),
+            Err(crate::error::RuntimeError::RecordingSourceUnavailable { .. })
+        ));
+        std::fs::write(path, original).unwrap();
+        capture(&invalid).unwrap();
+    }
     assert_eq!(
         fixture
             .runtime
@@ -1063,6 +1394,40 @@ fn subject_release_scope_fixes_multiple_sessions_and_detached_branches_until_exa
             .unwrap(),
         held
     );
+    let fence_bytes = std::fs::read(owner.release_fence_path()).unwrap();
+    std::fs::remove_file(owner.release_fence_path()).unwrap();
+    assert!(
+        capture(&capture_request).is_err(),
+        "no ordinary active capture fallback"
+    );
+    std::fs::write(owner.release_fence_path(), &fence_bytes).unwrap();
+    for (section, field) in [
+        ("request", "workspace_id"),
+        ("request", "worker_id"),
+        ("request", "binding_id"),
+        ("request", "operation_id"),
+        ("recording_scope", "workspace_id"),
+        ("recording_scope", "worker_id"),
+        ("recording_scope", "source_runtime_id"),
+    ] {
+        let mut saved: serde_json::Value = serde_json::from_slice(&fence_bytes).unwrap();
+        saved[section][field] = if field == "worker_id" {
+            serde_json::to_value(WorkerId::now_v7()).unwrap()
+        } else {
+            serde_json::json!("different-identity")
+        };
+        std::fs::write(
+            owner.release_fence_path(),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            capture(&capture_request).is_err(),
+            "saved {section}.{field} must match"
+        );
+    }
+    std::fs::write(owner.release_fence_path(), &fence_bytes).unwrap();
+    capture(&capture_request).unwrap();
     let append = || {
         producer.append(
             session,
@@ -1111,6 +1476,14 @@ fn subject_release_scope_fixes_multiple_sessions_and_detached_branches_until_exa
         .subject_release_scoped(&fixture.scope, request.clone())
         .unwrap();
     assert!(!owner.release_fence_path().exists());
+    assert!(
+        capture(&capture_request).is_err(),
+        "cancelled scope cannot be captured"
+    );
+    // Even a stale fence left by interrupted cancellation is not read authority.
+    std::fs::write(owner.release_fence_path(), &fence_bytes).unwrap();
+    assert!(capture(&capture_request).is_err());
+    std::fs::remove_file(owner.release_fence_path()).unwrap();
     append().unwrap();
     let old_cancel = request.clone();
     request.operation_id = "release-2".into();
@@ -1133,6 +1506,13 @@ fn subject_release_scope_fixes_multiple_sessions_and_detached_branches_until_exa
         .subject_release_scoped(&fixture.scope, request.clone())
         .unwrap();
     assert!(append().is_err(), "disconnected body remains NoPublication");
+    assert!(
+        capture(&capture_request).is_err(),
+        "new release cannot revive old capture identity"
+    );
+    let mut disconnected_capture = capture_request.clone();
+    disconnected_capture.operation_id = request.operation_id.clone();
+    capture(&disconnected_capture).unwrap();
     request.action = Action::Cancel;
     assert!(
         fixture
@@ -1159,6 +1539,37 @@ fn subject_release_scope_fixes_multiple_sessions_and_detached_branches_until_exa
         after_stop, main.descriptors,
         "Stop housekeeping must preserve every fixed recording descriptor"
     );
+    drop(guard);
+    let before_remove = capture(&disconnected_capture).unwrap();
+    let mut removal = removal_request(fixture.worker.worker_id);
+    removal.session_disposition = SessionDisposition::Archive;
+    removal.archive_id = Some("released-body-archive".into());
+    fixture
+        .runtime
+        .freeze_worker_removal_scoped(&fixture.scope, &removal)
+        .unwrap();
+    fixture.runtime.execute_worker_retention(&removal).unwrap();
+    assert!(
+        capture(&disconnected_capture).is_err(),
+        "release capture is live-source only, even when a removal archive exists"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .capture_worker_removal_session_scoped(
+                &fixture.scope,
+                &removal.operation_id,
+                fixture.worker.worker_id,
+                disconnected_capture.session_id,
+                disconnected_capture.active_segment_id,
+                disconnected_capture.start,
+                disconnected_capture.max_entries,
+                disconnected_capture.max_serialized_bytes,
+            )
+            .unwrap(),
+        before_remove,
+        "Backend can explicitly switch to the later Remove capture",
+    );
 }
 
 #[test]
@@ -1173,6 +1584,16 @@ fn subject_release_restart_requires_actual_controller_guard_before_returning_sav
         .subject_release_scoped(&fixture.scope, request.clone())
         .unwrap();
     assert!(held.recording_scope.is_some());
+    let capture_request =
+        release_capture_request(&request, &held.recording_scope.as_ref().unwrap().members[0]);
+    let captured = fixture
+        .runtime
+        .capture_subject_release_session_scoped(
+            &fixture.scope,
+            fixture.worker.worker_id,
+            &capture_request,
+        )
+        .unwrap();
     let ReleaseFixture {
         root,
         runtime,
@@ -1191,10 +1612,18 @@ fn subject_release_restart_requires_actual_controller_guard_before_returning_sav
     );
     let reopened = EmbeddedRuntime::with_fs_store_and_execution_backend(
         FsRuntimeStoreOptions::new(root.path()).with_runtime_id("runtime-test"),
-        backend,
+        backend.clone(),
     )
     .unwrap();
     reopened.bind_runtime_identity("runtime-test").unwrap();
+    assert_eq!(
+        reopened
+            .capture_subject_release_session_scoped(&scope, worker.worker_id, &capture_request)
+            .unwrap(),
+        captured,
+        "saved union validation requires no restored Controller",
+    );
+    assert!(backend.workers.lock().unwrap().is_empty());
     assert!(matches!(
         reopened.subject_release_scoped(&scope, request.clone()),
         Err(crate::error::RuntimeError::RecordingExecutionUnconfirmed { .. })
@@ -1214,6 +1643,11 @@ fn subject_release_restart_requires_actual_controller_guard_before_returning_sav
         .subject_release_scoped(&scope, request.clone())
         .unwrap();
     assert!(!owner.release_fence_path().exists());
+    assert!(
+        reopened
+            .capture_subject_release_session_scoped(&scope, worker.worker_id, &capture_request)
+            .is_err()
+    );
     assert!(owner.lock_publication().is_ok());
     assert!(
         reopened

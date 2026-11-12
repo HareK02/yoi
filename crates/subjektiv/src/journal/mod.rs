@@ -111,18 +111,96 @@ impl From<rusqlite::Error> for JournalError {
     }
 }
 
+#[derive(Debug, Clone)]
+enum JournalHostAuthority {
+    Session {
+        binding_id: Option<String>,
+    },
+    RecordingSource,
+    RecordingJob {
+        journal_id: String,
+        binding: JobAttemptBinding,
+    },
+}
+
 /// Host-issued in-process authority, never a model request DTO. Reader contexts need no live Session.
 #[derive(Debug, Clone)]
 pub struct JournalHostContext {
     scope_id: String,
     subject_id: String,
     attribution: Option<SubjectSessionAttribution>,
-    writer_binding_id: Option<String>,
+    authority: JournalHostAuthority,
 }
 impl JournalHostContext {
     /// Evidence for a retained Job grant, not permission to mint or renew a binding.
     pub fn writer_binding_id(&self) -> Option<&str> {
-        self.writer_binding_id.as_deref()
+        match &self.authority {
+            JournalHostAuthority::Session { binding_id } => binding_id.as_deref(),
+            JournalHostAuthority::RecordingSource | JournalHostAuthority::RecordingJob { .. } => {
+                None
+            }
+        }
+    }
+
+    fn require_job_binding(&self, binding: &JobAttemptBinding) -> JournalResult<()> {
+        if matches!(self.authority, JournalHostAuthority::RecordingSource) {
+            return Err(JournalError::PermissionDenied(
+                "source retention is not recording Job authority".into(),
+            ));
+        }
+        if let JournalHostAuthority::RecordingJob {
+            binding: expected, ..
+        } = &self.authority
+        {
+            if binding != expected {
+                return Err(JournalError::PermissionDenied(
+                    "different Host-bound Job attempt".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Host-only source admission after verifying retained originals and current
+    /// Subject permission. This context cannot acquire a Job generation or write
+    /// records; an actual Job/attempt context is required for those effects.
+    pub fn validated_recording_source(
+        store: &SubjektivStore,
+        attribution: SubjectSessionAttribution,
+    ) -> JournalResult<Self> {
+        let mut context = Self::validated_session(store, attribution)?;
+        context.authority = JournalHostAuthority::RecordingSource;
+        store
+            .database
+            .try_with_connection(|tx| self::store::check_host(store, tx, &context, true))?;
+        Ok(context)
+    }
+
+    /// The Host checks the current Job grant, attempt and input digest before
+    /// issuing this context. Source attribution is provenance, not a live body
+    /// lease. Store mutations additionally check the exact active generation.
+    pub fn validated_recording_job(
+        store: &SubjektivStore,
+        attribution: SubjectSessionAttribution,
+        journal_id: &str,
+        binding: JobAttemptBinding,
+    ) -> JournalResult<Self> {
+        let mut context = Self::validated_session(store, attribution)?;
+        if journal_id.is_empty() || binding.job_id.is_empty() || binding.attempt_id.is_empty() {
+            return Err(JournalError::InvalidInput(
+                "missing recording Job identity".into(),
+            ));
+        }
+        context.authority = JournalHostAuthority::RecordingJob {
+            journal_id: journal_id.into(),
+            binding,
+        };
+        store.database.try_with_connection(|tx| {
+            self::store::check_host(store, tx, &context, true)?;
+            self::store::journal(tx, &context, journal_id, true)?;
+            Ok::<_, JournalError>(())
+        })?;
+        Ok(context)
     }
 
     pub fn validated_reader(store: &SubjektivStore, subject_id: &str) -> JournalResult<Self> {
@@ -133,7 +211,7 @@ impl JournalHostContext {
             scope_id: store.scope_id().into(),
             subject_id: subject_id.into(),
             attribution: None,
-            writer_binding_id: None,
+            authority: JournalHostAuthority::Session { binding_id: None },
         })
     }
     /// External authentication, public-history validation and execution authority are Host duties.
@@ -148,7 +226,7 @@ impl JournalHostContext {
         }
         let mut context = Self::validated_reader(store, &attribution.subject_id)?;
         use rusqlite::OptionalExtension;
-        context.writer_binding_id = store.database.try_with_connection(|tx| {
+        let binding_id = store.database.try_with_connection(|tx| {
             Ok::<_, JournalError>(
                 tx.query_row(
                     "SELECT binding_id FROM journal_session_bindings WHERE session_id=?1",
@@ -158,6 +236,7 @@ impl JournalHostContext {
                 .optional()?,
             )
         })?;
+        context.authority = JournalHostAuthority::Session { binding_id };
         context.attribution = Some(attribution);
         Ok(context)
     }

@@ -3,6 +3,8 @@
 //! runtime or provider is started. Temporary storage owns cleanup. Receipt insertion faults are
 //! deterministic SQLite triggers, not a claim of arbitrary process-crash durability.
 
+mod recording_job_ownership;
+
 mod input_delivery {
     use super::*;
     use transport::{JournalJobRequest as Request, JournalJobResponse as Response};
@@ -1978,7 +1980,7 @@ fn release_rejects_unbound_legacy_body_sessions_even_without_admitted_sources() 
 }
 
 #[test]
-fn predecessor_prefers_latest_journal_activity_not_session_attachment_order() {
+fn predecessor_uses_session_attribution_order_despite_delayed_journal_activity() {
     let f = Fixture::new();
     let binding = f
         .store()
@@ -2066,7 +2068,7 @@ fn predecessor_prefers_latest_journal_activity_not_session_attachment_order() {
             .journal_predecessor_session(&replacement)
             .unwrap()
             .as_deref(),
-        Some("source-session")
+        Some("later-attached-session")
     );
 }
 

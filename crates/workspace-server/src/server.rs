@@ -5693,7 +5693,6 @@ impl WorkspaceApi {
     /// Claim occurs only after lane admission; retained exact owners recover storage faults.
     fn schedule_backend_job_worker_cleanup(&self, attempt: &BackendJobAttemptRecord) -> bool {
         if !attempt.state.terminal()
-            || attempt.worker.is_none()
             || !matches!(
                 attempt.worker_cleanup_state,
                 Some(
@@ -5706,7 +5705,16 @@ impl WorkspaceApi {
         {
             return false;
         }
-        self.own_backend_job_cleanup(attempt)
+        match self
+            .store
+            .get_backend_job(self.workspace_id(), &attempt.job_id)
+        {
+            Ok(Some(job)) if job.state == BackendJobState::Finalizing => {
+                self.own_backend_job_cleanup(attempt)
+            }
+            // Settled history is never cleanup work, regardless of caller.
+            _ => false,
+        }
     }
 
     async fn wait_for_backend_job_worker_run_teardown(
@@ -6150,7 +6158,9 @@ impl WorkspaceApi {
         drop(subject_guard);
         // Closing a generation/releasing pins is a writer operation, not a consequence
         // of accepting a result. Canonical cleanup performs it after independent fences.
-        notification_delivery::deliver_job_result(self, &acceptance);
+        if acceptance.job.state == BackendJobState::Completed {
+            notification_delivery::deliver_job_result(self, &acceptance);
+        }
         let _ = self.schedule_backend_job_worker_cleanup(&acceptance.attempt);
         self.drain_reserved_backend_jobs();
         Ok(acceptance)
@@ -33164,7 +33174,7 @@ async fn execute_runtime_cleanup_with_context(
             action: candidate.action.clone(),
             status: if removal.removed { "deleted" } else if removal.state == Some(server_api::WorkerRemovalState::Held) { "held" } else { "waiting" }.into(),
             message: if removal.removed { "Worker deleted from Runtime and Backend registry" }
-                else { "Removal intent retained; original history and writer remain until Journal completion is confirmed" }.into(),
+                else { "Removal intent retained; source release awaits confirmed execution termination and history handoff" }.into(),
             removal: removal.observation(),
         });
     }
@@ -55359,7 +55369,7 @@ mod tests {
             }]}),
         };
         let accepted = api.accept_backend_job_result(&worker, &submission).unwrap();
-        assert_eq!(accepted.job.state, BackendJobState::Completed);
+        assert_eq!(accepted.job.state, BackendJobState::Finalizing);
         let notifications = execution.take_inputs();
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].0.worker_id.to_string(), source.worker_id);
@@ -55958,7 +55968,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.failure_cause, attempt.failure_cause);
-        assert_eq!(reloaded.state, BackendJobState::Failed);
+        assert_eq!(reloaded.state, BackendJobState::Finalizing);
         assert_eq!(reloaded.current_attempt, 1);
     }
 
@@ -56033,7 +56043,7 @@ mod tests {
             .get_backend_job(api.workspace_id(), &request.job_id)
             .unwrap()
             .unwrap();
-        assert_eq!(job.state, BackendJobState::Failed);
+        assert_eq!(job.state, BackendJobState::Finalizing);
         let projected = job
             .failure_cause
             .unwrap()
@@ -56070,7 +56080,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(job.state, BackendJobState::Failed);
+        assert_eq!(job.state, BackendJobState::Finalizing);
         assert_eq!(attempt.state, BackendJobAttemptState::Failed);
         assert_eq!(job.failure_cause, attempt.failure_cause);
         assert_eq!(

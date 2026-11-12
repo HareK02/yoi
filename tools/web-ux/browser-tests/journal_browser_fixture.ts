@@ -129,6 +129,11 @@ export async function journalBrowserFixture(
           journal: journal(id, subjectId),
           original_source: source(id),
           unreflected_sources: id === "journal-review",
+          retained_recording: id === "journal-release"
+            ? { producer: "removed", completed: false, cause: "job_failed" }
+            : id === "journal-review"
+            ? { producer: "released", completed: false, cause: "job_pending" }
+            : { producer: "removed", completed: true, cause: null },
         })),
         next: offset === 0 ? "fixture-sessions-2" : null,
       });

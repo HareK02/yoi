@@ -37,6 +37,7 @@ fn input_content_identity_is_computed_and_unknown_fields_are_rejected() {
 fn shared_lifecycle_enums_round_trip_all_host_states() {
     for (state, name) in [
         (JobState::Pending, "pending"),
+        (JobState::Finalizing, "finalizing"),
         (JobState::Completed, "completed"),
         (JobState::Failed, "failed"),
         (JobState::Cancelled, "cancelled"),
@@ -66,6 +67,7 @@ fn shared_lifecycle_enums_round_trip_all_host_states() {
     assert!(serde_json::from_value::<JobAttemptState>(json!("unknown")).is_err());
     assert!(serde_json::from_value::<JobState>(json!("running")).is_err());
     assert!(serde_json::from_value::<JobAttemptState>(json!("idle")).is_err());
+    assert!(serde_json::from_value::<JobAttemptState>(json!("finalizing")).is_err());
 }
 
 #[test]
@@ -129,6 +131,34 @@ fn outcome_is_a_neutral_read_snapshot_with_optional_result_and_failure() {
             serde_json::from_str::<JobOutcome>(&serde_json::to_string(&outcome).unwrap()).unwrap(),
             outcome
         );
+    }
+}
+
+#[test]
+fn finalizing_snapshot_preserves_result_and_attempt_state_on_the_wire() {
+    for (attempt_state, result, category, detail) in [
+        ("completed", json!({"ok": true}), None, None),
+        (
+            "failed",
+            json!(null),
+            Some("execution"),
+            Some("known failure"),
+        ),
+    ] {
+        let encoded = json!({
+            "job_id": "job-1",
+            "input_digest": request().input_digest().unwrap(),
+            "attempt_id": "job-1:attempt:2",
+            "attempt": 2,
+            "state": "finalizing",
+            "attempt_state": attempt_state,
+            "result": result,
+            "failure_category": category,
+            "failure_detail": detail,
+        });
+        let outcome: JobOutcome = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(outcome.state, JobState::Finalizing);
+        assert_eq!(serde_json::to_value(outcome).unwrap(), encoded);
     }
 }
 

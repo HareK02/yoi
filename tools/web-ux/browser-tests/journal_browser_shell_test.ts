@@ -47,6 +47,66 @@ async function capture(page: Page, name: string) {
   await page.screenshot({ path: join(artifacts, `${name}.png`) });
 }
 
+Deno.test("Journal retained recording remains separate from producer removal", async () => {
+  const before = Deno.args.includes("--before");
+  const output = join(root, "target/web-ux/retained-recording", before ? "before" : "after");
+  await Deno.mkdir(output, { recursive: true });
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const server = new Deno.Command(Deno.execPath(), {
+    args: ["run", "--allow-net", "--allow-read", join(root, "tools/web-ux/browser-tests/memory_document_fixture_server.ts"), String(port), join(root, "web/workspace/build")],
+    stdout: "null", stderr: "piped",
+  }).spawn();
+  const errors: string[] = [];
+  const evidence: unknown[] = [];
+  const imageHash = async (bytes: Uint8Array) => Array.from(new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new Uint8Array(bytes).buffer),
+  ), byte => byte.toString(16).padStart(2, "0")).join("");
+  try {
+    await waitForServer(`${base}/health`);
+    const browser = await chromium.launch({ headless: true });
+    try {
+      for (const colorScheme of ["light", "dark"] as const) {
+        for (const width of [1440, 768, 390]) {
+          const context = await browser.newContext({ viewport: { width, height: 900 }, colorScheme });
+          const page = await context.newPage();
+          page.on("pageerror", error => errors.push(String(error)));
+          page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
+          page.on("requestfailed", request => {
+            if (request.failure()?.errorText !== "net::ERR_ABORTED") errors.push(`${request.failure()?.errorText} ${request.url()}`);
+          });
+          page.on("response", response => { if (response.status() >= 400) errors.push(`${response.status()} ${response.url()}`); });
+          const response = await page.goto(`${base}${journalPath}?view=sessions`);
+          await page.getByRole("link", { name: "Release coordination Session →", exact: true }).waitFor();
+          if (!before) {
+            await page.getByText("元Workerは削除済みです。", { exact: true }).waitFor();
+            await page.getByText("記録Jobが失敗しています。未記録の原文は保持されています。", { exact: true }).waitFor();
+            await page.getByText("元WorkerはSubjectから解放済みです。", { exact: true }).waitFor();
+          }
+          await assertNoPageWideOverflow(page);
+          const name = `pending-${width}-${colorScheme}.png`;
+          const image = await page.screenshot({ path: join(output, name) });
+          evidence.push({ name, sha256: await imageHash(image), width, colorScheme, status: response?.status(), accessibility: await page.locator("main").ariaSnapshot() });
+          await page.getByRole("link", { name: "次のページ →", exact: true }).click();
+          await page.getByRole("link", { name: "Archived planning Session →", exact: true }).waitFor();
+          if (!before) await page.getByText("引き継いだ範囲のJournal記録は完了しています。", { exact: true }).waitFor();
+          await assertNoPageWideOverflow(page);
+          const complete = `completed-${width}-${colorScheme}.png`;
+          const completedImage = await page.screenshot({ path: join(output, complete) });
+          evidence.push({ name: complete, sha256: await imageHash(completedImage), width, colorScheme, accessibility: await page.locator("main").ariaSnapshot() });
+          await context.close();
+        }
+      }
+    } finally { await browser.close(); }
+    assertEquals(errors, []);
+  } finally {
+    server.kill("SIGTERM");
+    await server.status;
+    await server.stderr.cancel();
+    await Deno.writeTextFile(join(output, "review-context.json"), JSON.stringify({ before, errors, evidence }, null, 2));
+  }
+});
+
 Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinct read states", async (t) => {
   await Deno.stat(join(root, "web/workspace/build/index.html"));
   await Deno.mkdir(artifacts, { recursive: true });
@@ -117,7 +177,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
           })
             .waitFor();
           assertEquals(await page.locator(".session-list > li").count(), 2);
-          await page.getByText("記録待ち・未反映の原資料があります。", {
+          await page.getByText("Journal記録は未完です。", {
             exact: true,
           }).waitFor();
           await capture(page, "sessions-desktop-light");

@@ -77,7 +77,7 @@ use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, Runti
 use worker_runtime::profile_archive::ProfileSourceArchive;
 use worker_runtime::retention::{
     WorkerRemovalFreeze, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
-    WorkerRetentionInventory,
+    WorkerRetentionInventory, WorkerSessionArchiveManifest,
 };
 use worker_runtime::ssh_host_key_probe::{
     SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SshHostKeyProbeRequest,
@@ -1687,6 +1687,29 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         ))
     }
 
+    fn publish_worker_removal_archive(
+        &self,
+        _request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerSessionArchiveManifest, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_removal_archive_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support frozen Worker removal archive publication",
+        ))
+    }
+
+    fn capture_subject_release_session(
+        &self,
+        _worker_id: &str,
+        _request: runtime_api::SubjectReleaseSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "subject_release_capture_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support fixed Subject release recording capture",
+        ))
+    }
+
     fn capture_worker_removal_session(
         &self,
         _worker_id: &str,
@@ -2887,6 +2910,64 @@ impl RuntimeRegistry {
             });
         }
         Ok(freeze)
+    }
+
+    pub fn publish_worker_removal_archive(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerSessionArchiveManifest, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        if request.worker_id.to_string() != worker.worker_id
+            || request.source_runtime_id != worker.runtime_id
+        {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_removal_target_mismatch".into(),
+                message: "removal request Runtime/Worker identity does not match target".into(),
+            });
+        }
+        let expected = request.clone();
+        let archive = self
+            .runtime(&worker.runtime_id)?
+            .publish_worker_removal_archive(request)
+            .map_err(|cause| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: cause.code,
+                message: cause.message,
+            })?;
+        if archive.operation_id != expected.operation_id
+            || archive.input_fingerprint != expected.input_fingerprint
+            || Some(archive.archive_id.as_str()) != expected.archive_id.as_deref()
+            || archive.workspace_id != expected.workspace_id
+            || archive.source_runtime_id != expected.source_runtime_id
+            || archive.source_worker_id != expected.worker_id
+        {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_removal_archive_identity_mismatch".into(),
+                message: "Runtime removal archive does not match the exact retention request"
+                    .into(),
+            });
+        }
+        Ok(archive)
+    }
+
+    pub fn capture_subject_release_session(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: runtime_api::SubjectReleaseSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        self.runtime(&worker.runtime_id)?
+            .capture_subject_release_session(&worker.worker_id, request)
+            .map_err(|cause| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: cause.code,
+                message: cause.message,
+            })
     }
 
     pub fn capture_worker_removal_session(
@@ -4223,6 +4304,49 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .map_err(|error| embedded_runtime_diagnostic(&error))
     }
 
+    fn publish_worker_removal_archive(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerSessionArchiveManifest, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id || request.source_runtime_id != self.runtime_id
+        {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal request does not match embedded Runtime/Workspace",
+            ));
+        }
+        let scope = RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend");
+        self.runtime
+            .publish_worker_removal_archive_scoped(&scope, &request)
+            .map_err(|error| embedded_runtime_diagnostic(&error))
+    }
+
+    fn capture_subject_release_session(
+        &self,
+        worker_id: &str,
+        request: runtime_api::SubjectReleaseSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id {
+            return Err(diagnostic(
+                "subject_release_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "release capture Workspace does not match embedded Runtime",
+            ));
+        }
+        let worker_id = EmbeddedWorkerId::parse(worker_id).ok_or_else(|| {
+            diagnostic(
+                "embedded_worker_id_invalid",
+                HostDiagnosticSeverity::Error,
+                "invalid Worker identity for release capture",
+            )
+        })?;
+        let scope = RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend");
+        self.runtime
+            .capture_subject_release_session_scoped(&scope, worker_id, &request)
+            .map_err(|error| embedded_runtime_diagnostic(&error))
+    }
+
     fn capture_worker_removal_session(
         &self,
         worker_id: &str,
@@ -5359,6 +5483,17 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
         return "workers:read";
     }
     "runtime:read"
+}
+
+#[cfg(test)]
+#[test]
+fn release_capture_remote_authority_matches_worker_retention_route() {
+    let path = "/v1/workers/released-worker/retention/release-capture";
+    assert_eq!(workspace_runtime_operation("POST", path), "workers:delete");
+    assert_eq!(
+        worker_id_from_remote_path(path).as_deref(),
+        Some("released-worker")
+    );
 }
 
 fn worker_id_from_remote_path(path_and_query: &str) -> Option<String> {
@@ -7178,6 +7313,62 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.freeze_worker_removal(worker_id, request).await },
+            runtime_removal_api_diagnostic,
+        )
+    }
+
+    fn publish_worker_removal_archive(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerSessionArchiveManifest, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id || request.source_runtime_id != self.runtime_id
+        {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal request does not match remote Runtime/Workspace",
+            ));
+        }
+        let worker_id = request.worker_id.to_string();
+        let request = runtime_contract_convert(request)?;
+        self.run_runtime_api_with_diagnostic(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .publish_worker_removal_archive(worker_id, request)
+                    .await
+            },
+            runtime_removal_api_diagnostic,
+        )
+        .and_then(runtime_contract_convert)
+    }
+
+    fn capture_subject_release_session(
+        &self,
+        worker_id: &str,
+        mut request: runtime_api::SubjectReleaseSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id {
+            return Err(diagnostic(
+                "subject_release_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "release capture Workspace does not match remote Runtime",
+            ));
+        }
+        // Direct slice response: its budget includes metadata and JSON escaping.
+        request.max_serialized_bytes = request
+            .max_serialized_bytes
+            .min(MAX_REMOTE_RUNTIME_RESPONSE_BYTES);
+        let worker_id = worker_id.to_string();
+        self.run_runtime_api_with_diagnostic(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .capture_subject_release_session(worker_id, request)
+                    .await
+            },
             runtime_removal_api_diagnostic,
         )
     }
@@ -11773,6 +11964,13 @@ mod tests {
             if code == "worker_removal_freeze_unsupported")
         );
         let error = registry
+            .publish_worker_removal_archive(&worker, removal_request("runtime-a", &worker_id))
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "worker_removal_archive_unsupported")
+        );
+        let error = registry
             .capture_worker_removal_session(&worker, removal_capture_request())
             .unwrap_err();
         assert!(
@@ -11790,6 +11988,13 @@ mod tests {
             removal_request("runtime-b", &worker_id),
             removal_request("runtime-a", &EmbeddedWorkerId::now_v7().to_string()),
         ] {
+            let error = registry
+                .publish_worker_removal_archive(&worker, request.clone())
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+                if code == "worker_removal_target_mismatch")
+            );
             let error = registry
                 .freeze_worker_removal(&worker, request)
                 .unwrap_err();
@@ -11816,6 +12021,95 @@ mod tests {
         )
         .unwrap();
         (RuntimeRegistry::new(vec![Arc::new(runtime)]), server)
+    }
+
+    #[test]
+    fn worker_removal_archive_transport_preserves_request_and_rejects_foreign_response() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+        let request = removal_request("remote:removal", &worker_id);
+        let manifest = WorkerSessionArchiveManifest {
+            schema_version: 1,
+            archive_id: request.archive_id.clone().unwrap(),
+            workspace_id: request.workspace_id.clone(),
+            source_runtime_id: request.source_runtime_id.clone(),
+            source_worker_id: request.worker_id,
+            source_session_id: session_store::SessionId::new_v4().to_string(),
+            retained_sessions: vec![],
+            source_active_segment_id: None,
+            segment_ids: vec![],
+            source_created_at: request.source_created_at.clone(),
+            removed_at: request.removed_at.clone(),
+            archived_at_unix_seconds: 1,
+            effective_profile: request.effective_profile.clone(),
+            retention_class: request.retention_class.clone(),
+            content_checksum_sha256: "a".repeat(64),
+            content_bytes: 0,
+            content_file_count: 0,
+            policy_id: request.policy_id.clone(),
+            operation_id: request.operation_id.clone(),
+            input_fingerprint: request.input_fingerprint.clone(),
+        };
+        let path = format!("/v1/workers/{worker_id}/retention/archive");
+        assert_eq!(workspace_runtime_operation("POST", &path), "workers:delete");
+        for changed_field in [
+            None,
+            Some("archive_id"),
+            Some("workspace_id"),
+            Some("source_runtime_id"),
+            Some("source_worker_id"),
+            Some("operation_id"),
+            Some("input_fingerprint"),
+        ] {
+            let mut response = serde_json::to_value(&manifest).unwrap();
+            if let Some(field) = changed_field {
+                response[field] = if field == "source_worker_id" {
+                    json!(EmbeddedWorkerId::now_v7())
+                } else {
+                    json!("foreign-identity")
+                };
+            }
+            let (registry, server) = removal_remote_registry(vec![MockResponse {
+                request_body: Some(serde_json::to_value(&request).unwrap()),
+                ..mock_response("POST", path.clone(), true, 200, response.to_string())
+            }]);
+            let result = registry.publish_worker_removal_archive(&worker, request.clone());
+            if changed_field.is_none() {
+                assert_eq!(result.unwrap(), manifest);
+            } else {
+                assert!(
+                    matches!(
+                        result.unwrap_err(), RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+                        if code == "worker_removal_archive_identity_mismatch"
+                    ),
+                    "foreign {changed_field:?} was not rejected"
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn worker_removal_archive_transport_preserves_recording_failure() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+        let request = removal_request("remote:removal", &worker_id);
+        let (registry, server) = removal_remote_registry(vec![MockResponse {
+            request_body: Some(serde_json::to_value(&request).unwrap()),
+            ..mock_response(
+                "POST",
+                format!("/v1/workers/{worker_id}/retention/archive"),
+                true,
+                409,
+                json!({"error":{"code":"removal_operation_conflict","message":"different saved request"}}).to_string(),
+            )
+        }]);
+        assert!(matches!(
+            registry.publish_worker_removal_archive(&worker, request).unwrap_err(),
+            RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "removal_operation_conflict"
+        ));
+        server.join().unwrap();
     }
 
     #[test]

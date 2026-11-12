@@ -500,8 +500,8 @@ pub(super) fn reconcile_domain_result(
         }
         let (digest,json) = result_digest(&submission.result,job.request.limits.max_result_bytes)?;
         tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,worker_cleanup_state=COALESCE(worker_cleanup_state,'pending'),worker_cleanup_updated_at=CASE WHEN worker_cleanup_state IS NULL THEN ?6 ELSE worker_cleanup_updated_at END,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,json,digest,now])?;
-        tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2",params![workspace,expected.job_id,json,digest,now])?;
-        notification_routing::jobs::capture(&tx,workspace,&expected.job_id,&expected.attempt_id)?;
+        tx.execute("UPDATE backend_jobs SET state='finalizing',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,updated_at=?5,completed_at=NULL WHERE workspace_id=?1 AND job_id=?2",params![workspace,expected.job_id,json,digest,now])?;
+
         let result = read_backend_job_attempt(&tx,workspace,&expected.job_id,&expected.attempt_id)?.ok_or_else(||Error::Store("reconciled owner disappeared".into()))?;
         tx.commit()?;
         Ok(result)
@@ -1298,6 +1298,10 @@ mod tests {
         let history = store
             .list_backend_job_attempts("workspace", "accepted")
             .unwrap();
+        let (controller, host) = evidence(&executing);
+        store
+            .record_backend_job_execution_fence("workspace", &executing, &controller, &host, NOW)
+            .unwrap();
         let historical = store
             .finish_backend_job_worker_cleanup_owned(
                 "workspace",
@@ -1308,6 +1312,9 @@ mod tests {
                 None,
                 NOW,
             )
+            .unwrap();
+        store
+            .finalize_backend_job("workspace", "accepted", NOW)
             .unwrap();
         let next = store
             .reserve_backend_job_retry("workspace", "accepted", NOW)
@@ -1365,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_journal_with_available_input_is_rediscovered_without_claiming_recording_complete()
+    fn finalizing_journal_with_available_input_is_rediscovered_without_claiming_recording_complete()
     {
         let (_dir, store, reserved) = fixture();
         let owner = bind_fixture_owner(&store, &reserved);
@@ -1386,7 +1393,8 @@ mod tests {
         request.job_id = "journal-retirement".into();
         request.serialization_key = Some(crate::backend_job::journal_serialization_key("journal"));
         request.grants.subjektiv_journal = Some(crate::backend_job::SubjektivJournalGrant {
-            binding_id: "binding".into(), subject_id: "subject".into(), session_id: "session".into(), journal_id: "journal".into(),
+            binding_id: "source-lifetime".into(),
+            subject_id: "subject".into(), session_id: "session".into(), journal_id: "journal".into(),
             selected_ranges: vec![serde_json::from_value(serde_json::json!({
                 "source":{"session_id":"session", "pointer":{"segment_id":"019a4ea8-0000-7000-8000-000000000001", "entry_ref":"Eentry"},
                     "order":0,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "total_bytes":1},
@@ -1398,7 +1406,7 @@ mod tests {
             .unwrap();
         store.with_conn(|conn| {
             conn.execute("UPDATE backend_job_attempts SET state='completed',runtime_id='runtime',worker_id='journal-worker',runtime_run_id='run',result_json='{}',result_digest='fixture-result',worker_cleanup_state='completed' WHERE attempt_id=?1", params![journal.attempt.attempt_id])?;
-            conn.execute("UPDATE backend_jobs SET state='completed',result_json='{}',result_digest='fixture-result' WHERE job_id=?1", params![request.job_id])?;
+            conn.execute("UPDATE backend_jobs SET state='finalizing',result_json='{}',result_digest='fixture-result' WHERE job_id=?1", params![request.job_id])?;
             Ok(())
         }).unwrap();
         let selected = store
@@ -1415,6 +1423,12 @@ mod tests {
                 .has_backend_job_execution_fence("workspace", &selected[0])
                 .unwrap()
         );
+        assert!(
+            store
+                .finalize_backend_job("workspace", &request.job_id, NOW)
+                .is_err(),
+            "completed cleanup alone does not retire successful Journal input"
+        );
         store
             .reclaim_backend_job_input(
                 "workspace",
@@ -1423,11 +1437,21 @@ mod tests {
                 crate::backend_job::JobInputRetirementReason::ExplicitErasure,
             )
             .unwrap();
-        assert!(
+        assert_eq!(
             store
                 .list_backend_job_worker_cleanups("workspace", None, 100)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1,
+            "input erasure does not certify execution or finalization"
+        );
+        assert_eq!(
+            store
+                .finalize_backend_job("workspace", &request.job_id, NOW)
+                .unwrap()
+                .state,
+            BackendJobState::Completed,
+            "saved cleanup completion is not re-fenced after the remaining input responsibility ends"
         );
     }
 
@@ -2002,6 +2026,9 @@ mod tests {
                 )
                 .is_err()
         );
+        store
+            .finalize_backend_job("workspace", "accepted", NOW)
+            .unwrap();
         let next = store
             .reserve_backend_job_retry("workspace", "accepted", NOW)
             .unwrap();
@@ -2054,6 +2081,14 @@ mod tests {
     fn cleanup_cas_rejects_changed_history_and_wrong_worker_run_without_releasing_owner() {
         let (_dir, store, reserved) = fixture();
         let owner = bind_fixture_owner(&store, &reserved);
+        store.with_conn(|conn| {
+            conn.execute("UPDATE backend_job_attempts SET worker_id='019a4ea8-0000-7000-8000-000000000003' WHERE attempt_id=?1", params![owner.attempt_id])?;
+            Ok(())
+        }).unwrap();
+        let owner = store
+            .get_backend_job_attempt("workspace", "accepted", &owner.attempt_id)
+            .unwrap()
+            .unwrap();
         let history = store
             .list_backend_job_attempts("workspace", "accepted")
             .unwrap();
@@ -2089,6 +2124,10 @@ mod tests {
         );
         let history = store
             .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let (controller, host) = evidence(&executing);
+        store
+            .record_backend_job_execution_fence("workspace", &executing, &controller, &host, NOW)
             .unwrap();
         let done = store
             .finish_backend_job_worker_cleanup_owned(

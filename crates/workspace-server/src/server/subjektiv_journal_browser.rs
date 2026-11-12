@@ -80,6 +80,93 @@ pub(super) struct BrowserSession {
     pub journal: JournalMetadata,
     pub unreflected_sources: bool,
     pub original_source: SourceStatus,
+    pub retained_recording: Option<RetainedRecordingObservation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RecordingProducerState {
+    Released,
+    Removing,
+    Removed,
+}
+
+/// The whole fixed source scope, not just the prefix already admitted to a Job.
+/// Producer release/removal and recording completion are independent observations.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct RetainedRecordingObservation {
+    pub producer: RecordingProducerState,
+    pub completed: bool,
+    pub cause: Option<crate::store::JournalRemovalCause>,
+}
+
+fn retained_recording(
+    api: &WorkspaceApi,
+    store: &crate::subjektiv::SubjektivStore,
+    subject: &str,
+    session: &str,
+) -> Result<Option<RetainedRecordingObservation>> {
+    let Some(attr) = store
+        .session_attribution(session)
+        .map_err(subjektiv_store_error)?
+    else {
+        return Ok(None);
+    };
+    if attr.subject_id != subject {
+        return Err(Error::RepositoryConflict(
+            "Journal source attribution differs".into(),
+        ));
+    }
+    let worker = RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id);
+    let identity = api
+        .feature_storage
+        .existing_identity(&api.subjektiv_registration)
+        .map_err(Error::SubjektivStorage)?;
+    // Removal supersedes a release only after its durable archive handoff. Neither
+    // registry absence nor a finished Job is evidence of physical source removal.
+    if let Some(prepared) = api
+        .config_store
+        .recover_worker_removal_execution(api.workspace_id(), &worker)
+        .map_err(|error| Error::Store(error.to_string()))?
+        && let Some(progress) = api.store.get_journal_removal(&prepared)?
+        && let Some(recording) = progress.metadata.retained_recording
+        && progress.metadata.binding.subject_id == subject
+        && progress.metadata.binding.database == identity
+        && progress
+            .metadata
+            .members
+            .as_ref()
+            .is_some_and(|members| members.iter().any(|member| member.session_id == session))
+    {
+        return Ok(Some(RetainedRecordingObservation {
+            producer: if progress.metadata.phase == crate::store::JournalRemovalPhase::Completed {
+                RecordingProducerState::Removed
+            } else {
+                RecordingProducerState::Removing
+            },
+            completed: recording.completed,
+            cause: recording.cause,
+        }));
+    }
+    if let Some(progress) = api
+        .config_store
+        .get_release_journal_recording(api.workspace_id(), &worker)?
+        && progress.released
+        && progress.recording.binding.subject_id == subject
+        && progress.recording.binding.database == identity
+        && progress
+            .recording
+            .members
+            .iter()
+            .any(|member| member.session_id == session)
+    {
+        return Ok(Some(RetainedRecordingObservation {
+            producer: RecordingProducerState::Released,
+            completed: progress.recording.completed,
+            cause: progress.recording.cause,
+        }));
+    }
+    Ok(None)
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct BrowserEntry {
@@ -250,10 +337,18 @@ fn execute(
                     store.journal_has_unreflected_sources(host, &journal.id)?;
                 let original_source =
                     source_status(api, store, subject_id, Some(&journal.source_session_id));
+                let retained_recording =
+                    retained_recording(api, store, subject_id, &journal.source_session_id)
+                        .map_err(|_| {
+                            JournalError::Conflict(
+                                "Retained recording observation unavailable".into(),
+                            )
+                        })?;
                 items.push(BrowserSession {
                     journal,
                     unreflected_sources,
                     original_source,
+                    retained_recording,
                 });
             }
             BrowserResponse::Sessions(JournalPage {

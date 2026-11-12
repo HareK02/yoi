@@ -79,6 +79,19 @@ fn bounded(case: &str) {
 }
 
 #[test]
+fn signed_journal_source_removed_keeps_job_authority_but_not_revoked_policy() {
+    bounded("signed_journal_source_removed_case");
+}
+
+#[test]
+#[ignore = "exact subprocess case run by bounded signed Journal parent"]
+fn signed_journal_source_removed_case() {
+    run(Change::SourceRemoved);
+    run(Change::SourceRemovedPolicyRevoked);
+    run(Change::SourceRemovedCancelled);
+}
+
+#[test]
 fn signed_journal_unchanged_authority_commits_entry_and_exact_receipt() {
     bounded("signed_journal_allowed_case");
 }
@@ -264,6 +277,9 @@ enum Change {
     Unchanged,
     RevokePolicy,
     RemoveFeature,
+    SourceRemoved,
+    SourceRemovedPolicyRevoked,
+    SourceRemovedCancelled,
 }
 fn run(change: Change) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -453,17 +469,15 @@ impl RemoteJournal {
             subject_id: self.grant().subject_id.clone(),
             runtime_id: self.policy.source.runtime_id.clone(),
             worker_id: self.policy.source.worker_id.clone(),
-            binding_id: self.grant().binding_id.clone(),
+            binding_id: host.writer_binding_id().unwrap().into(),
         };
-        assert!(store.journal_writer_active(&writer).unwrap());
-        assert!(
-            store
-                .journal_session_writer_matches(&writer, &self.grant().session_id)
-                .unwrap()
-        );
-        json!({"journal": store.journal_resume_state(&host, id).unwrap(),
+        json!({"journal": store.read_journal(&host, id).unwrap(),
             "writer": writer,
-            "generation": store.active_journal_generation(&host, id).unwrap(),
+            "writer_active": store.journal_writer_active(&writer).unwrap(),
+            "generation": store.retained_journal_generation(&host, id, &subjektiv::api::JobAttemptBinding {
+                job_id: self.reservation.job.request.job_id.clone(),
+                attempt_id: self.reservation.attempt.attempt_id.clone(),
+            }).unwrap(),
             "operations": operations, "sources": sources, "entries": entries})
     }
     fn assert_no_receipt(&self, request_id: &str) {
@@ -507,9 +521,25 @@ fn pause_hook(
 
 async fn schedule(change: Change) {
     let mut f = RemoteJournal::new().await;
+    if matches!(
+        change,
+        Change::SourceRemoved | Change::SourceRemovedPolicyRevoked | Change::SourceRemovedCancelled
+    ) {
+        let store = open_subjektiv_store(&f.policy.api).unwrap();
+        super::super::subjektiv_journal_tests::release_saved_source(
+            &f.policy.api,
+            &store,
+            &f.host(&store),
+            &f.policy.source,
+            &f.policy.subject,
+        );
+    }
     let operation = f.create("signed-native-create");
     let before = f.snapshot();
-    let (hook, pause, counts) = if matches!(change, Change::RevokePolicy) {
+    let (hook, pause, counts) = if matches!(
+        change,
+        Change::RevokePolicy | Change::SourceRemovedPolicyRevoked
+    ) {
         let (hook, pause, counts) = pause_hook(CREATE, 1);
         f.policy.api.journal_before_effect = Some(hook.clone());
         (hook, pause, counts)
@@ -532,14 +562,29 @@ async fn schedule(change: Change) {
     .await
     .unwrap();
     match change {
-        Change::Unchanged => {}
-        Change::RevokePolicy => {
+        Change::Unchanged | Change::SourceRemoved => {}
+        Change::RevokePolicy | Change::SourceRemovedPolicyRevoked => {
             // The Feature transaction has not begun. Real configuration adoption
             // is allowed to acquire it and commits before the request resumes.
             // Keep input.supply and all other set operations; revoke only create.
             tokio::time::timeout(WAIT, f.policy.adopt_policy(
                 r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "journal"; keys = ["journal.entry.create"]; }]; }"#, "{}"))
                 .await.expect("canonical policy adoption before native admission");
+        }
+        Change::SourceRemovedCancelled => {
+            f.policy
+                .api
+                .store
+                .finish_backend_job_attempt(
+                    TEST_WORKSPACE_ID,
+                    &f.reservation.job.request.job_id,
+                    &f.reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "cancelled",
+                    "cancelled at the native effect boundary",
+                    &Utc::now().to_rfc3339(),
+                )
+                .unwrap();
         }
         Change::RemoveFeature => {
             // The native Feature transaction is held, before registry/Host
@@ -563,7 +608,7 @@ async fn schedule(change: Change) {
     let admissions = counts.load(Ordering::SeqCst);
     f.policy.api.journal_before_effect = None;
     f.policy.api.subject_effect_admission_observer = None;
-    if matches!(change, Change::Unchanged) {
+    if matches!(change, Change::Unchanged | Change::SourceRemoved) {
         assert_eq!(
             admissions,
             CREATE_MUTATION_ADMISSION + 1,
@@ -599,7 +644,10 @@ async fn schedule(change: Change) {
     } else {
         assert_eq!(
             admissions,
-            if matches!(change, Change::RevokePolicy) {
+            if matches!(
+                change,
+                Change::RevokePolicy | Change::SourceRemovedPolicyRevoked
+            ) {
                 1
             } else {
                 CREATE_MUTATION_ADMISSION

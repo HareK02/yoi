@@ -379,7 +379,9 @@ async fn connected_wait_for_recording(
     phase: &str,
 ) {
     let host = JournalHostContext::validated_session(store, attr.clone()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    // Completion includes real Controller/Host teardown after the final
+    // checkpoint; allow that additional phase under concurrent suite load.
+    tokio::time::timeout(std::time::Duration::from_secs(90), async {
         loop {
             let poll_started = model.elapsed_micros();
             let jobs = api
@@ -555,10 +557,9 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         worker_id: old.worker_id.clone(),
         binding_id: old_host.writer_binding_id().unwrap().into(),
     };
-    // Corrupt only the saved Job projection after real completion, deliberately
-    // leaving its attempt/checkpoint completed. This is a fail-closed consumer
-    // contrast, not a simulated transaction interruption or a recovery mechanism.
-    // The pre-revoke refusal must cancel the actual Controller guard before retry.
+    // Perturb only the Job projection after real checkpoint/attempt completion.
+    // Body release must retain this unresolved recording responsibility rather
+    // than borrowing Job completion as its own quiescence or ownership proof.
     let recorded = api
         .store
         .list_backend_journal_jobs(TEST_WORKSPACE_ID, &old_attr.session_id, None, 100)
@@ -600,38 +601,37 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let incomplete = json!({
         "worker":old,"binding_id":old_binding.binding_id,"operation_id":"connected-incomplete-release",
     });
-    let error = subjektiv_journal::release_subject(
+    let released = subjektiv_journal::release_subject(
         &api,
         serde_json::from_value(incomplete.clone()).unwrap(),
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("still pending"), "{error}");
-    assert!(store.journal_writer_active(&old_binding).unwrap());
+    .unwrap();
+    assert_eq!(
+        released.state,
+        runtime_api::SubjectReleaseState::Disconnected
+    );
+    assert!(!store.journal_writer_active(&old_binding).unwrap());
     assert!(
         !api.config_store
             .subject_release_pending(TEST_WORKSPACE_ID, &old)
             .unwrap()
     );
-    let cancelled: bool = conn.query_row("SELECT cancelled FROM subject_worker_releases WHERE workspace_id=?1 AND operation_id='connected-incomplete-release'", [TEST_WORKSPACE_ID], |r| r.get(0)).unwrap();
-    assert!(
-        cancelled,
-        "checked pre-revoke refusal needs a terminal cancellation receipt"
-    );
-    assert!(
-        subjektiv_journal::release_subject(&api, serde_json::from_value(incomplete).unwrap())
-            .is_err(),
-        "cancelled release identity must not rearm"
-    );
+    let recording = api
+        .config_store
+        .get_release_journal_recording(TEST_WORKSPACE_ID, &old)
+        .unwrap()
+        .unwrap();
+    assert!(recording.released && !recording.recording.completed);
+    assert!(!recording.recording.members.is_empty());
     conn.execute(
         "UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4 WHERE workspace_id=?1 AND job_id=?2",
         rusqlite::params![TEST_WORKSPACE_ID, uncertain_job, saved_result.0, saved_result.1],
     )
     .unwrap();
-    // The new release below must reacquire the genuine Controller guard. It cannot
-    // succeed if the failed pre-revoke operation left the body frozen.
-    let release = subjektiv_journal::release_subject(&api, serde_json::from_value(json!({
-        "worker":old,"binding_id":old_binding.binding_id,"operation_id":"connected-normal-release",
-    })).unwrap()).unwrap();
+    // Replay the same release, resuming recording without reclaiming the body.
+    let release =
+        subjektiv_journal::release_subject(&api, serde_json::from_value(incomplete).unwrap())
+            .unwrap();
     assert_eq!(
         release.state,
         runtime_api::SubjectReleaseState::Disconnected
@@ -1484,6 +1484,21 @@ impl worker_runtime::execution::WorkerExecutionBackend for CallerReplayBackend {
             .push((request, result.clone()));
         result
     }
+    fn termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<Option<worker_runtime::execution::WorkerExecutionTermination>, String>
+    {
+        self.inner.termination_receipt(worker)
+    }
+    fn reconcile_termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+        saved: &worker_runtime::execution::WorkerExecutionTermination,
+    ) -> std::result::Result<Option<worker_runtime::execution::WorkerExecutionTermination>, String>
+    {
+        self.inner.reconcile_termination_receipt(worker, saved)
+    }
     fn worker_snapshot(
         &self,
         worker: &worker_runtime::identity::WorkerRef,
@@ -2049,7 +2064,38 @@ async fn connected_restore_fixture_with_pending_head(
             }
         })
         .await
-        .expect("seed Journal work must settle before measuring restore");
+        .unwrap_or_else(|_| {
+            let jobs = api
+                .store
+                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
+                .unwrap();
+            let states: Vec<_> = jobs
+                .iter()
+                .map(|job| {
+                    let attempts = api
+                        .store
+                        .list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id)
+                        .unwrap();
+                    (
+                        job.request.job_id.clone(),
+                        job.state,
+                        job.failure_category.clone(),
+                        attempts
+                            .into_iter()
+                            .map(|a| {
+                                (
+                                    a.state,
+                                    a.worker_cleanup_state,
+                                    a.worker_cleanup_failure_category,
+                                    a.worker_cleanup_failure_detail,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            panic!("seed Journal work must settle before measuring restore: {states:?}");
+        });
     }
 
     ConnectedRestoreFixture {

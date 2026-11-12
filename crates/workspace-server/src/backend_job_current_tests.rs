@@ -385,7 +385,7 @@ fn descriptor_classification_preserves_current_grants_and_retired_input_bytes() 
     store::configure_sqlite(&conn).unwrap();
     workspace(&conn);
     let journal = serde_json::json!({
-        "binding_id":"writer-generation", "subject_id":"subject", "session_id":"session",
+        "binding_id":"source-lifetime", "subject_id":"subject", "session_id":"session",
         "journal_id":"journal", "selected_ranges":[]
     });
     job_with_request(&conn, "w", "journal-current", "completed", |r| {
@@ -516,6 +516,7 @@ fn migration_rejects_wrong_boundary_and_current_reopen_does_not_sweep_new_jobs()
     }
     assert_eq!(saved, dump(&conn));
     migrate(&conn).unwrap();
+    advance(&conn, store::LATEST_SCHEMA_VERSION);
     job(&conn, "w", "new-after-upgrade", "pending");
     let saved = job_graph(&conn);
     let history_query =
@@ -538,7 +539,7 @@ fn migration_rejects_wrong_boundary_and_current_reopen_does_not_sweep_new_jobs()
             .collect::<Vec<_>>(),
         store::MIGRATIONS
             .iter()
-            .filter(|step| step.version > 130)
+            .filter(|step| step.version > store::LATEST_SCHEMA_VERSION)
             .map(|step| vec![Value::Integer(step.version), Value::Text(step.name.into())])
             .collect::<Vec<_>>(),
         "owner open appends only the later schema receipts, without rewriting Job history"

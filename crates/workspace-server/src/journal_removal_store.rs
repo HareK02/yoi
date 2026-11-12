@@ -128,6 +128,16 @@ pub struct JournalRemovalMetadata {
     pub cause: Option<JournalRemovalCause>,
     /// None means the source is not yet frozen; Some(empty) is a confirmed empty scope.
     pub members: Option<Vec<FrozenJournalRemovalMember>>,
+    /// Absent until a verified archive owns the complete frozen originals.
+    pub retained_recording: Option<RetainedJournalRecording>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedJournalRecording {
+    pub archive_id: String,
+    pub completed: bool,
+    pub cause: Option<JournalRemovalCause>,
 }
 
 fn invalid(message: &str) -> Error {
@@ -265,6 +275,7 @@ impl SqliteWorkspaceStore {
                     phase: JournalRemovalPhase::AwaitingQuiescence,
                     cause: None,
                     members: None,
+                    retained_recording: None,
                 },
             )?;
             let current = load(&tx, &prepared.plan.operation_id)?.expect("saved removal intent");
@@ -308,6 +319,90 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    /// Save source responsibility before releasing the producer. Replaying the same
+    /// archive is harmless; a different archive cannot replace a retained source.
+    pub fn retain_journal_recording(
+        &self,
+        prepared: &PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        archive_id: &str,
+    ) -> Result<JournalRemovalProgress> {
+        if archive_id.is_empty()
+            || prepared.runtime_request.archive_id.as_deref() != Some(archive_id)
+        {
+            return Err(invalid("Journal archive differs from removal intent"));
+        }
+        self.change_journal_removal(prepared, expected, |metadata| {
+            if metadata.members.as_ref().is_none_or(Vec::is_empty) {
+                return Err(invalid("Recording handoff has no frozen originals"));
+            }
+            if let Some(retained) = &metadata.retained_recording {
+                if retained.archive_id != archive_id {
+                    return Err(invalid("Recording archive identity changed"));
+                }
+            } else {
+                metadata.retained_recording = Some(RetainedJournalRecording {
+                    archive_id: archive_id.into(),
+                    completed: false,
+                    cause: None,
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub fn list_retained_journal_recordings(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalRemovalProgress>> {
+        if !(1..=100).contains(&limit) {
+            return Err(invalid("Recording page limit must be 1..=100"));
+        }
+        self.with_conn(|conn| {
+            let ids = conn.prepare("SELECT operation_id FROM worker_removal_operations WHERE workspace_id=?1 AND json_extract(journal_removal_json,'$.retained_recording.completed')=0 AND (?2 IS NULL OR operation_id>?2) ORDER BY operation_id LIMIT ?3")?
+                .query_map(params![workspace_id,after,limit as i64], |r|r.get::<_,String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.iter().map(|id| load(conn,id)?.ok_or_else(|| invalid("Recording responsibility disappeared"))).collect()
+        })
+    }
+
+    /// Recording progress is independent of the removal case, including after its
+    /// completed commit. Current domain checkpoints and erasure fences are checked
+    /// by the caller; CAS prevents a stale callback from overwriting newer evidence.
+    pub fn update_retained_journal_recording(
+        &self,
+        expected: &JournalRemovalProgress,
+        completed: bool,
+        cause: Option<JournalRemovalCause>,
+    ) -> Result<JournalRemovalProgress> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut current = load(&tx, &expected.operation_id)?
+                .ok_or_else(|| invalid("Recording handoff missing"))?;
+            if &current != expected {
+                return Err(invalid("Recording progress CAS conflict"));
+            }
+            let recording = current
+                .metadata
+                .retained_recording
+                .as_mut()
+                .ok_or_else(|| invalid("Recording handoff missing"))?;
+            if recording.completed && !completed {
+                return Err(invalid("Completed recording cannot be reopened"));
+            }
+            if completed && cause.is_some() {
+                return Err(invalid("Completed recording cannot carry a failure"));
+            }
+            recording.completed = completed;
+            recording.cause = cause;
+            save(&tx, &current.operation_id, &current.metadata)?;
+            tx.commit()?;
+            Ok(current)
+        })
+    }
+
     /// CAS progress only. The Server must read domain checkpoints, execution-end
     /// evidence and guarded writer ownership before recording release. Completed
     /// cannot be supplied here: it is derived from the canonical removal commit.
@@ -323,14 +418,16 @@ impl SqliteWorkspaceStore {
             let allowed = matches!(
                 (metadata.phase, phase),
                 (AwaitingQuiescence, AwaitingQuiescence)
-                    | (Recording, Recording | AwaitingEffectsEnd)
+                    | (Recording, Recording | AwaitingEffectsEnd | Released)
                     | (
                         AwaitingEffectsEnd,
                         AwaitingEffectsEnd | Recording | Released
                     )
                     | (Released, Released)
             );
-            if !allowed || (phase == Released && cause.is_some()) {
+            if !allowed
+                || (phase == Released && (cause.is_some() || metadata.retained_recording.is_none()))
+            {
                 return Err(invalid("Invalid Journal removal phase transition"));
             }
             metadata.phase = phase;

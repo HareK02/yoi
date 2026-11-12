@@ -9,7 +9,7 @@
 //! | --- | --- | --- |
 //! | Assign, Answer, content and post edits, case, tags, tracking, release | Ticket transaction captures facts; `notification_routing` decides both recipients and non-notification reasons | Saved assignment/Worker requests and ACKs; mutation wakeup and periodic rounds |
 //! | Workspace startup, Orchestrator create/restore/replacement, idle | Wakeup only; never a new request or a second policy | Same saved pending decisions |
-//! | Backend Job result | Result transaction captures source; checker supplies domain facts; common routing records result/suppression/failure | Fixed Worker request bytes, binding, ACK and legacy receipt; same recovery rounds |
+//! | Backend Job result | Successful finalization captures source after resource release; checker supplies domain facts; common routing records result/suppression/failure | Fixed Worker request bytes, binding, ACK and legacy receipt; same recovery rounds |
 //! | MR review/request/revoke/cancel/merge and typed implementation result | Atomic business source capture; central policy | Same durable routing and periodic recovery; never inferred from comments |
 //! | Explicit WorkerNotify/WorkerSendInput | Authenticated caller communication | Not automatic business routing |
 //! | Internal SubWorker result and Web subscription | Parent/child execution and UI synchronization respectively | Remain separate; no Ticket policy in Runtime |
@@ -495,6 +495,11 @@ fn job_result_facts(
 
 pub(super) fn deliver_job_result(api: &WorkspaceApi, acceptance: &BackendJobResultAcceptance) {
     use crate::store::JobNotificationFacts;
+    // Result acceptance is not whole-Job completion. Recovery callers share the
+    // same boundary; the durable notification source is created by finalization.
+    if acceptance.job.state != crate::backend_job::BackendJobState::Completed {
+        return;
+    }
     // A recovered/captured result is not delivery authority. Serialize even the
     // Runtime send with deletion, so no prepared bytes escape after its fence.
     let subject = subjektiv_deletion::job_subject(&acceptance.job.request);

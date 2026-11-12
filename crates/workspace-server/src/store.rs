@@ -130,6 +130,8 @@ pub use ticket::{
 const OLDEST_SCHEMA_VERSION: i64 = 50;
 #[path = "backend_job_current.rs"]
 mod backend_job_current;
+#[path = "backend_job_finalizing.rs"]
+mod backend_job_finalizing;
 #[path = "backend_job_recovery_store.rs"]
 mod backend_job_recovery_store;
 #[path = "backend_job_reference_migration.rs"]
@@ -151,7 +153,13 @@ pub(crate) use journal_removal_store::{
     record_physical_failure as record_journal_removal_physical_failure,
 };
 
-const LATEST_SCHEMA_VERSION: i64 = 133;
+#[path = "subject_release_recording_store.rs"]
+mod subject_release_recording_store;
+pub(crate) use subject_release_recording_store::{
+    ReleaseJournalRecording, ReleaseJournalRecordingProgress,
+};
+
+const LATEST_SCHEMA_VERSION: i64 = 135;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -592,6 +600,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 133,
         name: crate::subject_policy::MIGRATION_NAME,
         apply: migrate_subject_permission_domain_to_v133,
+    },
+    Migration {
+        version: 134,
+        name: backend_job_finalizing::MIGRATION_NAME,
+        apply: backend_job_finalizing::migrate,
+    },
+    Migration {
+        version: 135,
+        name: subject_release_recording_store::MIGRATION_NAME,
+        apply: subject_release_recording_store::migrate,
     },
 ];
 
@@ -1742,6 +1760,39 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         let _ = (workspace_id, worker);
         Ok(None)
     }
+    fn retain_journal_recording(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        archive_id: &str,
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (prepared, expected, archive_id);
+        Err(Error::InvalidInput(
+            "Journal recording persistence unavailable".into(),
+        ))
+    }
+    fn list_retained_journal_recordings(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalRemovalProgress>> {
+        let _ = (workspace_id, after, limit);
+        Err(Error::InvalidInput(
+            "Journal recording persistence unavailable".into(),
+        ))
+    }
+    fn update_retained_journal_recording(
+        &self,
+        expected: &JournalRemovalProgress,
+        completed: bool,
+        cause: Option<JournalRemovalCause>,
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (expected, completed, cause);
+        Err(Error::InvalidInput(
+            "Journal recording persistence unavailable".into(),
+        ))
+    }
     fn get_journal_removal(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
@@ -2108,6 +2159,13 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<BackendJobReservation>;
     /// Host-only retirement; fence domain mutations and delivered snapshots first for erasure.
     /// Completed reclamation additionally requires canonical Worker cleanup for all attempts.
+    fn finalize_backend_job(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        now: &str,
+    ) -> Result<BackendJobRecord>;
+
     fn reclaim_backend_job_input(
         &self,
         workspace_id: &str,
@@ -6978,6 +7036,30 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         SqliteWorkspaceStore::recover_worker_removal_execution(self, workspace_id, worker)
     }
 
+    fn retain_journal_recording(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        archive_id: &str,
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::retain_journal_recording(self, prepared, expected, archive_id)
+    }
+    fn list_retained_journal_recordings(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalRemovalProgress>> {
+        SqliteWorkspaceStore::list_retained_journal_recordings(self, workspace_id, after, limit)
+    }
+    fn update_retained_journal_recording(
+        &self,
+        expected: &JournalRemovalProgress,
+        completed: bool,
+        cause: Option<JournalRemovalCause>,
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::update_retained_journal_recording(self, expected, completed, cause)
+    }
     fn get_journal_removal(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
@@ -8584,9 +8666,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 if let Some(worker) = worker
                     && !worker_registry_identity_exists(&tx, workspace_id, worker)?
                 {
-                    return Err(Error::InvalidInput(format!(
-                        "Backend Job {role} Worker does not belong to this Workspace"
-                    )));
+                    let retained_source = if role == "source" {
+                        if let Some(grant) = &request.grants.subjektiv_journal {
+                            tx.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM worker_removal_operations r, json_each(r.journal_removal_json,'$.members') member
+                                 WHERE r.workspace_id=?1 AND r.runtime_id=?2 AND r.worker_id=?3
+                                   AND json_extract(r.journal_removal_json,'$.binding.subject_id')=?4
+                                   AND json_extract(member.value,'$.session_id')=?5
+                                   AND json_extract(r.journal_removal_json,'$.phase') IN ('released','completed')
+                                   AND json_extract(r.journal_removal_json,'$.retained_recording.completed')=0
+                                   AND length(json_extract(r.journal_removal_json,'$.retained_recording.archive_id'))>0)",
+                                params![workspace_id,worker.runtime_id,worker.worker_id,grant.subject_id,grant.session_id],
+                                |row| row.get::<_,bool>(0),
+                            )?
+                        } else { false }
+                    } else { false };
+                    if !retained_source {
+                        return Err(Error::InvalidInput(format!(
+                            "Backend Job {role} Worker does not belong to this Workspace"
+                        )));
+                    }
                 }
             }
             let current_attempt = 1_u8;
@@ -8605,6 +8704,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::Store("reserved Backend Job attempt is missing".to_string()))?;
             tx.commit()?;
             Ok(BackendJobReservation { job, attempt, replayed: false, resource_reused: false })
+        })
+    }
+
+    fn finalize_backend_job(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        now: &str,
+    ) -> Result<BackendJobRecord> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let job = backend_job_finalizing::settle(&tx, workspace_id, job_id, now)?;
+            tx.commit()?;
+            Ok(job)
         })
     }
 
@@ -8634,7 +8747,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             job.load_executable_request()?;
                 let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, &attempt_id(job_id, job.current_attempt))?
                     .ok_or_else(|| Error::Store("Backend Job current attempt missing".into()))?;
-                if job.state != BackendJobState::Completed || attempt.state != BackendJobAttemptState::Completed
+                if !matches!(job.state, BackendJobState::Finalizing | BackendJobState::Completed) || attempt.state != BackendJobAttemptState::Completed
                     || job.result.is_none() || backend_job_has_unfinished_cleanup(&tx, workspace_id, job_id)?
                 { return Err(Error::InvalidInput("input reclaim requires known completed result and completed Worker cleanup".into())); }
             }
@@ -8888,6 +9001,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         failure_cause: Option<&crate::backend_job::BackgroundFailure>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord> {
+        if state == BackendJobWorkerCleanupState::Completed {
+            self.with_conn(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                backend_job_recovery_store::require_history(
+                    &tx,
+                    workspace_id,
+                    expected_history,
+                    expected,
+                )?;
+                if !backend_job_recovery_store::has_fence(&tx, workspace_id, expected)? {
+                    return Err(Error::RepositoryConflict(
+                        "Backend Job cleanup requires the exact execution fence".into(),
+                    ));
+                }
+                tx.commit()?;
+                Ok(())
+            })?;
+        }
+        // Fences are immutable. The completion transaction below compares this
+        // entire history again before changing cleanup, fencing a concurrent rebind.
         backend_job_recovery_store::finish_cleanup_owned(
             self,
             workspace_id,
@@ -9181,7 +9314,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 params![workspace_id, submission.job_id, submission.attempt_id, result_json, digest, now],
             )?;
             let job_changed = tx.execute(
-                "UPDATE backend_jobs SET state = 'completed', result_json = ?3, result_digest = ?4, failure_category = NULL, failure_detail = NULL, failure_cause = NULL, completed_at = ?5, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
+                "UPDATE backend_jobs SET state = 'finalizing', result_json = ?3, result_digest = ?4, failure_category = NULL, failure_detail = NULL, failure_cause = NULL, completed_at = NULL, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
                 params![workspace_id, submission.job_id, result_json, digest, now],
             )?;
             if attempt_changed != 1 || job_changed != 1 {
@@ -9191,7 +9324,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::Store("accepted Backend Job disappeared".to_string()))?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, &submission.job_id, &submission.attempt_id)?
                 .ok_or_else(|| Error::Store("accepted Backend Job attempt disappeared".to_string()))?;
-            notification_routing::jobs::capture(&tx,workspace_id,&submission.job_id,&submission.attempt_id)?;
+
             tx.commit()?;
             Ok(BackendJobResultAcceptance { job, attempt, replayed: false })
         })
@@ -9241,7 +9374,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if &attempt != expected || job.current_attempt != attempt.attempt
                 || job.request.grants.subjektiv_journal.is_none()
                 || attempt.input_digest != job.input_digest
-                || !matches!(job.state, BackendJobState::Pending | BackendJobState::Completed | BackendJobState::Failed) {
+                || !matches!(job.state, BackendJobState::Pending | BackendJobState::Finalizing | BackendJobState::Completed | BackendJobState::Failed) {
                 return Err(Error::InvalidInput("Journal reconciliation binding changed".into()));
             }
             if let Some(submission) = completion {
@@ -9254,8 +9387,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     return Err(Error::InvalidInput("Journal completion cannot replace definitive outcome".into()));
                 }
                 tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,worker_cleanup_state=COALESCE(worker_cleanup_state,'pending'),worker_cleanup_updated_at=CASE WHEN worker_cleanup_state IS NULL THEN ?6 ELSE worker_cleanup_updated_at END,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='dispatched'",params![workspace_id,expected.job_id,expected.attempt_id,json,digest,now])?;
-                tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,json,digest,now])?;
-                notification_routing::jobs::capture(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?;
+                tx.execute("UPDATE backend_jobs SET state='finalizing',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,updated_at=?5,completed_at=NULL WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,json,digest,now])?;
+
             } else {
                 if attempt.state == BackendJobAttemptState::Failed && attempt.failure_category.as_deref() == Some("journal_attempt_fenced") { tx.commit()?; return Ok(attempt); }
                 if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending
@@ -9270,7 +9403,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 let cause = crate::backend_job::BackgroundJobCause::JournalAttemptFenced.storage()
                     .map_err(|_| Error::Store("Journal failure evidence projection unavailable".into()))?;
                 tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed; retained operations remain valid',failure_cause=?5,updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='dispatched'",params![workspace_id,expected.job_id,expected.attempt_id,now,cause.as_storage_str()])?;
-                tx.execute("UPDATE backend_jobs SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',failure_cause=?4,updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,now,cause.as_storage_str()])?;
+                tx.execute("UPDATE backend_jobs SET state='finalizing',completed_at=NULL,failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',failure_cause=?4,updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,now,cause.as_storage_str()])?;
             }
             let result = read_backend_job_attempt(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?.ok_or_else(|| Error::Store("Reconciled Journal attempt missing".into()))?;
             tx.commit()?; Ok(result)
@@ -9321,18 +9454,21 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 attempt.failure_cause.as_ref(), failure_cause,
             ).map_err(Error::BackendJobCauseProjection)?;
             tx.execute(
-                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, failure_cause = ?8, worker_cleanup_state = CASE WHEN state='reserved' AND worker_id IS NULL THEN 'completed' ELSE 'pending' END, worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_failure_cause = NULL, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = CASE WHEN state='reserved' AND worker_id IS NULL THEN ?7 ELSE NULL END, allocation_precluded_at = CASE WHEN state='reserved' AND runtime_id IS NULL AND worker_id IS NULL AND runtime_run_id IS NULL AND dispatched_at IS NULL THEN ?7 ELSE NULL END, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
+                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, failure_cause = ?8, worker_cleanup_state = CASE WHEN state='reserved' AND runtime_id IS NULL AND worker_id IS NULL AND runtime_run_id IS NULL AND dispatched_at IS NULL THEN 'completed' ELSE 'pending' END, worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_failure_cause = NULL, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = CASE WHEN state='reserved' AND runtime_id IS NULL AND worker_id IS NULL AND runtime_run_id IS NULL AND dispatched_at IS NULL THEN ?7 ELSE NULL END, allocation_precluded_at = CASE WHEN state='reserved' AND runtime_id IS NULL AND worker_id IS NULL AND runtime_run_id IS NULL AND dispatched_at IS NULL THEN ?7 ELSE NULL END, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
                 params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now, failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)],
             )?;
             if attempt.attempt == job.current_attempt && job.state == BackendJobState::Pending {
-                let job_state = BackendJobState::Failed;
+                let job_state = BackendJobState::Finalizing;
                 tx.execute(
-                    "UPDATE backend_jobs SET state = ?3, failure_category = ?4, failure_detail = ?5, failure_cause = ?7, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
+                    "UPDATE backend_jobs SET state = ?3, failure_category = ?4, failure_detail = ?5, failure_cause = ?7, completed_at = NULL, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
                     params![workspace_id, job_id, job_state.as_str(), failure_category, detail, now, failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)],
                 )?;
             }
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::Store("finished Backend Job attempt disappeared".to_string()))?;
+            if attempt.allocation_precluded_at.is_some() {
+                backend_job_finalizing::settle(&tx, workspace_id, job_id, now)?;
+            }
             tx.commit()?;
             Ok(attempt)
         })
@@ -9346,7 +9482,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR ((a.state='completed' OR (a.state='failed' AND j.failure_category='journal_execution_terminated')) AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND j.state='finalizing' AND a.state IN ('completed', 'failed') ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
             // Immutable identities keep the boundary stable while admitted
             // owners change cleanup state/timestamps. Selection grants no claim.
@@ -9445,6 +9581,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if current.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Executing) {
                 return Err(Error::InvalidInput(
                     "Backend Job Worker cleanup is not executing".to_string(),
+                ));
+            }
+            if state == BackendJobWorkerCleanupState::Completed
+                && !backend_job_recovery_store::has_fence(&tx, workspace_id, &current)?
+            {
+                return Err(Error::RepositoryConflict(
+                    "Backend Job cleanup requires the exact execution fence".into(),
                 ));
             }
             let completed_at = (state == BackendJobWorkerCleanupState::Completed).then_some(now);
@@ -13700,7 +13843,7 @@ fn read_active_backend_job_for_resource(
     // effects block even after Worker removal; cleanup is not outcome resolution.
     let id = conn.query_row(
         "SELECT job.job_id FROM backend_jobs job WHERE job.workspace_id = ?1 AND job.resource_key = ?2
-         AND (job.state='pending' OR EXISTS (
+         AND (job.state IN ('pending','finalizing') OR EXISTS (
              SELECT 1 FROM backend_job_attempts attempt WHERE attempt.workspace_id = job.workspace_id
              AND attempt.job_id = job.job_id
              AND attempt.worker_cleanup_state IS NOT 'completed'))
@@ -17262,6 +17405,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
     conn.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
     conn.execute_batch(journal_removal_store::SCHEMA_SQL)?;
+    conn.execute_batch(subject_release_recording_store::SCHEMA_SQL)?;
     conn.execute_batch(crate::config_publication::SCHEMA)?;
     conn.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
@@ -17329,7 +17473,7 @@ fn create_workspace_schema_structure(
     // The pre-124 reference composition must not already contain the column
     // added by migration 124. Fresh latest creation installs it after this prefix.
     let job_schema = if current_jobs {
-        schema_sql.to_owned()
+        backend_job_finalizing::current_schema(schema_sql)
     } else {
         backend_job_upgrade::retained_checks(schema_sql)
     };
@@ -29296,7 +29440,8 @@ INSERT INTO worker_registry (
         reservation: &BackendJobReservation,
         id: &str,
     ) -> RuntimeWorkerRef {
-        let worker = RuntimeWorkerRef::new("embedded-worker-runtime", id);
+        let worker =
+            RuntimeWorkerRef::new("embedded-worker-runtime", WorkerId::now_v7().to_string());
         store
             .upsert_worker_registry(&WorkerRegistryRecord {
                 workspace_id: "resource-workspace".into(),
@@ -29338,7 +29483,7 @@ INSERT INTO worker_registry (
         store: &SqliteWorkspaceStore,
         reservation: &BackendJobReservation,
     ) {
-        let (_, claimed) = store
+        let (executing, claimed) = store
             .claim_backend_job_worker_cleanup(
                 "resource-workspace",
                 &reservation.job.request.job_id,
@@ -29347,7 +29492,8 @@ INSERT INTO worker_registry (
             )
             .unwrap();
         assert!(claimed);
-        store
+        backend_job_finalizing::record_fixture_fence(store, "resource-workspace", &executing);
+        let cleaned = store
             .finish_backend_job_worker_cleanup(
                 "resource-workspace",
                 &reservation.job.request.job_id,
@@ -29358,6 +29504,16 @@ INSERT INTO worker_registry (
                 RESOURCE_JOB_NOW,
             )
             .unwrap();
+        if !store
+            .with_conn(|conn| {
+                backend_job_has_unfinished_cleanup(conn, "resource-workspace", &cleaned.job_id)
+            })
+            .unwrap()
+        {
+            store
+                .finalize_backend_job("resource-workspace", &cleaned.job_id, RESOURCE_JOB_NOW)
+                .unwrap();
+        }
     }
 
     fn stored_job_cause() -> crate::backend_job::BackgroundFailure {
@@ -30641,6 +30797,7 @@ INSERT INTO worker_registry (
         let history = store
             .list_backend_job_attempts("resource-workspace", &request.job_id)
             .unwrap();
+        backend_job_finalizing::record_fixture_fence(&store, "resource-workspace", &executing);
         store
             .finish_backend_job_worker_cleanup_owned(
                 "resource-workspace",
@@ -31145,7 +31302,8 @@ INSERT INTO worker_registry (
             .unwrap();
         let source = RuntimeWorkerRef::new("embedded-worker-runtime", "source");
         let worker = RuntimeWorkerRef::new("embedded-worker-runtime", "job-worker");
-        let retry_worker = RuntimeWorkerRef::new("embedded-worker-runtime", "retry-worker");
+        let retry_worker =
+            RuntimeWorkerRef::new("embedded-worker-runtime", WorkerId::now_v7().to_string());
         let worker_record = |worker: RuntimeWorkerRef, display_name: &str| WorkerRegistryRecord {
             workspace_id: workspace_id.to_string(),
             worker,
@@ -31335,7 +31493,7 @@ INSERT INTO worker_registry (
         let accepted = store
             .accept_backend_job_result(workspace_id, &worker, &submission, "2026-09-01T00:00:03Z")
             .unwrap();
-        assert_eq!(accepted.job.state, BackendJobState::Completed);
+        assert_eq!(accepted.job.state, BackendJobState::Finalizing);
         assert!(
             store
                 .accept_backend_job_result(
@@ -31369,7 +31527,7 @@ INSERT INTO worker_registry (
                 .unwrap()
                 .unwrap()
                 .state,
-            BackendJobState::Completed
+            BackendJobState::Finalizing
         );
         assert!(
             !store
@@ -31490,7 +31648,7 @@ INSERT INTO worker_registry (
                 &retry_request.job_id,
                 &failed.attempt.attempt_id,
                 &retry_worker,
-                None,
+                Some("retry-run"),
                 "2026-09-01T00:01:01Z",
             )
             .unwrap();
@@ -31530,7 +31688,7 @@ INSERT INTO worker_registry (
                 .is_err(),
             "failed attempt cannot retry before canonical Worker cleanup"
         );
-        store
+        let (executing, claimed) = store
             .claim_backend_job_worker_cleanup(
                 workspace_id,
                 &retry_request.job_id,
@@ -31538,6 +31696,8 @@ INSERT INTO worker_registry (
                 "2026-09-01T00:01:04Z",
             )
             .unwrap();
+        assert!(claimed);
+        backend_job_finalizing::record_fixture_fence(&store, workspace_id, &executing);
         store
             .finish_backend_job_worker_cleanup(
                 workspace_id,
@@ -31548,6 +31708,9 @@ INSERT INTO worker_registry (
                 None,
                 "2026-09-01T00:01:04Z",
             )
+            .unwrap();
+        store
+            .finalize_backend_job(workspace_id, &retry_request.job_id, "2026-09-01T00:01:04Z")
             .unwrap();
         let second = store
             .reserve_backend_job_retry(workspace_id, &retry_request.job_id, "2026-09-01T00:01:04Z")

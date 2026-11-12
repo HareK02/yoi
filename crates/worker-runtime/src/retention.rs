@@ -13,6 +13,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod frozen_archive;
+
 const ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const OPERATION_SCHEMA_VERSION: u32 = 1;
 const RETENTION_LOCK: &str = ".worker-retention.lock";
@@ -1221,18 +1223,7 @@ impl FsWorkerRetentionProvider {
             sessions.dedup();
             sessions
                 .into_iter()
-                .map(|session| {
-                    if self
-                        .runtime_root
-                        .join("retention/removal-freezes")
-                        .join(format!("{}.json", request.worker_id))
-                        .exists()
-                    {
-                        retention.lock_unpinned(session)
-                    } else {
-                        retention.lock_live(session)
-                    }
-                })
+                .map(|session| retention.lock_live(session))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(retention_error)?
         } else {

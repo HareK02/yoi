@@ -52,66 +52,6 @@ fn waiting(
     }))
 }
 
-/// Shared last-mile decision for ordinary Remove and explicit release. The
-/// retained owner resource, not cleanup status or an empty live map, excludes
-/// accepted cleanup descendants through the current DB/writer commit.
-pub(super) fn release_writer_checked(
-    api: &WorkspaceApi,
-    database: &crate::FeatureDatabase,
-    expected: &feature_storage::DatabaseIdentity,
-    store: &crate::subjektiv::SubjektivStore,
-    binding: &JournalWriterBinding,
-    coverage: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let mut owners = Vec::new();
-    for attr in store
-        .subject_session_attributions(&binding.subject_id)
-        .map_err(subjektiv_store_error)?
-        .into_iter()
-        .filter(|attr| attr.runtime_id == binding.runtime_id && attr.worker_id == binding.worker_id)
-    {
-        let mut after = None;
-        loop {
-            let jobs = api.store.list_backend_journal_jobs(
-                api.workspace_id(),
-                &attr.session_id,
-                after.as_deref(),
-                100,
-            )?;
-            for job in &jobs {
-                require_job_effects_ended(api, job)?;
-                for attempt in api
-                    .store
-                    .list_backend_job_attempts(api.workspace_id(), &job.request.job_id)?
-                {
-                    if attempt.worker.is_some() {
-                        if attempt.worker_cleanup_state
-                            != Some(BackendJobWorkerCleanupState::Completed)
-                        {
-                            return Err(Error::RepositoryConflict(
-                                "Journal attempt cleanup is not complete".into(),
-                            ));
-                        }
-                        owners.push(
-                            crate::backend_job_host_effects::JobHostEffects::try_fence_retained(
-                                &api.config.database_path,
-                                &attempt,
-                            )?,
-                        );
-                    }
-                }
-            }
-            if jobs.len() < 100 {
-                break;
-            }
-            after = jobs.last().map(|job| job.request.job_id.clone());
-        }
-    }
-    let _storage = database.guard(expected).map_err(Error::SubjektivStorage)?;
-    coverage()?;
-    store.release_journal_writer(binding).map_err(domain)
-}
-
 pub(in crate::server) fn removal_observation(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -289,73 +229,11 @@ pub(super) fn require_archive_scope(
     Ok(())
 }
 
-pub(super) fn require_scope_complete(
-    api: &WorkspaceApi,
-    store: &crate::subjektiv::SubjektivStore,
-    worker: &RuntimeWorkerRef,
-    subject: &str,
-    members: &[WorkerRemovalSessionMember],
-) -> Result<()> {
-    verify_members(members)?;
-    let attributed: std::collections::HashSet<_> = store
-        .subject_session_attributions(subject)
-        .map_err(subjektiv_store_error)?
-        .into_iter()
-        .filter(|attr| attr.runtime_id == worker.runtime_id && attr.worker_id == worker.worker_id)
-        .map(|attr| attr.session_id)
-        .collect();
-    let frozen: std::collections::HashSet<_> = members
-        .iter()
-        .map(|member| member.session_id.to_string())
-        .collect();
-    if members.is_empty() || frozen.len() != members.len() || attributed != frozen {
-        return Err(Error::RepositoryConflict(
-            "Journal recording scope ownership is absent or changed".into(),
-        ));
-    }
-    for member in members {
-        let attr = store
-            .session_attribution(&member.session_id.to_string())
-            .map_err(subjektiv_store_error)?
-            .filter(|attr| {
-                attr.subject_id == subject
-                    && attr.runtime_id == worker.runtime_id
-                    && attr.worker_id == worker.worker_id
-            })
-            .ok_or_else(|| {
-                Error::RepositoryConflict("Journal recording member ownership missing".into())
-            })?;
-        require_member_complete(api, store, &attr, member)?;
-    }
-    Ok(())
-}
-
-fn capture_member(
-    api: &WorkspaceApi,
-    prepared: &PreparedWorkerRemoval,
+pub(super) fn validate_capture(
     member: &WorkerRemovalSessionMember,
-    order: u64,
-    offset: u64,
+    slice: session_store::capture::RecordingCaptureSlice,
     budget: usize,
 ) -> Result<session_store::capture::CaptureDto> {
-    let slice = api
-        .runtime
-        .capture_worker_removal_session(
-            &prepared.plan.worker,
-            runtime_api::WorkerRemovalSessionCaptureRequest {
-                workspace_id: api.workspace_id().into(),
-                operation_id: prepared.plan.operation_id.clone(),
-                session_id: member.session_id,
-                active_segment_id: member.active_segment_id,
-                start: session_store::capture::RecordingPosition {
-                    canonical_order: order,
-                    byte_offset: offset,
-                },
-                max_entries: MAX_JOURNAL_RANGES,
-                max_serialized_bytes: budget,
-            },
-        )
-        .map_err(RuntimeRegistryError::into_error)?;
     if slice.capture.session_id != member.session_id.to_string()
         || serde_json::to_vec(&slice)
             .map_err(|error| Error::Store(error.to_string()))?
@@ -405,7 +283,7 @@ fn verify_freeze(prepared: &PreparedWorkerRemoval, freeze: &WorkerRemovalFreeze)
     verify_members(&freeze.members)
 }
 
-fn verify_members(members: &[WorkerRemovalSessionMember]) -> Result<()> {
+pub(super) fn verify_members(members: &[WorkerRemovalSessionMember]) -> Result<()> {
     if members.is_empty() {
         return Err(Error::RepositoryConflict(
             "Recording scope is unavailable, not empty".into(),
@@ -438,6 +316,28 @@ fn verify_members(members: &[WorkerRemovalSessionMember]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn freeze_failure_cause(error: &RuntimeRegistryError) -> Cause {
+    use protocol::control_failure::RuntimeControlCause as C;
+    match error {
+        RuntimeRegistryError::RuntimeControlFailed {
+            cause: C::RecordingSourceUnavailable,
+            ..
+        } => Cause::SourceUnavailable,
+        RuntimeRegistryError::RuntimeControlFailed {
+            cause: C::RecordingOwnershipUnknown,
+            ..
+        } => Cause::OwnershipUnknown,
+        RuntimeRegistryError::RuntimeOperationFailed { code, .. } => match code.as_str() {
+            "source_unavailable" => Cause::SourceUnavailable,
+            "ownership_unknown"
+            | "worker_removal_target_mismatch"
+            | "worker_removal_freeze_identity_mismatch" => Cause::OwnershipUnknown,
+            _ => Cause::ExecutionUnconfirmed,
+        },
+        _ => Cause::ExecutionUnconfirmed,
+    }
 }
 
 pub(in crate::server) fn advance_worker_removal(
@@ -515,6 +415,15 @@ pub(in crate::server) fn advance_worker_removal(
     if store.journal_session_erased(&host).map_err(domain)? {
         return Ok(None);
     }
+    if saved.as_ref().is_some_and(|progress| {
+        matches!(progress.metadata.phase, Phase::Released | Phase::Completed)
+            && progress.metadata.retained_recording.is_some()
+    }) {
+        // The handoff is durable. Replaying physical removal must not freeze or
+        // republish a producer already removed by this exact operation. The
+        // retention receipt and catalog commit still validate the saved scope.
+        return Ok(None);
+    }
     if saved.is_none()
         && prepared.prior_failure_category.as_deref() == Some("metadata_commit_failed")
         && prepared.runtime_request.session_disposition
@@ -546,79 +455,17 @@ pub(in crate::server) fn advance_worker_removal(
             database: database.identity().clone(),
         },
     )?;
-    // Release is independently rechecked on every resume. The phase alone is not proof.
-    if matches!(progress.metadata.phase, Phase::Released | Phase::Completed) {
-        let _storage = database
-            .guard(&progress.metadata.binding.database)
-            .map_err(Error::SubjektivStorage)?;
-        if !store
-            .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
-            .map_err(domain)?
-        {
-            return Err(Error::RepositoryConflict(
-                "Saved release observation has no current writer revocation".into(),
-            ));
-        }
-        require_body_recording_and_effects_ended(&api, &store, &attr)?;
-        let members = progress
-            .metadata
-            .members
-            .as_ref()
-            .ok_or_else(|| Error::Store("Released body has no frozen scope".into()))?
-            .iter()
-            .map(|member| {
-                Ok(WorkerRemovalSessionMember {
-                    session_id: member
-                        .session_id
-                        .parse()
-                        .map_err(|_| Error::Store("Frozen Session identity invalid".into()))?,
-                    active_segment_id: member.active_segment_id,
-                    materialized: member.materialized,
-                    end: member.end,
-                    descriptors: member.descriptors.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        require_scope_complete(&api, &store, target, &attr.subject_id, &members)?;
-        drop(_storage);
-        release_body_pins(&api, runtime, prepared, &store, &attr)?;
-        return Ok(None);
-    }
-    let writer_released = store
-        .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
-        .map_err(domain)?;
-    if !writer_released {
-        if !enabled(&api, target)? {
-            let phase = progress.metadata.phase;
-            return waiting(
-                service,
-                prepared,
-                &progress,
-                phase,
-                Cause::RecordingDisabled,
-            );
-        }
-        authorize_source(&api, &attr, "journal.recording.request")?;
-    }
     let freeze = match runtime.freeze_worker_removal(target, prepared.runtime_request.clone()) {
         Ok(freeze) => freeze,
         Err(error) => {
             tracing::warn!(operation_id=%prepared.plan.operation_id, ?error, "Runtime quiescence/freeze unconfirmed");
-            let phase = progress.metadata.phase;
-            let cause = match &error {
-                RuntimeRegistryError::RuntimeOperationFailed { code, .. }
-                    if code == "source_unavailable" =>
-                {
-                    Cause::SourceUnavailable
-                }
-                RuntimeRegistryError::RuntimeOperationFailed { code, .. }
-                    if code == "ownership_unknown" =>
-                {
-                    Cause::OwnershipUnknown
-                }
-                _ => Cause::ExecutionUnconfirmed,
-            };
-            return waiting(service, prepared, &progress, phase, cause);
+            return waiting(
+                service,
+                prepared,
+                &progress,
+                progress.metadata.phase,
+                freeze_failure_cause(&error),
+            );
         }
     };
     verify_freeze(prepared, &freeze)?;
@@ -636,265 +483,284 @@ pub(in crate::server) fn advance_worker_removal(
     progress = service
         .store
         .freeze_journal_removal(prepared, &progress, &members)?;
-    // No absent/unmapped retained Session may disappear by filtering the Runtime set.
-    let attrs = store
+    let attributed: std::collections::HashSet<_> = store
         .subject_session_attributions(&attr.subject_id)
-        .map_err(subjektiv_store_error)?;
-    let attributed: std::collections::HashSet<_> = attrs
-        .iter()
+        .map_err(subjektiv_store_error)?
+        .into_iter()
         .filter(|session| {
             session.runtime_id == target.runtime_id && session.worker_id == target.worker_id
         })
-        .map(|session| session.session_id.as_str())
+        .map(|session| session.session_id)
         .collect();
     if attributed
         != members
             .iter()
-            .map(|member| member.session_id.as_str())
+            .map(|member| member.session_id.clone())
             .collect()
     {
         return waiting(
             service,
             prepared,
             &progress,
-            Phase::Recording,
+            progress.metadata.phase,
             Cause::OwnershipUnknown,
         );
     }
-    let mut complete = true;
-    let mut incomplete_cause = Cause::JobPending;
+    for member in &freeze.members {
+        if member.materialized {
+            let session = member_attribution(&store, prepared, &attr.subject_id, member)?;
+            if let Err(original) = retain_source(
+                runtime,
+                api.workspace_id(),
+                &session,
+                runtime_api::SessionPublicSource::Retained {
+                    worker_id: prepared.runtime_request.worker_id,
+                },
+                false,
+            ) {
+                let archive_id = prepared
+                    .runtime_request
+                    .archive_id
+                    .clone()
+                    .ok_or(original)?;
+                retain_source(
+                    runtime,
+                    api.workspace_id(),
+                    &session,
+                    runtime_api::SessionPublicSource::Archived { archive_id },
+                    false,
+                )?;
+            }
+        }
+    }
+    let archive = match runtime
+        .publish_worker_removal_archive(target, prepared.runtime_request.clone())
+    {
+        Ok(archive) => archive,
+        Err(error) => {
+            tracing::warn!(operation_id=%prepared.plan.operation_id, ?error, "Frozen original archive publication unconfirmed");
+            return waiting(
+                service,
+                prepared,
+                &progress,
+                progress.metadata.phase,
+                Cause::SourceUnavailable,
+            );
+        }
+    };
+    require_archive_scope(&progress, &archive)?;
+    progress = service
+        .store
+        .retain_journal_recording(prepared, &progress, &archive.archive_id)?;
+    // The archive shares the Session pin namespace with the producer. Never
+    // release those pins here: recording completion or explicit erasure owns them.
+    let gate = lifecycle_lock(&api, &attr.subject_id)?;
+    let _gate = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    let _storage = database
+        .guard(&progress.metadata.binding.database)
+        .map_err(Error::SubjektivStorage)?;
     for member in &freeze.members {
         let session = member_attribution(&store, prepared, &attr.subject_id, member)?;
+        let host = JournalHostContext::validated_session(&store, session).map_err(domain)?;
+        if store.journal_session_erased(&host).map_err(domain)? {
+            return Err(Error::RepositoryConflict(
+                "Session erased during recording handoff".into(),
+            ));
+        }
+    }
+    store
+        .release_retained_journal_writer(&JournalWriterBinding {
+            subject_id: attr.subject_id.clone(),
+            runtime_id: attr.runtime_id.clone(),
+            worker_id: attr.worker_id.clone(),
+            binding_id: progress.metadata.binding.writer_binding_id.clone(),
+        })
+        .map_err(domain)?;
+    if progress.metadata.phase != Phase::Released {
+        service.store.update_journal_removal_progress(
+            prepared,
+            &progress,
+            Phase::Released,
+            None,
+        )?;
+    }
+    drop(_storage);
+    drop(_gate);
+    if let Err(error) = recover_retained_recordings(&api) {
+        tracing::warn!(operation_id=%progress.operation_id, %error, "Retained recording continuation deferred");
+    }
+    Ok(None)
+}
+
+pub(super) fn resume_retained_source(
+    api: &WorkspaceApi,
+    progress: &RetainedSourceProgress,
+) -> Result<bool> {
+    let database = api
+        .feature_storage
+        .open_existing(&api.subjektiv_registration, &progress.binding.database)
+        .map_err(Error::SubjektivStorage)?;
+    let store =
+        crate::subjektiv::SubjektivStore::from_database(database).map_err(subjektiv_store_error)?;
+    let mut complete = true;
+    for frozen in &progress.members {
+        let attr = store
+            .session_attribution(&frozen.session_id)
+            .map_err(subjektiv_store_error)?
+            .filter(|attr| {
+                attr.subject_id == progress.binding.subject_id
+                    && attr.runtime_id == progress.worker.runtime_id
+                    && attr.worker_id == progress.worker.worker_id
+            })
+            .ok_or_else(|| {
+                Error::RepositoryConflict("Retained recording attribution mismatch".into())
+            })?;
         let session_host =
-            JournalHostContext::validated_session(&store, session.clone()).map_err(domain)?;
-        if writer_released {
-            // Explicit release already revoked this body. Recheck its complete
-            // coverage and effects, but never request new execution authority.
-            if require_member_complete(&api, &store, &session, member).is_err() {
-                return waiting(
-                    service,
-                    prepared,
-                    &progress,
-                    Phase::Recording,
-                    Cause::ExecutionUnconfirmed,
-                );
-            }
+            JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
+        if store
+            .journal_session_erased(&session_host)
+            .map_err(domain)?
+        {
             continue;
         }
-        authorize_source(&api, &session, "journal.recording.request")?;
-        let mut id = store.journal_for_session(&session_host).map_err(domain)?;
-        if let Some(journal_id) = &id {
-            // T-841 owns an accepted Job's recovery; never reselect its missing prefix.
-            if let Err(error) =
-                dispatch_with_capture(&api, session.clone(), journal_id, false, |_, _, _| {
-                    Err(Error::Store("Saved-only dispatch cannot capture".into()))
-                })
-            {
-                tracing::debug!(operation_id=%prepared.plan.operation_id, %error, "Frozen Job awaits execution-end reconciliation");
+        let member = WorkerRemovalSessionMember {
+            session_id: frozen
+                .session_id
+                .parse()
+                .map_err(|_| Error::Store("Invalid retained Session identity".into()))?,
+            active_segment_id: frozen.active_segment_id,
+            materialized: frozen.materialized,
+            end: frozen.end,
+            descriptors: frozen.descriptors.clone(),
+        };
+        if require_member_complete(api, &store, &attr, &member).is_ok() {
+            if !member.materialized {
+                continue;
             }
-        }
-        if require_member_complete(&api, &store, &session, member).is_ok() {
+            retain_source(
+                api.runtime.as_ref(),
+                api.workspace_id(),
+                &attr,
+                progress.material_source()?,
+                true,
+            )?;
             continue;
         }
         complete = false;
-        if id.is_none() && !member.descriptors.is_empty() {
-            let capture = match capture_member(
-                &api,
-                prepared,
-                member,
-                0,
-                0,
-                JournalInput::capture_budget(),
-            ) {
-                Ok(capture) => capture,
-                Err(error) => {
-                    tracing::warn!(operation_id=%prepared.plan.operation_id, %error, "Frozen member capture unavailable");
-                    return waiting(
-                        service,
-                        prepared,
-                        &progress,
-                        Phase::Recording,
-                        Cause::SourceUnavailable,
-                    );
-                }
-            };
+        // Admission checks current Subject policy, not the removed producers grant.
+        // The guarded store repeats that check at each persisted source effect.
+        let source_store = retained_source_store(api, &attr)?;
+        let source_host =
+            JournalHostContext::validated_recording_source(&source_store, attr.clone())
+                .map_err(domain)?;
+        let mut journal = source_store
+            .journal_for_session(&source_host)
+            .map_err(domain)?;
+        if journal.is_none() && !member.descriptors.is_empty() {
+            let capture = progress.capture(api, &member, 0, 0, JournalInput::capture_budget())?;
             let ranges = journal::recording::capture_ranges(&capture).map_err(domain)?;
             if ranges.is_empty() {
-                return waiting(
-                    service,
-                    prepared,
-                    &progress,
-                    Phase::Recording,
-                    Cause::SourceUnavailable,
-                );
+                return Err(Error::RepositoryConflict(
+                    "Frozen recording source unexpectedly empty".into(),
+                ));
             }
-            authorize_source(&api, &session, "journal.recording.request")?;
-            id = Some(
-                store
-                    .accept_journal_sources(&session_host, "Session activity", &ranges)
+            journal = Some(
+                source_store
+                    .accept_journal_sources(&source_host, "Session activity", &ranges)
                     .map_err(domain)?,
             );
         }
+        if let Some(journal) = journal {
+            dispatch_retained_with_capture(api, attr, &journal, |order, offset, budget| {
+                progress.capture(api, &member, order, offset, budget)
+            })?;
+        }
+    }
+    Ok(complete)
+}
+
+pub(super) fn members_have_failed_job(
+    api: &WorkspaceApi,
+    members: &[FrozenJournalRemovalMember],
+) -> Result<bool> {
+    for member in members {
         let mut after = None;
         loop {
             let jobs = api.store.list_backend_journal_jobs(
                 api.workspace_id(),
-                &session.session_id,
+                &member.session_id,
                 after.as_deref(),
                 100,
             )?;
-            for job in &jobs {
-                if job.state == BackendJobState::Failed && !can_resume_partial(job) {
-                    incomplete_cause = Cause::JobFailed;
-                } else if job.state == BackendJobState::Pending
-                    && incomplete_cause != Cause::JobFailed
-                {
-                    let attempt = api.store.get_backend_job_attempt(
-                        api.workspace_id(),
-                        &job.request.job_id,
-                        &crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt),
-                    )?;
-                    if attempt.is_none_or(|attempt| {
-                        attempt.worker.is_none() && attempt.allocation_precluded_at.is_none()
-                    }) {
-                        incomplete_cause = Cause::ExecutionUnconfirmed;
-                    }
-                }
+            if jobs
+                .iter()
+                .any(|job| job.state == BackendJobState::Failed && !can_resume_partial(job))
+            {
+                return Ok(true);
             }
             if jobs.len() < 100 {
                 break;
             }
             after = jobs.last().map(|job| job.request.job_id.clone());
         }
-        if let Some(id) = id {
-            let capture_failed = std::cell::Cell::new(false);
-            if let Err(error) =
-                dispatch_with_capture(&api, session.clone(), &id, true, |order, offset, budget| {
-                    let result = capture_member(&api, prepared, member, order, offset, budget);
-                    capture_failed.set(result.is_err());
-                    result
-                })
-            {
-                tracing::warn!(operation_id=%prepared.plan.operation_id, %error, "Frozen recording remains held");
-                let cause = if capture_failed.get() {
-                    Cause::SourceUnavailable
-                } else if incomplete_cause == Cause::JobFailed {
-                    Cause::JobFailed
-                } else {
-                    Cause::ExecutionUnconfirmed
-                };
-                return waiting(service, prepared, &progress, Phase::Recording, cause);
-            }
-        }
     }
-    if !complete {
-        return waiting(
-            service,
-            prepared,
-            &progress,
-            Phase::Recording,
-            incomplete_cause,
-        );
-    }
-    progress = service.store.update_journal_removal_progress(
-        prepared,
-        &progress,
-        Phase::AwaitingEffectsEnd,
-        None,
-    )?;
-    let release = (|| -> Result<()> {
-        // Short final exclusion only: no Runtime I/O, Job wait, or transaction
-        // crosses this guard. Reopen checked the existing physical DB, never CREATE.
-        let gate = lifecycle_lock(&api, &attr.subject_id)?;
-        let _gate = gate
-            .lock()
-            .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
-        for member in &freeze.members {
-            let session = member_attribution(&store, prepared, &attr.subject_id, member)?;
-            require_member_complete(&api, &store, &session, member)?;
-        }
-        let binding = JournalWriterBinding {
-            subject_id: attr.subject_id.clone(),
-            runtime_id: attr.runtime_id.clone(),
-            worker_id: attr.worker_id.clone(),
-            binding_id: host
-                .writer_binding_id()
-                .ok_or_else(|| {
-                    Error::RepositoryConflict("Frozen body writer binding missing".into())
-                })?
-                .into(),
-        };
-        release_writer_checked(
-            &api,
-            &database,
-            &progress.metadata.binding.database,
-            &store,
-            &binding,
-            || require_scope_complete(&api, &store, target, &attr.subject_id, &freeze.members),
-        )?;
-        Ok(())
-    })();
-    if let Err(error) = release {
-        tracing::debug!(operation_id=%prepared.plan.operation_id, %error, "Writer release awaits exact cleanup return");
-        return waiting(
-            service,
-            prepared,
-            &progress,
-            Phase::AwaitingEffectsEnd,
-            Cause::ExecutionUnconfirmed,
-        );
-    }
-    service
-        .store
-        .update_journal_removal_progress(prepared, &progress, Phase::Released, None)?;
-    release_body_pins(&api, runtime, prepared, &store, &attr)?;
-    Ok(None)
+    Ok(false)
 }
 
-fn release_body_pins(
-    api: &WorkspaceApi,
-    runtime: &RuntimeRegistry,
-    prepared: &PreparedWorkerRemoval,
-    store: &crate::subjektiv::SubjektivStore,
-    attr: &crate::subjektiv::SubjectSessionAttribution,
-) -> Result<()> {
-    for session in store
-        .subject_session_attributions(&attr.subject_id)
-        .map_err(subjektiv_store_error)?
-        .into_iter()
-        .filter(|session| {
-            session.runtime_id == attr.runtime_id && session.worker_id == attr.worker_id
-        })
-    {
-        if let Err(original) = retain_source(
-            runtime,
+/// Resume only durable unfinished recording responsibilities, including after the
+/// producers removal commit. This never reopens removal or restores a producer.
+pub(super) fn recover_retained_recordings(api: &WorkspaceApi) -> Result<()> {
+    let mut after = None;
+    loop {
+        let page = api.store.list_retained_journal_recordings(
             api.workspace_id(),
-            &session,
-            runtime_api::SessionPublicSource::Retained {
-                worker_id: prepared.runtime_request.worker_id,
-            },
-            true,
-        ) {
-            let archive_id = prepared
-                .runtime_request
-                .archive_id
-                .clone()
-                .ok_or(original)?;
-            retain_source(
-                runtime,
-                api.workspace_id(),
-                &session,
-                runtime_api::SessionPublicSource::Archived { archive_id },
-                true,
-            )?;
+            after.as_deref(),
+            100,
+        )?;
+        for progress in &page {
+            let outcome = RetainedSourceProgress::removal(progress)
+                .and_then(|source| resume_retained_source(api, &source));
+            let (complete, mut cause) = match outcome {
+                Ok(true) => (true, None),
+                Ok(false) => (false, Some(Cause::JobPending)),
+                Err(error) => {
+                    let cause = match &error {
+                        Error::WorkspacePermissionDenied(_) => Cause::OwnershipUnknown,
+                        Error::SubjektivStorage(_) => Cause::StorageUnavailable,
+                        _ => Cause::SourceUnavailable,
+                    };
+                    tracing::warn!(operation_id=%progress.operation_id, %error, "Retained Journal recording awaits recovery");
+                    (false, Some(cause))
+                }
+            };
+            if !complete
+                && members_have_failed_job(
+                    api,
+                    progress.metadata.members.as_deref().unwrap_or_default(),
+                )?
+            {
+                cause = Some(Cause::JobFailed);
+            }
+            if let Err(error) = api
+                .store
+                .update_retained_journal_recording(progress, complete, cause)
+            {
+                tracing::debug!(operation_id=%progress.operation_id, %error, "Recording progress changed during recovery");
+            }
         }
+        if page.len() < 100 {
+            return retained::recover_releases(api);
+        }
+        after = page.last().map(|p| p.operation_id.clone());
     }
-    Ok(())
 }
 
 /// Startup and exact Job-cleanup completion both resume saved parent intentions.
 /// No retry timer blindly resubmits failures; the same operation is reconciled.
 pub(in crate::server) fn resume_removals(api: &WorkspaceApi) -> Result<()> {
+    recover_retained_recordings(api)?;
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| Error::Store(error.to_string()))?;
     let mut after = None;

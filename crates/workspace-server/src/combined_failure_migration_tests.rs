@@ -766,9 +766,7 @@ const JOURNAL_HISTORIES: [&str; 2] = [
 
 fn published_journal(path: &Path, sql: &str) -> Connection {
     let conn = Connection::open(path).unwrap();
-    conn.execute_batch(sql).unwrap();
-    conn.execute_batch(include_str!("fixtures/published_journal124_values.sql"))
-        .unwrap();
+    crate::published_journal_test_support::install(&conn, sql);
     conn
 }
 

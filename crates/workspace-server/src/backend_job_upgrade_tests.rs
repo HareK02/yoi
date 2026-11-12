@@ -1181,7 +1181,10 @@ fn fresh_creation_and_empty_retained_upgrade_have_identical_job_ddl() {
         }
         signature.extend(rows(&conn,"SELECT type,name,replace(replace(replace(sql,char(10),''),char(13),''),' ','') FROM sqlite_schema WHERE name LIKE 'backend_job%' AND type IN ('trigger','index') AND sql IS NOT NULL ORDER BY type,name"));
         store_owner::backend_job_current::verify(&conn).unwrap();
-        assert_eq!(store_owner::current_schema_version(&conn).unwrap(), 130);
+        assert_eq!(
+            store_owner::current_schema_version(&conn).unwrap(),
+            store_owner::LATEST_SCHEMA_VERSION
+        );
         signature
     }
     assert_eq!(objects(&migrated), objects(&fresh));

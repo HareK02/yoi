@@ -1,4 +1,32 @@
-// Real SQLite result transactions, migration, reopen and concurrent recovery.
+// Real SQLite finalization transactions, migration, reopen and concurrent recovery.
+// Store-only fixtures supply execution-end evidence at the storage boundary;
+// real Runtime cleanup is covered by the Server integration suite.
+fn release_notice_execution(
+    store: &SqliteWorkspaceStore,
+    acceptance: &BackendJobResultAcceptance,
+) -> BackendJobAttemptRecord {
+    let attempt = &acceptance.attempt;
+    let (executing, _) = store
+        .claim_backend_job_worker_cleanup(
+            "w",
+            &attempt.job_id,
+            &attempt.attempt_id,
+            RESOURCE_JOB_NOW,
+        )
+        .unwrap();
+    backend_job_finalizing::record_fixture_fence(store, "w", &executing);
+    store
+        .finish_backend_job_worker_cleanup(
+            "w",
+            &attempt.job_id,
+            &attempt.attempt_id,
+            BackendJobWorkerCleanupState::Completed,
+            None,
+            None,
+            RESOURCE_JOB_NOW,
+        )
+        .unwrap()
+}
 fn job_notice_fixture(
     store: &SqliteWorkspaceStore,
     id: &str,
@@ -9,7 +37,7 @@ fn job_notice_fixture(
     request.grants = Default::default();
     request.profile = "builtin:backend-job".into();
     request.notification_target = target.then(|| RuntimeWorkerRef::new("r", "replacement"));
-    let worker = RuntimeWorkerRef::new("r", format!("job-worker-{id}"));
+    let worker = RuntimeWorkerRef::new("r", uuid::Uuid::now_v7().to_string());
     let mut registration = store
         .get_worker_registry("w", &RuntimeWorkerRef::new("r", "replacement"))
         .unwrap()
@@ -37,7 +65,7 @@ fn job_notice_fixture(
             RESOURCE_JOB_NOW,
         )
         .unwrap();
-    let acceptance = store
+    let mut acceptance = store
         .accept_backend_job_result(
             "w",
             &worker,
@@ -49,6 +77,11 @@ fn job_notice_fixture(
             },
             RESOURCE_JOB_NOW,
         )
+        .unwrap();
+    assert_eq!(acceptance.job.state, BackendJobState::Finalizing);
+    acceptance.attempt = release_notice_execution(store, &acceptance);
+    acceptance.job = store
+        .finalize_backend_job("w", id, RESOURCE_JOB_NOW)
         .unwrap();
     let source = JobNotificationSource {
         job_id: id.into(),
@@ -142,20 +175,38 @@ async fn job_notification_routing_common_policy_distinguishes_suppression_failur
             store.route_job_notification("w", &source, &facts).unwrap(),
             disposition == "deliver"
         );
-        let diagnostics=store.notification_diagnostics("w",&server_api::NotificationDiagnosticsQuery{job_id:Some(name.into()),..Default::default()}).unwrap();
-        let item=&diagnostics.items[0];
-        assert_eq!(item.disposition.as_deref(),Some(disposition));
-        assert_eq!(item.reason.as_deref(),Some(reason));
-        assert_eq!(item.job_id.as_deref(),Some(name));
+        let diagnostics = store
+            .notification_diagnostics(
+                "w",
+                &server_api::NotificationDiagnosticsQuery {
+                    job_id: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let item = &diagnostics.items[0];
+        assert_eq!(item.disposition.as_deref(), Some(disposition));
+        assert_eq!(item.reason.as_deref(), Some(reason));
+        assert_eq!(item.job_id.as_deref(), Some(name));
         assert!(diagnostics.source_checks[0].captured);
-        assert_eq!(diagnostics.source_checks[0].origin_present,Some(true));
+        assert_eq!(diagnostics.source_checks[0].origin_present, Some(true));
         assert!(!item.model_processing_confirmed);
-        if disposition=="deliver" {
-            assert_eq!(item.stage,server_api::NotificationDiagnosticStage::RequestPersisted);
-            assert_eq!(item.target_worker_id.as_deref(),Some("replacement"));
+        if disposition == "deliver" {
+            assert_eq!(
+                item.stage,
+                server_api::NotificationDiagnosticStage::RequestPersisted
+            );
+            assert_eq!(item.target_worker_id.as_deref(), Some("replacement"));
         } else {
             assert!(!item.retry_candidate);
-            assert_eq!(item.stage,if disposition=="suppress"{server_api::NotificationDiagnosticStage::Suppressed}else{server_api::NotificationDiagnosticStage::Deferred});
+            assert_eq!(
+                item.stage,
+                if disposition == "suppress" {
+                    server_api::NotificationDiagnosticStage::Suppressed
+                } else {
+                    server_api::NotificationDiagnosticStage::Deferred
+                }
+            );
         }
         assert_eq!(
             job_notice_evidence(&store, &source),
@@ -205,13 +256,39 @@ async fn job_notification_routing_common_policy_distinguishes_suppression_failur
 async fn job_notification_preparation_failures_remain_pending_and_append_only() {
     let (_directory, store) = tracking_store_fixture().await;
     for target in [true, false] {
-        let (_, source) = job_notice_fixture(&store, if target { "retry" } else { "retry-no-target" }, target);
+        let (_, source) = job_notice_fixture(
+            &store,
+            if target { "retry" } else { "retry-no-target" },
+            target,
+        );
         for _ in 0..2 {
-            assert!(!store.route_job_notification("w", &source, &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)).unwrap());
+            assert!(
+                !store
+                    .route_job_notification(
+                        "w",
+                        &source,
+                        &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)
+                    )
+                    .unwrap()
+            );
         }
         if !target {
-            assert_eq!(job_notice_evidence(&store,&source),("suppress".into(),"no_recipient".into(),false,Some("source_lookup_failed".into())));
-            assert!(!store.list_pending_job_notifications("w",100).unwrap().iter().any(|s|s.delivery_id==source.delivery_id));
+            assert_eq!(
+                job_notice_evidence(&store, &source),
+                (
+                    "suppress".into(),
+                    "no_recipient".into(),
+                    false,
+                    Some("source_lookup_failed".into())
+                )
+            );
+            assert!(
+                !store
+                    .list_pending_job_notifications("w", 100)
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.delivery_id == source.delivery_id)
+            );
             continue;
         }
         store.with_conn(|conn| {
@@ -223,13 +300,44 @@ async fn job_notification_preparation_failures_remain_pending_and_append_only() 
             assert!(conn.execute("INSERT INTO notification_source_preparation_failures(source_sequence,code) VALUES(-1,'source_lookup_failed')", []).is_err());
             Ok(())
         }).unwrap();
-        assert!(store.list_pending_job_notifications("w", 100).unwrap().iter().any(|s| s.delivery_id == source.delivery_id));
-        assert_eq!(store.route_job_notification("w", &source, &JobNotificationFacts::Result("recovered body".into())).unwrap(), target);
-        let pinned = store.job_notification_request("w", &source.delivery_id).unwrap();
+        assert!(
+            store
+                .list_pending_job_notifications("w", 100)
+                .unwrap()
+                .iter()
+                .any(|s| s.delivery_id == source.delivery_id)
+        );
+        assert_eq!(
+            store
+                .route_job_notification(
+                    "w",
+                    &source,
+                    &JobNotificationFacts::Result("recovered body".into())
+                )
+                .unwrap(),
+            target
+        );
+        let pinned = store
+            .job_notification_request("w", &source.delivery_id)
+            .unwrap();
         // Later failed reads cannot overwrite the pinned decision/body/recipient
         // or fabricate a new pre-decision observation after routing has finished.
-        assert_eq!(store.route_job_notification("w", &source, &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)).unwrap(), target);
-        assert_eq!(store.job_notification_request("w", &source.delivery_id).unwrap(), pinned);
+        assert_eq!(
+            store
+                .route_job_notification(
+                    "w",
+                    &source,
+                    &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)
+                )
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            store
+                .job_notification_request("w", &source.delivery_id)
+                .unwrap(),
+            pinned
+        );
         store.with_conn(|conn| {
             assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_source_preparation_failures f JOIN notification_sources s ON s.sequence=f.source_sequence WHERE s.input_event_id=?1", [&source.delivery_id], |r| r.get::<_, i64>(0))?, 2);
             Ok(())
@@ -243,10 +351,15 @@ async fn job_notification_fair_offers_survive_reopen_and_bound_preparation_and_a
     let mut failing = Vec::new();
     for i in 0..25 {
         let (_, source) = job_notice_fixture(&store, &format!("failing-{i}"), true);
-        assert!(!store.route_job_notification(
-            "w", &source,
-            &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
-        ).unwrap());
+        assert!(
+            !store
+                .route_job_notification(
+                    "w",
+                    &source,
+                    &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
+                )
+                .unwrap()
+        );
         failing.push(source);
     }
     let (_, healthy) = job_notice_fixture(&store, "later-healthy", true);
@@ -255,26 +368,52 @@ async fn job_notification_fair_offers_survive_reopen_and_bound_preparation_and_a
         worker: RuntimeWorkerRef::new("r", "replacement"),
         authentication_binding_id: "tracking-binding".into(),
     };
-    assert!(store.route_job_notification(
-        "w", &retry, &JobNotificationFacts::Result("original pinned bytes".into()),
-    ).unwrap());
-    assert_eq!(store.authorize_job_notification("w", &retry.delivery_id, &target).unwrap(), None);
+    assert!(
+        store
+            .route_job_notification(
+                "w",
+                &retry,
+                &JobNotificationFacts::Result("original pinned bytes".into()),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .authorize_job_notification("w", &retry.delivery_id, &target)
+            .unwrap(),
+        None
+    );
     let retry_key = NotificationDeliveryKey::WorkerNotification {
         delivery_id: retry.delivery_id.clone(),
     };
-    store.record_notification_delivery_failure(
-        "w", &retry_key, NotificationFailureCode::AcceptanceUnknown,
-    ).unwrap();
-    let pinned = store.job_notification_request("w", &retry.delivery_id).unwrap();
+    store
+        .record_notification_delivery_failure(
+            "w",
+            &retry_key,
+            NotificationFailureCode::AcceptanceUnknown,
+        )
+        .unwrap();
+    let pinned = store
+        .job_notification_request("w", &retry.delivery_id)
+        .unwrap();
     // Start with an already-offered pinned retry, not only a never-offered result.
     // All sources share the same offer clock; 25 failure observations are not ticks.
-    assert_eq!(store.list_pending_job_notifications("w", 100).unwrap().len(), 27);
+    assert_eq!(
+        store
+            .list_pending_job_notifications("w", 100)
+            .unwrap()
+            .len(),
+        27
+    );
     let snapshot = |store: &SqliteWorkspaceStore, table: &str| {
-        store.with_conn(|conn| Ok(stored_fixture_rows(conn, table))).unwrap()
+        store
+            .with_conn(|conn| Ok(stored_fixture_rows(conn, table)))
+            .unwrap()
     };
     let original_sources = snapshot(&store, "notification_sources");
     let original_decisions = snapshot(&store, "notification_decisions");
-    let original_preparation_failures = snapshot(&store, "notification_source_preparation_failures");
+    let original_preparation_failures =
+        snapshot(&store, "notification_source_preparation_failures");
     let original_delivery_failures = snapshot(&store, "notification_failures");
     let original_jobs = snapshot(&store, "backend_jobs");
     let mut failure_offers = vec![0; failing.len()];
@@ -293,33 +432,73 @@ async fn job_notification_fair_offers_survive_reopen_and_bound_preparation_and_a
             assert!(pending.iter().all(|s| s.job_id.starts_with("failing-")));
         }
         for source in pending {
-            if let Some(index) = failing.iter().position(|s| s.delivery_id == source.delivery_id) {
+            if let Some(index) = failing
+                .iter()
+                .position(|s| s.delivery_id == source.delivery_id)
+            {
                 failure_offers[index] += 1;
-                assert!(!store.route_job_notification(
-                    "w", &source,
-                    &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
-                ).unwrap());
+                assert!(
+                    !store
+                        .route_job_notification(
+                            "w",
+                            &source,
+                            &JobNotificationFacts::Failed(
+                                NotificationFailureCode::SourceLookupFailed
+                            ),
+                        )
+                        .unwrap()
+                );
             } else if source.delivery_id == healthy.delivery_id {
                 assert!(healthy_round.replace(round).is_none());
-                assert!(store.route_job_notification(
-                    "w", &source, &JobNotificationFacts::Result("healthy body".into()),
-                ).unwrap());
-                assert_eq!(store.authorize_job_notification("w", &source.delivery_id, &target).unwrap(), None);
-                store.ack_job_notification("w", &source.delivery_id, &target.worker).unwrap();
+                assert!(
+                    store
+                        .route_job_notification(
+                            "w",
+                            &source,
+                            &JobNotificationFacts::Result("healthy body".into()),
+                        )
+                        .unwrap()
+                );
+                assert_eq!(
+                    store
+                        .authorize_job_notification("w", &source.delivery_id, &target)
+                        .unwrap(),
+                    None
+                );
+                store
+                    .ack_job_notification("w", &source.delivery_id, &target.worker)
+                    .unwrap();
             } else {
                 assert_eq!(source.delivery_id, retry.delivery_id);
                 retry_rounds.push(round);
                 // Neither scheduling nor a new rendering may replace the request.
-                assert!(store.route_job_notification(
-                    "w", &source, &JobNotificationFacts::Result("must not replace pinned bytes".into()),
-                ).unwrap());
-                assert_eq!(store.job_notification_request("w", &source.delivery_id).unwrap(), pinned);
+                assert!(
+                    store
+                        .route_job_notification(
+                            "w",
+                            &source,
+                            &JobNotificationFacts::Result("must not replace pinned bytes".into()),
+                        )
+                        .unwrap()
+                );
+                assert_eq!(
+                    store
+                        .job_notification_request("w", &source.delivery_id)
+                        .unwrap(),
+                    pinned
+                );
                 if retry_rounds.len() == 1 {
-                    store.record_notification_delivery_failure(
-                        "w", &retry_key, NotificationFailureCode::AcceptanceUnknown,
-                    ).unwrap();
+                    store
+                        .record_notification_delivery_failure(
+                            "w",
+                            &retry_key,
+                            NotificationFailureCode::AcceptanceUnknown,
+                        )
+                        .unwrap();
                 } else {
-                    store.ack_job_notification("w", &source.delivery_id, &target.worker).unwrap();
+                    store
+                        .ack_job_notification("w", &source.delivery_id, &target.worker)
+                        .unwrap();
                 }
             }
         }
@@ -331,7 +510,11 @@ async fn job_notification_fair_offers_survive_reopen_and_bound_preparation_and_a
     }
     // With 26 sources still pending after the healthy ACK, even the last source
     // in an offer-time tie returns within ceil(26 / 20) = 2 further rounds.
-    assert_eq!(retry_rounds, vec![2, 4], "a pinned retry must not starve behind undecided sources");
+    assert_eq!(
+        retry_rounds,
+        vec![2, 4],
+        "a pinned retry must not starve behind undecided sources"
+    );
     assert!(job_notice_evidence(&store, &healthy).2);
     assert!(job_notice_evidence(&store, &retry).2);
     assert_eq!(snapshot(&store, "notification_sources"), original_sources);
@@ -340,10 +523,24 @@ async fn job_notification_fair_offers_survive_reopen_and_bound_preparation_and_a
     assert!(original_decisions.iter().all(|row| decisions.contains(row)));
     let preparation_failures = snapshot(&store, "notification_source_preparation_failures");
     assert!(preparation_failures.starts_with(&original_preparation_failures));
-    assert_eq!(preparation_failures.len(), 25 + failure_offers.iter().sum::<usize>());
+    assert_eq!(
+        preparation_failures.len(),
+        25 + failure_offers.iter().sum::<usize>()
+    );
     assert!(snapshot(&store, "notification_failures").starts_with(&original_delivery_failures));
-    assert_eq!(store.job_notification_request("w", &retry.delivery_id).unwrap(), pinned);
-    assert!(store.list_pending_job_notifications("w", 20).unwrap().iter().all(|s| s.job_id.starts_with("failing-")));
+    assert_eq!(
+        store
+            .job_notification_request("w", &retry.delivery_id)
+            .unwrap(),
+        pinned
+    );
+    assert!(
+        store
+            .list_pending_job_notifications("w", 20)
+            .unwrap()
+            .iter()
+            .all(|s| s.job_id.starts_with("failing-"))
+    );
     store.with_conn(|conn| {
         assert!(conn.execute("INSERT INTO notification_source_offers VALUES(-1,1)", []).is_err());
         assert!(conn.execute("UPDATE notification_source_offers SET last_offered=0", []).is_err());
@@ -556,64 +753,148 @@ async fn job_notification_result_commit_reopen_parallel_recovery_and_fixed_targe
 #[tokio::test]
 async fn job_notification_current_result_replay_and_delivery_need_no_legacy_tables() {
     let (_directory, store) = tracking_store_fixture().await;
-    store.with_conn(|conn| {
-        // Explicitly remove the retired representation even if a fixture still
-        // installs the historical prefix. Current processing must never query it.
-        conn.execute_batch("DROP TABLE IF EXISTS notification_job_legacy_receipts;
-            DROP TABLE IF EXISTS backend_job_deliveries;")?;
-        notification_routing::jobs::verify(conn)?;
-        Ok(())
-    }).unwrap();
+    store
+        .with_conn(|conn| {
+            // Explicitly remove the retired representation even if a fixture still
+            // installs the historical prefix. Current processing must never query it.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS notification_job_legacy_receipts;
+            DROP TABLE IF EXISTS backend_job_deliveries;",
+            )?;
+            notification_routing::jobs::verify(conn)?;
+            Ok(())
+        })
+        .unwrap();
     let (accepted, source) = job_notice_fixture(&store, "current-only", true);
     let (_, no_target) = job_notice_fixture(&store, "current-only-no-target", false);
-    let saved = store.job_notification_source("w", &source.job_id, &source.attempt_id).unwrap();
+    let saved = store
+        .job_notification_source("w", &source.job_id, &source.attempt_id)
+        .unwrap();
     assert_eq!(saved.delivery_id, source.delivery_id);
-    assert_eq!(store.list_pending_job_notifications("w", 100).unwrap().len(), 2);
+    assert_eq!(
+        store
+            .list_pending_job_notifications("w", 100)
+            .unwrap()
+            .len(),
+        2
+    );
     let submission = BackendJobResultSubmission {
         job_id: source.job_id.clone(),
         attempt_id: source.attempt_id.clone(),
         input_digest: accepted.attempt.input_digest.clone(),
         result: accepted.job.result.clone().unwrap(),
     };
-    assert!(store.accept_backend_job_result(
-        "w", accepted.attempt.worker.as_ref().unwrap(), &submission, RESOURCE_JOB_NOW,
-    ).unwrap().replayed);
+    assert!(
+        store
+            .accept_backend_job_result(
+                "w",
+                accepted.attempt.worker.as_ref().unwrap(),
+                &submission,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap()
+            .replayed
+    );
     let mut wrong_identity = source.clone();
     wrong_identity.delivery_id = "old-nonderived-delivery".into();
-    assert!(store.route_job_notification(
-        "w", &wrong_identity, &JobNotificationFacts::Result("wrong identity".into()),
-    ).is_err());
-    assert!(!store.route_job_notification("w", &no_target, &JobNotificationFacts::NoFindings).unwrap());
-    assert!(!store.route_job_notification(
-        "w", &source, &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
-    ).unwrap());
-    assert!(store.route_job_notification(
-        "w", &source, &JobNotificationFacts::Result("current pinned bytes".into()),
-    ).unwrap());
-    let pinned = store.job_notification_request("w", &source.delivery_id).unwrap();
+    assert!(
+        store
+            .route_job_notification(
+                "w",
+                &wrong_identity,
+                &JobNotificationFacts::Result("wrong identity".into()),
+            )
+            .is_err()
+    );
+    assert!(
+        !store
+            .route_job_notification("w", &no_target, &JobNotificationFacts::NoFindings)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .route_job_notification(
+                "w",
+                &source,
+                &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .route_job_notification(
+                "w",
+                &source,
+                &JobNotificationFacts::Result("current pinned bytes".into()),
+            )
+            .unwrap()
+    );
+    let pinned = store
+        .job_notification_request("w", &source.delivery_id)
+        .unwrap();
     let target = TicketWorkerNotificationTarget {
         worker: RuntimeWorkerRef::new("r", "replacement"),
         authentication_binding_id: "tracking-binding".into(),
     };
-    assert_eq!(pinned, Some(("current pinned bytes".into(), target.worker.clone())));
-    assert_eq!(store.authorize_job_notification("w", &source.delivery_id, &target).unwrap(), None);
-    store.record_notification_delivery_failure(
-        "w", &NotificationDeliveryKey::WorkerNotification { delivery_id: source.delivery_id.clone() },
-        NotificationFailureCode::AcceptanceUnknown,
-    ).unwrap();
-    assert!(store.route_job_notification("w", &source, &JobNotificationFacts::StaleContent).unwrap());
-    assert_eq!(store.job_notification_request("w", &source.delivery_id).unwrap(), pinned);
+    assert_eq!(
+        pinned,
+        Some(("current pinned bytes".into(), target.worker.clone()))
+    );
+    assert_eq!(
+        store
+            .authorize_job_notification("w", &source.delivery_id, &target)
+            .unwrap(),
+        None
+    );
+    store
+        .record_notification_delivery_failure(
+            "w",
+            &NotificationDeliveryKey::WorkerNotification {
+                delivery_id: source.delivery_id.clone(),
+            },
+            NotificationFailureCode::AcceptanceUnknown,
+        )
+        .unwrap();
+    assert!(
+        store
+            .route_job_notification("w", &source, &JobNotificationFacts::StaleContent)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .job_notification_request("w", &source.delivery_id)
+            .unwrap(),
+        pinned
+    );
     let pending = store.list_pending_job_notifications("w", 100).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].delivery_id, source.delivery_id);
     for _ in 0..2 {
-        store.ack_job_notification("w", &source.delivery_id, &target.worker).unwrap();
+        store
+            .ack_job_notification("w", &source.delivery_id, &target.worker)
+            .unwrap();
     }
-    assert!(!store.route_job_notification(
-        "w", &source, &JobNotificationFacts::Result("must not resend".into()),
-    ).unwrap());
-    assert!(store.list_pending_job_notifications("w", 100).unwrap().is_empty());
-    assert_eq!(store.job_notification_request("w", &source.delivery_id).unwrap(), pinned);
+    assert!(
+        !store
+            .route_job_notification(
+                "w",
+                &source,
+                &JobNotificationFacts::Result("must not resend".into()),
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .list_pending_job_notifications("w", 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .job_notification_request("w", &source.delivery_id)
+            .unwrap(),
+        pinned
+    );
     assert!(job_notice_evidence(&store, &source).2);
     store.with_conn(|conn| {
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_sources WHERE role='backend_job'", [], |r| r.get::<_, i64>(0))?, 2);
@@ -674,7 +955,10 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
     };
     let ticket_before = ticket_graph(&conn);
     assert!(ticket_before.iter().all(|rows| !rows.is_empty()));
-    let schema_before = fixture_query_rows(&conn, "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('trigger','index') AND sql IS NOT NULL ORDER BY name");
+    let schema_before = fixture_query_rows(
+        &conn,
+        "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('trigger','index') AND sql IS NOT NULL ORDER BY name",
+    );
     let check_guards = |conn: &Connection| {
         for sql in [
             "UPDATE notification_sources SET kind='changed' WHERE input_event_id='ticket-ack'",
@@ -691,9 +975,24 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
         ] {
             assert!(conn.execute_batch(sql).is_err(), "guard lost: {sql}");
         }
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-        assert_eq!(conn.query_row("PRAGMA legacy_alter_table", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA legacy_alter_table", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     };
     check_guards(&conn);
     let accepted = job_notice_legacy_seed(&conn, "ack", Some("completed"), None, true);
@@ -759,7 +1058,13 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
     // Multiple retained identities must never create a fresh send: an ACK wins
     // over unknown history; without an ACK the ambiguity stays terminal.
     let multi_ack = job_notice_legacy_seed(&conn, "multi-ack", Some("completed"), None, true);
-    let multi_unknown = job_notice_legacy_seed(&conn, "multi-unknown", Some("unknown"), Some("notification_outcome_unknown"), true);
+    let multi_unknown = job_notice_legacy_seed(
+        &conn,
+        "multi-unknown",
+        Some("unknown"),
+        Some("notification_outcome_unknown"),
+        true,
+    );
     for id in [&multi_ack, &multi_unknown] {
         conn.execute("INSERT INTO backend_job_deliveries(workspace_id,delivery_id,job_id,attempt_id,target_runtime_id,target_worker_id,state,failure_category,created_at,updated_at) SELECT workspace_id,'another-' || delivery_id,job_id,attempt_id,target_runtime_id,target_worker_id,'unknown','notification_outcome_unknown','0','0' FROM backend_job_deliveries WHERE delivery_id=?1", [id]).unwrap();
     }
@@ -773,7 +1078,13 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
     assert!(migrate_job_notifications_v95_to_v96(&conn).is_err());
     assert_eq!(current_schema_version(&conn).unwrap(), 95);
     assert_eq!(ticket_graph(&conn), ticket_before);
-    assert_eq!(fixture_query_rows(&conn, "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('trigger','index') AND sql IS NOT NULL ORDER BY name"), schema_before);
+    assert_eq!(
+        fixture_query_rows(
+            &conn,
+            "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('trigger','index') AND sql IS NOT NULL ORDER BY name"
+        ),
+        schema_before
+    );
     check_guards(&conn);
     assert_eq!(stored_fixture_rows(&conn, "backend_job_deliveries"), before);
     assert_eq!(
@@ -787,7 +1098,10 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
     assert_eq!(current_schema_version(&conn).unwrap(), 96);
     assert_eq!(ticket_graph(&conn), ticket_before);
     check_guards(&conn);
-    let schema_after = fixture_query_rows(&conn, "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('trigger','index') AND sql IS NOT NULL ORDER BY name");
+    let schema_after = fixture_query_rows(
+        &conn,
+        "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('trigger','index') AND sql IS NOT NULL ORDER BY name",
+    );
     assert!(schema_before.iter().all(|row| schema_after.contains(row)));
     assert_eq!(stored_fixture_rows(&conn, "backend_job_deliveries"), before);
     for (id, disposition, reason, runtime_accepted) in [
@@ -797,7 +1111,12 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
         (&unknown, "deliver", "result", false),
         (&ambiguous, "defer", "source_unavailable", false),
         (&multi_ack, "deliver", "result", true),
-        (&multi_unknown_retained, "defer", "source_unavailable", false),
+        (
+            &multi_unknown_retained,
+            "defer",
+            "source_unavailable",
+            false,
+        ),
     ] {
         let got=conn.query_row("SELECT d.disposition,d.reason,l.runtime_accepted FROM notification_decisions d JOIN notification_job_legacy_receipts l USING(workspace_id,delivery_id) WHERE d.workspace_id='w' AND d.delivery_id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?))).unwrap();
         assert_eq!(got, (disposition.into(), reason.into(), runtime_accepted));
@@ -813,9 +1132,25 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
         "retain the Ticket ACK, never fabricate modern ACKs for legacy Job receipts"
     );
     for id in [&multi_ack, &multi_unknown_retained] {
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_requests WHERE delivery_id=?1", [id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM notification_requests WHERE delivery_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
-    assert_eq!(conn.query_row("SELECT code FROM notification_failures WHERE delivery_id=?1", [&multi_unknown_retained], |r| r.get::<_, String>(0)).unwrap(), "preparation_failed");
+    assert_eq!(
+        conn.query_row(
+            "SELECT code FROM notification_failures WHERE delivery_id=?1",
+            [&multi_unknown_retained],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "preparation_failed"
+    );
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
             .get::<_, i64>(
@@ -837,7 +1172,10 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
             "SELECT s.input_event_id,d.source_sequence IS NULL FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id='w' AND s.role='backend_job' AND json_extract(s.facts_json,'$.backend_job.job_id')=?1",
             [job], |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
-        assert_eq!(id, crate::backend_job::delivery_id(job, &attempt_id(job, 1)));
+        assert_eq!(
+            id,
+            crate::backend_job::delivery_id(job, &attempt_id(job, 1))
+        );
         assert!(undecided);
     }
     assert_eq!(conn.query_row(
@@ -868,33 +1206,51 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
     assert_eq!(ticket_graph(&conn), ticket_before);
     assert_eq!(stored_fixture_rows(&conn, "backend_job_deliveries"), before);
     check_guards(&conn);
-    let checker_body: String = conn.query_row(
-        "SELECT content FROM notification_requests WHERE workspace_id='w' AND delivery_id=?1",
-        [&checker], |r| r.get(0),
-    ).unwrap();
+    let checker_body: String = conn
+        .query_row(
+            "SELECT content FROM notification_requests WHERE workspace_id='w' AND delivery_id=?1",
+            [&checker],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(checker_body.contains("Content digest: original-digest"));
     assert!(checker_body.contains("Quote: \"Writer-only scope\""));
     assert!(checker_body.contains("not a new user request, approval gate"));
-    assert_eq!(conn.query_row(
-        "SELECT content FROM notification_requests WHERE workspace_id='w' AND delivery_id=?1",
-        [&unknown], |r| r.get::<_, String>(0),
-    ).unwrap(), pinned);
+    assert_eq!(
+        conn.query_row(
+            "SELECT content FROM notification_requests WHERE workspace_id='w' AND delivery_id=?1",
+            [&unknown],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
+        pinned
+    );
     // Historical validation still requires historical guards; current validation
     // must not require the retired receipt representation.
-    conn.execute_batch("SAVEPOINT missing_legacy_guard; DROP TRIGGER notification_job_legacy_no_update;").unwrap();
+    conn.execute_batch(
+        "SAVEPOINT missing_legacy_guard; DROP TRIGGER notification_job_legacy_no_update;",
+    )
+    .unwrap();
     assert!(notification_routing::jobs::verify_schema96(&conn).is_err());
     notification_routing::jobs::verify(&conn).unwrap();
-    conn.execute_batch("ROLLBACK TO missing_legacy_guard; RELEASE missing_legacy_guard;").unwrap();
+    conn.execute_batch("ROLLBACK TO missing_legacy_guard; RELEASE missing_legacy_guard;")
+        .unwrap();
     notification_routing::jobs::verify_schema96(&conn).unwrap();
 }
 
 #[tokio::test]
-async fn job_notification_source_is_atomic_with_result_and_schema_guards_are_verified() {
+async fn job_notification_source_is_atomic_with_finalization_and_schema_guards_are_verified() {
     let (directory, store) = tracking_store_fixture().await;
     let mut request = resource_job_request("atomic-source", "atomic-source", "atomic-source");
     request.purpose = "notification_test".into();
     request.grants = Default::default();
-    let worker = RuntimeWorkerRef::new("r", "replacement");
+    let worker = RuntimeWorkerRef::new("r", uuid::Uuid::now_v7().to_string());
+    let mut registration = store
+        .get_worker_registry("w", &RuntimeWorkerRef::new("r", "replacement"))
+        .unwrap()
+        .unwrap();
+    registration.worker = worker.clone();
+    store.upsert_worker_registry(&registration).unwrap();
     let reservation = store
         .reserve_backend_job("w", &request, RESOURCE_JOB_NOW)
         .unwrap();
@@ -923,19 +1279,28 @@ async fn job_notification_source_is_atomic_with_result_and_schema_guards_are_ver
         result: serde_json::json!({"saved":true}),
     };
     store.with_conn(|conn| {conn.execute_batch("CREATE TRIGGER reject_job_source BEFORE INSERT ON notification_sources WHEN NEW.role='backend_job' BEGIN SELECT RAISE(ABORT,'injected source commit failure'); END;")?;Ok(())}).unwrap();
+    let accepted = store
+        .accept_backend_job_result("w", &worker, &submission, RESOURCE_JOB_NOW)
+        .unwrap();
+    assert_eq!(accepted.job.state, BackendJobState::Finalizing);
     assert!(
         store
-            .accept_backend_job_result("w", &worker, &submission, RESOURCE_JOB_NOW)
+            .list_pending_job_notifications("w", 100)
+            .unwrap()
+            .is_empty()
+    );
+    release_notice_execution(&store, &accepted);
+    assert!(
+        store
+            .finalize_backend_job("w", &request.job_id, RESOURCE_JOB_NOW)
             .is_err()
     );
-    assert_eq!(
-        store
-            .get_backend_job("w", &request.job_id)
-            .unwrap()
-            .unwrap()
-            .state,
-        BackendJobState::Pending
-    );
+    let retained = store
+        .get_backend_job("w", &request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.state, BackendJobState::Finalizing);
+    assert_eq!(retained.result, accepted.job.result);
     assert!(
         store
             .list_pending_job_notifications("w", 100)
@@ -949,7 +1314,7 @@ async fn job_notification_source_is_atomic_with_result_and_schema_guards_are_ver
         })
         .unwrap();
     store
-        .accept_backend_job_result("w", &worker, &submission, RESOURCE_JOB_NOW)
+        .finalize_backend_job("w", &request.job_id, RESOURCE_JOB_NOW)
         .unwrap();
     assert_eq!(
         store
@@ -964,11 +1329,18 @@ async fn job_notification_source_is_atomic_with_result_and_schema_guards_are_ver
             Ok(())
         })
         .unwrap();
-    store.with_conn(|conn| {
-        let error = notification_routing::jobs::verify(conn).unwrap_err();
-        assert!(error.to_string().contains("notification_job_targets_no_update"), "{error}");
-        Ok(())
-    }).unwrap();
+    store
+        .with_conn(|conn| {
+            let error = notification_routing::jobs::verify(conn).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("notification_job_targets_no_update"),
+                "{error}"
+            );
+            Ok(())
+        })
+        .unwrap();
     drop(store);
     // Exact current schema validation can reject before the component validator.
     assert!(SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).is_err());

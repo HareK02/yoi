@@ -574,14 +574,24 @@ impl SqliteWorkspaceStore {
             .map_err(|_| {
                 WorkerRetentionError::Invalid("Worker id must be a canonical UUIDv7".to_string())
             })?;
-        let worker = if plan.state == WorkerRemovalPlanState::Succeeded {
-            None
-        } else {
-            Some(
-                self.with_conn(|conn| load_worker(conn, workspace_id, &plan.worker))?
-                    .ok_or(WorkerRetentionError::WorkerNotFound)?,
-            )
-        };
+        let (source_created_at, effective_profile) =
+            if plan.state == WorkerRemovalPlanState::Succeeded {
+                // The registry row is gone, but an exact replay still needs the
+                // original source identity used by the Runtime removal freeze.
+                let tombstone = self
+                    .worker_tombstone(workspace_id, &plan.worker)?
+                    .filter(|tombstone| tombstone.operation_id == plan.operation_id)
+                    .ok_or_else(|| WorkerRetentionError::StalePlan {
+                        plan_id: plan.plan_id.clone(),
+                        reason: "completed removal has no matching Worker tombstone".into(),
+                    })?;
+                (tombstone.created_at, tombstone.profile)
+            } else {
+                let worker = self
+                    .with_conn(|conn| load_worker(conn, workspace_id, &plan.worker))?
+                    .ok_or(WorkerRetentionError::WorkerNotFound)?;
+                (worker.created_at, worker.profile)
+            };
         Ok(Some(PreparedWorkerRemoval {
             runtime_request: WorkerRetentionExecutionRequest {
                 operation_id: plan.operation_id.clone(),
@@ -590,15 +600,9 @@ impl SqliteWorkspaceStore {
                 workspace_id: plan.workspace_id.clone(),
                 source_runtime_id: plan.worker.runtime_id.clone(),
                 worker_id: worker_id,
-                source_created_at: worker
-                    .as_ref()
-                    .map(|worker| worker.created_at.clone())
-                    .unwrap_or_else(|| plan.created_at.clone()),
+                source_created_at,
                 removed_at: plan.created_at.clone(),
-                effective_profile: worker
-                    .as_ref()
-                    .map(|worker| worker.profile.clone())
-                    .unwrap_or_else(|| Some("removed".to_string())),
+                effective_profile,
                 retention_class: None,
                 policy_id: plan.policy_id.clone(),
                 session_disposition: plan.session_disposition,
@@ -1742,8 +1746,8 @@ mod tests {
         }
     }
 
-    // Frozen inputs were exported from the published owner, not reconstructed by
-    // the current registry. They must remain independent when the canonical tail moves.
+    // Journal inputs were exported from the published owner, not reconstructed by
+    // the current registry. The unrelated permission cutover is a fixture precondition.
     #[test]
     fn published_journal_histories_preserve_frozen_intents_through_owner_preflight_and_reopen() {
         use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
@@ -1877,9 +1881,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("server.sqlite");
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(frozen).unwrap();
-            conn.execute_batch(include_str!("fixtures/published_journal124_values.sql"))
-                .unwrap();
+            crate::published_journal_test_support::install(&conn, frozen);
             // Keep the published current Pending Job, and add a synthetic obsolete
             // Journal Job whose grant predates binding_id. Removing its execution
             // rows must neither complete nor discard the independent removal intent.
@@ -1969,9 +1971,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("server.sqlite");
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(frozen).unwrap();
-            conn.execute_batch(include_str!("fixtures/published_journal124_values.sql"))
-                .unwrap();
+            crate::published_journal_test_support::install(&conn, frozen);
             // Corrupt only this private negative fixture, never an adopted database.
             conn.execute_batch("DROP TRIGGER worker_removal_journal_immutable;")
                 .unwrap();
@@ -2224,9 +2224,16 @@ mod tests {
         let effects = store
             .update_journal_removal_progress(&prepared, &frozen, Phase::AwaitingEffectsEnd, None)
             .unwrap();
-        // These are store observations only, not a Journal release or execution-end proof.
+        // These are store observations only, not a Runtime archive publication proof.
+        let retained = store
+            .retain_journal_recording(
+                &prepared,
+                &effects,
+                prepared.runtime_request.archive_id.as_deref().unwrap(),
+            )
+            .unwrap();
         let released = store
-            .update_journal_removal_progress(&prepared, &effects, Phase::Released, None)
+            .update_journal_removal_progress(&prepared, &retained, Phase::Released, None)
             .unwrap();
         store.with_conn(|conn| {
             conn.execute_batch("CREATE TRIGGER reject_failure_cause BEFORE UPDATE OF journal_removal_json ON worker_removal_operations WHEN json_extract(NEW.journal_removal_json,'$.cause')='execution_unconfirmed' BEGIN SELECT RAISE(ABORT,'injected cause save failure'); END;")?;
@@ -2962,7 +2969,8 @@ mod tests {
             Ok(())
         }).unwrap();
         let p = s.plan_worker_removal(&req(), &inv()).unwrap();
-        s.begin_worker_removal("w", &p.plan_id, &p.input_fingerprint)
+        let original = s
+            .prepare_worker_removal_execution("w", &p.plan_id, &p.input_fingerprint)
             .unwrap();
         let result = WorkerRetentionExecutionResult {
             operation_id: p.operation_id.clone(),
@@ -3030,6 +3038,14 @@ mod tests {
             "every later cursor page and direct Read must observe archive grant revocation"
         );
         assert!(s.worker_tombstone("w", &p.worker).unwrap().is_some());
+        let recovered = s
+            .recover_worker_removal_execution("w", &p.worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.runtime_request, original.runtime_request,
+            "registry removal must not change the frozen Runtime request"
+        );
         let reservation_state: String = s.with_conn(|conn| {
             conn.query_row(
                 "SELECT state FROM worker_create_reservations WHERE workspace_id='w' AND allocation_key='allocation-old'",

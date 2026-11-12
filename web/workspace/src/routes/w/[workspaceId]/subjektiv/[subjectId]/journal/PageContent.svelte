@@ -18,6 +18,15 @@
   }
   function entryHref(e: JournalEntry) { return journalHref(data.workspaceId, data.subjectId, { journal: e.journal_id, entry: e.id }); }
   function nextText(key: string, page: TextPage) { return href({ [`${key}_byte`]: String(page.next_byte), [`${key}_token`]: page.content_token }); }
+  const recordingCauses = {
+    recording_disabled: '記録が無効になっています。',
+    source_unavailable: '保持した原文を読み取れません。',
+    ownership_unknown: '記録権限の確認が必要です。',
+    job_pending: 'Journal記録は未完です。',
+    job_failed: '記録Jobが失敗しています。未記録の原文は保持されています。',
+    execution_unconfirmed: '記録Jobの終了確認を待っています。',
+    storage_unavailable: '記録用ストレージを利用できません。',
+  };
   function memoryHref(memoryId: string, changeId: string) {
     return `${subjectMemoryHref(data.workspaceId, data.subjectId, memoryId)}?change_id=${encodeURIComponent(changeId)}`;
   }
@@ -101,7 +110,14 @@
         <ul class="session-list">{#each data.sessions.data.items as session (session.journal.id)}<li>
           <h2><a href={journalHref(data.workspaceId, data.subjectId, { journal: session.journal.id })}>{session.journal.title} →</a></h2>
           <p><time datetime={session.journal.created_at}>{formatDate(session.journal.created_at)}</time></p>
-          {#if session.unreflected_sources}<p class="attention">記録待ち・未反映の原資料があります。</p>{:else}<p class="muted">保存された原資料に未反映は確認されていません。</p>{/if}
+          {#if session.retained_recording}
+            <p class="muted">{session.retained_recording.producer === 'removed' ? '元Workerは削除済みです。' : session.retained_recording.producer === 'released' ? '元WorkerはSubjectから解放済みです。' : '元Workerの削除処理中です。'}</p>
+            {#if session.retained_recording.completed}
+              <p class="muted">引き継いだ範囲のJournal記録は完了しています。</p>
+            {:else}
+              <p class="attention">{session.retained_recording.cause ? recordingCauses[session.retained_recording.cause] : '引き継いだ範囲のJournal記録は未完です。'}</p>
+            {/if}
+          {:else if session.unreflected_sources}<p class="attention">記録待ち・未反映の原資料があります。</p>{:else}<p class="muted">保存された原資料に未反映は確認されていません。</p>{/if}
           <details><summary>原資料とSession識別情報</summary><code>{session.journal.source_session_id}</code><OriginalSource source={session.original_source} /></details>
         </li>{/each}</ul>
         {#if data.sessions.data.next}<a href={href({ after: data.sessions.data.next })}>次のページ →</a>{/if}

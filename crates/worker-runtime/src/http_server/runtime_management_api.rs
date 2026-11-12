@@ -33,6 +33,24 @@ mod attachment_control_tests {
     }
 }
 
+#[cfg(test)]
+mod release_capture_tests {
+    use super::*;
+
+    #[test]
+    fn release_capture_uses_worker_bound_retention_authority() {
+        let path = "/v1/workers/released-worker/retention/release-capture";
+        assert_eq!(
+            required_runtime_permission(&Method::POST, path),
+            Some("workers:delete")
+        );
+        assert_eq!(
+            worker_id_from_runtime_path(path).as_deref(),
+            Some("released-worker")
+        );
+    }
+}
+
 // Axum request extensions remain the authorization authority. The generated adapter deliberately
 // has no authentication model, so the verified extension is scoped across its service call.
 tokio::task_local! {
@@ -1133,6 +1151,68 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 503,
                 "worker_retention_unavailable",
                 "Worker removal requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn publish_worker_removal_archive(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerRetentionExecutionRequest,
+    ) -> Result<runtime_api::WorkerSessionArchiveManifest, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &value.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        if value.worker_id != worker_ref.worker_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                400,
+                "worker_id_mismatch",
+                "Frozen archive route identity mismatch",
+            ));
+        }
+        #[cfg(feature = "fs-store")]
+        {
+            let request: WorkerRetentionExecutionRequest = request(value)?;
+            let manifest = self
+                .state
+                .runtime
+                .publish_worker_removal_archive_scoped(&scope, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)?;
+            response(manifest)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, value);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Frozen archive requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn capture_subject_release_session(
+        &self,
+        worker_id: String,
+        request: runtime_api::SubjectReleaseSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .capture_subject_release_session_scoped(&scope, worker_ref.worker_id, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, worker_ref, request);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "subject_release_capture_unavailable",
+                "Subject release capture requires filesystem storage",
             ))
         }
     }

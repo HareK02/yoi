@@ -504,6 +504,8 @@ fn backend_error(error: job::JobError) -> Error {
 #[serde(rename_all = "snake_case")]
 pub enum BackendJobState {
     Pending,
+    /// Outcome saved; execution, Host effects or resource retirement remain owned.
+    Finalizing,
     Completed,
     Failed,
 }
@@ -512,6 +514,7 @@ impl From<BackendJobState> for job::JobState {
     fn from(state: BackendJobState) -> Self {
         match state {
             BackendJobState::Pending => Self::Pending,
+            BackendJobState::Finalizing => Self::Finalizing,
             BackendJobState::Completed => Self::Completed,
             BackendJobState::Failed => Self::Failed,
         }
@@ -522,6 +525,7 @@ impl BackendJobState {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Finalizing => "finalizing",
             Self::Completed => "completed",
             Self::Failed => "failed",
         }
@@ -530,6 +534,7 @@ impl BackendJobState {
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "pending" => Ok(Self::Pending),
+            "finalizing" => Ok(Self::Finalizing),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             other => Err(Error::Store(format!("unknown Backend Job state `{other}`"))),
@@ -682,7 +687,8 @@ pub struct SubjektivConsolidationGrant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivJournalGrant {
-    /// Required frozen writer generation; never inferred from the current Session writer.
+    /// Immutable producer lifetime for this source Session, never a live writer lease.
+    /// It must match retained provenance even after the original body is released.
     pub binding_id: String,
     pub subject_id: String,
     pub session_id: String,
@@ -785,7 +791,7 @@ impl BackendJobRequest {
                 ));
             }
             for (name, id) in [
-                ("journal binding", &grant.binding_id),
+                ("journal source lifetime", &grant.binding_id),
                 ("journal subject", &grant.subject_id),
                 ("journal session", &grant.session_id),
                 ("journal id", &grant.journal_id),

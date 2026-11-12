@@ -647,6 +647,7 @@ fn job_permissions_with_policy(
         .store
         .get_backend_job(api.workspace_id(), &binding.job_id)?
         .ok_or_else(|| denied("Job authorization binding has no intent"))?;
+    job.load_executable_request()?;
     let subject_id = job
         .request
         .grants
@@ -673,7 +674,9 @@ fn job_permissions_with_policy(
         .source_worker
         .as_ref()
         .ok_or_else(|| denied("saved Job has no frozen operation-authority origin"))?;
-    if current_body_subject(api, origin)?.as_deref() != Some(subject_id.as_str()) {
+    if job.request.grants.subjektiv_journal.is_none()
+        && current_body_subject(api, origin)?.as_deref() != Some(subject_id.as_str())
+    {
         return Err(denied("Job origin is no longer the current Subject body"));
     }
     let Some(policy) = current_policy(subject_id)? else {
@@ -773,18 +776,51 @@ pub(super) fn authorize_job_input(
     api: &WorkspaceApi,
     request: &BackendJobRequest,
 ) -> ApiResult<()> {
+    if let Some(grant) = &request.grants.subjektiv_journal {
+        let saved = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)?
+            .ok_or_else(|| denied("Journal input has no saved Job grant"))?;
+        if saved.workspace_id != api.workspace_id() || &saved.request != request {
+            return Err(denied("Journal input differs from its saved Job grant"));
+        }
+        saved.load_executable_request()?;
+        let store = open_subjektiv_store(api)?;
+        let attr = store
+            .session_attribution(&grant.session_id)
+            .map_err(subjektiv_store_error)?
+            .filter(|attr| attr.subject_id == grant.subject_id)
+            .ok_or_else(|| denied("Journal source attribution missing"))?;
+        if request.source_worker.as_ref()
+            != Some(&RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id))
+        {
+            return Err(denied("Journal saved source provenance mismatch"));
+        }
+        if subjektiv_journal::session_erased(api, request)? {
+            return Err(denied("Journal source was explicitly erased"));
+        }
+        let policy = policy(api, &grant.subject_id)?
+            .ok_or_else(|| denied("Subject permissions are unset"))?;
+        let authority = WorkerAuthorityView::from(api);
+        for operation in ["journal.job.input.read", "journal.job.input.supply"] {
+            let permission = ScopedPermission {
+                operation: operation.into(),
+                resource: PermissionResource::Subject {
+                    workspace_id: api.workspace_id().into(),
+                    subject_id: grant.subject_id.clone(),
+                },
+            };
+            if !policy.allows(&authority, &permission, false, &grant.subject_id)? {
+                return Err(denied(format!("Current Subject policy denies {operation}")));
+            }
+        }
+        return Ok(());
+    }
     let binding = request
         .grants
         .subjektiv_consolidation
         .as_ref()
-        .map(|grant| (&grant.subject_id, "memory.consolidation.supply"))
-        .or_else(|| {
-            request
-                .grants
-                .subjektiv_journal
-                .as_ref()
-                .map(|grant| (&grant.subject_id, "journal.job.input.supply"))
-        });
+        .map(|grant| (&grant.subject_id, "memory.consolidation.supply"));
     let Some((subject_id, operation)) = binding else {
         return Ok(());
     };
@@ -1649,9 +1685,38 @@ pub(super) fn administration_actor(
         .ok_or_else(|| denied("Subject permission administration requires an authenticated owner"))
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum JournalAttemptEffect {
+    PrepareInput,
+    ConfirmInputDelivery,
+    ReconcileCompletion,
+}
+
+impl JournalAttemptEffect {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::PrepareInput | Self::ConfirmInputDelivery => "journal.job.input.supply",
+            Self::ReconcileCompletion => "journal.finish",
+        }
+    }
+}
+
+enum SubjectEffectPrincipal {
+    Worker(RuntimeWorkerRef),
+    RetainedJournalSource {
+        attribution: crate::subjektiv::SubjectSessionAttribution,
+        progress: Box<subjektiv_journal::RetainedSourceProgress>,
+    },
+    JournalAttempt {
+        job: Box<crate::backend_job::BackendJobRecord>,
+        attempt: Box<BackendJobAttemptRecord>,
+        effect: JournalAttemptEffect,
+    },
+}
+
 struct SubjectEffectAuthority {
     api: WorkspaceApi,
-    worker: RuntimeWorkerRef,
+    principal: SubjectEffectPrincipal,
     subject: String,
     operation: String,
     runtime_source: Option<server_api::ServerRuntimeSource>,
@@ -1703,13 +1768,18 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
         api.store = catalog.clone();
         let authority = WorkerAuthorityView::from(&api);
         if let Some(source) = &self.runtime_source {
+            let SubjectEffectPrincipal::Worker(worker) = &self.principal else {
+                return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                    "Runtime source cannot authorize internal Journal recovery".into(),
+                ));
+            };
             catalog
                 .with_conn(|connection| {
                     crate::SqliteWorkspaceStore::require_authenticated_subject_request(
                         connection,
                         api.workspace_id(),
                         source,
-                        &self.worker,
+                        worker,
                     )
                 })
                 .map_err(|error| reject(error.into()))?;
@@ -1742,9 +1812,107 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
                 subject_id: self.subject.clone(),
             },
         };
+        let worker = match &self.principal {
+            SubjectEffectPrincipal::Worker(worker) => worker,
+            SubjectEffectPrincipal::RetainedJournalSource {
+                attribution,
+                progress,
+            } => {
+                let current = subjektiv_journal::retained_source_progress(&api, attribution)
+                    .map_err(|error| reject(error.into()))?;
+                if &current != progress.as_ref()
+                    || self.operation != "journal.recording.request"
+                    || !CurrentSubjectPolicy::Canonical(source)
+                        .allows_in_registry(&authority, &requested, false, &self.subject, &registry)
+                        .map_err(reject)?
+                {
+                    return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                        "Retained Journal source or current policy changed".into(),
+                    ));
+                }
+                return Ok(Box::new((catalog, registry)));
+            }
+            SubjectEffectPrincipal::JournalAttempt {
+                job,
+                attempt,
+                effect,
+            } => {
+                let validate = || -> ApiResult<()> {
+                    let current = api
+                        .store
+                        .get_backend_job(api.workspace_id(), &job.request.job_id)?
+                        .ok_or_else(|| denied("Journal Job no longer exists"))?;
+                    let current_attempt = api
+                        .store
+                        .get_backend_job_attempt(
+                            api.workspace_id(),
+                            &job.request.job_id,
+                            &attempt.attempt_id,
+                        )?
+                        .ok_or_else(|| denied("Journal attempt no longer exists"))?;
+                    if current.workspace_id != api.workspace_id()
+                        || current.request != job.request
+                        || current.input_digest != job.input_digest
+                        || current.intent_fingerprint != job.intent_fingerprint
+                        || current.current_attempt != attempt.attempt
+                        || current.state != BackendJobState::Pending
+                        || &current_attempt != attempt.as_ref()
+                        || current_attempt.state.terminal()
+                        || current_attempt.input_digest != current.input_digest
+                        || current
+                            .request
+                            .grants
+                            .subjektiv_journal
+                            .as_ref()
+                            .is_none_or(|grant| grant.subject_id != self.subject)
+                        || self.operation != effect.operation()
+                    {
+                        return Err(denied("Journal saved effect authority changed"));
+                    }
+                    current.load_executable_request()?;
+                    let policy = CurrentSubjectPolicy::Canonical(source.clone());
+                    if !policy.allows_in_registry(
+                        &authority,
+                        &requested,
+                        false,
+                        &self.subject,
+                        &registry,
+                    )? {
+                        return Err(denied("Current policy denies the saved Journal effect"));
+                    }
+                    if self.operation == "journal.job.input.supply" {
+                        // A saved Runtime delivery receipt remains reconcilable after
+                        // the supply deadline; it neither resends input nor extends it.
+                        if matches!(effect, JournalAttemptEffect::PrepareInput)
+                            && chrono::DateTime::parse_from_rfc3339(&current_attempt.deadline_at)
+                                .map_err(|error| Error::Store(error.to_string()))?
+                                <= Utc::now()
+                        {
+                            return Err(denied("Journal input attempt deadline expired"));
+                        }
+                        let read = ScopedPermission {
+                            operation: "journal.job.input.read".into(),
+                            resource: requested.resource.clone(),
+                        };
+                        if !policy.allows_in_registry(
+                            &authority,
+                            &read,
+                            false,
+                            &self.subject,
+                            &registry,
+                        )? {
+                            return Err(denied("Current policy denies saved Journal input read"));
+                        }
+                    }
+                    Ok(())
+                };
+                validate().map_err(reject)?;
+                return Ok(Box::new((catalog, registry)));
+            }
+        };
         let permissions = job_permissions_with_policy(
             &api,
-            &self.worker,
+            worker,
             |subject| {
                 if subject != self.subject {
                     return Err(denied("Subject Job Subject changed"));
@@ -1765,14 +1933,14 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
             }
         } else {
             if authority
-                .current_body_subject(&self.worker)
+                .current_body_subject(worker)
                 .map_err(reject)?
                 .as_deref()
                 != Some(self.subject.as_str())
             {
                 let owner = api
                     .store
-                    .require_current_worker_singleton_owner(api.workspace_id(), &self.worker)
+                    .require_current_worker_singleton_owner(api.workspace_id(), worker)
                     .map_err(|error| {
                         subjektiv::SubjektivError::AuthorizationDenied(error.to_string())
                     })?;
@@ -1798,6 +1966,82 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
     }
 }
 
+/// Source admission is bounded by a durable retention handoff and current Subject
+/// policy, never by an original or successor body's execution permissions.
+pub(super) fn retained_journal_source_store(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    attribution: &crate::subjektiv::SubjectSessionAttribution,
+    progress: subjektiv_journal::RetainedSourceProgress,
+) -> ApiResult<subjektiv::SubjektivStore> {
+    let subject = &attribution.subject_id;
+    let permission = ScopedPermission {
+        operation: "journal.recording.request".into(),
+        resource: PermissionResource::Subject {
+            workspace_id: api.workspace_id().into(),
+            subject_id: subject.clone(),
+        },
+    };
+    let policy = policy(api, subject)?.ok_or_else(|| denied("Subject permissions are unset"))?;
+    if !policy.allows(&WorkerAuthorityView::from(api), &permission, false, subject)? {
+        return Err(denied(
+            "Current policy denies retained Journal source admission",
+        ));
+    }
+    Ok(
+        store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+            api: api.clone(),
+            principal: SubjectEffectPrincipal::RetainedJournalSource {
+                attribution: attribution.clone(),
+                progress: Box::new(progress),
+            },
+            subject: subject.clone(),
+            operation: permission.operation,
+            runtime_source: None,
+            #[cfg(test)]
+            before_registry: None,
+            #[cfg(test)]
+            after_reservation: None,
+        })),
+    )
+}
+
+/// Internal prepare/recovery owns a saved attempt, not a source Worker. Native
+/// admission holds the same policy/catalog fences as authenticated Job effects.
+pub(super) fn journal_attempt_effect_store(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    job: &crate::backend_job::BackendJobRecord,
+    attempt: &BackendJobAttemptRecord,
+    effect: JournalAttemptEffect,
+) -> Result<subjektiv::SubjektivStore> {
+    let grant = job
+        .request
+        .grants
+        .subjektiv_journal
+        .as_ref()
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied("Journal effect requires a saved grant".into())
+        })?;
+    Ok(
+        store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+            api: api.clone(),
+            principal: SubjectEffectPrincipal::JournalAttempt {
+                job: Box::new(job.clone()),
+                attempt: Box::new(attempt.clone()),
+                effect,
+            },
+            subject: grant.subject_id.clone(),
+            operation: effect.operation().into(),
+            runtime_source: None,
+            #[cfg(test)]
+            before_registry: None,
+            #[cfg(test)]
+            after_reservation: None,
+        })),
+    )
+}
+
 #[cfg(test)]
 pub(super) fn subject_effect_store(
     api: &WorkspaceApi,
@@ -1808,7 +2052,7 @@ pub(super) fn subject_effect_store(
 ) -> subjektiv::SubjektivStore {
     store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
         api: api.clone(),
-        worker: worker.clone(),
+        principal: SubjectEffectPrincipal::Worker(worker.clone()),
         subject: subject.into(),
         operation: operation.into(),
         runtime_source: None,
@@ -1831,7 +2075,7 @@ pub(super) fn authenticated_subject_effect_store(
 ) -> subjektiv::SubjektivStore {
     store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
         api: api.clone(),
-        worker: worker.clone(),
+        principal: SubjectEffectPrincipal::Worker(worker.clone()),
         subject: subject.into(),
         operation: operation.into(),
         runtime_source: Some(source.clone()),
@@ -1853,7 +2097,7 @@ pub(super) fn memory_effect_store_before_registry(
 ) -> subjektiv::SubjektivStore {
     store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
         api: api.clone(),
-        worker: worker.clone(),
+        principal: SubjectEffectPrincipal::Worker(worker.clone()),
         subject: subject.into(),
         operation: operation.into(),
         runtime_source: None,
@@ -1873,7 +2117,7 @@ pub(super) fn memory_effect_store_after_reservation(
 ) -> subjektiv::SubjektivStore {
     store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
         api: api.clone(),
-        worker: worker.clone(),
+        principal: SubjectEffectPrincipal::Worker(worker.clone()),
         subject: subject.into(),
         operation: operation.into(),
         runtime_source: None,

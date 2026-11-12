@@ -690,6 +690,73 @@ impl Runtime {
         Ok(freeze)
     }
 
+    /// Publish and verify every frozen original without removing its producer.
+    /// The saved freeze is the replay identity, including after registry removal.
+    pub fn publish_worker_removal_archive_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &WorkerRetentionExecutionRequest,
+    ) -> Result<crate::retention::WorkerSessionArchiveManifest, RuntimeError> {
+        crate::retention::validate_request(request)?;
+        if request.workspace_id != scope.workspace_id {
+            return Err(ownership_unknown("Frozen archive Workspace mismatch"));
+        }
+        let lease = self.worker_operation_lock(request.worker_id)?;
+        let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        let (root, fingerprint) = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_workspace_owner(scope, false)?;
+            if state.runtime_identity.as_deref() != Some(request.source_runtime_id.as_str()) {
+                return Err(ownership_unknown("Frozen archive Runtime mismatch"));
+            }
+            let fingerprint = if state.workers.contains_key(&request.worker_id) {
+                let worker_ref = WorkerRef::new(request.worker_id);
+                state.refresh_uncertain_worker_write(&worker_ref)?;
+                let worker = state.worker(&worker_ref)?;
+                if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str())
+                    || worker.status != WorkerStatus::Stopped
+                    || worker.has_pending_lifecycle_operation()
+                {
+                    return Err(execution_unconfirmed(
+                        "Frozen archive requires a settled producer",
+                    ));
+                }
+                Some(
+                    worker
+                        .request
+                        .as_ref()
+                        .ok_or_else(|| ownership_unknown("Frozen archive create identity missing"))?
+                        .create_fingerprint
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            let root = state
+                .fs_store()
+                .ok_or_else(|| source_unavailable("Frozen archive storage unavailable"))?
+                .runtime_dir()
+                .to_path_buf();
+            (root, fingerprint)
+        };
+        let owner = sources(&root, &scope.workspace_id, request.worker_id)?;
+        let _publication = owner.lock_exclusive().map_err(source_error)?;
+        let saved = read_saved(&owner.freeze_path())?.ok_or_else(|| {
+            execution_unconfirmed("Frozen archive requires a saved removal freeze")
+        })?;
+        if saved.request != *request
+            || fingerprint
+                .as_deref()
+                .is_some_and(|value| value != saved.create_fingerprint)
+        {
+            return Err(ownership_unknown(
+                "Frozen archive operation or producer identity mismatch",
+            ));
+        }
+        FsWorkerRetentionProvider::new(&root).publish_frozen_archive(request, &saved.freeze)
+    }
+
     pub(super) fn additional_session_binding_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,
@@ -842,6 +909,181 @@ impl Runtime {
         Ok(true)
     }
 
+    /// Read only the live-source union fixed by the exact saved release. No
+    /// Controller restore or ordinary active-lineage/archive fallback is allowed.
+    /// Reserved reads validate preservation; Backend still owns release completion
+    /// and must not dispatch recording work before that completion is durable.
+    pub fn capture_subject_release_session_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_id: WorkerId,
+        request: &runtime_api::SubjectReleaseSessionCaptureRequest,
+    ) -> Result<RecordingCaptureSlice, RuntimeError> {
+        if request.workspace_id != scope.workspace_id
+            || request.operation_id.trim().is_empty()
+            || request.binding_id.trim().is_empty()
+            || request.operation_id.len() > 512
+            || request.binding_id.len() > 512
+        {
+            return Err(rejected("Invalid Subject release capture identity"));
+        }
+        if !(1..=4096).contains(&request.max_entries)
+            || !(1024..=4 * 1024 * 1024).contains(&request.max_serialized_bytes)
+        {
+            return Err(rejected(
+                "Subject release capture exceeds recording transport limits",
+            ));
+        }
+        let lease = self.worker_operation_lock(worker_id)?;
+        let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        let (root, runtime_id) = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_workspace_owner(scope, false)?;
+            let worker = state.worker(&WorkerRef::new(worker_id))?;
+            if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
+                return Err(ownership_unknown("Subject release capture owner mismatch"));
+            }
+            let (release, status) = state
+                .subject_release_operations
+                .get(&(worker_id, request.operation_id.clone()))
+                .ok_or_else(|| ownership_unknown("Subject release operation missing"))?;
+            if release.workspace_id != request.workspace_id
+                || release.worker_id != worker_id
+                || release.operation_id != request.operation_id
+                || release.binding_id != request.binding_id
+                || !matches!(
+                    status,
+                    runtime_api::SubjectReleaseState::Reserved
+                        | runtime_api::SubjectReleaseState::Disconnected
+                )
+            {
+                return Err(ownership_unknown(
+                    "Subject release capture operation mismatch",
+                ));
+            }
+            (
+                state
+                    .fs_store()
+                    .ok_or_else(|| source_unavailable("Subject release storage unavailable"))?
+                    .runtime_dir()
+                    .to_path_buf(),
+                state.runtime_identity.clone(),
+            )
+        };
+        let owner = sources(&root, &scope.workspace_id, worker_id)?;
+        let _publication = owner.lock_exclusive().map_err(source_error)?;
+        let saved = read_release_scope(&owner)?
+            .ok_or_else(|| ownership_unknown("Subject release source fence missing"))?;
+        if saved.request.workspace_id != request.workspace_id
+            || saved.request.worker_id != worker_id
+            || saved.request.operation_id != request.operation_id
+            || saved.request.binding_id != request.binding_id
+            || saved.request.action == runtime_api::SubjectReleaseAction::Cancel
+        {
+            return Err(ownership_unknown("Subject release saved identity mismatch"));
+        }
+        let fixed = saved
+            .recording_scope
+            .ok_or_else(|| source_unavailable("Subject release recording scope missing"))?;
+        let mut sessions = std::collections::HashSet::new();
+        if fixed.workspace_id != request.workspace_id
+            || fixed.worker_id != worker_id
+            || runtime_id.as_deref() != Some(fixed.source_runtime_id.as_str())
+            || fixed.members.is_empty()
+            || fixed.members.iter().any(|member| {
+                !sessions.insert(member.session_id)
+                    || member.end.byte_offset != 0
+                    || member.end.canonical_order != member.descriptors.len() as u64
+                    || member.materialized != member.active_segment_id.is_some()
+                    || (!member.materialized && !member.descriptors.is_empty())
+                    || member
+                        .descriptors
+                        .iter()
+                        .enumerate()
+                        .any(|(index, descriptor)| descriptor.canonical_order != index as u64)
+            })
+        {
+            return Err(ownership_unknown(
+                "Subject release scope metadata is inconsistent",
+            ));
+        }
+        let member = fixed
+            .members
+            .iter()
+            .find(|member| {
+                member.session_id == request.session_id
+                    && member.active_segment_id == request.active_segment_id
+            })
+            .ok_or_else(|| ownership_unknown("Subject release Session is not a fixed member"))?;
+        let active = member
+            .active_segment_id
+            .ok_or_else(|| rejected("Subject release Session is not materialized"))?;
+        let retained = owner
+            .retained_bindings()
+            .map_err(|error| ownership_unknown(error.to_string()))?;
+        let retention = crate::retention::runtime_session_retention(&root);
+        let guard = retention
+            .lock_live(member.session_id)
+            .map_err(source_error)?;
+        let result = if let Some(binding) = retained
+            .iter()
+            .find(|binding| binding.session_id == member.session_id)
+        {
+            if binding.active_segment_id != active {
+                return Err(ownership_unknown("Retained Session selector changed"));
+            }
+            session_store::capture::capture_recording_union_fs_guarded(
+                &owner.retained_root(),
+                member.session_id,
+                active,
+                Default::default(),
+                &member.descriptors,
+                request.start,
+                request.max_entries,
+                request.max_serialized_bytes,
+                &guard,
+            )
+        } else {
+            // This is an explicitly verified primary source, not a fallback to
+            // whichever Session happens to be active now.
+            let metadata = session_store::WorkerAggregateStore::open_read_only(
+                owner.worker_root(),
+                crate::worker_backend::ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(
+                    &WorkerRef::new(worker_id),
+                ),
+            )
+            .and_then(|store| store.read_read_only())
+            .map_err(|_| ownership_unknown("Subject release primary ownership unavailable"))?
+            .ok_or_else(|| ownership_unknown("Subject release primary ownership missing"))?;
+            if metadata.workspace_id.as_deref() != Some(scope.workspace_id.as_str())
+                || !metadata.active.is_some_and(|selected| {
+                    selected.session_id == member.session_id && selected.segment_id == Some(active)
+                })
+            {
+                return Err(ownership_unknown(
+                    "Subject release primary selector changed",
+                ));
+            }
+            session_store::capture::capture_recording_union_worker_guarded(
+                &owner.worker_root().join("session"),
+                member.session_id,
+                active,
+                Default::default(),
+                &member.descriptors,
+                request.start,
+                request.max_entries,
+                request.max_serialized_bytes,
+                &guard,
+            )
+        };
+        result.map_err(|error| {
+            source_unavailable(format!(
+                "Fixed Subject release capture unavailable: {error}"
+            ))
+        })
+    }
+
     /// Capture from the immutable per-Session union fixed by this exact removal.
     pub fn capture_worker_removal_session_scoped(
         &self,
@@ -863,10 +1105,28 @@ impl Runtime {
         }
         let lease = self.worker_operation_lock(worker_id)?;
         let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
-        self.ensure_worker_in_workspace(scope, &WorkerRef::new(worker_id))?;
         let (root, runtime_id, fingerprint) = {
-            let state = self.lock()?;
-            let worker = state.worker(&WorkerRef::new(worker_id))?;
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_workspace_owner(scope, false)?;
+            let fingerprint = match state.workers.get(&worker_id) {
+                Some(worker) => {
+                    if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
+                        return Err(ownership_unknown("Worker removal capture owner mismatch"));
+                    }
+                    Some(
+                        worker
+                            .request
+                            .as_ref()
+                            .ok_or_else(|| {
+                                ownership_unknown("Worker removal create identity missing")
+                            })?
+                            .create_fingerprint
+                            .clone(),
+                    )
+                }
+                None => None,
+            };
             (
                 state
                     .fs_store()
@@ -874,10 +1134,7 @@ impl Runtime {
                     .runtime_dir()
                     .to_path_buf(),
                 state.runtime_identity.clone(),
-                worker
-                    .request
-                    .as_ref()
-                    .map(|request| request.create_fingerprint.clone()),
+                fingerprint,
             )
         };
         let owner = sources(&root, &scope.workspace_id, worker_id)?;
@@ -887,7 +1144,9 @@ impl Runtime {
         if saved.request.operation_id != operation_id
             || saved.request.workspace_id != scope.workspace_id
             || runtime_id.as_deref() != Some(saved.request.source_runtime_id.as_str())
-            || fingerprint.as_deref() != Some(saved.create_fingerprint.as_str())
+            || fingerprint
+                .as_deref()
+                .is_some_and(|value| value != saved.create_fingerprint)
         {
             return Err(ownership_unknown(
                 "Worker removal capture identity mismatch",
@@ -903,11 +1162,45 @@ impl Runtime {
             .ok_or_else(|| ownership_unknown("Worker removal Session is not a fixed member"))?;
         let active = active_segment_id
             .ok_or_else(|| rejected("Worker removal Session is not materialized"))?;
+        let (primary_root, retained_root, retained) = if fingerprint.is_some() {
+            (
+                owner.worker_root().join("session"),
+                owner.retained_root(),
+                owner
+                    .retained_bindings()
+                    .map_err(|error| ownership_unknown(error.to_string()))?,
+            )
+        } else {
+            let archive_id = saved
+                .request
+                .archive_id
+                .as_deref()
+                .ok_or_else(|| source_unavailable("Removed Worker has no retained archive"))?;
+            // A different Session may have been explicitly erased since publication.
+            // Validate this member's frozen descriptors under its own erasure lock,
+            // rather than requiring the entire archive's original checksum here.
+            let (manifest, archive_root) =
+                FsWorkerRetentionProvider::new(&root).session_archive_identity(archive_id)?;
+            if manifest.workspace_id != scope.workspace_id
+                || manifest.source_runtime_id != saved.request.source_runtime_id
+                || manifest.source_worker_id != worker_id
+                || manifest.operation_id != operation_id
+                || manifest.input_fingerprint != saved.request.input_fingerprint
+                || (manifest.source_session_id == session_id.to_string()
+                    && manifest.source_active_segment_id != Some(active))
+            {
+                return Err(ownership_unknown(
+                    "Removed Worker archive identity mismatch",
+                ));
+            }
+            (
+                archive_root.clone(),
+                archive_root.join("retained-sessions"),
+                manifest.retained_sessions,
+            )
+        };
         let retention = crate::retention::runtime_session_retention(&root);
         let guard = retention.lock_live(session_id).map_err(source_error)?;
-        let retained = owner
-            .retained_bindings()
-            .map_err(|error| ownership_unknown(error.to_string()))?;
         let result = if let Some(binding) = retained
             .iter()
             .find(|binding| binding.session_id == session_id)
@@ -916,7 +1209,7 @@ impl Runtime {
                 return Err(ownership_unknown("Retained Session selector changed"));
             }
             session_store::capture::capture_recording_union_fs_guarded(
-                &owner.retained_root(),
+                &retained_root,
                 session_id,
                 active,
                 Default::default(),
@@ -928,7 +1221,7 @@ impl Runtime {
             )
         } else {
             session_store::capture::capture_recording_union_worker_guarded(
-                &owner.worker_root().join("session"),
+                &primary_root,
                 session_id,
                 active,
                 Default::default(),

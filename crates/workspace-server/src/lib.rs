@@ -34,6 +34,8 @@ pub mod plugin_settings;
 pub mod policy_config;
 pub mod profile_settings;
 pub mod prompt_settings;
+#[cfg(test)]
+mod published_journal_test_support;
 pub mod records;
 pub mod repositories;
 pub mod repository_access;

@@ -78,25 +78,24 @@ fn evidence_column_cutover_preserves_all_values_and_current_schema_names() {
     let raw_evidence_schema = fresh
         .with_conn(|conn| Ok(fixture_query_rows(conn, raw_evidence_query)))
         .unwrap();
+    assert!(
+        raw_evidence_schema.is_empty(),
+        "obsolete Job evidence is retired"
+    );
     for store in [&upgraded, &fresh] {
         store.with_conn(|conn| {
-            // Raw pre-content evidence intentionally keeps its original field spelling;
-            // compare its exact schema rather than exempting arbitrary history objects.
             assert_eq!(fixture_query_rows(conn, raw_evidence_query), raw_evidence_schema);
-            for table in ["backend_job_pre_content_history", "backend_job_attempt_pre_content_history"] {
-                assert!(column_exists(conn, table, "input_revision")?);
-                assert!(!column_exists(conn, table, "input_digest")?);
-            }
             for table in ["backend_jobs", "backend_job_attempts"] {
                 assert!(column_exists(conn, table, "input_digest")?);
                 assert!(!column_exists(conn, table, "input_revision")?);
             }
             let mut stmt = conn.prepare("SELECT name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")?;
             let objects = stmt.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            for (name,table,sql) in objects {
-                assert!(!name.to_ascii_lowercase().contains("revision"),"old object name in current schema: {name}");
-                if !["backend_job_pre_content_history", "backend_job_attempt_pre_content_history"].contains(&table.as_str()) {
-                    assert!(!sql.to_ascii_lowercase().contains("revision"),"old name in current schema: {name}");
+            // Check the retired evidence names, not unrelated live policy versions.
+            for (name, _table, sql) in objects {
+                for retired in ["source_revision", "result_revision", "expected_revision", "input_revision"] {
+                    assert!(!name.to_ascii_lowercase().contains(retired),"old evidence object name: {name}");
+                    assert!(!sql.to_ascii_lowercase().contains(retired),"old evidence name in current schema: {name}");
                 }
             }
             Ok(())

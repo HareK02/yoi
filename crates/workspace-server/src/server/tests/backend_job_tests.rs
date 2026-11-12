@@ -722,7 +722,7 @@ async fn backend_job_lost_input_ack_uses_exact_receipt_without_second_submit() {
         )
         .unwrap();
     assert_eq!(accepted.attempt.attempt, 1);
-    assert_eq!(accepted.job.state, BackendJobState::Completed);
+    assert_eq!(accepted.job.state, BackendJobState::Finalizing);
     assert!(execution.take_inputs().is_empty());
     api.stop_backend_job_recovery().await;
 }
@@ -969,7 +969,7 @@ async fn backend_job_runner_uses_registered_embedded_worker_and_structured_resul
             },
         )
         .unwrap();
-    assert_eq!(accepted.job.state, BackendJobState::Completed);
+    assert_eq!(accepted.job.state, BackendJobState::Finalizing);
 }
 
 #[tokio::test]
@@ -1005,7 +1005,7 @@ async fn terminal_backend_job_cleanup_removes_only_bound_worker_and_retains_resu
     };
 
     let accepted = api.accept_backend_job_result(&worker, &submission).unwrap();
-    assert_eq!(accepted.job.state, BackendJobState::Completed);
+    assert_eq!(accepted.job.state, BackendJobState::Finalizing);
     let cleaned = wait_for_backend_job_worker_cleanup(
         &api,
         &request.job_id,
@@ -1460,7 +1460,7 @@ async fn backend_job_restart_without_live_host_owner_keeps_cleanup_unconfirmed()
         .get_backend_job(TEST_WORKSPACE_ID, &request.job_id)
         .unwrap()
         .unwrap();
-    assert_eq!(saved.state, BackendJobState::Completed);
+    assert_eq!(saved.state, BackendJobState::Finalizing);
     assert_eq!(saved.result, Some(serde_json::json!({"persisted": true})));
     assert_eq!(saved.request, request);
     assert_eq!(
@@ -1537,7 +1537,7 @@ async fn backend_job_fast_result_is_accepted_after_prebound_tracked_run() {
 
     let dispatched = api.dispatch_backend_job(&request).unwrap();
     assert_eq!(*acceptance_observed.lock().unwrap(), Some(true));
-    assert_eq!(dispatched.job.state, BackendJobState::Completed);
+    assert_eq!(dispatched.job.state, BackendJobState::Finalizing);
     let expected_run_id =
         crate::backend_job::runtime_run_id(&crate::backend_job::attempt_id(&request.job_id, 1));
     assert_eq!(
@@ -1612,7 +1612,7 @@ async fn backend_job_result_http_response_precedes_cleanup_until_tracked_run_fin
     )
     .await
     .unwrap();
-    assert_eq!(acceptance.job.state, BackendJobState::Completed);
+    assert_eq!(acceptance.job.state, BackendJobState::Finalizing);
     let still_running = api.runtime.worker(&worker).unwrap();
     assert!(still_running.worker_state.is_some_and(|snapshot| {
         snapshot.state
@@ -1671,38 +1671,7 @@ async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
     .await
     .unwrap();
     seed_test_delivery_binding(&api);
-    let target = api
-        .spawn_workspace_worker(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            WorkerSpawnRequest {
-                requested_worker_name: Some("job-notification-target".to_string()),
-                intent: WorkerSpawnIntent::WorkspaceCompanion,
-                singleton_key: None,
-                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                    expected_segments: 0,
-                },
-                profile: ProfileSelector::Builtin("builtin:companion".to_string()),
-                ticket_assignment: None,
-                initial_submit: Vec::new(),
-                workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachments: Vec::new(),
-                resolved_config_bundle: Some(runtime_test_bundle()),
-                resolved_worker_observation_enabled: false,
-                resolved_worker_observation_grants: Vec::new(),
-                resolved_workspace_api: None,
-                resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
-                resolved_control_operation: None,
-                resolved_execution_grant: None,
-                authorization: None,
-                resolved_core_execution_grant: None,
-            },
-        )
-        .unwrap()
-        .worker
-        .unwrap()
-        .worker;
+    let target = spawn_ticket_check_source(&api, "job-notification-target");
     let request = BackendJobRequest {
         job_id: "n".repeat(256),
         purpose: "delivery_recovery_contract_check".to_string(),
@@ -1721,6 +1690,8 @@ async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
     };
     let dispatched = api.dispatch_backend_job(&request).unwrap();
     let worker = dispatched.attempt.worker.clone().unwrap();
+    seed_worker_session_for_cleanup(temp.path(), &worker);
+    api.stop_backend_job_recovery().await;
     let acceptance = api
         .store
         .accept_backend_job_result(
@@ -1737,25 +1708,12 @@ async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
         .unwrap();
     let delivery_id =
         crate::backend_job::delivery_id(&request.job_id, &acceptance.attempt.attempt_id);
-    let source = api
-        .store
-        .job_notification_source(
-            TEST_WORKSPACE_ID,
-            &request.job_id,
-            &acceptance.attempt.attempt_id,
-        )
+    execution.reject_inputs("interrupted notification transport");
+    api.backend_job_recovery.resume_after_test_pause();
+    api.run_backend_job_cleanup(acceptance.attempt.clone())
+        .await
         .unwrap();
-    assert!(
-        api.store
-            .route_job_notification(
-                TEST_WORKSPACE_ID,
-                &source,
-                &crate::store::JobNotificationFacts::Result(
-                    "saved notification before interrupted transport".into()
-                ),
-            )
-            .unwrap()
-    );
+    *execution.input_failure.lock().unwrap() = None;
     let pinned = api
         .store
         .job_notification_request(TEST_WORKSPACE_ID, &delivery_id)
@@ -1921,7 +1879,7 @@ async fn backend_job_input_response_loss_is_owned_until_deadline_without_resubmi
         .get_backend_job(TEST_WORKSPACE_ID, &request.job_id)
         .unwrap()
         .unwrap();
-    assert_eq!(retained.state, BackendJobState::Failed);
+    assert_eq!(retained.state, BackendJobState::Finalizing);
     assert_eq!(retained.failure_category.as_deref(), Some("timeout"));
     assert_eq!(retained.request, request);
     assert_eq!(
@@ -2126,7 +2084,7 @@ async fn backend_job_recovery_drains_more_than_one_reserved_page() {
         api.store
             .get_backend_job(TEST_WORKSPACE_ID, job_id)
             .unwrap()
-            .is_some_and(|job| job.state == BackendJobState::Failed)
+            .is_some_and(|job| job.state == BackendJobState::Finalizing)
     }));
 }
 
@@ -2560,4 +2518,388 @@ async fn backend_job_recovery_pages_remain_read_only_when_earlier_attempts_termi
             .is_empty()
     );
     shutdown_workspace_feature_storage(&api).await.unwrap();
+}
+
+#[tokio::test]
+async fn finalizing_journal_mixed_history_retires_input_without_refencing_completed_cleanup() {
+    use crate::backend_job::{
+        JobInputDisposition, SubjektivJournalGrant, journal_serialization_key,
+    };
+    use subjektiv::journal::{
+        JournalByteRange, JournalSource, JournalSourcePointer, JournalSourceRange,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+    api.stop_backend_job_recovery().await;
+    let domain = open_subjektiv_store(&api).unwrap();
+    let subject = domain
+        .create_subject(crate::subjektiv::SubjectRole::new("mixed-history").unwrap())
+        .unwrap();
+    let source = spawn_ticket_check_source(&api, "mixed-history-source");
+    let attr = domain
+        .record_session_attribution(
+            crate::subjektiv::SubjectSessionAttribution::new(
+                &subject.id,
+                &source.runtime_id,
+                &source.worker_id,
+                Uuid::new_v4().to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let writer = domain
+        .claim_journal_writer(&subject.id, &source.runtime_id, &source.worker_id)
+        .unwrap();
+    let host = domain.bind_journal_session(&writer, attr.clone()).unwrap();
+    let range = JournalSourceRange {
+        source: JournalSource {
+            session_id: attr.session_id.clone(),
+            pointer: JournalSourcePointer {
+                segment_id: Uuid::new_v4(),
+                entry_ref: "E1".into(),
+            },
+            order: 0,
+            content_sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                .into(),
+            total_bytes: 5,
+        },
+        bytes: JournalByteRange { start: 0, end: 5 },
+    };
+    let journal = domain
+        .accept_journal_sources(&host, "mixed history", &[range.clone()])
+        .unwrap();
+    let mut request = recovery_request("finalizing-journal-mixed-history");
+    request.grants.subjektiv_journal = Some(SubjektivJournalGrant {
+        binding_id: writer.binding_id,
+        subject_id: subject.id,
+        session_id: attr.session_id,
+        journal_id: journal.clone(),
+        selected_ranges: vec![range],
+    });
+    request.serialization_key = Some(journal_serialization_key(&journal));
+    request.source_worker = Some(source);
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let reserved = api
+        .store
+        .reserve_backend_job(api.workspace_id(), &request, &now)
+        .unwrap();
+    let prior_id = reserved.attempt.attempt_id;
+    let current_id = crate::backend_job::attempt_id(&request.job_id, 2);
+    let current_worker = Uuid::now_v7().to_string();
+    // Model the schema-134 mixed-history boundary: an old released attempt has
+    // no retained fence; the latest accepted success still owns its cleanup.
+    // Execution/result production is fixture data, not part of this regression.
+    api.config_store.with_conn(|conn| {
+        conn.execute(
+            "UPDATE backend_job_attempts SET state='failed',runtime_id='old-runtime',worker_id=?4,runtime_run_id='old-run',worker_cleanup_state='completed',worker_cleanup_completed_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",
+            rusqlite::params![api.workspace_id(), request.job_id, prior_id, Uuid::new_v4().to_string(), now],
+        )?;
+        conn.execute(
+            "INSERT INTO backend_job_attempts(workspace_id,job_id,attempt_id,attempt,input_digest,state,deadline_at,runtime_id,worker_id,runtime_run_id,result_json,result_digest,worker_cleanup_state,created_at,updated_at,completed_at) VALUES(?1,?2,?3,2,?4,'completed',?5,'fixture-runtime',?6,'current-run','{\"saved\":true}','result-digest','pending',?5,?5,?5)",
+            rusqlite::params![api.workspace_id(), request.job_id, current_id, reserved.attempt.input_digest, now, current_worker],
+        )?;
+        conn.execute(
+            "UPDATE backend_jobs SET state='finalizing',current_attempt=2,result_json='{\"saved\":true}',result_digest='result-digest',completed_at=NULL WHERE workspace_id=?1 AND job_id=?2",
+            rusqlite::params![api.workspace_id(), request.job_id],
+        )?;
+        Ok(())
+    }).unwrap();
+    let reopened =
+        Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
+    let mut restarted = api.clone();
+    restarted.store = reopened.clone();
+    restarted.config_store = reopened;
+    restarted.backend_job_recovery = Arc::default();
+    let read_job = || {
+        restarted
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap()
+    };
+    let read_prior = || {
+        restarted
+            .store
+            .get_backend_job_attempt(api.workspace_id(), &request.job_id, &prior_id)
+            .unwrap()
+            .unwrap()
+    };
+    let prior = read_prior();
+    assert!(
+        restarted
+            .require_backend_job_attempt_effects_ended(&prior)
+            .is_err()
+    );
+    let before = read_job();
+    assert_eq!(before.state, BackendJobState::Finalizing);
+    assert_eq!(before.input_disposition, JobInputDisposition::Available);
+    let (current, acquired) = restarted
+        .store
+        .claim_backend_job_worker_cleanup(api.workspace_id(), &request.job_id, &current_id, &now)
+        .unwrap();
+    assert!(acquired);
+    let finish_cleanup = || {
+        restarted.store.finish_backend_job_worker_cleanup(
+            api.workspace_id(),
+            &request.job_id,
+            &current_id,
+            BackendJobWorkerCleanupState::Completed,
+            None,
+            None,
+            &now,
+        )
+    };
+    assert!(
+        matches!(finish_cleanup(), Err(Error::RepositoryConflict(_))),
+        "a new cleanup commit still requires its exact execution fence"
+    );
+    assert!(
+        restarted
+            .finish_backend_job_cleanup_retirement(&request.job_id, &current_id)
+            .is_err()
+    );
+    assert_eq!(read_job(), before);
+
+    // Substitute only external termination evidence; persist/validate the fence
+    // and new cleanup completion through the production Store transactions.
+    let owner = crate::backend_job_host_effects::JobHostOwner::try_from(&current).unwrap();
+    let controller = serde_json::json!({
+        "scope":"controller", "worker_ref":{"worker_id":current_worker},
+        "stop_operation_id":Uuid::now_v7(), "execution_id":Uuid::new_v4(),
+        "shutdown_command_id":1,
+        "submissions":[{"submission_request_id":"current-run","submission_id":"fixture-submission","disposition":"started"}],
+        "feature_failures":[]
+    });
+    restarted
+        .store
+        .record_backend_job_execution_fence(
+            api.workspace_id(),
+            &current,
+            &controller.to_string(),
+            &serde_json::to_string(&owner).unwrap(),
+            &now,
+        )
+        .unwrap();
+    let cleaned = finish_cleanup().unwrap();
+    restarted
+        .require_backend_job_attempt_effects_ended(&cleaned)
+        .unwrap();
+    assert_eq!(read_job().state, BackendJobState::Finalizing);
+    // Contrast with unfinished historical cleanup. Restore the same retained
+    // fixture checkpoint afterwards; do not create a new cleanup completion.
+    for state in ["pending", "executing", "failed", "completed"] {
+        restarted.config_store.with_conn(|conn| {
+            conn.execute(
+                "UPDATE backend_job_attempts SET worker_cleanup_state=?4,worker_cleanup_completed_at=CASE WHEN ?4='completed' THEN ?5 ELSE NULL END WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",
+                rusqlite::params![api.workspace_id(), request.job_id, prior_id, state, now],
+            )?;
+            Ok(())
+        }).unwrap();
+        if state != "completed" {
+            assert!(
+                restarted
+                    .finish_backend_job_cleanup_retirement(&request.job_id, &current_id)
+                    .is_err()
+            );
+            assert_eq!(read_job(), before);
+        }
+    }
+    execution.take_inputs();
+    restarted
+        .run_backend_job_cleanup(cleaned.clone())
+        .await
+        .unwrap();
+    let settled = read_job();
+    assert_eq!(settled.state, BackendJobState::Completed);
+    assert_eq!(settled.input_disposition, JobInputDisposition::Reclaimed);
+    assert_eq!(settled.result, before.result);
+    assert_eq!(settled.input_digest, before.input_digest);
+    assert!(settled.completed_at.is_some());
+    assert_eq!(read_prior(), prior);
+    assert!(
+        restarted
+            .require_backend_job_attempt_effects_ended(&prior)
+            .is_err(),
+        "retirement must not synthesize a historical fence"
+    );
+    assert!(
+        restarted
+            .store
+            .list_backend_job_worker_cleanups(api.workspace_id(), None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    restarted.run_backend_job_cleanup(cleaned).await.unwrap();
+    assert_eq!(read_job(), settled);
+    assert!(
+        execution.take_inputs().is_empty(),
+        "finalization must not resubmit input"
+    );
+    restarted.stop_backend_job_recovery().await;
+}
+
+#[tokio::test]
+async fn finalizing_cleanup_commit_survives_terminal_save_failure_and_reopen_without_host_resource()
+{
+    for success in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let mut request = recovery_request(if success {
+            "finalizing-success"
+        } else {
+            "finalizing-failure"
+        });
+        request.serialization_key = Some("finalizing-resource".into());
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        let worker = dispatched.attempt.worker.clone().unwrap();
+        assert_eq!(execution.take_inputs().len(), 1);
+        seed_worker_session_for_cleanup(temp.path(), &worker);
+        api.stop_backend_job_recovery().await;
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let attempt = if success {
+            api.store
+                .accept_backend_job_result(
+                    api.workspace_id(),
+                    &worker,
+                    &BackendJobResultSubmission {
+                        job_id: request.job_id.clone(),
+                        attempt_id: dispatched.attempt.attempt_id.clone(),
+                        input_digest: dispatched.attempt.input_digest.clone(),
+                        result: serde_json::json!({"saved":true}),
+                    },
+                    &now,
+                )
+                .unwrap()
+                .attempt
+        } else {
+            api.store
+                .finish_backend_job_attempt(
+                    api.workspace_id(),
+                    &request.job_id,
+                    &dispatched.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "deadline",
+                    "retained timeout cause",
+                    &now,
+                )
+                .unwrap()
+        };
+        let accepted = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.state, BackendJobState::Finalizing);
+        assert!(accepted.completed_at.is_none());
+        assert!(
+            api.store
+                .finalize_backend_job(api.workspace_id(), &request.job_id, &now)
+                .is_err()
+        );
+        assert!(
+            api.store
+                .reserve_backend_job_retry(api.workspace_id(), &request.job_id, &now)
+                .is_err()
+        );
+        api.config_store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_terminal_save BEFORE UPDATE ON backend_jobs WHEN OLD.state='finalizing' AND NEW.state IN ('completed','failed') BEGIN SELECT RAISE(ABORT,'injected terminal save failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        api.backend_job_recovery.resume_after_test_pause();
+        assert!(api.schedule_backend_job_worker_cleanup(&attempt));
+        let cleaned = wait_for_backend_job_worker_cleanup(
+            &api,
+            &request.job_id,
+            &attempt.attempt_id,
+            BackendJobWorkerCleanupState::Completed,
+        )
+        .await;
+        api.stop_backend_job_recovery().await;
+        assert!(
+            api.require_backend_job_attempt_effects_ended(&cleaned)
+                .is_ok()
+        );
+        let unsettled = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unsettled.state, BackendJobState::Finalizing);
+        assert_eq!(unsettled.result, accepted.result);
+        assert_eq!(unsettled.failure_detail, accepted.failure_detail);
+        assert!(
+            api.store
+                .find_active_backend_job_for_resource(api.workspace_id(), "finalizing-resource")
+                .unwrap()
+                .is_some()
+        );
+        api.config_store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_terminal_save;")?;
+                Ok(())
+            })
+            .unwrap();
+        // Private fixture interruption after saved cleanup. Runtime storage and the
+        // original admission file may now be absent; saved exact fences remain.
+        let mut admission = api.config.database_path.as_os_str().to_owned();
+        admission.push(".job-host-admission");
+        std::fs::remove_dir_all(std::path::PathBuf::from(admission)).unwrap();
+        let reopened =
+            Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
+        let mut restarted = api.clone();
+        restarted.store = reopened.clone();
+        restarted.config_store = reopened;
+        restarted.backend_job_recovery = Arc::default();
+        assert_eq!(
+            restarted
+                .store
+                .list_backend_job_worker_cleanups(api.workspace_id(), None, 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        restarted
+            .run_backend_job_cleanup(cleaned.clone())
+            .await
+            .unwrap();
+        let settled = restarted
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.state,
+            if success {
+                BackendJobState::Completed
+            } else {
+                BackendJobState::Failed
+            }
+        );
+        assert!(settled.completed_at.is_some());
+        assert_eq!(settled.result, accepted.result);
+        assert_eq!(settled.failure_detail, accepted.failure_detail);
+        assert_eq!(settled.request.input, request.input);
+        assert!(
+            restarted
+                .store
+                .find_active_backend_job_for_resource(api.workspace_id(), "finalizing-resource")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            restarted
+                .store
+                .list_backend_job_worker_cleanups(api.workspace_id(), None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!restarted.schedule_backend_job_worker_cleanup(&cleaned));
+        restarted.run_backend_job_cleanup(cleaned).await.unwrap();
+        assert!(
+            execution.take_inputs().is_empty(),
+            "finalization must not rerun saved input"
+        );
+        restarted.stop_backend_job_recovery().await;
+    }
 }

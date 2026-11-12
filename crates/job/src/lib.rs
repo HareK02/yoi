@@ -189,6 +189,10 @@ pub struct JobResultSubmission {
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Pending,
+    /// The execution outcome is settled, but required termination and resource
+    /// or input responsibility release are not complete. The attempt retains
+    /// its result state; a saved result does not imply Job completion.
+    Finalizing,
     Completed,
     Failed,
     Cancelled,

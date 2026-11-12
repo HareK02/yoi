@@ -99,35 +99,35 @@ async fn cleanup_retention_failures_preserve_cause_on_execution_and_recovery() {
     // A file in place of the receipt directory deterministically fails both attempts.
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;
-    let spawned = api
-        .spawn_workspace_worker(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            WorkerSpawnRequest {
-                intent: WorkerSpawnIntent::WorkspaceCompanion,
-                requested_worker_name: Some("retention-error-test".into()),
-                singleton_key: None,
-                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                    expected_segments: 0,
-                },
-                profile: ProfileSelector::Builtin("builtin:companion".into()),
-                ticket_assignment: None,
-                initial_submit: Vec::new(),
-                workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachments: Vec::new(),
-                resolved_config_bundle: Some(runtime_test_bundle()),
-                resolved_worker_observation_enabled: false,
-                resolved_worker_observation_grants: Vec::new(),
-                resolved_workspace_api: None,
-                resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
-                resolved_control_operation: None,
-                resolved_execution_grant: None,
-                authorization: None,
-                resolved_core_execution_grant: None,
+    let spawned = spawn_workspace_worker_as_owner(
+        &api,
+        EMBEDDED_WORKER_RUNTIME_ID,
+        WorkerSpawnRequest {
+            intent: WorkerSpawnIntent::WorkspaceCompanion,
+            requested_worker_name: Some("retention-error-test".into()),
+            singleton_key: None,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
             },
-        )
-        .unwrap();
+            profile: ProfileSelector::Builtin("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
+            resolved_control_operation: None,
+            resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
+        },
+    )
+    .unwrap();
     let worker = spawned.worker.unwrap().worker;
     api.runtime
         .stop_worker(
