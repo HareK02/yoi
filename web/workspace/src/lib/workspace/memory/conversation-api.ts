@@ -282,15 +282,18 @@ export async function sendConversationInput(
     reply_to: attempt.replyTo,
     work_ref: attempt.workRef,
   };
-  const v = object(
-    await request(
+  const value = await request(
       fetchFn,
       `${base(scope)}/${encodeURIComponent(attempt.conversationId)}/messages`,
       signal,
       body,
-    ),
-    ["message", "delivery"],
-  );
+    );
+  return parseConversationReceive(value, scope, attempt);
+}
+
+export function parseConversationReceive(value: unknown, scope: ConversationScope, attempt: ConversationAttempt): ChatReceiveResponse {
+  const body: ChatUserMessageRequest = { operation_id: attempt.operationId, text: attempt.text, reply_to: attempt.replyTo, work_ref: attempt.workRef };
+  const v = object(value, ["message", "delivery"]);
   const message = parseConversationMessage(
     v.message,
     scope,

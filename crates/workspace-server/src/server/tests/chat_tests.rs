@@ -6,6 +6,8 @@
 //! is scripted. All endpoints and storage are ephemeral; no live model is used.
 use super::*;
 use server_api::{ChatConversation, ChatMessagePage, ChatReceiveResponse};
+#[path = "chat_messaging_tests.rs"]
+mod messaging;
 #[path = "chat_binding_tests.rs"]
 mod signed_binding;
 #[path = "chat_web_connected.rs"]

@@ -6,7 +6,7 @@
 use crate::{SubjektivError, SubjektivStore, require_active_subject};
 use feature_storage::FeatureStorageError;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use server_api::{
+use subjektiv_api::{
     CHAT_DEFAULT_PAGE_LIMIT, CHAT_MAX_COUNTER, CHAT_MAX_PAGE_LIMIT, CHAT_MAX_TEXT_BYTES,
     ChatConversation, ChatCreateConversationRequest, ChatMessage, ChatMessagePage,
     ChatMessagePageQuery, ChatMessageSender, ChatSendMessageRequest, ChatUserMessageRequest,
@@ -332,7 +332,7 @@ fn append_in_transaction(
     expected_permission_change_id: Option<&str>,
 ) -> Result<ChatMessage> {
     identifier(input.operation_id)?;
-    if input.text.trim().is_empty() || input.text.len() > CHAT_MAX_TEXT_BYTES {
+    if !subjektiv_api::valid_chat_text(input.text) {
         return Err(ChatError::InvalidInput(format!(
             "text must be nonblank and at most {CHAT_MAX_TEXT_BYTES} UTF-8 bytes"
         )));
@@ -469,7 +469,7 @@ fn check_authorization(
 }
 
 fn identifier(value: &str) -> Result<()> {
-    if value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+    if !subjektiv_api::valid_chat_identifier(value) {
         return Err(ChatError::InvalidInput(
             "identifiers must be nonblank, control-free and at most 512 UTF-8 bytes".into(),
         ));

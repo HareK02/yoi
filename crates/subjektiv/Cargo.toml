@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+subjektiv-api.workspace = true
 feature-permissions.workspace = true
 feature-storage = { path = "../feature-storage" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

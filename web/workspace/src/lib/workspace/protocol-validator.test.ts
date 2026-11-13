@@ -1,3 +1,4 @@
+import { deepStrictEqual as assertEquals } from 'node:assert/strict';
 import type { EventSubscriptionSelector, SubscriptionFrame } from '#lib/generated/protocol.ts';
 import {
   decodeSubscriptionFrame,
@@ -347,4 +348,26 @@ Deno.test('generated subscription schema accepts invocation descriptors, context
     { value: '1', is_dir: false, invocation: { ...descriptor, client_adapter: 'newer_adapter' } },
   ] } }]));
   assert(!newer.ok, 'unknown adapter capabilities must fail closed');
+});
+
+Deno.test('messaging pages use generated structural validation and bounded matching Subject identities', () => {
+  const conversation = { id: 'c', subject_id: 's', participant_account_id: 'a', last_user_message_id: null };
+  const message = { id: 'm', conversation_id: 'c', sequence: 7, sender: { kind: 'subject', subject_id: 's' }, text: 'public', reply_to: null, work_ref: null, operation_id: 'publish', last_user_message_id: null };
+  const frame = { protocol_version: 2, frame: 'messaging_response', message: { request_id: 'r', result: { kind: 'subscribed', subscription_id: 'sub', selector: { subject_id: 's', conversation_id: 'c', after_sequence: 3 }, page: { conversation, messages: [message], has_more: false } } } };
+  assertEquals(decodeSubscriptionFrame(JSON.stringify(frame)).ok, true);
+  for (const mutate of [
+    (v: typeof frame) => { v.message.result.selector.subject_id = 'other'; },
+    (v: typeof frame) => { v.message.result.page.messages[0].sequence = Number.MAX_SAFE_INTEGER + 1; },
+    (v: typeof frame) => { v.message.result.page.messages[0].text = 'é'.repeat(8193); },
+    (v: typeof frame) => { v.message.result.page.messages[0].sender.subject_id = 'other'; },
+    (v: typeof frame) => { v.message.result.page.messages[0].operation_id = 'control\u0000'; },
+    (v: typeof frame) => { v.message.result.page.messages.push(v.message.result.page.messages[0]); },
+  ]) {
+    const invalid = structuredClone(frame); mutate(invalid);
+    assertEquals(decodeSubscriptionFrame(JSON.stringify(invalid)).ok, false);
+  }
+  const missing = JSON.parse(JSON.stringify(frame)); delete missing.message.result.page.messages[0].reply_to;
+  assertEquals(decodeSubscriptionFrame(JSON.stringify(missing)).ok, false);
+  const extra = JSON.parse(JSON.stringify(frame)); extra.message.result.page.internal_session = [];
+  assertEquals(decodeSubscriptionFrame(JSON.stringify(extra)).ok, false);
 });

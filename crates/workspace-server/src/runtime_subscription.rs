@@ -904,7 +904,11 @@ async fn handle_frame(
                 send_subscribe(socket, state, selector).await?;
             }
         }
-        SubscriptionFramePayload::Request(_) | SubscriptionFramePayload::WorkerProtocol(_) => {
+        SubscriptionFramePayload::MessagingRequest(_)
+        | SubscriptionFramePayload::MessagingResponse(_)
+        | SubscriptionFramePayload::MessagingEvent(_)
+        | SubscriptionFramePayload::Request(_)
+        | SubscriptionFramePayload::WorkerProtocol(_) => {
             return Err(());
         }
     }

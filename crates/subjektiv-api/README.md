@@ -1,0 +1,1 @@
+Public text-only Subject conversation contracts, independent of storage, Host authority and Worker execution. [`messaging`] defines the dedicated Workspace transport lane; HTTP and explicit Subject publication share the same DTOs.

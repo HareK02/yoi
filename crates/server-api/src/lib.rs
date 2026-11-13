@@ -19,19 +19,18 @@ pub use repository_error::RepositoryBoundary;
 mod repository_access_error;
 pub mod repository_access_failure;
 pub use repository_access_error::RepositoryAccessApiError;
-mod chat;
+
 pub mod configuration_adoption;
 pub mod configuration_publication;
 pub use configuration_publication::*;
 pub mod feature_permissions;
-pub use chat::*;
 pub use configuration_adoption::*;
+pub use subjektiv_api::*;
 mod subject_body;
 pub use subject_body::*;
 pub mod subject_policy;
 pub use subject_policy::*;
-mod chat_transport;
-pub use chat_transport::*;
+
 mod drive;
 mod workdir_error;
 pub mod workdir_management_error;
@@ -412,16 +411,6 @@ impl_openapi_schema!(
     PluginHostRequest,
     PluginHostResponse,
     PluginHostError,
-    ChatCreateConversationRequest,
-    ChatConversation,
-    ChatUserMessageRequest,
-    ChatSendMessageRequest,
-    ChatMessagePageQuery,
-    ChatMessagePage,
-    ChatMessage,
-    ChatReceiveResponse,
-    ChatWorkerRequest,
-    ChatWorkerResponse,
     PluginInstallRequest,
     PluginAddArtifactRequest,
     PluginRevokeRequest,

@@ -5,6 +5,14 @@ import SubjectConversation from "./SubjectConversation.svelte";
 import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
 import { readConversationAttempt } from "./conversation-attempt.ts";
+import type { ChatMessagePage, MessagingCommand, MessagingResult } from '#lib/generated/chat-api.ts';
+const transport = vi.hoisted(() => ({ request: vi.fn<(command: MessagingCommand) => Promise<MessagingResult>>() }));
+vi.mock('#lib/workspace/multiplexer.ts', () => ({ workspaceMultiplexer: () => ({
+  connectMessaging(listener: { onStatus(status: string): void }) {
+    queueMicrotask(() => listener.onStatus('open'));
+    return { request: (command: MessagingCommand) => transport.request(command), close: vi.fn() };
+  },
+}) }));
 const props = {
   workspaceId: "w",
   subjectId: "s",
@@ -14,6 +22,7 @@ const props = {
 beforeEach(() => {
   sessionStorage.clear();
   localStorage.clear();
+  transport.request.mockReset();
   browserSession.snapshot = {
     kind: "ready",
     value: {
@@ -37,7 +46,7 @@ function conversation(subject: string) {
     last_user_message_id: null,
   };
 }
-function page(subject: string, text: string) {
+function page(subject: string, text: string): ChatMessagePage {
   return {
     conversation: conversation(subject),
     messages: [{
@@ -56,27 +65,18 @@ function page(subject: string, text: string) {
 }
 for (const status of [401, 403, 404]) {
   test(`${status} withdraws retained text and fences a late POST ACK without deleting its retry record`, async () => {
-    let release!: (response: Response) => void;
+    let release!: (response: MessagingResult) => void;
     let posted = false;
     let denied = false;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string, init?: RequestInit) => {
-        if (String(input) === "/api/auth/whoami" && browserSession.snapshot.kind === "ready") {
-          return Response.json(browserSession.snapshot.value);
-        }
-        if (String(input).endsWith("/conversations")) return Response.json(conversation("s"));
-        if (init?.method === "POST") {
-          posted = true;
-          return await new Promise<Response>((resolve) => {
-            release = resolve;
-          });
-        }
-        return denied
-          ? new Response(null, { status })
-          : Response.json({ conversation: conversation("s"), messages: [], has_more: false });
-      }),
-    );
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(browserSession.snapshot.kind === 'ready' ? browserSession.snapshot.value : {})));
+    transport.request.mockImplementation(async command => {
+      if (command.kind === 'open') return { kind: 'opened', conversation: conversation('s') };
+      if (command.kind === 'post') { posted = true; return await new Promise(resolve => { release = resolve; }); }
+      if (denied) return { kind: 'rejected', status };
+      const empty = { conversation: conversation('s'), messages: [], has_more: false };
+      if (command.kind === 'subscribe') return { kind: 'subscribed', subscription_id: 'sub', selector: command.selector, page: empty };
+      return { kind: 'history', page: empty };
+    });
     render(SubjectConversation, props);
     await screen.findByText("No public messages yet.");
     await fireEvent.input(screen.getByRole("textbox"), {
@@ -92,7 +92,7 @@ for (const status of [401, 403, 404]) {
     expect(screen.getByRole("alert").textContent).toBe(deniedMessage);
     expect(screen.queryByText("retained private text")).toBeNull();
     expect(screen.queryByRole("textbox")).toBeNull();
-    release(Response.json({
+    release({ kind: "saved", response: {
       message: {
         id: "user",
         conversation_id: attempt.conversationId,
@@ -105,7 +105,7 @@ for (const status of [401, 403, 404]) {
         last_user_message_id: "user",
       },
       delivery: { state: "accepted", runtime_id: "r", worker_id: "w" },
-    }));
+    }});
     await Promise.resolve();
     expect(readConversationAttempt(sessionStorage, props)).toEqual(attempt);
     expect(
@@ -117,51 +117,37 @@ for (const status of [401, 403, 404]) {
 
 for (const changed of [{ subjectId: "other" }, { workspaceId: "other" }]) {
   test(`late history cannot populate a different ${Object.keys(changed)[0]} route`, async () => {
-    let release!: (response: Response) => void;
+    let release!: (response: MessagingResult) => void;
     let first = true;
     let readingOld = false;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: string, init?: RequestInit) => {
-        if (init?.method === "POST") {
-          return Response.json(conversation(JSON.parse(String(init.body)).subject_id));
-        }
-        if (first) {
-          first = false;
-          readingOld = true;
-          return await new Promise<Response>((resolve) => {
-            release = resolve;
-          });
-        }
-        return Response.json(page(changed.subjectId ?? "s", "current route public reply"));
-      }),
-    );
+    transport.request.mockImplementation(async command => {
+      if (command.kind === 'open') return { kind: 'opened', conversation: conversation(command.request.subject_id) };
+      if (command.kind !== 'subscribe') throw new Error('unexpected command');
+      if (first) {
+        first = false; readingOld = true;
+        return await new Promise(resolve => { release = resolve; });
+      }
+      return { kind: 'subscribed', subscription_id: 'new', selector: command.selector, page: page(changed.subjectId ?? 's', 'current route public reply') };
+    });
     const view = render(SubjectConversation, props);
     await waitFor(() => expect(readingOld).toBe(true));
     await view.rerender({ ...props, ...changed });
     await screen.findByText("current route public reply");
-    release(Response.json(page("s", "old route secret reply")));
+    release({ kind: "subscribed", subscription_id: "old", selector: { subject_id: "s", conversation_id: "c-s", after_sequence: 0 }, page: page("s", "old route secret reply") });
     await Promise.resolve();
     expect(screen.queryByText("old route secret reply")).toBeNull();
   });
 }
 
 test("authentication change while POST is in flight never clears the former Account's retained input or adopts its ACK", async () => {
-  let release!: (response: Response) => void;
+  let release!: (response: MessagingResult) => void;
   let posted = false;
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: string, init?: RequestInit) => {
-      if (String(input).endsWith("/conversations")) return Response.json(conversation("s"));
-      if (init?.method === "POST") {
-        posted = true;
-        return await new Promise<Response>((resolve) => {
-          release = resolve;
-        });
-      }
-      return Response.json({ conversation: conversation("s"), messages: [], has_more: false });
-    }),
-  );
+  transport.request.mockImplementation(async command => {
+    if (command.kind === 'open') return { kind: 'opened', conversation: conversation('s') };
+    if (command.kind === 'post') { posted = true; return await new Promise(resolve => { release = resolve; }); }
+    if (command.kind !== 'subscribe') throw new Error('unexpected command');
+    return { kind: 'subscribed', subscription_id: 'sub', selector: command.selector, page: { conversation: conversation('s'), messages: [], has_more: false } };
+  });
   render(SubjectConversation, props);
   await screen.findByText("No public messages yet.");
   await fireEvent.input(screen.getByRole("textbox"), { target: { value: "former account input" } });
@@ -169,7 +155,7 @@ test("authentication change while POST is in flight never clears the former Acco
   await waitFor(() => expect(posted).toBe(true));
   const attempt = readConversationAttempt(sessionStorage, props)!;
   browserSession.invalidate();
-  release(Response.json({
+  release({ kind: "saved", response: {
     message: {
       id: "user",
       conversation_id: attempt.conversationId,
@@ -182,7 +168,7 @@ test("authentication change while POST is in flight never clears the former Acco
       last_user_message_id: "user",
     },
     delivery: { state: "accepted", runtime_id: "r", worker_id: "w" },
-  }));
+  }});
   await Promise.resolve();
   expect(readConversationAttempt(sessionStorage, props)).toEqual(attempt);
   expect(

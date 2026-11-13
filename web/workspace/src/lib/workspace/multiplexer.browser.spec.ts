@@ -261,3 +261,39 @@ test('valid subscription closure remains isolated and resubscribes only its sele
   expect(socket.closes).toEqual([]);
   multiplexer.dispose();
 });
+
+test('messaging and Worker subscriptions share one socket and terminate independently', async () => {
+  const multiplexer = new WorkspaceMultiplexer('workspace-messaging');
+  const worker = multiplexer.subscribe({ topic: 'workspace_workers' }, { onFrame: vi.fn() });
+  const onEvent = vi.fn(); const onStatus = vi.fn();
+  const chat = multiplexer.connectMessaging({ onEvent, onStatus });
+  const socket = FakeWebSocket.instances[0]; socket.open();
+  expect(FakeWebSocket.instances).toHaveLength(1);
+  const selector = { subject_id: 's', conversation_id: 'c', after_sequence: 0 };
+  const pending = chat.request({ kind: 'subscribe', selector }, new AbortController().signal);
+  const request = JSON.parse(socket.sent.at(-1)!);
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'messaging_response', message: { request_id: request.message.request_id, result: { kind: 'subscribed', subscription_id: 'chat-1', selector, page: { conversation: { id: 'c', subject_id: 's', participant_account_id: 'a', last_user_message_id: null }, messages: [], has_more: false } } } }));
+  expect((await pending).kind).toBe('subscribed');
+  worker.close(); expect(socket.closes).toEqual([]);
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'messaging_event', message: { kind: 'closed', subscription_id: 'chat-1', reason: 'lagged' } }));
+  expect(onEvent).toHaveBeenCalledWith({ kind: 'closed', subscription_id: 'chat-1', reason: 'lagged' });
+  expect(socket.closes).toEqual([]);
+  chat.close(); expect(socket.closes).toEqual([[undefined, undefined]]);
+});
+
+test('messaging-only disconnect reconnects and an aborted late subscribe is explicitly released', async () => {
+  vi.useFakeTimers();
+  const multiplexer = new WorkspaceMultiplexer('messaging-reconnect');
+  const chat = multiplexer.connectMessaging({ onEvent: vi.fn(), onStatus: vi.fn() });
+  const first = FakeWebSocket.instances[0]; first.open(); first.close();
+  vi.advanceTimersByTime(500);
+  const socket = FakeWebSocket.instances[1]; expect(socket).toBeDefined(); socket.open();
+  const controller = new AbortController();
+  const selector = { subject_id: 's', conversation_id: 'c', after_sequence: 0 };
+  const pending = chat.request({ kind: 'subscribe', selector }, controller.signal);
+  const request = JSON.parse(socket.sent.at(-1)!);
+  controller.abort(); await expect(pending).rejects.toThrow('outcome unknown');
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'messaging_response', message: { request_id: request.message.request_id, result: { kind: 'subscribed', subscription_id: 'orphan', selector, page: { conversation: { id: 'c', subject_id: 's', participant_account_id: 'a', last_user_message_id: null }, messages: [], has_more: false } } } }));
+  expect(JSON.parse(socket.sent.at(-1)!).message.command).toEqual({ kind: 'unsubscribe', subscription_id: 'orphan' });
+  chat.close();
+});

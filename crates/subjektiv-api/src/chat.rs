@@ -8,7 +8,7 @@ pub const CHAT_DEFAULT_PAGE_LIMIT: u32 = 50;
 /// Largest counter representable without loss by the JSON/browser contract.
 pub const CHAT_MAX_COUNTER: u64 = 9_007_199_254_740_991;
 
-fn bounded_counter<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+pub(crate) fn bounded_counter<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let value = u64::deserialize(deserializer)?;
     if value > CHAT_MAX_COUNTER {
         return Err(serde::de::Error::custom(
@@ -38,6 +38,8 @@ pub struct ChatConversation {
     pub subject_id: String,
     pub participant_account_id: String,
     /// Latest user input in this conversation; empty conversations use null.
+    #[serde(deserialize_with = "required_user_message_identity")]
+    #[schemars(required, schema_with = "nullable_identity_schema")]
     pub last_user_message_id: Option<String>,
 }
 
@@ -61,11 +63,17 @@ pub struct ChatMessage {
     pub sequence: u64,
     pub sender: ChatMessageSender,
     pub text: String,
+    #[serde(deserialize_with = "required_user_message_identity")]
+    #[schemars(required, schema_with = "nullable_identity_schema")]
     pub reply_to: Option<String>,
     /// Opaque related-work reference, not a grant or an attachment path.
+    #[serde(deserialize_with = "required_user_message_identity")]
+    #[schemars(required, schema_with = "nullable_identity_schema")]
     pub work_ref: Option<String>,
     pub operation_id: String,
     /// User messages refer to themselves; Subject messages pin the latest observed user input.
+    #[serde(deserialize_with = "required_user_message_identity")]
+    #[schemars(required, schema_with = "nullable_identity_schema")]
     pub last_user_message_id: Option<String>,
 }
 
@@ -98,11 +106,15 @@ pub struct ChatSendMessageRequest {
     pub work_ref: Option<String>,
     /// Observed user input, independent of the optional reply target. Empty conversations use null.
     #[serde(deserialize_with = "required_user_message_identity")]
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable_identity_schema")]
     pub expected_last_user_message_id: Option<String>,
 }
 
 // An explicit null is an observation of an empty conversation; omission is not.
+fn nullable_identity_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    generator.subschema_for::<Option<String>>()
+}
+
 fn required_user_message_identity<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
@@ -137,6 +149,17 @@ pub fn chat_api_typescript() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
         ChatConversation::decl(&config),
+        ChatSendMessageRequest::decl(&config),
+        crate::ChatWorkerRequest::decl(&config),
+        crate::ChatWorkerOperation::decl(&config),
+        crate::ChatWorkerResponse::decl(&config),
+        crate::MessagingSelector::decl(&config),
+        crate::MessagingCommand::decl(&config),
+        crate::MessagingRequest::decl(&config),
+        crate::MessagingResult::decl(&config),
+        crate::MessagingResponse::decl(&config),
+        crate::MessagingEvent::decl(&config),
+        crate::MessagingTermination::decl(&config),
         ChatMessageSender::decl(&config),
         ChatMessage::decl(&config),
         ChatCreateConversationRequest::decl(&config),
@@ -151,7 +174,8 @@ pub fn chat_api_typescript() -> String {
     .collect::<Vec<_>>()
     .join("\n\n");
     format!(
-        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_chat_api_types > web/workspace/src/lib/generated/chat-api.ts\n\nexport const CHAT_LIMITS = {{ maxTextBytes: {CHAT_MAX_TEXT_BYTES}, maxPageLimit: {CHAT_MAX_PAGE_LIMIT}, maxCounter: {CHAT_MAX_COUNTER} }} as const;\n\n{declarations}\n"
+        "// Generated from subjektiv-api. Do not edit by hand.\n// Regenerate: cargo run -q -p subjektiv-api --features typescript --example generate_chat_api_types > web/workspace/src/lib/generated/chat-api.ts\n\nexport const CHAT_LIMITS = {{ maxTextBytes: {CHAT_MAX_TEXT_BYTES}, maxPageLimit: {CHAT_MAX_PAGE_LIMIT}, maxCounter: {CHAT_MAX_COUNTER} }} as const;\n\n{declarations}\n{}\n",
+        include_str!("messaging_validator_template.ts")
     )
 }
 
@@ -234,7 +258,7 @@ mod tests {
             );
         }
         assert!(serde_json::from_value::<ChatSendMessageRequest>(json!({"conversation_id":"c", "operation_id":"op", "text":"answer", "expected_last_user_message_id":1})).is_err());
-        let mut message = json!({"id":"m", "conversation_id":"c", "sequence":CHAT_MAX_COUNTER, "sender":{"kind":"subject","subject_id":"s"}, "text":"answer", "operation_id":"op", "last_user_message_id":null});
+        let mut message = json!({"id":"m", "conversation_id":"c", "sequence":CHAT_MAX_COUNTER, "sender":{"kind":"subject","subject_id":"s"}, "text":"answer", "reply_to":null,"work_ref":null,"operation_id":"op", "last_user_message_id":null});
         assert!(serde_json::from_value::<ChatMessage>(message.clone()).is_ok());
         message["sequence"] = json!(CHAT_MAX_COUNTER + 1);
         assert!(serde_json::from_value::<ChatMessage>(message).is_err());

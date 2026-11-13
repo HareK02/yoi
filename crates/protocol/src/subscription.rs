@@ -50,6 +50,7 @@ pub enum SubscriptionValidationError {
     InvalidIdentifier {
         field: &'static str,
     },
+    InvalidMessaging,
     EmptyWorkerSelection,
     TooManyWorkers {
         max: usize,
@@ -83,6 +84,7 @@ impl fmt::Display for SubscriptionValidationError {
                 formatter,
                 "{field} must be trimmed and must not contain control characters"
             ),
+            Self::InvalidMessaging => formatter.write_str("invalid messaging payload"),
             Self::EmptyWorkerSelection => {
                 formatter.write_str("worker_lifecycle requires at least one worker id")
             }
@@ -364,6 +366,9 @@ pub enum SubscriptionFramePayload {
     Response(SubscriptionResponse),
     Event(SubscriptionEvent),
     WorkerProtocol(SubscriptionWorkerProtocolMethod),
+    MessagingRequest(subjektiv_api::MessagingRequest),
+    MessagingResponse(subjektiv_api::MessagingResponse),
+    MessagingEvent(subjektiv_api::MessagingEvent),
 }
 
 impl SubscriptionFramePayload {
@@ -373,6 +378,27 @@ impl SubscriptionFramePayload {
             Self::Response(response) => response.validate(),
             Self::Event(event) => event.validate(),
             Self::WorkerProtocol(message) => message.validate(),
+            Self::MessagingRequest(message) => {
+                if message.validate() {
+                    Ok(())
+                } else {
+                    Err(SubscriptionValidationError::InvalidMessaging)
+                }
+            }
+            Self::MessagingResponse(message) => {
+                if message.validate() {
+                    Ok(())
+                } else {
+                    Err(SubscriptionValidationError::InvalidMessaging)
+                }
+            }
+            Self::MessagingEvent(message) => {
+                if message.validate() {
+                    Ok(())
+                } else {
+                    Err(SubscriptionValidationError::InvalidMessaging)
+                }
+            }
         }
     }
 }
