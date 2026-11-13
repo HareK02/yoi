@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { CHAT_LIMITS, type ChatConversation, type ChatDelivery, type ChatMessage } from '#lib/generated/chat-api.ts';
+  import { CHAT_LIMITS, chatHasText, type ChatConversation, type ChatDelivery, type ChatMessage } from '#lib/generated/chat-api.ts';
   import { browserSession } from '#lib/workspace/auth/session-state.ts';
   import { ConversationApiError } from './conversation-api.ts';
   import { ConversationMessagingClient } from './conversation-messaging.ts';
@@ -118,7 +118,7 @@
     try {
       await context.client?.refresh();
       if (!current(context)) return;
-      historyError = null;
+      // onPage clears history errors only after a confirmed snapshot, including resubscription.
     } catch (error) {
       if (!current(context)) return;
       historyError = error instanceof ConversationApiError ? error.message : 'Conversation history could not be loaded.';
@@ -131,7 +131,7 @@
   async function send(retry = false): Promise<void> {
     const context = active;
     if (!context || !current(context) || sending || inaccessible || storageBlocked || !conversation) return;
-    if (!retry && (attempt || !draft.trim() || draftBytes > CHAT_LIMITS.maxTextBytes)) return;
+    if (!retry && (attempt || !chatHasText(draft) || draftBytes > CHAT_LIMITS.maxTextBytes)) return;
     const request = retry ? attempt : Object.freeze({ conversationId: conversation.id, operationId: crypto.randomUUID(), text: draft, replyTo: null, workRef: null });
     if (!request || request.conversationId !== conversation.id) return;
     // 同期保存が成功するまで送信しない。unknownでの編集や再訪でも同じ全入力を使う。
@@ -234,7 +234,7 @@
       <p id="conversation-constraint">Text only, up to {CHAT_LIMITS.maxTextBytes} UTF-8 bytes. Attachments are not supported.</p>
       {#if draftBytes > CHAT_LIMITS.maxTextBytes}<p class="error">The message exceeds the text limit.</p>{/if}
       {#if attempt}<p>Resolve the retained send before sending another message. Your next draft remains editable.</p>{/if}
-      <button class="workspace-secondary-button" type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !draft.trim() || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
+      <button class="workspace-secondary-button" type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !chatHasText(draft) || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
     </form>
   {/if}
 </section>

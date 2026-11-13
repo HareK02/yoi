@@ -70,7 +70,12 @@ export class ConversationMessagingClient {
       this.#subscriptionId = result.subscription_id;
       this.#accept(result.page);
       this.observer.onStatus('open');
-    } catch (error) { if (this.#current(epoch)) this.#fail(error instanceof ConversationApiError ? error : new ConversationApiError(null)); }
+    } catch (error) {
+      if (this.#current(epoch)) {
+        this.observer.onStatus('closed');
+        this.#fail(error instanceof ConversationApiError ? error : new ConversationApiError(null));
+      }
+    }
   }
   #accept(value: unknown): void {
     if (!this.#conversation || this.signal.aborted || this.#closed) return;
@@ -94,7 +99,13 @@ export class ConversationMessagingClient {
     if ([401, 403, 404].includes(error.status ?? 0)) this.close();
   }
   async refresh(): Promise<void> {
-    if (this.#closed || this.signal.aborted || !this.#conversation) return;
+    if (this.#closed || this.signal.aborted) return;
+    // 明示再同期はOpen/Subscribeのunknown後にもlive購読を復元する。自動再送loopにはしない。
+    if (!this.#subscriptionId) {
+      this.observer.onStatus('connecting');
+      await this.#subscribe(++this.#epoch);
+      return;
+    }
     const epoch = this.#epoch;
     const selector = this.#selector();
     const result = await this.#request({ kind: 'history', selector, query: { after_sequence: selector.after_sequence, limit: 100 } });

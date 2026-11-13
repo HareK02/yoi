@@ -523,3 +523,289 @@ async fn messaging_lag_and_page_backpressure_close_only_the_bounded_subscription
         })
     ));
 }
+
+// Each helper is a distinct OS process with a fresh API, broadcast ring and SQLite handles.
+// Only fixture admission/execution is substituted, not the HTTP/WS/storage/authentication path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "private child entry point selected only by messaging_server_process_restart"]
+async fn messaging_restart_server_child() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    assert!(std::env::var_os("T855_RESTART_CHILD").is_some());
+    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let init: Value = serde_json::from_str(&input.next_line().await.unwrap().unwrap()).unwrap();
+    let root = Path::new(init["root"].as_str().unwrap());
+    assert!(root.is_absolute());
+    let api = test_api(root).await;
+    let (owner, conversation) = if init["bootstrap"] == true {
+        let owner =
+            seed_test_workspace_owner_token(api.store.as_ref(), "restart-messaging-owner").await;
+        let subject = open_subjektiv_store(&api)
+            .unwrap()
+            .create_subject(crate::subjektiv::SubjectRole::new("restart-messaging").unwrap())
+            .unwrap()
+            .id;
+        let (status, conversation) = account(
+            &api,
+            &owner,
+            "POST",
+            &conversations_path(),
+            Some(json!({"operation_id":"restart-open","subject_id":subject})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        (owner, conversation)
+    } else {
+        (
+            init["owner"].as_str().unwrap().to_owned(),
+            init["conversation"].clone(),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopping) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(
+        axum::serve(listener, build_router(api.clone()))
+            .with_graceful_shutdown(async {
+                let _ = stopping.await;
+            })
+            .into_future(),
+    );
+    // This IPC line is captured by the parent and never printed in validation logs.
+    println!(
+        "T855_SERVER_READY {}",
+        json!({"url":format!("ws://{address}/api/w/{TEST_WORKSPACE_ID}/protocol/ws"),"owner":owner,"conversation":conversation})
+    );
+    let shutdown: Value = serde_json::from_str(&input.next_line().await.unwrap().unwrap()).unwrap();
+    if shutdown["revoke"] == true {
+        api.config_store
+            .with_conn(|connection| {
+                connection.execute(
+                    "UPDATE api_tokens SET revoked_at='2026-01-02T00:00:00Z' WHERE token_hash=?1",
+                    [token_hash(&owner)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    shutdown_workspace_feature_storage(&api).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn messaging_server_process_restart_recovers_committed_ack_loss_without_duplicates_and_rechecks_auth()
+ {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    struct Server {
+        child: tokio::process::Child,
+        input: tokio::process::ChildStdin,
+        state: Value,
+    }
+    impl Server {
+        async fn start(init: Value) -> Self {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "server::tests::subject_authorization_tests::chat_tests::messaging::messaging_restart_server_child", "--ignored", "--nocapture"])
+                .env("T855_RESTART_CHILD", "1")
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+                .kill_on_drop(true).spawn().unwrap();
+            let mut input = child.stdin.take().unwrap();
+            input
+                .write_all(format!("{init}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+            let state = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while let Some(line) = output.next_line().await.unwrap() {
+                    if let Some(wire) = line.strip_prefix("T855_SERVER_READY ") {
+                        return serde_json::from_str::<Value>(wire).unwrap();
+                    }
+                }
+                panic!("restart helper exited before readiness (credentials withheld)");
+            })
+            .await
+            .unwrap();
+            // Drain the harness's bounded tail without exposing the private readiness line.
+            tokio::spawn(async move { while output.next_line().await.ok().flatten().is_some() {} });
+            Self {
+                child,
+                input,
+                state,
+            }
+        }
+        async fn stop(mut self, revoke: bool) -> Value {
+            self.input
+                .write_all(format!("{}\n", json!({"revoke":revoke})).as_bytes())
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(20), self.child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success(),
+                "restart helper failed; credentials withheld"
+            );
+            self.state
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let first = Server::start(json!({"root":root.path(),"bootstrap":true})).await;
+    let c: ChatConversation = serde_json::from_value(first.state["conversation"].clone()).unwrap();
+    let owner = first.state["owner"].as_str().unwrap();
+    let mut socket = Wire::connect(first.state["url"].as_str().unwrap(), owner).await;
+    let selector = MessagingSelector {
+        subject_id: c.subject_id.clone(),
+        conversation_id: c.id.clone(),
+        after_sequence: 0,
+    };
+    let (id, initial) = subscribe(&mut socket, selector.clone(), "initial").await;
+    assert!(initial.messages.is_empty());
+    let command = |operation: &str| MessagingCommand::Post {
+        selector: selector.clone(),
+        request: server_api::ChatUserMessageRequest {
+            operation_id: operation.into(),
+            text: operation.into(),
+            reply_to: None,
+            work_ref: None,
+        },
+    };
+    socket.command("before", command("before-shutdown")).await;
+    let observed = socket.messages(&id).await.messages.remove(0);
+    assert!(matches!(
+        socket.result("before").await,
+        MessagingResult::Saved { .. }
+    ));
+    socket
+        .command("boundary", command("committed-before-lost-ack"))
+        .await;
+    let boundary = socket.messages(&id).await.messages.remove(0);
+    socket.socket.close(None).await.unwrap(); // Do not read the POST ACK.
+    let state = first.stop(false).await;
+    let next = || json!({"root":root.path(),"bootstrap":false,"owner":state["owner"],"conversation":state["conversation"]});
+    let second = Server::start(next()).await;
+    let mut socket = Wire::connect(
+        second.state["url"].as_str().unwrap(),
+        state["owner"].as_str().unwrap(),
+    )
+    .await;
+    let (id, recovered) = subscribe(
+        &mut socket,
+        MessagingSelector {
+            after_sequence: observed.sequence,
+            ..selector.clone()
+        },
+        "resume",
+    )
+    .await;
+    assert_eq!(recovered.conversation.id, c.id);
+    assert_eq!(recovered.messages, vec![boundary.clone()]);
+    socket
+        .command("replay", command("committed-before-lost-ack"))
+        .await;
+    let MessagingResult::Saved { response } = socket.result("replay").await else {
+        panic!("persisted replay must recover saved result")
+    };
+    assert_eq!(response.message, boundary);
+    socket.command("after", command("after-restart")).await;
+    let after = socket.messages(&id).await.messages.remove(0);
+    socket
+        .command(
+            "all",
+            MessagingCommand::History {
+                selector: selector.clone(),
+                query: server_api::ChatMessagePageQuery {
+                    after_sequence: Some(0),
+                    limit: Some(100),
+                },
+            },
+        )
+        .await;
+    let MessagingResult::History { page } = socket.result("all").await else {
+        panic!("history")
+    };
+    assert_eq!(page.messages, vec![observed, boundary, after]);
+    socket.socket.close(None).await.unwrap();
+    second.stop(true).await;
+    let third = Server::start(next()).await;
+    let mut request = third.state["url"]
+        .as_str()
+        .unwrap()
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", state["owner"].as_str().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    let Err(tokio_tungstenite::tungstenite::Error::Http(rejected)) = connect_async(request).await
+    else {
+        panic!("revoked credentials must not regain a subscription after restart")
+    };
+    assert_eq!(rejected.status().as_u16(), 401);
+    third.stop(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn messaging_subject_deletion_closes_only_its_subscription_and_wrong_workspace_never_upgrades()
+ {
+    use protocol::subscription::*;
+    let f = Fixture::new().await;
+    let subject = open_subjektiv_store(&f.api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("delete-chat").unwrap())
+        .unwrap()
+        .id;
+    let c = conversation(&f, &subject, "deleted-conversation").await;
+    let (url, _server) = socket_server(&f).await;
+    let mut wire = Wire::connect(&url, &f.owner).await;
+    let (id, _) = subscribe(
+        &mut wire,
+        MessagingSelector {
+            subject_id: subject.clone(),
+            conversation_id: c.id.clone(),
+            after_sequence: 0,
+        },
+        "deleted",
+    )
+    .await;
+    let (status, deleted) = account(
+        &f.api,
+        &f.owner,
+        "DELETE",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}"),
+        Some(json!({"operation_id":"delete-messaging-subject"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["completed"], true);
+    let _ = f.api.chat_changes.send(c.id);
+    assert!(matches!(wire.take(|frame| matches!(frame, SubscriptionFramePayload::MessagingEvent(MessagingEvent::Closed { subscription_id, .. }) if subscription_id == &id)).await, SubscriptionFramePayload::MessagingEvent(MessagingEvent::Closed { reason:server_api::MessagingTermination::AccessRevoked, .. })));
+    wire.send(SubscriptionFramePayload::Request(
+        SubscriptionRequest::SubscribeEvents {
+            request_id: SubscriptionRequestId::new("workers-after-deletion").unwrap(),
+            selector: EventSubscriptionSelector::WorkspaceWorkers,
+        },
+    ))
+    .await;
+    assert!(matches!(
+        wire.take(|frame| matches!(frame, SubscriptionFramePayload::Response(_)))
+            .await,
+        SubscriptionFramePayload::Response(SubscriptionResponse::Subscribed { .. })
+    ));
+    let wrong_workspace = url.replace(TEST_WORKSPACE_ID, "missing-workspace");
+    let mut request = wrong_workspace.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", f.owner).parse().unwrap(),
+    );
+    let Err(tokio_tungstenite::tungstenite::Error::Http(rejected)) = connect_async(request).await
+    else {
+        panic!("wrong Workspace must not upgrade")
+    };
+    assert_eq!(rejected.status().as_u16(), 404);
+}

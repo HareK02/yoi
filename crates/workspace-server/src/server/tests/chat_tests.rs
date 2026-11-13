@@ -508,7 +508,27 @@ async fn chat_cross_subject_background_and_released_body_cannot_read_or_publish(
         .map(|op| subject_permission(&f.subject, op))
         .collect::<Vec<_>>();
     f.assign(permissions.clone(), permissions.clone()).await;
-    let child = f.child("background-chat", permissions).await;
+    let Json(child) = create_workspace_worker_as_owner(
+        State(f.api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: f.source.runtime_id.clone(),
+            display_name: "Ordinary chat permission holder".into(),
+            singleton_key: None,
+            profile: Some("builtin:coder".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: Default::default(),
+            control_operation_id: Some("background-chat".into()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                assignment: Some(standalone_assignment(
+                    r#"{ namespaces = [{ namespace = "chat"; keys = ["chat.read", "chat.send"]; }]; }"#,
+                )),
+            },
+        }),
+    ).await.unwrap();
+    let child = RuntimeWorkerRef::new(child.runtime_id, child.worker_id);
     for source in [&child, &f.source] {
         let target = if source == &child { &c.id } else { &foreign.id };
         for request in [read(target), send(target, "not-authorized", None)] {

@@ -333,3 +333,18 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[test]
+fn unicode_whitespace_corpus_preserves_rust_storage_admission() {
+    let corpus: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/chat-whitespace.json")).unwrap();
+    for case in corpus {
+        let text = case["text"].as_str().unwrap();
+        assert_eq!(
+            valid_chat_text(text),
+            case["nonblank"].as_bool().unwrap(),
+            "{text:?}"
+        );
+    }
+}

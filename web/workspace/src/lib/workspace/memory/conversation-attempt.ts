@@ -1,5 +1,7 @@
 // 会話の正本や配送queueではなく、同じtabでの明示再送に必要な全入力だけを保持する。
 // 送信結果が不明な間は次の要求で上書きせず、本文の後続編集とは分離する。
+import { chatHasText } from '#lib/generated/chat-api.ts';
+
 export type ConversationScope = Readonly<{
   workspaceId: string;
   subjectId: string;
@@ -37,7 +39,7 @@ function exact(value: Record<string, unknown>, keys: string[]): boolean {
 }
 
 function id(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0 &&
+  return typeof value === "string" && chatHasText(value) &&
     new TextEncoder().encode(value).length <= 512 &&
     !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
 }
@@ -77,7 +79,7 @@ export function readConversationAttempt(
     ]) ||
     !id(attempt.conversationId) || !id(attempt.operationId) ||
     typeof attempt.text !== "string" ||
-    !attempt.text.trim() || !nullableId(attempt.replyTo) ||
+    !chatHasText(attempt.text) || !nullableId(attempt.replyTo) ||
     !nullableId(attempt.workRef)
   ) {
     throw new Error(

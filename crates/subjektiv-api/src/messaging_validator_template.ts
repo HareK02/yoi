@@ -1,7 +1,11 @@
 // Semantic guards paired with the Rust-owned messaging DTO/schema. The multiplexer
 // checks structural shape first; these checks bind pages, identities and byte limits.
+// Rust str::trim uses Unicode White_Space, not ECMAScript TrimString (which removes FEFF).
+export function chatHasText(value: string): boolean {
+  return /[^\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/u.test(value);
+}
 function chatIdentifier(value: string): boolean {
-  return typeof value === 'string' && value.trim().length > 0 && new TextEncoder().encode(value).length <= 512 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+  return typeof value === 'string' && chatHasText(value) && new TextEncoder().encode(value).length <= 512 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
 }
 function chatReference(value: string | null): boolean {
   return value === null || chatIdentifier(value);
@@ -11,7 +15,7 @@ export function validChatConversation(c: ChatConversation): boolean {
 }
 export function validChatMessage(m: ChatMessage): boolean {
   return [m.id, m.conversation_id, m.operation_id].every(chatIdentifier) &&
-    m.text.trim().length > 0 && new TextEncoder().encode(m.text).length <= CHAT_LIMITS.maxTextBytes &&
+    chatHasText(m.text) && new TextEncoder().encode(m.text).length <= CHAT_LIMITS.maxTextBytes &&
     Number.isSafeInteger(m.sequence) && m.sequence >= 1 && m.sequence <= CHAT_LIMITS.maxCounter &&
     [m.reply_to, m.work_ref, m.last_user_message_id].every(chatReference) &&
     chatIdentifier(m.sender.kind === 'user' ? m.sender.account_id : m.sender.subject_id);

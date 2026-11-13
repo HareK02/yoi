@@ -17,12 +17,14 @@ const commands: Record<string, unknown>[] = [];
 let httpChatRequests = 0;
 let droppedAck = false;
 let dropNextSaved = false;
+let delayedSubscription: string | null = null;
+let droppedSubscribeAck = false;
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, colorScheme: 'light' });
 const cookie = (value: string) => ({ name: 'yoi_workspace_session', value, url: origin.origin, httpOnly: true, sameSite: 'Lax' as const });
 await context.addCookies([cookie(input.owner_session)]);
 const git = async (args: string[]) => { const result = await new Deno.Command('git', { args, stdout: 'piped' }).output(); assert(result.success); return new TextDecoder().decode(result.stdout).trim(); };
-const manifest = { evidence: 'real Browser/Backend/SQLite/signed Runtime; external model scripted', source: { commit: await git(['rev-parse', 'HEAD']), status: await git(['status', '--porcelain']) }, driverSha256: await sha256File(new URL(import.meta.url).pathname), baseline: input.baseline, visualVerdict: 'UNREVIEWED: author must open images', status: 'running', captures, pageErrors, requestErrors, httpChatRequests: 0, droppedAck: false, messagingCommands: [] as string[] };
+const manifest = { evidence: 'real Browser/Backend/SQLite/signed Runtime; external model scripted', source: { commit: await git(['rev-parse', 'HEAD']), tree: await git(['rev-parse', 'HEAD^{tree}']), status: await git(['status', '--porcelain']) }, driverSha256: await sha256File(new URL(import.meta.url).pathname), baseline: input.baseline, visualVerdict: 'UNREVIEWED: author must open images', status: 'running', captures, pageErrors, requestErrors, httpChatRequests: 0, droppedAck: false, messagingCommands: [] as string[] };
 const save = () => Deno.writeTextFile(`${output}/review-context.json`, JSON.stringify(manifest, null, 2));
 async function capture(page: Page, id: string) {
   await assertNoPageWideOverflow(page);
@@ -39,6 +41,10 @@ if (!input.baseline) await context.routeWebSocket('**/protocol/ws', socket => {
   server.onMessage(message => {
     if (typeof message === 'string') {
       const frame = JSON.parse(message);
+      if (frame.frame === 'messaging_response' && frame.message.result.kind === 'subscribed') {
+        if (!droppedSubscribeAck) { droppedSubscribeAck = true; delayedSubscription = message; return; }
+        if (delayedSubscription) { socket.send(delayedSubscription); delayedSubscription = null; }
+      }
       if (dropNextSaved && frame.frame === 'messaging_response' && frame.message.result.kind === 'saved') { dropNextSaved = false; droppedAck = true; return; }
     }
     socket.send(message);
@@ -51,6 +57,11 @@ page.on('request', r => { if (/\/chat\/conversations/.test(new URL(r.url()).path
 page.on('requestfailed', r => { if (!r.failure()?.errorText.includes('ABORTED')) requestErrors.push(new URL(r.url()).pathname); });
 try {
   await page.goto(new URL(subjectChatHref(input.workspace_id, input.subject_id), origin).href);
+  if (!input.baseline) {
+    await page.getByRole('alert').filter({ hasText: /outcome could not be confirmed/ }).waitFor();
+    await page.getByText('Conversation connection: disconnected — history is the last confirmed observation', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Refresh history', exact: true }).click();
+  }
   await page.getByText('No public messages yet.', { exact: true }).waitFor();
   await capture(page, 'empty-1440-light');
   if (input.baseline) {
@@ -85,6 +96,13 @@ try {
     const requests = posts.map(f => (f.message as {command: {request: unknown}}).command.request);
     assertEquals(requests[1], requests[0]); assertEquals(requests[2], requests[0]);
     assert(commands.some(f => f.frame === 'request' && (f.message as {method: string}).method === 'subscribe_events'));
+    assert(droppedSubscribeAck && delayedSubscription === null);
+    assert(commands.some(f => f.frame === 'messaging_request' && (f.message as {command: {kind: string}}).command.kind === 'unsubscribe'), 'late Subscribe ACK must be cleaned up');
+    await page.getByRole('button', { name: 'Stop conversation body', exact: true }).click();
+    await page.getByRole('button', { name: 'Start conversation body', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Start conversation body', exact: true }).click();
+    await page.getByRole('button', { name: 'Stop conversation body', exact: true }).waitFor();
+    assertEquals(await history.getByRole('listitem').count(), 2, 'body replacement must retain the same public history');
     assertEquals(httpChatRequests, 0, 'normal conversation must not use HTTP history/polling');
     await page.goto(new URL(subjectChatHref(input.workspace_id, input.other_subject_id), origin).href);
     await page.getByText('No public messages yet.', { exact: true }).waitFor(); assertEquals(await history.getByRole('listitem').count(), 0);
