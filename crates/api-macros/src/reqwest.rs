@@ -174,7 +174,7 @@ pub struct ClientBuilder<A = NoAuthorizer> {
     base_url: BaseUrl,
     client: Option<Client>,
     authorizer: A,
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
     response_body_limit: usize,
 }
 
@@ -188,7 +188,7 @@ impl ClientBuilder<NoAuthorizer> {
             base_url,
             client: None,
             authorizer: NoAuthorizer,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
             response_body_limit: DEFAULT_RESPONSE_BODY_LIMIT,
         }
     }
@@ -210,8 +210,10 @@ impl<A> ClientBuilder<A> {
         }
     }
 
-    pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+    /// Set the generated client's request deadline. `None` disables this layer's
+    /// deadline; any timeout configured on a supplied reqwest Client still applies.
+    pub fn request_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.request_timeout = timeout.into();
         self
     }
 
@@ -255,7 +257,7 @@ pub struct ClientCore<A = NoAuthorizer> {
     base_url: BaseUrl,
     client: Client,
     authorizer: A,
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
     response_body_limit: usize,
 }
 
@@ -289,14 +291,14 @@ impl<A> ClientCore<A> {
         base_url: BaseUrl,
         client: Client,
         authorizer: A,
-        request_timeout: Duration,
+        request_timeout: impl Into<Option<Duration>>,
         response_body_limit: usize,
     ) -> Self {
         Self {
             base_url,
             client,
             authorizer,
-            request_timeout,
+            request_timeout: request_timeout.into(),
             response_body_limit,
         }
     }
@@ -381,11 +383,10 @@ impl<A: RequestAuthorizer> ClientCore<A> {
             );
         }
 
-        let mut request = self
-            .client
-            .request(method, url)
-            .headers(headers)
-            .timeout(self.request_timeout);
+        let mut request = self.client.request(method, url).headers(headers);
+        if let Some(timeout) = self.request_timeout {
+            request = request.timeout(timeout);
+        }
         if let Some(body) = body {
             request = request.body(body.bytes);
         }
@@ -755,6 +756,27 @@ pub mod framework {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_deadline_can_be_cleared_without_restoring_the_default() {
+        let builder = ClientBuilder::try_new("http://localhost").unwrap();
+        assert_eq!(builder.request_timeout, Some(DEFAULT_REQUEST_TIMEOUT));
+        let core = builder
+            .request_timeout(Duration::from_millis(10))
+            .request_timeout(None)
+            .authorizer(NoAuthorizer)
+            .build()
+            .unwrap();
+        assert_eq!(core.request_timeout, None);
+        assert_eq!(core.clone().request_timeout, None);
+        let explicit = ClientBuilder::try_new("http://localhost")
+            .unwrap()
+            .request_timeout(None)
+            .request_timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+        assert_eq!(explicit.request_timeout, Some(Duration::from_millis(20)));
+    }
 
     #[test]
     fn bodyless_response_validation_rejects_retained_bytes_without_exposing_them() {

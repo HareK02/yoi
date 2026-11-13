@@ -293,7 +293,7 @@ fn execute_remote_worker_remove_http_blocking(
             WORKSPACE_REQUEST_PERMISSION,
             Some(request.source_worker_id),
             headers,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
             8 * 1024 * 1024,
         )
         .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
@@ -637,7 +637,7 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         let request_client = self.request_client.clone();
         let workspace_id = self.workspace_id.clone();
         let worker_id = self.worker_id.clone();
-        let timeout = self.request_timeout.unwrap_or(Duration::from_secs(5));
+        let timeout = self.request_timeout;
         std::thread::Builder::new()
             .name("yoi-workspace-server-api".to_string())
             .spawn(move || {
@@ -874,7 +874,7 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         let request_client = self.request_client.clone();
         let workspace_id = self.workspace_id.clone();
         let worker_id = self.worker_id.clone();
-        let timeout = self.request_timeout.unwrap_or(Duration::from_secs(5));
+        let timeout = self.request_timeout;
         let query = server_api::WorkspaceWorkerDiscoveryQuery {
             cursor: request.cursor,
             limit: Some(request.limit),

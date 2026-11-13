@@ -2062,7 +2062,10 @@ fn reqwest_adapter_tokens(
                 #builder_ident { inner: self.inner.authorizer(authorizer) }
             }
 
-            pub fn request_timeout(mut self, timeout: ::std::time::Duration) -> Self {
+            pub fn request_timeout(
+                mut self,
+                timeout: impl ::core::convert::Into<::core::option::Option<::std::time::Duration>>,
+            ) -> Self {
                 self.inner = self.inner.request_timeout(timeout);
                 self
             }

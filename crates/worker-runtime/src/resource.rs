@@ -274,7 +274,7 @@ impl BackendResourceClient for HttpBackendResourceClient {
                 BACKEND_RESOURCE_FETCH_PERMISSION,
                 None,
                 headers,
-                self.request_timeout,
+                Some(self.request_timeout),
                 8 * 1024 * 1024,
             )
             .map_err(|error| BackendResourceError::Transport {

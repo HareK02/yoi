@@ -227,7 +227,7 @@ impl RuntimeWorkspaceRequestClient {
         permission: impl Into<String>,
         worker_id: Option<String>,
         extra_headers: HeaderMap,
-        timeout: Duration,
+        timeout: Option<Duration>,
         response_body_limit: usize,
     ) -> Result<
         server_api::ServerApiClient<RuntimeWorkspaceRequestAuthorizer>,
