@@ -104,7 +104,7 @@ async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stdin_ownership_timeout_and_cancel_do_not_send_a_method() {
     for cancel in [false, true] {
         let bytes = Arc::new(StdMutex::new(Vec::new()));
@@ -139,7 +139,7 @@ async fn stdin_ownership_timeout_and_cancel_do_not_send_a_method() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn interrupted_write_or_flush_closes_stdin_before_the_next_frame() {
     for (stall, stage) in [
         (Stall::PartialWrite, McpRequestStage::WritingFrame),
@@ -201,7 +201,7 @@ async fn interrupted_write_or_flush_closes_stdin_before_the_next_frame() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn flushed_call_timeout_or_cancel_is_not_replayed_and_late_response_is_not_mixed() {
     for cancel in [false, true] {
         let bytes = Arc::new(StdMutex::new(Vec::new()));

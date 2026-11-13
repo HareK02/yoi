@@ -3500,7 +3500,7 @@ mod tests {
             &workdir,
             CommandRequest {
                 transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
-                command: "sleep 30".into(),
+                command: "printf ready; exec tail -f /dev/null".into(),
                 timeout_secs: 1,
 
                 cwd: WorkdirPath::root(),
@@ -3510,6 +3510,28 @@ mod tests {
         )
         .await
         .unwrap();
+        let ready = WorkdirSession::command_output(
+            &workdir,
+            CommandOutputRequest {
+                handle: handle.clone(),
+                cursor: 0,
+                limit: 5,
+                wait: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ready
+                .chunks
+                .iter()
+                .flat_map(|c| c.bytes.iter().copied())
+                .collect::<Vec<_>>(),
+            b"ready"
+        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
         let output = crate::command_test_support::CollectCommand::collect_command_output(
             &workdir,
             CommandOutputRequest {

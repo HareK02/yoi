@@ -13,7 +13,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time", "test-util"] }
 
 [[bin]]
 name = "mcp-stdio-mock-server"

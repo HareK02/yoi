@@ -398,7 +398,36 @@ async fn native_timeout_and_cancellation_keep_terminal_evidence_instead_of_succe
         .await
         .is_ok()
     );
-    let error = runtime.invoke("/bash-output".into(), contextual_reference("yoi.bash/command/v1", "/bash-output"), "run".into(), json!({"input":{"command":"printf timeout; while :; do :; done","cwd":".","timeout":1}}), Default::default()).await.unwrap_err();
+    let mut events = session.subscribe_command_events().unwrap();
+    let execution = runtime.invoke(
+        "/bash-output".into(),
+        contextual_reference("yoi.bash/command/v1", "/bash-output"),
+        "run".into(),
+        json!({"input":{"command":"printf timeout; exec tail -f /dev/null","cwd":".","timeout":1}}),
+        Default::default(),
+    );
+    tokio::pin!(execution);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut execution => panic!("command ended before output: {result:?}"),
+                event = events.recv() => {
+                    if matches!(event.unwrap(), workdir::CommandEvent::Output { .. }) {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::time::resume();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+        .await
+        .unwrap()
+        .unwrap_err();
     let ToolError::Interrupted(output) = error else {
         panic!("expected timeout evidence")
     };

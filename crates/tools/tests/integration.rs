@@ -1866,8 +1866,33 @@ async fn utf8_quota_boundary_preserves_raw_prefix_and_reports_saved_vs_seen() {
 
 #[tokio::test]
 async fn timeout_terminal_fences_retained_stdout_and_stderr() {
-    let (_root, _session, view, bash) = output_fixture();
-    let error = tokio::time::timeout(std::time::Duration::from_secs(5), bash.execute(r#"{"command":"printf before; printf err-before >&2; while :; do :; done","cwd":".","timeout":1}"#, Default::default())).await.unwrap().unwrap_err();
+    let (_root, session, view, bash) = output_fixture();
+    let mut events = session.subscribe_command_events().unwrap();
+    let execution = bash.execute(r#"{"command":"printf before; printf err-before >&2; exec tail -f /dev/null","cwd":".","timeout":1}"#, Default::default());
+    tokio::pin!(execution);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (mut stdout, mut stderr) = (false, false);
+        while !(stdout && stderr) {
+            tokio::select! {
+                result = &mut execution => panic!("command ended before both streams were observed: {result:?}"),
+                event = events.recv() => {
+                    if let workdir::CommandEvent::Output { stream, .. } = event.unwrap() {
+                        match stream {
+                            workdir::CommandStream::Stdout => stdout = true,
+                            workdir::CommandStream::Stderr => stderr = true,
+                        }
+                    }
+                }
+            }
+        }
+    }).await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::time::resume();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+        .await
+        .unwrap()
+        .unwrap_err();
     let ToolError::Interrupted(out) = error else {
         panic!("expected timeout output");
     };

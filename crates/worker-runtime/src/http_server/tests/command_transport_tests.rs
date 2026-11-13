@@ -4,11 +4,69 @@
 
 use super::*;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use workdir::http::{
     RemoteWorkdirSession, WorkdirHttpAuthorization, WorkdirHttpAuthorizationFuture,
 };
 use workdir::{CommandOutputRequest, CommandRequest, CommandStream, WorkdirSession};
+
+// Only the selected silent read runs on a virtual clock. HTTP I/O and the real
+// command remain on the caller's clock, so advancing the long poll cannot also
+// expire the command or race socket readiness.
+struct LongPollProbe {
+    cursor: u64,
+    calls: AtomicUsize,
+    observed: tokio::sync::mpsc::UnboundedSender<CommandOutputRequest>,
+}
+
+async fn observed_command_operation(
+    probe: Option<Arc<LongPollProbe>>,
+    state: State<RuntimeHttpState>,
+    path: Path<String>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    body: Result<Json<WorkdirSessionOperationRequest>, JsonRejection>,
+) -> Result<Json<WorkdirSessionOperationResult>, RuntimeHttpWorkdirError> {
+    if let Some(probe) = probe
+        && let Ok(Json(operation_body)) = &body
+        && let WorkdirSessionOperation::CommandOutput(request) = &operation_body.operation
+        && request.wait
+        && request.cursor == probe.cursor
+    {
+        probe.observed.send(request.clone()).unwrap();
+        if probe.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let cursor = request.cursor;
+            return tokio::task::spawn_blocking(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .start_paused(true)
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let started = tokio::time::Instant::now();
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(21),
+                            run_workdir_session_operation(state, path, auth, body),
+                        )
+                        .await
+                        .expect("production long poll must expire within its virtual deadline")?;
+                        assert!(started.elapsed() >= Duration::from_secs(20));
+                        assert!(started.elapsed() < Duration::from_secs(21));
+                        let WorkdirSessionOperationResult::CommandOutput(output) = &result.0 else {
+                            panic!("expected command output");
+                        };
+                        assert!(output.chunks.is_empty());
+                        assert!(output.terminal.is_none());
+                        assert_eq!(output.next_cursor, cursor);
+                        Ok(result)
+                    })
+            })
+            .await
+            .unwrap();
+        }
+    }
+    run_workdir_session_operation(state, path, auth, body).await
+}
 
 struct SignedAuthorization {
     identity: RuntimeIdentityMaterial,
@@ -78,6 +136,14 @@ impl Harness {
         root: tempfile::TempDir,
         command_environment: BTreeMap<String, String>,
     ) -> Self {
+        Self::with_long_poll_probe(root, command_environment, None).await
+    }
+
+    async fn with_long_poll_probe(
+        root: tempfile::TempDir,
+        command_environment: BTreeMap<String, String>,
+        probe: Option<Arc<LongPollProbe>>,
+    ) -> Self {
         let session: WorkdirSessionHandle =
             Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
                 Workdir::new("wd-transport"),
@@ -123,7 +189,9 @@ impl Harness {
             )
             .route(
                 "/v1/workdir-sessions/{session_id}/operations",
-                post(run_workdir_session_operation),
+                post(move |state, path, auth, body| {
+                    observed_command_operation(probe.clone(), state, path, auth, body)
+                }),
             )
             .route(
                 "/v1/workdir-sessions/{session_id}",
@@ -178,8 +246,18 @@ impl Harness {
 
 #[tokio::test]
 async fn real_http_waiting_command_survives_long_poll_expiry() {
-    tokio::time::timeout(Duration::from_secs(45), async {
-        let harness = Harness::new().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (observed, mut polls) = tokio::sync::mpsc::unbounded_channel();
+        let probe = Arc::new(LongPollProbe {
+            cursor: b"ready".len() as u64,
+            calls: AtomicUsize::new(0),
+            observed,
+        });
+        let harness = Harness::with_long_poll_probe(
+            tempfile::tempdir().unwrap(),
+            BTreeMap::new(),
+            Some(probe),
+        ).await;
         let handle = harness
             .remote
             .start_command(CommandRequest {
@@ -202,14 +280,17 @@ async fn real_http_waiting_command_survives_long_poll_expiry() {
         assert!(ready.terminal.is_none());
         request.cursor = ready.next_cursor;
 
-        // Keep the command silent until the production HTTP handler has expired
-        // its 20-second long poll. The client must keep waiting, not fail or
-        // expose an empty page as completed output.
+        // Observe the initial silent read and its continuation after the real
+        // handler's virtual 20-second expiry. Reaching the second request proves
+        // the client consumed the empty page without returning it to the caller.
         let waiting = harness.remote.command_output(request.clone());
         tokio::pin!(waiting);
-        tokio::select! {
-            result = &mut waiting => panic!("waiting read ended before release: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_secs(21)) => {}
+        for _ in 0..2 {
+            tokio::select! {
+                biased;
+                result = &mut waiting => panic!("waiting read ended before release: {result:?}"),
+                observed = polls.recv() => assert_eq!(observed.unwrap(), request),
+            }
         }
         std::fs::write(harness._root.path().join("release"), b"").unwrap();
         let mut page = waiting.await.unwrap();
@@ -604,6 +685,11 @@ async fn real_http_cancel_drains_tail_before_terminal_and_timeout_is_distinct() 
             cursor = first.next_cursor;
             if cancel {
                 harness.remote.cancel_command(handle.clone()).await.unwrap();
+            } else {
+                // Readiness is observed over HTTP before expiring the process deadline.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(timeout)).await;
+                tokio::time::resume();
             }
             loop {
                 let page = harness

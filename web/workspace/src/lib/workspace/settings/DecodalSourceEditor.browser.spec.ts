@@ -10,7 +10,10 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import DecodalSourceEditor from "./DecodalSourceEditor.svelte";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 function setup(
   value: string,
@@ -80,6 +83,7 @@ test("Enter does not mutate readonly sources", async () => {
 });
 
 test("Enter adds an indented newline instead of accepting a visible completion", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
   const value = "{\n  na";
   const { content, editor } = setup(value, {
     onComplete: async () => ({
@@ -90,9 +94,8 @@ test("Enter adds an indented newline instead of accepting a visible completion",
   editor.dispatch({ selection: { anchor: value.length } });
   startCompletion(editor);
   await waitFor(() => expect(completionStatus(editor.state)).toBe("active"));
-  // Wait past CodeMirror's completion interaction delay, so accepting a
-  // suggestion would be observable rather than ignored as an early keypress.
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  // Cross CodeMirror's interaction delay without waiting in real time.
+  vi.setSystemTime(Date.now() + 100);
   await fireEvent.keyDown(content, { key: "Enter", code: "Enter" });
   expect(editor.state.doc.toString()).toBe("{\n  na\n  ");
   await waitFor(() => expect(completionStatus(editor.state)).toBeNull());

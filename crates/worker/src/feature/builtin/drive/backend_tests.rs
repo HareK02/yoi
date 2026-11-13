@@ -514,7 +514,7 @@ async fn production_binary_length_transport_and_upload_loss_are_diagnosed() {
         assert!(state.requests[0].path.ends_with(&format!("/requests/{ID}")));
     }
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn production_deadline_does_not_cancel_effect_or_infer_uncommitted_from_snapshot() {
     for mutation_call in [false, true] {
         let client = Client::new(Fault::Deadline, Fault::Unrecognized);
@@ -541,6 +541,8 @@ async fn production_deadline_does_not_cancel_effect_or_infer_uncommitted_from_sn
             assert_eq!(state.mutations, usize::from(mutation_call));
             assert!(!state.released && !state.finished);
         }
+        // The blocking effect has entered its gate; expire only the async deadline.
+        tokio::time::advance(backend.deadline).await;
         let result = request.await;
         let error = result.unwrap_err();
         assert!(if mutation_call {

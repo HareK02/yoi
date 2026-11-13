@@ -572,7 +572,7 @@ async fn cancellation_drops_staging_without_exposing_a_partial_final_file() {
     assert_eq!(retry.resolve(&cache).await.unwrap().bytes(), artifact.bytes);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stalled_transfer_deadline_releases_lock_and_staging() {
     let (artifact, descriptor) = fixture();
     let mut source = Source::new(&artifact, descriptor);

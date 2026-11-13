@@ -2231,6 +2231,7 @@ async fn backend_job_missing_worker_reaches_failure_without_fabricated_cleanup()
 async fn backend_job_timeout_fences_late_structured_result() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
+    api.stop_backend_job_recovery().await;
     let request = BackendJobRequest {
         job_id: "runner-timeout-1".to_string(),
         purpose: "timeout_contract_check".to_string(),
@@ -2243,7 +2244,6 @@ async fn backend_job_timeout_fences_late_structured_result() {
         source_worker: None,
         notification_target: None,
         limits: crate::backend_job::BackendJobLimits {
-            timeout_seconds: 1,
             max_attempts: 1,
             ..Default::default()
         },
@@ -2251,16 +2251,32 @@ async fn backend_job_timeout_fences_late_structured_result() {
     let dispatched = api.dispatch_backend_job(&request).unwrap();
     let worker = dispatched.attempt.worker.clone().unwrap();
     seed_worker_session_for_cleanup(temp.path(), &worker);
-    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
-    let attempt = api
-        .store
-        .get_backend_job_attempt(
-            TEST_WORKSPACE_ID,
-            &request.job_id,
-            &dispatched.attempt.attempt_id,
-        )
-        .unwrap()
+    // Supply an already-expired persisted deadline, not a guessed delay for
+    // recovery completion. Production reconciliation still owns failure/cleanup.
+    api.config_store
+        .with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE backend_job_attempts SET deadline_at=?1 WHERE workspace_id=?2 AND job_id=?3 AND attempt_id=?4",
+                rusqlite::params![
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    TEST_WORKSPACE_ID,
+                    request.job_id,
+                    dispatched.attempt.attempt_id,
+                ],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        })
         .unwrap();
+    api.backend_job_recovery.resume_after_test_pause();
+    api.recover_backend_jobs().unwrap();
+    let attempt = wait_for_attempt(
+        &api,
+        &request.job_id,
+        &dispatched.attempt.attempt_id,
+        |attempt| attempt.state == BackendJobAttemptState::Failed,
+    )
+    .await;
     assert_eq!(attempt.state, BackendJobAttemptState::Failed);
     assert_eq!(attempt.failure_category.as_deref(), Some("timeout"));
     wait_for_backend_job_worker_cleanup(

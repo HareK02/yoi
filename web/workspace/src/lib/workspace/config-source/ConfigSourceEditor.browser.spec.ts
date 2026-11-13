@@ -116,6 +116,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -177,6 +178,7 @@ test("loading is not an empty source tree; editing waits for schema installation
 test.each(["http", "invalid"])(
   "%s failure has a manual reload, not creation controls or automatic retries",
   async (failure) => {
+    vi.useFakeTimers();
     fetcher.mockResolvedValueOnce(
       failure === "http"
         ? new Response("Backend unavailable", { status: 503 })
@@ -185,7 +187,7 @@ test.each(["http", "invalid"])(
         ),
     );
     const view = renderEditor();
-    await waitFor(() =>
+    await vi.waitFor(() =>
       expect(view.getByRole("alert").textContent).toContain(
         "Unable to load workspace configuration",
       )
@@ -195,8 +197,9 @@ test.each(["http", "invalid"])(
     );
     expectNoEditor(view);
     expect(toolchain.setSnapshot).not.toHaveBeenCalled();
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await vi.advanceTimersByTimeAsync(300);
     expect(fetcher).toHaveBeenCalledOnce();
+    vi.useRealTimers();
     await fireEvent.click(
       view.getByRole("button", { name: "Reload source tree" }),
     );

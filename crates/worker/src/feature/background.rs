@@ -1973,7 +1973,7 @@ mod tests {
         assert!(registry.inner.running.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn hung_cleanup_has_separate_host_deadline_and_drops_before_shutdown_returns() {
         let feature = FeatureId::builtin("cleanup-timeout");
         let (mut task, mut runs, mut stops) = controlled_task();

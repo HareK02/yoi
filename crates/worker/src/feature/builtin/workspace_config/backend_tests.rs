@@ -457,7 +457,7 @@ async fn production_typed_rejections_preserve_public_codes_and_never_apply() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn production_deadline_is_unknown_after_effect_and_blocking_completion_is_not_retried() {
     for mutation in [false, true] {
         let client = Client::new(Fault::Deadline);
@@ -485,6 +485,8 @@ async fn production_deadline_is_unknown_after_effect_and_blocking_completion_is_
             assert_eq!(state.saved.is_some(), mutation);
             assert!(!state.completed && !state.released);
         }
+        // Expire the async deadline after the blocking effect has reached its gate.
+        tokio::time::advance(Duration::from_secs(1)).await;
         let result = request.await;
         assert_cause(
             result.as_ref().err().unwrap(),
@@ -659,7 +661,7 @@ async fn production_oversized_request_is_rejected_before_dispatch() {
     assert_eq!(state.mutations, 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn production_current_deadline_remains_bounded_and_has_no_mutation() {
     let client = Client::new(Fault::Deadline);
     let release = Release(client.clone());
@@ -673,6 +675,7 @@ async fn production_current_deadline_remains_bounded_and_has_no_mutation() {
         _ = &mut request => panic!("current request must enter the gate before timeout is observed"),
     }
     assert_eq!(client.state.lock().unwrap().mutations, 0);
+    tokio::time::advance(Duration::from_secs(1)).await;
     let error = request.await;
     assert_cause(
         error.as_ref().err().unwrap(),

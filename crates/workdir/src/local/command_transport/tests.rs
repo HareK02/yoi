@@ -228,6 +228,12 @@ async fn timeout_and_session_close_finalize_without_an_output_subscriber() {
     let handle = harness
         .start("printf ready; exec tail -f /dev/null", 1)
         .await;
+    let first = harness.page(&handle, 0, 5).await;
+    assert_eq!(stream_bytes(&first.chunks, CommandStream::Stdout), b"ready");
+    // The process has started; expire its deadline without delaying the test.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
     let (chunks, terminal) = harness.collect(&handle, 0).await;
     assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"ready");
     assert_eq!(terminal.status, CommandStatus::TimedOut);
@@ -376,7 +382,7 @@ async fn exhausted_budget_finishes_without_receiver_and_keeps_timeout_cancel_dis
     ] {
         let handle = harness
             .start_budget(
-                "printf ready-extra; head -c 32768 /dev/zero; exec tail -f /dev/null",
+                "printf ready-extra; head -c 32768 /dev/zero; touch produced; exec tail -f /dev/null",
                 1,
                 5,
             )
@@ -389,6 +395,19 @@ async fn exhausted_budget_finishes_without_receiver_and_keeps_timeout_cancel_dis
                 .cancel_command(handle.clone())
                 .await
                 .unwrap();
+        } else {
+            // The byte budget hides later output. Observe the process's explicit
+            // completion marker before expiring it, so all expected bytes exist.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !harness._root.path().join("produced").try_exists().unwrap() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::resume();
         }
         let (rest, terminal) = harness.collect(&handle, first.next_cursor).await;
         assert!(rest.is_empty());
