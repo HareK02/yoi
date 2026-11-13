@@ -87,7 +87,14 @@
             sendError = 'The saved send belongs to another conversation. It has not been replaced.';
           }
         },
-        onStatus: status => { if (current(context)) connectionState = status; },
+        onStatus: status => {
+          if (!current(context)) return;
+          connectionState = status;
+          if (status === 'closed') {
+            reading = false;
+            if (!conversation) historyError = 'Conversation connection is unavailable. Confirm your session and viewing permissions, then refresh.';
+          }
+        },
         onError: error => {
           if (!current(context)) return;
           historyError = error.message;

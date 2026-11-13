@@ -6,10 +6,10 @@ import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
 import { readConversationAttempt } from "./conversation-attempt.ts";
 import type { ChatMessagePage, MessagingCommand, MessagingResult } from '#lib/generated/chat-api.ts';
-const transport = vi.hoisted(() => ({ request: vi.fn<(command: MessagingCommand) => Promise<MessagingResult>>() }));
+const transport = vi.hoisted(() => ({ status: 'open', request: vi.fn<(command: MessagingCommand) => Promise<MessagingResult>>() }));
 vi.mock('#lib/workspace/multiplexer.ts', () => ({ workspaceMultiplexer: () => ({
   connectMessaging(listener: { onStatus(status: string): void }) {
-    queueMicrotask(() => listener.onStatus('open'));
+    queueMicrotask(() => listener.onStatus(transport.status));
     return { request: (command: MessagingCommand) => transport.request(command), close: vi.fn() };
   },
 }) }));
@@ -23,6 +23,7 @@ beforeEach(() => {
   sessionStorage.clear();
   localStorage.clear();
   transport.request.mockReset();
+  transport.status = 'open';
   browserSession.snapshot = {
     kind: "ready",
     value: {
@@ -176,4 +177,20 @@ test("authentication change while POST is in flight never clears the former Acco
   ).toBeNull();
   expect(screen.queryByRole("textbox")).toBeNull();
   expect(readConversationAttempt(sessionStorage, { ...props, accountId: "other" })).toBeNull();
+});
+
+test('an unavailable initial socket stops loading and leaves explicit recovery available without claiming an auth verdict', async () => {
+  transport.status = 'closed';
+  transport.request.mockImplementation(async command => {
+    if (command.kind === 'open') return { kind: 'opened', conversation: conversation('s') };
+    if (command.kind === 'subscribe') return { kind: 'subscribed', subscription_id: 'recovered', selector: command.selector, page: page('s', 'recovered public reply') };
+    throw new Error('unexpected command');
+  });
+  render(SubjectConversation, props);
+  await screen.findByRole('alert');
+  expect(screen.queryByText('Loading conversation…')).toBeNull();
+  expect(screen.getByRole('button', { name: 'Refresh history' }).hasAttribute('disabled')).toBe(false);
+  await fireEvent.click(screen.getByRole('button', { name: 'Refresh history' }));
+  await screen.findByText('recovered public reply');
+  expect(screen.queryByRole('alert')).toBeNull();
 });

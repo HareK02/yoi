@@ -110,6 +110,8 @@ try {
     await history.getByText('WEB_MESSAGING_INPUT', { exact: true }).waitFor(); assertEquals(await history.getByRole('listitem').count(), 2);
     await context.clearCookies(); await context.addCookies([cookie(input.foreign_session)]);
     await page.reload(); await page.getByRole('alert').first().waitFor();
+    await page.getByText('Conversation connection is unavailable. Confirm your session and viewing permissions, then refresh.', { exact: true }).waitFor();
+    assertEquals(await page.getByText('Loading conversation…', { exact: true }).count(), 0);
     assertEquals(await page.getByRole('textbox', { name: `Message to ${input.subject_name}` }).count(), 0);
     assert(!(await page.locator('main').textContent())?.includes('WEB_MESSAGING_INPUT'));
     await capture(page, 'foreign-account-768-light');
