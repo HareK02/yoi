@@ -553,7 +553,10 @@ struct ResolvedWorkdirShareOptions {
     permissions: server_api::ExternalWorkdirPermissions,
 }
 
-pub fn parse_ttl(value: &str) -> Result<Duration, String> {
+pub fn parse_ttl(value: &str) -> Result<Option<Duration>, String> {
+    if matches!(value, "none" | "unlimited") {
+        return Ok(None);
+    }
     let (number, multiplier) = if let Some(value) = value.strip_suffix('h') {
         (value, 60 * 60)
     } else if let Some(value) = value.strip_suffix('m') {
@@ -572,7 +575,7 @@ pub fn parse_ttl(value: &str) -> Result<Duration, String> {
     if !(60..=86_400).contains(&seconds) {
         return Err("TTL must be between 60s and 24h".to_string());
     }
-    Ok(Duration::from_secs(seconds))
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 fn ttl_label(ttl: Option<Duration>) -> String {
@@ -708,9 +711,8 @@ fn configure_interactively(
     };
     options.ttl = match ttl.as_str() {
         "" => options.ttl,
-        "none" | "unlimited" => None,
         "q" | "quit" | "cancel" => return Ok(None),
-        value => Some(parse_ttl(value)?),
+        value => parse_ttl(value)?,
     };
 
     let workspace_id = options
@@ -1684,6 +1686,64 @@ mod tests {
             configure_interactively(share_options(), &workspaces, &mut eof, &mut Vec::new())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // Exercise the real resolver without a TTY or Backend: the invalid URL makes
+    // any accidental catalog lookup fail rather than contacting a live service.
+    #[tokio::test]
+    async fn non_interactive_share_resolves_the_same_choices_without_prompting() {
+        let workspaces = [workspace("workspace-a", "Alpha")];
+        for level in ["read", "write", "command"] {
+            for ttl in ["none", "unlimited", "15m"] {
+                let mut options = share_options();
+                options.backend_url = "not-a-backend-url".into();
+                options.path = PathBuf::from("./project");
+                options.display_name = "project".into();
+                // Start bounded so explicit none/unlimited must actually clear it.
+                options.ttl = Some(Duration::from_secs(3600));
+                let mut input = std::io::Cursor::new(format!("1\n{level}\n{ttl}\nyes\n"));
+                let interactive = configure_interactively(
+                    options.clone(),
+                    &workspaces,
+                    &mut input,
+                    &mut Vec::new(),
+                )
+                .unwrap()
+                .unwrap();
+                options.workspace_id = Some("workspace-a".into());
+                options.permissions = match level {
+                    "read" => server_api::ExternalWorkdirPermissions::READ,
+                    "write" => server_api::ExternalWorkdirPermissions::WRITE,
+                    "command" => server_api::ExternalWorkdirPermissions::COMMAND,
+                    _ => unreachable!(),
+                };
+                options.ttl = parse_ttl(ttl).unwrap();
+                options.non_interactive = true;
+                let automated = resolve_share_options(options).await.unwrap().unwrap();
+                assert_eq!(automated.path, interactive.path);
+                assert_eq!(automated.workspace_id, interactive.workspace_id);
+                assert_eq!(automated.backend_url, interactive.backend_url);
+                assert_eq!(automated.display_name, interactive.display_name);
+                assert_eq!(automated.permissions, interactive.permissions);
+                assert_eq!(automated.ttl, interactive.ttl);
+                assert_eq!(
+                    automated.ttl,
+                    if ttl == "15m" {
+                        Some(Duration::from_secs(900))
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+        let mut missing_workspace = share_options();
+        missing_workspace.non_interactive = true;
+        assert!(
+            resolve_share_options(missing_workspace)
+                .await
+                .unwrap_err()
+                .contains("requires --workspace-id")
         );
     }
 

@@ -1000,7 +1000,7 @@ fn parse_workdir_args(
         workspace_id,
         backend_url,
         display_name: display_name.unwrap_or_else(|| "External Workdir".to_string()),
-        ttl,
+        ttl: ttl.flatten(),
         permissions,
         non_interactive,
     }))
@@ -2235,7 +2235,7 @@ Options:
 
 fn print_workdir_help() {
     println!(
-        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> [OPTIONS]\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nInteractive mode is the default: choose an accessible Workspace, one READ/WRITE/COMMAND permission level, and TTL, then explicitly confirm before any grant is created.\nREAD enables Read/Glob/Grep and related observation operations. WRITE includes READ and adds Write/Edit. COMMAND includes WRITE and READ, adds command start/status/output/cancel, and runs with the sharing CLI user's host authority; it is not sandboxed.\nUse --permission once to choose the level in automation. Legacy --read-only and --read-write retain the READ and WRITE meanings and conflict with --permission.\nOmitting --ttl means unlimited automatic lifetime, but stop, disconnect, Ctrl-C, and revoke still fail closed. TTL accepts s, m, or h suffixes from 60s through 24h.\nNo host path is sent to the Backend. Ctrl-C explicitly revokes the grant before exit.\n\nOptions:\n      --workspace-id <ID>  Preselect a Workspace; required with --non-interactive\n      --permission <LEVEL>  Grant read, write (includes read), or command (includes write + read)\n      --read-only          Legacy alias for --permission read\n      --read-write         Legacy alias for --permission write\n      --ttl <TTL>          Automatic expiry; omission is unlimited\n      --display-name <NAME>  Backend-visible label (default: External Workdir)\n      --non-interactive    Never prompt; requires --workspace-id\n  -h, --help               Print help\n"
+        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> [OPTIONS]\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nInteractive mode is the default: choose an accessible Workspace, one READ/WRITE/COMMAND permission level, and TTL, then explicitly confirm before any grant is created.\nREAD enables Read/Glob/Grep and related observation operations. WRITE includes READ and adds Write/Edit. COMMAND includes WRITE and READ, adds command start/status/output/cancel, and runs with the sharing CLI user's host authority; it is not sandboxed.\nUse --permission once to choose the level in automation. Legacy --read-only and --read-write retain the READ and WRITE meanings and conflict with --permission.\nOmitting --ttl means unlimited automatic lifetime, but stop, disconnect, Ctrl-C, and revoke still fail closed. TTL accepts none or unlimited for no automatic expiry, or s, m, or h suffixes from 60s through 24h.\nNo host path is sent to the Backend. Ctrl-C explicitly revokes the grant before exit.\n\nOptions:\n      --workspace-id <ID>  Preselect a Workspace; required with --non-interactive\n      --permission <LEVEL>  Grant read, write (includes read), or command (includes write + read)\n      --read-only          Legacy alias for --permission read\n      --read-write         Legacy alias for --permission write\n      --ttl <TTL>          Automatic expiry: 60s..24h, none, or unlimited (default: none)\n      --display-name <NAME>  Backend-visible label (default: External Workdir)\n      --non-interactive    Skip all prompts including confirmation; requires --workspace-id\n                          Uses --permission (default: read) and --ttl (default: none)\n  -h, --help               Print help\n\nNon-interactive example (no TTY required; stays in the foreground):\n  yoi --backend https://backend.example workdir share ./project --workspace-id <ID> --permission write --ttl none --display-name project --non-interactive\n"
     );
 }
 
@@ -2347,6 +2347,65 @@ mod tests {
             options.permissions,
             server_api::ExternalWorkdirPermissions::COMMAND
         );
+    }
+
+    #[test]
+    fn workdir_share_accepts_all_selections_as_non_interactive_arguments() {
+        for (level, permissions) in [
+            ("read", server_api::ExternalWorkdirPermissions::READ),
+            ("write", server_api::ExternalWorkdirPermissions::WRITE),
+            ("command", server_api::ExternalWorkdirPermissions::COMMAND),
+        ] {
+            for (ttl, expected_ttl) in [
+                ("none", None),
+                ("unlimited", None),
+                ("60s", Some(Duration::from_secs(60))),
+                ("90m", Some(Duration::from_secs(5400))),
+                ("24h", Some(Duration::from_secs(86400))),
+            ] {
+                let args = [
+                    "share",
+                    "./project",
+                    "--backend",
+                    "https://backend.example",
+                    "--workspace-id",
+                    "workspace-a",
+                    "--permission",
+                    level,
+                    "--ttl",
+                    ttl,
+                    "--display-name",
+                    "project",
+                    "--non-interactive",
+                ]
+                .map(str::to_owned);
+                let Mode::WorkdirShare(options) =
+                    parse_workdir_args(&args, &TargetSelection::default()).unwrap()
+                else {
+                    panic!("expected Workdir share mode");
+                };
+                assert_eq!(options.path, PathBuf::from("./project"));
+                assert_eq!(options.backend_url, "https://backend.example");
+                assert_eq!(options.workspace_id.as_deref(), Some("workspace-a"));
+                assert_eq!(options.display_name, "project");
+                assert_eq!(options.permissions, permissions);
+                assert_eq!(options.ttl, expected_ttl);
+                assert!(options.non_interactive);
+            }
+        }
+    }
+
+    #[test]
+    fn workdir_share_rejects_repeated_ttl_even_after_explicit_unlimited() {
+        for first in ["none", "unlimited", "1h"] {
+            let args = ["share", ".", "--ttl", first, "--ttl", "2h"].map(str::to_owned);
+            assert!(
+                parse_workdir_args(&args, &TargetSelection::default())
+                    .unwrap_err()
+                    .0
+                    .contains("--ttl may only be provided once")
+            );
+        }
     }
 
     #[test]
