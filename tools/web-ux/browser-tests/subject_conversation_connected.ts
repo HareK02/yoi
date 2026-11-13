@@ -99,8 +99,8 @@ try {
     assert(droppedSubscribeAck && delayedSubscription === null);
     assert(commands.some(f => f.frame === 'messaging_request' && (f.message as {command: {kind: string}}).command.kind === 'unsubscribe'), 'late Subscribe ACK must be cleaned up');
     await page.getByRole('button', { name: 'Stop conversation body', exact: true }).click();
-    await page.getByRole('button', { name: 'Start conversation body', exact: true }).waitFor();
-    await page.getByRole('button', { name: 'Start conversation body', exact: true }).click();
+    await page.getByRole('button', { name: 'Restart conversation body', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Restart conversation body', exact: true }).click();
     await page.getByRole('button', { name: 'Stop conversation body', exact: true }).waitFor();
     assertEquals(await history.getByRole('listitem').count(), 2, 'body replacement must retain the same public history');
     assertEquals(httpChatRequests, 0, 'normal conversation must not use HTTP history/polling');
