@@ -412,6 +412,137 @@ test.each(["running", "paused"] as const)("Composer edits remain available while
   expect(view.container.querySelector(".composer-input.disabled")).toBeNull();
 });
 
+test.each([
+  { platform: "Linux x86_64", modifier: { ctrlKey: true }, label: "Ctrl+Enter" },
+  { platform: "MacIntel", modifier: { metaKey: true }, label: "Cmd+Enter" },
+])("$label notifies a running Worker; the Stop button still cancels", async ({ platform, modifier }) => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+  const { cm, view } = await liveComposer();
+  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  const stop = await view.findByRole("button", { name: "Stop Worker" });
+  cm.focus();
+  multiplexer.sendWorkerMethod.mockClear();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ...modifier });
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  cm.dispatch({ changes: { from: 0, insert: "next input" } });
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ...modifier });
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledOnce();
+  const notification = multiplexer.sendWorkerMethod.mock.calls[0][0] as Extract<Method, { method: "notify" }>;
+  expect(notification).toEqual({
+    method: "notify", params: { notification_request_id: expect.any(String), message: "next input" },
+  });
+  expect(cm.state.doc.toString()).toBe("next input");
+  protocolEvent({ event: "notification_accepted", data: { notification_request_id: notification.params.notification_request_id } });
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+
+  cm.dispatch({ changes: { from: 0, insert: "keep this draft" } });
+  await fireEvent.click(stop);
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledTimes(2);
+  expect(multiplexer.sendWorkerMethod.mock.calls[1][0]).toMatchObject({ method: "cancel" });
+  expect(cm.state.doc.toString()).toBe("keep this draft");
+});
+
+test.each([
+  { platform: "Linux x86_64", modifier: { ctrlKey: true }, label: "Ctrl+Enter" },
+  { platform: "MacIntel", modifier: { metaKey: true }, label: "Cmd+Enter" },
+])("$label still submits a draft while Worker is idle", async ({ platform, modifier }) => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+  const { cm } = await liveComposer();
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, insert: "next input" } });
+  multiplexer.sendWorkerMethod.mockClear();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ...modifier });
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledOnce();
+  expect(multiplexer.sendWorkerMethod.mock.calls[0][0]).toMatchObject({
+    method: "submit", params: { input: [{ kind: "text", content: "next input" }] },
+  });
+});
+
+test.each([
+  { platform: "Linux x86_64", modifier: { ctrlKey: true }, state: "running" },
+  { platform: "Linux x86_64", modifier: { ctrlKey: true }, state: "paused" },
+  { platform: "MacIntel", modifier: { metaKey: true }, state: "running" },
+  { platform: "MacIntel", modifier: { metaKey: true }, state: "paused" },
+] as const)("Shift submit queues the next input on $platform while $state", async ({ platform, modifier, state }) => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+  const { cm } = await liveComposer();
+  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state } } } } });
+  await screen.findByRole("button", { name: "Queue Submit" });
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, insert: "next turn" } });
+  multiplexer.sendWorkerMethod.mockClear();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", shiftKey: true, ...modifier });
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledOnce();
+  const queued = multiplexer.sendWorkerMethod.mock.calls[0][0] as Extract<Method, { method: "submit" }>;
+  expect(queued).toEqual({ method: "submit", params: {
+    submission_request_id: expect.any(String), input: [{ kind: "text", content: "next turn" }],
+  } });
+  expect(cm.state.doc.toString()).toBe("next turn");
+  protocolEvent({ event: "submission_accepted", data: { submission_request_id: queued.params.submission_request_id, submission_id: "queued-input", disposition: "queued" } });
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledOnce();
+  if (state === "paused") {
+    expect(screen.queryByRole("button", { name: "Stop Worker" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Send message" })).not.toBeNull();
+  }
+});
+
+test.each([
+  { platform: "Linux x86_64", modifier: { ctrlKey: true }, button: false },
+  { platform: "MacIntel", modifier: { metaKey: true }, button: false },
+  { platform: "Linux x86_64", modifier: { ctrlKey: true }, button: true },
+])("paused send uses Notify on $platform (button=$button), not Resume or Submit", async ({ platform, modifier, button }) => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+  const { cm, view } = await liveComposer();
+  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "paused" } } } } });
+  await view.findByRole("button", { name: "Queue Submit" });
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, insert: "continue with this context" } });
+  const send = view.getByRole("button", { name: "Send message" }) as HTMLButtonElement;
+  await waitFor(() => expect(send.disabled).toBe(false));
+  multiplexer.sendWorkerMethod.mockClear();
+  if (button) await fireEvent.click(send);
+  else await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ...modifier });
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledOnce();
+  const notification = multiplexer.sendWorkerMethod.mock.calls[0][0] as Extract<Method, { method: "notify" }>;
+  expect(notification).toEqual({ method: "notify", params: {
+    notification_request_id: expect.any(String), message: "continue with this context",
+  } });
+  expect(cm.state.doc.toString()).toBe("continue with this context");
+  protocolEvent({ event: "notification_accepted", data: { notification_request_id: notification.params.notification_request_id } });
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  // Only the Worker, not the UI, determines when the turn has started.
+  expect(view.queryByRole("button", { name: "Stop Worker" })).toBeNull();
+  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  await view.findByRole("button", { name: "Stop Worker" });
+});
+
+test("Shift submit respects Queue availability instead of falling back to immediate Submit", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+  const { cm } = await liveComposer();
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, insert: "keep until busy" } });
+  multiplexer.sendWorkerMethod.mockClear();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ctrlKey: true, shiftKey: true });
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  expect(cm.state.doc.toString()).toBe("keep until busy");
+});
+
+test("running submit shortcut preserves structured drafts instead of sending them as Notify", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+  const alert = vi.spyOn(alerts, "pushWorkspaceAlert");
+  const { cm, view } = await liveComposer();
+  await selectRun(cm);
+  const draft = cm.state.doc.toString();
+  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  await view.findByRole("button", { name: "Stop Worker" });
+  multiplexer.sendWorkerMethod.mockClear();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ctrlKey: true });
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  expect(cm.state.doc.toString()).toBe(draft);
+  expect(alert).toHaveBeenCalledWith("error", expect.stringContaining("Notify accepts text only"), expect.any(Object));
+});
+
 test("stopped Worker with retained conversation allows drafting but not sending", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => Response.json(
     String(input).includes("/session/history") ? emptyHistoryPage() : { availability: "retained_snapshot", snapshot: emptySession() },

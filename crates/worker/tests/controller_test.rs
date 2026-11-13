@@ -2969,6 +2969,263 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     );
 }
 
+// Real Controller -> Worker -> Engine -> FsStore connection; only the model is
+// scripted. Synchronize on model output, state events and FIFO method replies,
+// never elapsed time. These cases run in the normal controller_test target.
+mod paused_notifications {
+    use super::*;
+    use std::time::Duration;
+
+    const MESSAGE: &str = "notification resumes paused work";
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn notification(tracked: bool, request_id: &str, message: &str) -> Method {
+        if tracked {
+            Method::NotifyTracked {
+                receipt_scope: protocol::NotificationReceiptScope::Source,
+                notification_request_id: request_id.into(),
+                message: message.into(),
+                source: protocol::AuthenticatedInputSource::SubWorker {
+                    session_id: "paused-notification-source".into(),
+                },
+            }
+        } else {
+            Method::Notify {
+                notification_request_id: request_id.into(),
+                message: message.into(),
+            }
+        }
+    }
+
+    async fn pause_after_model_output(
+        handle: &WorkerHandle,
+        rx: &mut tokio::sync::broadcast::Receiver<Event>,
+    ) {
+        assert!(
+            drain_until(rx, TIMEOUT, |event| matches!(
+                event,
+                Event::TextDelta { .. }
+            ))
+            .await
+        );
+        handle
+            .send(Method::Pause {
+                command: worker_command(handle),
+            })
+            .await
+            .unwrap();
+        assert!(drain_until(rx, TIMEOUT, |event| matches!(event,
+            Event::WorkerState { snapshot }
+                if snapshot.state == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(protocol::WorkerRunState::Paused))
+        )).await);
+    }
+
+    #[tokio::test]
+    async fn paused_notify_resumes_and_delivers_before_queued_submit() {
+        for tracked in [false, true] {
+            let client = MockClient::sequential(vec![
+                MockResponse::Hang(vec![
+                    LlmEvent::text_block_start(0),
+                    LlmEvent::text_delta(0, "working"),
+                ]),
+                MockResponse::Complete(simple_text_events()),
+                MockResponse::Complete(simple_text_events()),
+            ]);
+            let worker = make_worker(client.clone()).await;
+            let store = worker.store().clone();
+            let handle = spawn_controller(worker).await;
+            let mut rx = handle.subscribe();
+            handle
+                .send(Method::submit_text("initial", "original task"))
+                .await
+                .unwrap();
+            pause_after_model_output(&handle, &mut rx).await;
+
+            // Shift Queue is the existing Submit path: acceptance must not resume.
+            handle
+                .send(Method::submit_text("queued", "queued task"))
+                .await
+                .unwrap();
+            assert!(drain_until(&mut rx, TIMEOUT, |event| matches!(event,
+                Event::SubmissionAccepted { submission_request_id, disposition: protocol::SubmissionDisposition::Queued, .. }
+                    if submission_request_id == "queued"
+            )).await);
+            handle.send(Method::ListPendingSubmissions).await.unwrap();
+            assert!(drain_until(&mut rx, TIMEOUT, |event| {
+                assert!(!matches!(event, Event::WorkerState { snapshot }
+                    if snapshot.state != protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(protocol::WorkerRunState::Paused))));
+                if let Event::PendingSubmissionsChanged { pending } = event {
+                    assert_eq!(pending.submissions.len(), 1);
+                    return true;
+                }
+                false
+            }).await);
+            assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
+            assert_eq!(client.captured_requests().len(), 1);
+
+            handle
+                .send(notification(tracked, "resume-notify", MESSAGE))
+                .await
+                .unwrap();
+            assert!(drain_until(&mut rx, TIMEOUT, |event| matches!(event,
+                Event::NotificationAccepted { notification_request_id } if notification_request_id == "resume-notify"
+            )).await);
+            assert!(drain_until(&mut rx, TIMEOUT, |event| {
+                assert!(!matches!(event, Event::Error { .. }), "{event:?}");
+                matches!(event, Event::WorkerState { snapshot } if snapshot.state == protocol::WorkerState::Idle)
+            }).await, "accepted Notify must resume without a Resume command (tracked={tracked})");
+
+            let requests = client.captured_requests();
+            assert_eq!(requests.len(), 3, "resume, then drain the queued Submit");
+            assert!(
+                !requests[0]
+                    .items
+                    .iter()
+                    .any(|item| item_text_contains(item, MESSAGE))
+            );
+            assert_eq!(
+                requests[1]
+                    .items
+                    .iter()
+                    .filter(|item| item.as_text().is_some_and(|text| text
+                        .contains("[Notification]")
+                        && text.contains(MESSAGE)))
+                    .count(),
+                1,
+                "notification must reach the resumed model request exactly once"
+            );
+            assert!(
+                !requests[1]
+                    .items
+                    .iter()
+                    .any(|item| item_text_contains(item, "queued task"))
+            );
+            assert!(
+                requests[2]
+                    .items
+                    .iter()
+                    .any(|item| item_text_contains(item, "queued task"))
+            );
+
+            // Read the real store, not only the sink mirror or acceptance event.
+            use session_store::Store;
+            let entries = store
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .flat_map(|session| {
+                    store
+                        .list_segments(session)
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(|segment| store.read_all(session, segment).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(entries.iter().filter(|entry| matches!(system_item(entry),
+                Some(session_store::SystemItem::Notification { message, .. }) if message == MESSAGE
+            )).count(), 1);
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(entry, LogEntry::RunResumed { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                !entries
+                    .iter()
+                    .any(|entry| matches!(entry, LogEntry::PausedTurnAbandoned { .. }))
+            );
+            handle
+                .send(Method::Shutdown {
+                    command: worker_command(&handle),
+                })
+                .await
+                .unwrap();
+            assert!(drain_until(&mut rx, TIMEOUT, |event| matches!(event, Event::Shutdown)).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_or_replayed_notify_keeps_worker_paused() {
+        for tracked in [false, true] {
+            let client = MockClient::sequential(vec![MockResponse::Hang(vec![
+                LlmEvent::text_block_start(0),
+                LlmEvent::text_delta(0, "working"),
+            ])]);
+            let worker = make_worker(client.clone())
+                .await
+                .with_notification_coalesce_delay(Duration::ZERO);
+            let handle = spawn_controller(worker).await;
+            let mut rx = handle.subscribe();
+            handle
+                .send(notification(tracked, "already-delivered", MESSAGE))
+                .await
+                .unwrap();
+            pause_after_model_output(&handle, &mut rx).await;
+            let paused = handle.shared_state.snapshot();
+
+            for (request_id, message, accepted) in [
+                ("", MESSAGE, false),
+                ("already-delivered", "conflicting payload", false),
+                ("already-delivered", MESSAGE, true),
+            ] {
+                handle
+                    .send(notification(tracked, request_id, message))
+                    .await
+                    .unwrap();
+                assert!(
+                    drain_until(&mut rx, TIMEOUT, |event| match event {
+                        Event::NotificationAccepted {
+                            notification_request_id,
+                        } => {
+                            assert!(accepted);
+                            assert_eq!(notification_request_id, request_id);
+                            true
+                        }
+                        Event::NotificationRejected {
+                            notification_request_id,
+                            ..
+                        } => {
+                            assert!(!accepted);
+                            assert_eq!(notification_request_id, request_id);
+                            true
+                        }
+                        _ => false,
+                    })
+                    .await
+                );
+                // FIFO reply is a processing barrier after the notification handler.
+                handle.send(Method::ListPendingSubmissions).await.unwrap();
+                assert!(
+                    drain_until(&mut rx, TIMEOUT, |event| {
+                        assert!(
+                            !matches!(event, Event::WorkerState { .. } | Event::Error { .. }),
+                            "unexpected restart: {event:?}"
+                        );
+                        if let Event::PendingSubmissionsChanged { pending } = event {
+                            assert_eq!(pending.notification_count, 0);
+                            return true;
+                        }
+                        false
+                    })
+                    .await
+                );
+                assert_eq!(handle.shared_state.snapshot(), paused);
+                assert_eq!(client.captured_requests().len(), 1);
+            }
+            handle
+                .send(Method::Shutdown {
+                    command: worker_command(&handle),
+                })
+                .await
+                .unwrap();
+            assert!(drain_until(&mut rx, TIMEOUT, |event| matches!(event, Event::Shutdown)).await);
+        }
+    }
+}
+
 #[tokio::test]
 async fn repeated_notify_while_idle_coalesces_and_auto_starts_one_turn() {
     let client = MockClient::new(simple_text_events());
@@ -3613,11 +3870,10 @@ async fn idle_only_submit_rejects_admission_race_and_paused_without_persisting()
     wait_for_status(&handle, WorkerStatus::Idle).await;
 }
 
-/// Paused → Running → Idle. A notification accepted while Paused must not
-/// auto-resume the Worker, and explicit Resume must inject it while preserving
-/// the interrupted turn's history consistency.
+/// Paused → Running → Idle. A notification accepted while Paused resumes the
+/// Worker while preserving interrupted history and separate usage records.
 #[tokio::test]
-async fn pause_then_resume_preserves_notifications_and_history_consistency() {
+async fn paused_notify_resumes_with_consistent_history_and_usage() {
     // Response 1: report billable partial usage, then hang after opening a text
     // block (no stop / completed). Pause must flush that usage without treating
     // the provider request as normally completed.
@@ -3695,7 +3951,10 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
         "expected RunEnd::Paused after Pause"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(drain_until(&mut rx, std::time::Duration::from_secs(2), |event| matches!(event,
+        Event::WorkerState { snapshot }
+            if snapshot.state == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(protocol::WorkerRunState::Paused))
+    )).await);
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
     let (paused_entries, _) = handle.sink.subscribe_with_snapshot();
     let paused_usage = paused_entries
@@ -3722,24 +3981,6 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
         })
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-    assert_eq!(
-        handle.shared_state.catalog_status(),
-        WorkerStatus::Paused,
-        "notification deadline must not auto-resume a paused Worker"
-    );
-    assert_eq!(
-        client_for_assert.captured_requests().len(),
-        1,
-        "paused notification must wait for an explicit resume"
-    );
-
-    handle
-        .send(Method::Resume {
-            command: worker_command(&handle),
-        })
-        .await
-        .unwrap();
 
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
@@ -3749,10 +3990,19 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
             }
         ))
         .await,
-        "expected RunEnd::Finished after Resume"
+        "expected RunEnd::Finished after Notify"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        drain_until(
+            &mut rx,
+            std::time::Duration::from_secs(2),
+            |event| matches!(event,
+                Event::WorkerState { snapshot } if snapshot.state == protocol::WorkerState::Idle
+            )
+        )
+        .await
+    );
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
     let requests = client_for_assert.captured_requests();
     assert_eq!(requests.len(), 2);
@@ -3762,7 +4012,7 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
     }));
 
     // History consistency: the interrupted partial response is absent, while
-    // the queued notification is committed on the explicit resume.
+    // the notification is committed on the Notify-triggered resume.
     let history = history_from_sink(&handle);
     let roles: Vec<&str> = history
         .iter()

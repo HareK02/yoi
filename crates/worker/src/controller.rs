@@ -2209,6 +2209,8 @@ where
     Ok(workdir_for_view)
 }
 
+/// Acknowledge durable acceptance (including replay), but return true only for
+/// a new notification. Replayed receipts must not restart a paused run.
 fn durably_accept_notification<St>(
     notification_request_id: String,
     message: String,
@@ -2227,11 +2229,11 @@ where
         source_namespace,
         provenance,
     ) {
-        Ok(_) => {
+        Ok(is_new) => {
             let _ = working_event_tx.send(Event::NotificationAccepted {
                 notification_request_id: request_id,
             });
-            true
+            is_new
         }
         Err(error) => {
             let _ = working_event_tx.send(Event::NotificationRejected {
@@ -2816,14 +2818,17 @@ async fn controller_loop<C, St>(
                 notification_request_id,
                 message,
             } => {
-                durably_accept_notification(
+                if durably_accept_notification(
                     notification_request_id,
                     message,
                     pending_submissions.direct_client_namespace(),
                     session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
                     &pending_submissions,
                     &working_event_tx,
-                );
+                ) && shared_state.catalog_status() == WorkerStatus::Paused
+                {
+                    pending = Some(PendingRun::Resume);
+                }
             }
 
             Method::NotifyTracked {
@@ -2835,14 +2840,17 @@ async fn controller_loop<C, St>(
                 let (source_namespace, provenance) =
                     resolved_input_source(&pending_submissions, &source);
                 let source_namespace = receipt_scope.namespace(source_namespace);
-                durably_accept_notification(
+                if durably_accept_notification(
                     notification_request_id,
                     message,
                     source_namespace,
                     provenance,
                     &pending_submissions,
                     &working_event_tx,
-                );
+                ) && shared_state.catalog_status() == WorkerStatus::Paused
+                {
+                    pending = Some(PendingRun::Resume);
+                }
             }
 
             Method::ListPendingSubmissions => {

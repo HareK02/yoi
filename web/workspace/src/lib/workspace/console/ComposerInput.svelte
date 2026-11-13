@@ -66,7 +66,7 @@
     historyScope: string;
     onchange?: (snapshot: ComposerDraftSnapshot) => void;
     onkeydown?: (event: KeyboardEvent) => void;
-    onsubmit?: () => void;
+    onsubmit?: (event: KeyboardEvent) => void;
     onpasteimages?: (files: File[]) => void;
     oncommand?: () => void;
     completionScope?: string;
@@ -862,7 +862,7 @@
                 })
               ) {
                 event.preventDefault();
-                onsubmit?.();
+                onsubmit?.(event);
                 return true;
               }
               return false;

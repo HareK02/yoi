@@ -1256,7 +1256,7 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
       consolePage.includes("lifecycleMethod(command)") &&
       consolePage.includes("command_id: commandId") &&
       !consolePage.includes("expected_execution_generation") &&
-      consolePage.includes("onsubmit={handleComposerSubmit}") &&
+      consolePage.includes('onsubmit={(event) => event.shiftKey ? handleQueueSubmit() : handleComposerSubmit("shortcut")}') &&
       !consolePage.includes("disabled={!composerEditable}") &&
       consolePage.includes("if (!canSendComposerControl) return;") &&
       consolePage.includes("class:stop={workerRunning && !rewindEntryId}") &&

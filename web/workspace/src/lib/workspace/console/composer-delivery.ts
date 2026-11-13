@@ -132,7 +132,7 @@ export type ComposerDeliveryState = {
 /**
  * Resolve whether the current Composer draft can use one delivery action.
  * Immediate Submit is idle-only; Queue submits to the busy Worker's FIFO.
- * Notify is running-only and remains distinct from next-turn input.
+ * Notify reaches running Workers or starts a turn from Pause, without queuing input.
  */
 export function canDeliverComposerDraft(state: ComposerDeliveryState): boolean {
   if (!state.protocolOpen || state.sending) return false;
@@ -146,8 +146,8 @@ export function canDeliverComposerDraft(state: ComposerDeliveryState): boolean {
         state.workerState === "paused") &&
         hasInput;
     case "notify":
-      return state.workerState === "running" && state.hasText &&
-        !state.hasAttachments;
+      return (state.workerState === "running" || state.workerState === "paused") &&
+        state.hasText && !state.hasAttachments;
   }
 }
 

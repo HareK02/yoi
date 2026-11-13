@@ -355,7 +355,7 @@
     );
     const canStopFromComposer = $derived(workerRunning && canSendComposerControl);
     const composerSubmitDisabled = $derived(
-        rewindEntryId ? !canSendComposerControl : workerRunning ? !canStopFromComposer : !canSubmitDraft,
+        rewindEntryId ? !canSendComposerControl : workerRunning ? !canStopFromComposer : workerPaused ? !canNotifyDraft : !canSubmitDraft,
     );
 
     async function getJson<T>(path: string): Promise<T> {
@@ -1132,7 +1132,7 @@
         if (value) void submitDraft(value);
     }
 
-    function handleComposerSubmit() {
+    function handleComposerSubmit(source: "shortcut" | "form") {
         if (rewindEntryId) { applySelectedRewind(); return; }
         const value = composerSnapshotOrReport();
         if (!value) return;
@@ -1141,8 +1141,13 @@
             return;
         }
         if (!canSendComposerControl) return;
+        if (workerPaused) {
+            void submitDraft(value, "notify");
+            return;
+        }
         if (workerRunning) {
-            sendWorkerControl("cancel");
+            if (source === "form") sendWorkerControl("cancel");
+            else void submitDraft(value, "notify");
             return;
         }
         void submitDraft(value);
@@ -1419,7 +1424,7 @@
 
     function sendMessage(event: SubmitEvent) {
         event.preventDefault();
-        handleComposerSubmit();
+        handleComposerSubmit("form");
     }
 
     function workerStateFromSnapshot(
@@ -2218,7 +2223,7 @@
                 bind:this={composerInputElement}
                 historyScope={workspaceId}
                 ariaLabel="Console input"
-                ariaKeyShortcuts="Meta+Enter Control+Enter"
+                ariaKeyShortcuts="Meta+Enter Control+Enter Meta+Shift+Enter Control+Shift+Enter"
                 onchange={handleComposerChange}
                 onkeydown={handleComposerKeydown}
                 completionScope={activeComposerTargetKey}
@@ -2232,7 +2237,7 @@
                     if (descriptor.client_adapter === "attachment") fileInput?.click();
                 }}
                 oncommand={handleComposerCommand}
-                onsubmit={handleComposerSubmit}
+                onsubmit={(event) => event.shiftKey ? handleQueueSubmit() : handleComposerSubmit("shortcut")}
                 onpasteimages={addPastedImages}
             />
             {#if attachments.length > 0}
