@@ -19,8 +19,9 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
@@ -144,7 +145,6 @@ struct ConsoleConnection<T> {
     backend_target: Option<BackendRuntimeTarget>,
     staged_uploads: HashMap<String, StagedUpload>,
     typed_submissions: HashMap<String, Method>,
-    rejected_typed_submit: Option<Method>,
     active_uploads: usize,
 }
 
@@ -228,7 +228,6 @@ impl<T: Socket> ConsoleConnection<T> {
             backend_target: None,
             staged_uploads: HashMap::new(),
             typed_submissions: HashMap::new(),
-            rejected_typed_submit: None,
             active_uploads: 0,
         }
     }
@@ -240,7 +239,6 @@ impl<T: Socket> ConsoleConnection<T> {
             backend_target: Some(target),
             staged_uploads: HashMap::new(),
             typed_submissions: HashMap::new(),
-            rejected_typed_submit: None,
             active_uploads: 0,
         }
     }
@@ -335,7 +333,7 @@ impl<T: Socket> ConsoleConnection<T> {
                 submission_request_id,
                 ..
             } => {
-                self.rejected_typed_submit = self.typed_submissions.remove(submission_request_id);
+                self.typed_submissions.remove(submission_request_id);
             }
             Event::UserMessage { segments, .. } => {
                 self.release_accepted_attachments(segments);
@@ -641,7 +639,14 @@ fn enter_fullscreen() -> Result<ConsoleTerminal, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     // Enable button-event tracking so the transcript can own drag selection;
     // avoid all-motion capture because hover-motion reports are unnecessary.
-    execute!(stdout, EnterAlternateScreen, EnableSinglePodMouseCapture)?;
+    // Legacy terminals collapse modified Enter into Enter. Request disambiguation
+    // on supporting terminals; unsupported terminals ignore this protocol.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        EnableSinglePodMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -650,7 +655,12 @@ pub(crate) fn enter_dashboard_fullscreen() -> Result<ConsoleTerminal, Box<dyn st
     let mut stdout = io::stdout();
     // Dashboard needs clicks and wheel input only; do not capture drag motion before
     // the first visible frame.
-    execute!(stdout, EnterAlternateScreen, EnableDashboardMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        EnableDashboardMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -659,6 +669,7 @@ fn leave_fullscreen(terminal: &mut ConsoleTerminal) -> io::Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen
     )
 }
@@ -1035,9 +1046,6 @@ async fn run_loop<T: Socket>(
                     if client.observe_worker_event(&ev) {
                         app.clear_actionbar_notice();
                     }
-                    if let Some(method) = client.rejected_typed_submit.take() {
-                        app.restore_unsent_run(&method);
-                    }
                     if let Some(method) = app.handle_worker_event(ev) {
                         send_console_method(app, client, &method).await?;
                     }
@@ -1143,15 +1151,13 @@ async fn send_console_method<T: Socket>(
             if input.iter().any(|segment| matches!(segment, Segment::UploadedFile { .. }))
     );
     if let Err(error) = client.send(method).await {
-        if sends_attachments
-            || matches!(method, Method::Submit { input, .. } if input.iter().any(|segment| matches!(segment, Segment::FeatureInvoke { .. })))
-        {
+        if matches!(method, Method::Submit { .. } | Method::Notify { .. }) {
             app.restore_unsent_run(method);
             app.push_error(format!(
-                "Typed input submission failed: {error}. The composer was restored; retry Send."
+                "Input delivery failed: {error}. Acceptance is unknown; retry with the same send action."
             ));
             app.flash_actionbar_notice(
-                "Typed input submission failed; composer chips are ready to retry.",
+                "Input delivery failed; draft retained for an exact-request retry.",
                 ActionbarNoticeLevel::Error,
                 ActionbarNoticeSource::Tui,
                 Duration::from_secs(60 * 60),
@@ -1469,6 +1475,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
     }
 
+    // Composer send shortcuts must precede completion acceptance. Command and
+    // rewind modes above retain their own Enter semantics.
+    if key.code == KeyCode::Enter && ctrl && !alt {
+        return if shift {
+            app.submit_queue_input()
+        } else {
+            app.submit_default_input()
+        };
+    }
+
     // Completion popup overrides — only when there's something to
     // navigate / commit. An empty popup (request in flight) falls
     // through to the default behaviour.
@@ -1545,7 +1561,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.cancel_completion();
             None
         }
-        KeyCode::Enter => app.submit_input(),
+        KeyCode::Enter if key.modifiers.is_empty() && app.paused && app.composer_is_blank() => {
+            app.submit_input()
+        }
+        KeyCode::Enter if !ctrl && !alt => {
+            apply_composer_edit_action(app, ComposerEditAction::InsertNewline)
+        }
         _ if composer_edit_action(key).is_some() => {
             match composer_edit_action(key).expect("checked above") {
                 ComposerEditAction::MoveUp => {
@@ -1778,7 +1799,6 @@ mod tests {
             backend_target: None,
             staged_uploads: HashMap::new(),
             typed_submissions: HashMap::new(),
-            rejected_typed_submit: None,
             active_uploads: 0,
         }
     }
@@ -1952,11 +1972,17 @@ mod tests {
                 reference: Some(reference.clone()),
             },
         );
-        let first = Method::Submit {
-            submission_request_id: "first".into(),
-            input: vec![Segment::UploadedFile {
-                file: reference.clone(),
-            }],
+        let mut app = App::new("test".into());
+        app.input.replace_with_segments(&[Segment::UploadedFile {
+            file: reference.clone(),
+        }]);
+        let first = app.submit_input().unwrap();
+        let Method::Submit {
+            submission_request_id: first_id,
+            ..
+        } = &first
+        else {
+            unreachable!()
         };
         let second = Method::Submit {
             submission_request_id: "second".into(),
@@ -1969,14 +1995,14 @@ mod tests {
         };
         connection.send(&first).await.unwrap();
         connection.send(&second).await.unwrap();
-        connection.observe_worker_event(&Event::SubmissionRejected {
-            submission_request_id: "first".into(),
+        let rejection = Event::SubmissionRejected {
+            submission_request_id: first_id.clone(),
             message: "rejected".into(),
-        });
+        };
+        connection.observe_worker_event(&rejection);
+        app.handle_worker_event(rejection);
         assert_eq!(connection.typed_submissions.len(), 1);
         assert!(connection.typed_submissions.contains_key("second"));
-        let mut app = App::new("test".into());
-        app.restore_unsent_run(&connection.rejected_typed_submit.take().unwrap());
         assert_eq!(
             app.input.submit_segments(),
             vec![Segment::UploadedFile {
@@ -2140,6 +2166,79 @@ mod tests {
         }
     }
 
+    // Component coverage: real key routing, App admission, Console transport glue,
+    // and Client serialization; only the external socket is replaced.
+    #[tokio::test]
+    async fn composer_transport_failure_retains_text_and_retries_exact_request_until_ack() {
+        for (status, modifiers) in [
+            (WorkerStatus::Idle, KeyModifiers::CONTROL),
+            (WorkerStatus::Running, KeyModifiers::CONTROL),
+            (
+                WorkerStatus::Paused,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            let mut connection = ConsoleConnection {
+                client: Client::new(FailOnceSocket {
+                    fail_next_send: true,
+                }),
+                standalone_host: None,
+                backend_target: None,
+                staged_uploads: HashMap::new(),
+                typed_submissions: HashMap::new(),
+                active_uploads: 0,
+            };
+            let mut app = App::new("test".into());
+            app.connected = true;
+            app.set_worker_status(status);
+            app.input.insert_str("draft");
+            let key = KeyEvent::new(KeyCode::Enter, modifiers);
+            let first = handle_key(&mut app, key).unwrap();
+            assert!(
+                handle_key(&mut app, key).is_none(),
+                "duplicate before transport"
+            );
+            send_console_method(&mut app, &mut connection, &first)
+                .await
+                .unwrap();
+            assert_eq!(input_text(&app), "draft");
+            let retry = handle_key(&mut app, key).unwrap();
+            assert_eq!(
+                serde_json::to_value(&retry).unwrap(),
+                serde_json::to_value(&first).unwrap()
+            );
+            send_console_method(&mut app, &mut connection, &retry)
+                .await
+                .unwrap();
+            assert!(handle_key(&mut app, key).is_none(), "duplicate before ACK");
+            assert_eq!(input_text(&app), "draft");
+            let accepted = match retry {
+                Method::Submit {
+                    submission_request_id,
+                    ..
+                } => Event::SubmissionAccepted {
+                    submission_request_id,
+                    submission_id: "accepted".into(),
+                    disposition: if status == WorkerStatus::Idle {
+                        protocol::SubmissionDisposition::Started
+                    } else {
+                        protocol::SubmissionDisposition::Queued
+                    },
+                },
+                Method::Notify {
+                    notification_request_id,
+                    ..
+                } => Event::NotificationAccepted {
+                    notification_request_id,
+                },
+                _ => unreachable!(),
+            };
+            connection.observe_worker_event(&accepted);
+            app.handle_worker_event(accepted);
+            assert!(app.input.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn attachment_submission_waits_for_authoritative_acceptance_and_can_retry() {
         let file = UploadedFileRef {
@@ -2160,7 +2259,6 @@ mod tests {
             backend_target: None,
             staged_uploads: HashMap::new(),
             typed_submissions: HashMap::new(),
-            rejected_typed_submit: None,
             active_uploads: 0,
         };
 
@@ -2170,7 +2268,7 @@ mod tests {
 
         connection.active_uploads = 1;
         let blocked = app.submit_input().unwrap();
-        assert!(app.input.is_empty());
+        assert!(!app.input.is_empty());
         send_console_method(&mut app, &mut connection, &blocked)
             .await
             .unwrap();
@@ -2199,9 +2297,25 @@ mod tests {
         send_console_method(&mut app, &mut connection, &retry)
             .await
             .unwrap();
-        assert!(app.input.is_empty());
+        assert!(!app.input.is_empty());
         assert!(connection.staged_uploads.is_empty());
         assert_eq!(connection.typed_submissions.len(), 1);
+
+        let Method::Submit {
+            submission_request_id,
+            ..
+        } = retry
+        else {
+            unreachable!()
+        };
+        let accepted = Event::SubmissionAccepted {
+            submission_request_id,
+            submission_id: "accepted".into(),
+            disposition: protocol::SubmissionDisposition::Started,
+        };
+        connection.observe_worker_event(&accepted);
+        app.handle_worker_event(accepted);
+        assert!(app.input.is_empty());
 
         connection.observe_worker_event(&Event::UserMessage {
             entry_id: None,
@@ -2231,7 +2345,6 @@ mod tests {
             backend_target: None,
             staged_uploads: HashMap::new(),
             typed_submissions: HashMap::new(),
-            rejected_typed_submit: None,
             active_uploads: 0,
         };
         let mut app = App::new("worker".into());
@@ -2561,26 +2674,110 @@ mod tests {
     }
 
     #[test]
-    fn running_enter_sends_submit_to_worker() {
-        let mut app = App::new("agent".to_string());
-        app.set_worker_status(WorkerStatus::Running);
-        for c in "queued".chars() {
-            assert!(
-                handle_key(
-                    &mut app,
-                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-                )
-                .is_none()
-            );
+    fn composer_enter_inserts_newline_except_empty_paused_resume() {
+        for status in [
+            WorkerStatus::Idle,
+            WorkerStatus::Running,
+            WorkerStatus::Paused,
+        ] {
+            for text in ["", " \n", "draft"] {
+                let mut app = App::new("test".into());
+                app.connected = true;
+                app.set_worker_status(status);
+                app.input.insert_str(text);
+                let method = handle_key(&mut app, key(KeyCode::Enter));
+                if status == WorkerStatus::Paused && text.trim().is_empty() {
+                    assert!(matches!(method, Some(Method::Resume { .. })));
+                    assert!(app.input.is_empty());
+                } else {
+                    assert!(method.is_none());
+                    assert_eq!(input_text(&app), format!("{text}\n"));
+                }
+            }
         }
+    }
 
-        assert!(matches!(
-            handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(Method::Submit { .. })
-        ));
+    #[test]
+    fn composer_ctrl_enter_routes_default_and_ctrl_shift_enter_queues_only_active_workers() {
+        for status in [
+            WorkerStatus::Idle,
+            WorkerStatus::Running,
+            WorkerStatus::Paused,
+        ] {
+            for queue in [false, true] {
+                let mut app = App::new("test".into());
+                app.connected = true;
+                app.set_worker_status(status);
+                app.input.insert_str("draft");
+                let modifiers = if queue {
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::CONTROL
+                };
+                let method = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, modifiers));
+                match (status, queue) {
+                    (WorkerStatus::Idle, true) => assert!(method.is_none()),
+                    (WorkerStatus::Idle, false) | (_, true) => {
+                        assert!(matches!(method, Some(Method::Submit { ref input, .. })
+                            if Segment::flatten_to_text(input) == "draft"));
+                    }
+                    _ => assert!(matches!(method, Some(Method::Notify { ref message, .. })
+                        if message == "draft")),
+                }
+                assert_eq!(input_text(&app), "draft", "retain draft until admission");
+                assert_eq!(app.queued_input_count(), 0);
+            }
+        }
+    }
 
-        assert_eq!(app.queued_input_count(), 0);
-        assert_eq!(input_text(&app), "");
+    #[test]
+    fn composer_send_shortcuts_bypass_completion_selection() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            let mut app = App::new("test".into());
+            app.connected = true;
+            app.set_worker_status(WorkerStatus::Running);
+            app.input.insert_str("@src");
+            let _ = app.refresh_completion();
+            app.completion.as_mut().unwrap().entries = vec![protocol::CompletionEntry {
+                value: "src/main.rs".into(),
+                ..Default::default()
+            }];
+            let method = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, modifiers));
+            if modifiers.contains(KeyModifiers::SHIFT) {
+                assert!(matches!(method, Some(Method::Submit { ref input, .. })
+                    if input == &[Segment::text("@src")]));
+            } else {
+                assert!(
+                    matches!(method, Some(Method::Notify { ref message, .. }) if message == "@src")
+                );
+            }
+            assert_eq!(input_text(&app), "@src");
+        }
+    }
+
+    #[test]
+    fn composer_modified_empty_enter_never_resumes_and_repeat_never_sends() {
+        let mut app = App::new("test".into());
+        app.connected = true;
+        app.set_worker_status(WorkerStatus::Paused);
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, modifiers)).is_none());
+        }
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).is_none());
+        assert_eq!(input_text(&app), "\n");
+        app.input.insert_str("draft");
+        for kind in [event::KeyEventKind::Repeat, event::KeyEventKind::Release] {
+            let mut key = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+            key.kind = kind;
+            assert!(handle_key(&mut app, key).is_none());
+        }
+        assert_eq!(input_text(&app), "\ndraft");
     }
 
     #[test]
@@ -2602,7 +2799,18 @@ mod tests {
                 ..
             }) if message == "progress"
         ));
-        assert_eq!(input_text(&app), "");
+        assert_eq!(input_text(&app), "progress");
+        let Some(Method::Notify {
+            notification_request_id,
+            ..
+        }) = method
+        else {
+            unreachable!()
+        };
+        app.handle_worker_event(Event::NotificationAccepted {
+            notification_request_id,
+        });
+        assert!(app.input.is_empty());
     }
 
     #[test]
@@ -3538,15 +3746,9 @@ mod tests {
     fn up_from_empty_composer_recalls_history_and_down_restores_empty_draft() {
         let mut app = App::new("agent".to_string());
         type_keys(&mut app, "first");
-        assert!(matches!(
-            handle_key(&mut app, key(KeyCode::Enter)),
-            Some(Method::Submit { .. })
-        ));
+        submit_and_accept(&mut app);
         type_keys(&mut app, "second");
-        assert!(matches!(
-            handle_key(&mut app, key(KeyCode::Enter)),
-            Some(Method::Submit { .. })
-        ));
+        submit_and_accept(&mut app);
 
         assert_eq!(input_text(&app), "");
         assert!(handle_key(&mut app, key(KeyCode::Up)).is_none());
@@ -3574,10 +3776,7 @@ mod tests {
     fn up_at_start_of_multiline_recalls_history() {
         let mut app = App::new("agent".to_string());
         type_keys(&mut app, "sent");
-        assert!(matches!(
-            handle_key(&mut app, key(KeyCode::Enter)),
-            Some(Method::Submit { .. })
-        ));
+        submit_and_accept(&mut app);
         type_keys(&mut app, "draft\nbody");
         app.move_cursor_start();
 
@@ -3589,6 +3788,22 @@ mod tests {
     fn enter_command_mode(app: &mut App) {
         assert!(handle_key(app, key(KeyCode::Char(':'))).is_none());
         assert!(app.is_command_mode());
+    }
+
+    fn submit_and_accept(app: &mut App) {
+        app.connected = true;
+        let Some(Method::Submit {
+            submission_request_id,
+            ..
+        }) = handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL))
+        else {
+            panic!("Ctrl+Enter should submit idle input");
+        };
+        app.handle_worker_event(Event::SubmissionAccepted {
+            submission_request_id,
+            submission_id: "history-input".into(),
+            disposition: protocol::SubmissionDisposition::Started,
+        });
     }
 
     fn type_keys(app: &mut App, text: &str) {

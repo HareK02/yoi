@@ -1866,7 +1866,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            " — Enter on empty input to resume, type + Enter to queue, Ctrl-X to cancel",
+            " — empty Enter Resume · Ctrl+Enter Notify · Ctrl+Shift+Enter Queue · Ctrl+X Cancel",
             Style::default().fg(Color::DarkGray),
         ));
     } else if !app.running {
@@ -1922,7 +1922,15 @@ fn actionbar_left_item(app: &App, now: Instant) -> Option<(String, Style)> {
             Style::default().fg(Color::Blue),
         ));
     }
-    None
+    Some((
+        if app.running || app.paused {
+            "Enter newline  Ctrl+Enter Notify  Ctrl+Shift+Enter Queue  Ctrl+C Pause  Ctrl+X Cancel"
+        } else {
+            "Enter newline  Ctrl+Enter Submit"
+        }
+        .to_string(),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn actionbar_notice_style(level: ActionbarNoticeLevel) -> Style {
@@ -2339,6 +2347,28 @@ mod tests {
         let app = App::new("test".into());
 
         assert_eq!(queue_status_text(&app), None);
+    }
+
+    #[test]
+    fn composer_help_labels_default_send_and_active_queue_shortcuts() {
+        for status in [
+            protocol::WorkerStatus::Idle,
+            protocol::WorkerStatus::Running,
+            protocol::WorkerStatus::Paused,
+        ] {
+            let mut app = App::new("test".into());
+            app.set_worker_status(status);
+            let (help, _) = actionbar_left_item(&app, Instant::now()).unwrap();
+            assert!(help.contains("Enter newline"));
+            if status == protocol::WorkerStatus::Idle {
+                assert!(help.contains("Ctrl+Enter Submit"));
+                assert!(!help.contains("Queue"));
+            } else {
+                assert!(help.contains("Ctrl+Enter Notify"));
+                assert!(help.contains("Ctrl+Shift+Enter Queue"));
+                assert!(help.contains("Ctrl+X Cancel"));
+            }
+        }
     }
 
     #[test]

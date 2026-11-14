@@ -460,7 +460,19 @@ fn feature_invocation_typed_history_draft_transport_and_rewind_restore_without_f
     let method = app.submit_input().unwrap();
     app.restore_unsent_run(&method);
     assert_eq!(app.input.submit_segments(), segments);
-    app.input.clear();
+    let Method::Submit {
+        submission_request_id,
+        ..
+    } = method
+    else {
+        panic!("expected Submit");
+    };
+    app.handle_worker_event(Event::SubmissionAccepted {
+        submission_request_id,
+        submission_id: "accepted".into(),
+        disposition: protocol::SubmissionDisposition::Started,
+    });
+    assert!(app.input.is_empty());
     let draft = vec![
         Segment::text("draft "),
         Segment::UploadedFile {

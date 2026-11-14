@@ -258,6 +258,30 @@ pub struct WorkerViewTab {
     pub selected: bool,
 }
 
+/// A transport write is not admission. Keep the exact request and draft until
+/// its matching receipt arrives, including across an uncertain transport error.
+struct ComposerAdmission {
+    method: Method,
+    segments: Vec<Segment>,
+    retryable: bool,
+}
+
+impl ComposerAdmission {
+    fn matches_receipt(&self, request_id: &str, notification: bool) -> bool {
+        match &self.method {
+            Method::Submit {
+                submission_request_id,
+                ..
+            } if !notification => submission_request_id == request_id,
+            Method::Notify {
+                notification_request_id,
+                ..
+            } if notification => notification_request_id == request_id,
+            _ => false,
+        }
+    }
+}
+
 pub struct App {
     pub worker_name: String,
     pub connected: bool,
@@ -378,7 +402,7 @@ pub struct App {
     /// Local submit state kept until the accepted run either completes
     /// normally or reports that the empty assistant turn was rolled back.
     pending_submit_rollback: Option<RollbackSubmitState>,
-    retry_submission: Option<Method>,
+    composer_admission: Option<ComposerAdmission>,
     /// Last rolled-back submit that could not be restored because the
     /// composer already contained unsent user input.
     last_rolled_back_input: Option<Vec<Segment>>,
@@ -442,7 +466,7 @@ impl App {
             input_history: ComposerInputHistory::new(),
             input_history_store: None,
             pending_submit_rollback: None,
-            retry_submission: None,
+            composer_admission: None,
             last_rolled_back_input: None,
         }
     }
@@ -1057,7 +1081,86 @@ impl App {
         })
     }
 
+    /// Default send follows the Web Composer: Submit only while Idle; new
+    /// notifications reach an active run or resume a paused one.
+    pub fn submit_default_input(&mut self) -> Option<Method> {
+        if !self.connected {
+            return None;
+        }
+        match self.worker_status {
+            WorkerStatus::Idle => self.submit_input(),
+            WorkerStatus::Running | WorkerStatus::Paused => self.submit_notify_input(),
+            _ => None,
+        }
+    }
+
+    pub fn composer_is_blank(&self) -> bool {
+        !self.input.has_attachment_stages() && segments_are_blank(&self.input.submit_segments())
+    }
+
+    pub fn submit_queue_input(&mut self) -> Option<Method> {
+        if !self.connected
+            || !matches!(
+                self.worker_status,
+                WorkerStatus::Running | WorkerStatus::Paused
+            )
+            || segments_are_blank(&self.input.submit_segments())
+        {
+            return None;
+        }
+        self.submit_input()
+    }
+
+    /// While awaiting admission, repeated keys must not create another request.
+    /// After transport failure an explicit retry reuses the exact original input.
+    fn pending_delivery(&mut self, notification: bool) -> Option<Option<Method>> {
+        let admission = self.composer_admission.as_mut()?;
+        let same_kind = matches!(&admission.method, Method::Notify { .. }) == notification;
+        let method = if admission.retryable
+            && same_kind
+            && self.input.submit_segments() == admission.segments
+        {
+            admission.retryable = false;
+            Some(admission.method.clone())
+        } else {
+            None
+        };
+        Some(method)
+    }
+
+    fn begin_delivery(&mut self, method: Method, segments: Vec<Segment>) -> Option<Method> {
+        self.composer_admission = Some(ComposerAdmission {
+            method: method.clone(),
+            segments,
+            retryable: false,
+        });
+        Some(method)
+    }
+
+    fn settle_delivery(&mut self, request_id: &str, notification: bool, accepted: bool) {
+        if !self
+            .composer_admission
+            .as_ref()
+            .is_some_and(|admission| admission.matches_receipt(request_id, notification))
+        {
+            return;
+        }
+        let admission = self.composer_admission.take().expect("matched admission");
+        if accepted {
+            if self.input.submit_segments() == admission.segments {
+                self.input.clear();
+                self.completion = None;
+            }
+            self.record_input_history(admission.segments);
+        } else if !notification {
+            self.pending_submit_rollback = None;
+        }
+    }
+
     pub fn submit_input(&mut self) -> Option<Method> {
+        if let Some(method) = self.pending_delivery(false) {
+            return method;
+        }
         if self.input.has_attachment_stages() {
             self.push_error("Attachment is still staging or failed; wait, retry with Alt+Enter, or delete its chip.");
             return None;
@@ -1084,12 +1187,14 @@ impl App {
             }
             return None;
         }
-        self.record_input_history(segments.clone());
-        self.input.clear();
-        Some(self.method_for_run(segments))
+        let method = self.method_for_run(segments.clone());
+        self.begin_delivery(method, segments)
     }
 
     pub fn submit_notify_input(&mut self) -> Option<Method> {
+        if let Some(method) = self.pending_delivery(true) {
+            return method;
+        }
         if self.input.has_attachment_stages() || self.input.has_selected_feature_invocations() {
             self.push_error("Notify accepts text only; confirm or remove Feature invocations and staging chips first.");
             return None;
@@ -1110,47 +1215,46 @@ impl App {
             return None;
         }
         let message = Segment::flatten_to_text(&segments);
-        self.record_input_history(segments);
-        self.input.clear();
-        Some(Method::Notify {
+        let method = Method::Notify {
             notification_request_id: protocol::new_submission_request_id(),
             message,
-        })
+        };
+        self.begin_delivery(method, segments)
     }
 
     pub fn restore_unsent_run(&mut self, method: &Method) {
-        let Method::Submit { input, .. } = method else {
-            return;
+        // Input is retained before admission; an uncertain write only enables
+        // exact-request retry. Never overwrite edits made after Send.
+        let (request_id, notification) = match method {
+            Method::Submit {
+                submission_request_id,
+                ..
+            } => (submission_request_id, false),
+            Method::Notify {
+                notification_request_id,
+                ..
+            } => (notification_request_id, true),
+            _ => return,
         };
-        self.pending_submit_rollback = None;
-        if self.input.is_empty() || self.input.submit_segments() == *input {
-            self.retry_submission = Some(method.clone());
-            self.input.replace_with_segments(input);
-            self.completion = None;
-        } else {
-            self.push_error(
-                "Submit transport failed; current Composer was preserved and the unsent input was not queued.",
-            );
+        if let Some(admission) = self.composer_admission.as_mut()
+            && admission.matches_receipt(request_id, notification)
+        {
+            admission.retryable = true;
         }
     }
 
     fn method_for_run(&mut self, segments: Vec<Segment>) -> Method {
         // TurnHeader / UserMessage blocks are pushed only after the Worker
         // emits `Event::UserMessage` from a committed `LogEntry::AnnotatedUserInput`.
-        // Locally we only clear the input buffer and forward the method,
-        // while remembering enough local state to undo the visible submit if
-        // the accepted run produced no assistant output and was rolled back.
+        // Keep the draft until admission, while remembering enough local state
+        // to undo the visible submit if the accepted run produced no assistant
+        // output and was rolled back.
         self.pending_submit_rollback = Some(RollbackSubmitState {
             text: Segment::flatten_to_text(&segments),
             segments: segments.clone(),
             block_start: self.blocks.len(),
             turn_before: self.turn_index,
         });
-        if let Some(method @ Method::Submit { .. }) = self.retry_submission.take() {
-            if matches!(&method, Method::Submit { input, .. } if *input == segments) {
-                return method;
-            }
-        }
         Method::Submit {
             submission_request_id: protocol::new_submission_request_id(),
             input: segments,
@@ -1524,20 +1628,28 @@ impl App {
             Event::SubmissionAccepted {
                 submission_request_id,
                 ..
+            } => self.settle_delivery(&submission_request_id, false, true),
+            Event::NotificationAccepted {
+                notification_request_id,
             } => {
-                if matches!(&self.retry_submission, Some(Method::Submit { submission_request_id: id, .. }) if *id == submission_request_id)
-                {
-                    if let Some(Method::Submit { input, .. }) = self.retry_submission.take() {
-                        if self.input.submit_segments() == input {
-                            self.input.clear();
-                            self.completion = None;
-                        }
-                    }
-                }
+                self.settle_delivery(&notification_request_id, true, true);
             }
-            Event::NotificationAccepted { .. } => {}
-            Event::SubmissionRejected { message, .. }
-            | Event::NotificationRejected { message, .. } => self.push_error(message),
+            Event::SubmissionRejected {
+                submission_request_id,
+                message,
+                ..
+            } => {
+                self.settle_delivery(&submission_request_id, false, false);
+                self.push_error(message);
+            }
+            Event::NotificationRejected {
+                notification_request_id,
+                message,
+                ..
+            } => {
+                self.settle_delivery(&notification_request_id, true, false);
+                self.push_error(message);
+            }
             Event::PendingSubmissionsChanged { pending } => {
                 self.pending_submissions = pending;
             }
@@ -3413,6 +3525,197 @@ mod rewind_refresh_tests {
 }
 
 #[cfg(test)]
+fn submit_and_accept(app: &mut App) -> Vec<Segment> {
+    let Some(Method::Submit {
+        submission_request_id,
+        input,
+    }) = app.submit_input()
+    else {
+        panic!("expected Submit");
+    };
+    app.handle_worker_event(Event::SubmissionAccepted {
+        submission_id: "accepted-submission".into(),
+        submission_request_id,
+        disposition: protocol::SubmissionDisposition::Queued,
+    });
+    input
+}
+
+#[cfg(test)]
+mod composer_admission_tests {
+    use super::*;
+
+    fn composer(status: WorkerStatus) -> App {
+        let mut app = App::new("test".into());
+        app.connected = true;
+        app.set_worker_status(status);
+        app.input.insert_str("draft");
+        app
+    }
+
+    fn receipt(method: &Method, accepted: bool) -> Event {
+        match (method, accepted) {
+            (
+                Method::Submit {
+                    submission_request_id,
+                    ..
+                },
+                true,
+            ) => Event::SubmissionAccepted {
+                submission_request_id: submission_request_id.clone(),
+                submission_id: "submission".into(),
+                disposition: protocol::SubmissionDisposition::Queued,
+            },
+            (
+                Method::Submit {
+                    submission_request_id,
+                    ..
+                },
+                false,
+            ) => Event::SubmissionRejected {
+                submission_request_id: submission_request_id.clone(),
+                message: "rejected".into(),
+            },
+            (
+                Method::Notify {
+                    notification_request_id,
+                    ..
+                },
+                true,
+            ) => Event::NotificationAccepted {
+                notification_request_id: notification_request_id.clone(),
+            },
+            (
+                Method::Notify {
+                    notification_request_id,
+                    ..
+                },
+                false,
+            ) => Event::NotificationRejected {
+                notification_request_id: notification_request_id.clone(),
+                message: "rejected".into(),
+            },
+            _ => panic!("expected composer delivery"),
+        }
+    }
+
+    #[test]
+    fn default_send_keeps_draft_until_correlated_acceptance_and_blocks_double_send() {
+        for status in [
+            WorkerStatus::Idle,
+            WorkerStatus::Running,
+            WorkerStatus::Paused,
+        ] {
+            let mut app = composer(status);
+            let method = app.submit_default_input().unwrap();
+            assert_eq!(
+                matches!(method, Method::Submit { .. }),
+                status == WorkerStatus::Idle
+            );
+            assert_eq!(
+                Segment::flatten_to_text(&app.input.submit_segments()),
+                "draft"
+            );
+            assert_eq!(app.input_history_len(), 0);
+            assert!(app.submit_default_input().is_none());
+            assert!(app.submit_queue_input().is_none());
+            app.handle_worker_event(Event::NotificationAccepted {
+                notification_request_id: "other".into(),
+            });
+            app.handle_worker_event(Event::SubmissionAccepted {
+                submission_request_id: "other".into(),
+                submission_id: "other".into(),
+                disposition: protocol::SubmissionDisposition::Queued,
+            });
+            assert!(!app.input.is_empty());
+            app.handle_worker_event(receipt(&method, true));
+            assert!(app.input.is_empty());
+            assert_eq!(app.input_history_len(), 1);
+            app.handle_worker_event(receipt(&method, true));
+            assert_eq!(app.input_history_len(), 1);
+        }
+    }
+
+    #[test]
+    fn acceptance_preserves_newer_draft_and_rejection_preserves_original_draft() {
+        for status in [
+            WorkerStatus::Idle,
+            WorkerStatus::Running,
+            WorkerStatus::Paused,
+        ] {
+            for accepted in [false, true] {
+                let mut app = composer(status);
+                let method = app.submit_default_input().unwrap();
+                if accepted {
+                    app.input.insert_str(" edited");
+                }
+                app.handle_worker_event(receipt(&method, accepted));
+                assert_eq!(
+                    Segment::flatten_to_text(&app.input.submit_segments()),
+                    if accepted { "draft edited" } else { "draft" }
+                );
+                assert_eq!(app.input_history_len(), usize::from(accepted));
+                assert!(app.submit_default_input().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_delivery_retry_retains_exact_id_and_does_not_replace_edited_input() {
+        for status in [
+            WorkerStatus::Idle,
+            WorkerStatus::Running,
+            WorkerStatus::Paused,
+        ] {
+            let mut app = composer(status);
+            let method = app.submit_default_input().unwrap();
+            app.restore_unsent_run(&method);
+            let retry = app.submit_default_input().unwrap();
+            assert_eq!(
+                serde_json::to_value(&method).unwrap(),
+                serde_json::to_value(&retry).unwrap()
+            );
+            app.restore_unsent_run(&retry);
+            app.input.insert_str(" edited");
+            assert!(app.submit_default_input().is_none());
+            app.handle_worker_event(receipt(&method, true));
+            assert_eq!(
+                Segment::flatten_to_text(&app.input.submit_segments()),
+                "draft edited"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_only_sends_nonempty_busy_drafts_and_never_resumes_empty_paused_input() {
+        for status in [
+            WorkerStatus::Idle,
+            WorkerStatus::Running,
+            WorkerStatus::Paused,
+        ] {
+            let mut app = composer(status);
+            let method = app.submit_queue_input();
+            if status == WorkerStatus::Idle {
+                assert!(method.is_none());
+            } else {
+                let method = method.unwrap();
+                assert!(matches!(method, Method::Submit { .. }));
+                assert!(!app.input.is_empty());
+                assert_eq!(app.worker_status, status);
+                app.handle_worker_event(receipt(&method, true));
+                assert!(app.input.is_empty());
+                assert!(app.submit_queue_input().is_none());
+                assert!(app.submit_default_input().is_none());
+            }
+        }
+        let mut disconnected = composer(WorkerStatus::Running);
+        disconnected.connected = false;
+        assert!(disconnected.submit_default_input().is_none());
+        assert!(disconnected.submit_queue_input().is_none());
+    }
+}
+
+#[cfg(test)]
 mod composer_history_persistence_tests {
     use super::*;
     use crate::composer_history::{COMPOSER_INPUT_HISTORY_LIMIT, ComposerHistoryStore};
@@ -3468,7 +3771,7 @@ mod composer_history_persistence_tests {
                 path: "src/lib.rs".into(),
             },
         ]);
-        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
+        submit_and_accept(&mut app);
 
         let mut reloaded = App::new_with_input_history_store("test".into(), store);
         assert!(reloaded.browse_input_history_older());
@@ -3548,10 +3851,7 @@ mod composer_history_persistence_tests {
         for c in text.chars() {
             app.insert_char(c);
         }
-        match app.submit_input() {
-            Some(Method::Submit { input, .. }) => input,
-            other => panic!("expected Run, got {other:?}"),
-        }
+        submit_and_accept(app)
     }
 
     fn input_text(app: &App) -> String {
@@ -4067,7 +4367,7 @@ mod completion_flow_tests {
 
         assert!(matches!(method, Some(Method::Submit { .. })));
         assert_eq!(app.queued_input_count(), 0);
-        assert_eq!(input_text(&app), "");
+        assert_eq!(input_text(&app), "queued turn");
     }
 
     #[test]
@@ -4105,7 +4405,7 @@ mod completion_flow_tests {
         app.set_worker_status(WorkerStatus::Paused);
         insert_text(&mut app, "next turn");
 
-        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
+        submit_and_accept(&mut app);
         assert_eq!(app.worker_status, WorkerStatus::Paused);
         assert_eq!(app.queued_input_count(), 0);
         assert_eq!(input_text(&app), "");
@@ -4130,10 +4430,7 @@ mod completion_flow_tests {
         for c in text.chars() {
             app.insert_char(c);
         }
-        match app.submit_input() {
-            Some(Method::Submit { input, .. }) => input,
-            other => panic!("expected Run, got {other:?}"),
-        }
+        submit_and_accept(app)
     }
 
     fn input_text(app: &App) -> String {
@@ -5381,14 +5678,14 @@ mod completion_flow_tests {
         for c in "repeat".chars() {
             app.insert_char(c);
         }
-        assert!(app.submit_input().is_some());
+        submit_and_accept(&mut app);
         assert_eq!(app.input_history_len(), 1);
         assert_eq!(app.queued_input_count(), 0);
 
         for c in "repeat".chars() {
             app.insert_char(c);
         }
-        assert!(app.submit_input().is_some());
+        submit_and_accept(&mut app);
         assert_eq!(app.input_history_len(), 1);
         assert_eq!(app.queued_input_count(), 0);
 
@@ -5418,7 +5715,7 @@ mod completion_flow_tests {
             },
         ];
         app.input.replace_with_segments(&original);
-        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
+        submit_and_accept(&mut app);
 
         assert!(app.browse_input_history_older());
         assert_eq!(app.input.submit_segments(), original);
@@ -5430,7 +5727,7 @@ mod completion_flow_tests {
         for c in "sent".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
+        submit_and_accept(&mut app);
 
         for c in "draft".chars() {
             app.insert_char(c);
@@ -5448,7 +5745,7 @@ mod completion_flow_tests {
         for c in "sent".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
+        submit_and_accept(&mut app);
 
         assert!(app.browse_input_history_older());
         assert!(app.input_history_is_browsing());
@@ -5465,21 +5762,16 @@ mod completion_flow_tests {
         for c in "first".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
+        submit_and_accept(&mut app);
         for c in "second".chars() {
             app.insert_char(c);
         }
-        assert!(matches!(app.submit_input(), Some(Method::Submit { .. })));
+        submit_and_accept(&mut app);
 
         assert!(app.browse_input_history_older());
         assert!(app.browse_input_history_older());
-        let method = app.submit_input();
-        match method {
-            Some(Method::Submit { input, .. }) => {
-                assert_eq!(Segment::flatten_to_text(&input), "first")
-            }
-            other => panic!("expected recalled run, got {other:?}"),
-        }
+        let input = submit_and_accept(&mut app);
+        assert_eq!(Segment::flatten_to_text(&input), "first");
         assert_eq!(app.input_history_len(), 3);
         assert!(!app.input_history_is_browsing());
     }
