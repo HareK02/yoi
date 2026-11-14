@@ -69,6 +69,11 @@ pub fn evaluate_workspace_config_state(
     state: &WorkspaceConfigState,
     schema_bundle: WorkspaceConfigSchemaBundle,
 ) -> Result<EvaluationResult> {
+    if state.contract.decodal_version != DECODAL_VERSION {
+        return Err(Error::RegistryInconsistency(
+            "Workspace config toolchain requires owner-authorized configuration refresh".into(),
+        ));
+    }
     let expected_fingerprint = state.contract.fingerprint.clone();
     let contract = main_config_contract_with_schema(schema_bundle);
     if !state.contract.schema_bundle.contributions.is_empty()
@@ -228,8 +233,9 @@ impl SqliteWorkspaceStore {
                 tx.commit()?;
                 Ok((state, requires_toolchain_refresh, base_identity, frozen))
             })?;
-        // Published configuration is changed only through owner-authorized publication.
-        if frozen {
+        // Published configuration and retained 0.4.0 provenance change only through
+        // owner-authorized adoption. Loading must not silently adopt fixed Unicode semantics.
+        if frozen || state.contract.decodal_version != DECODAL_VERSION {
             return Ok(state);
         }
         let desired_schema = crate::plugin_settings::materialization_schema(
@@ -358,6 +364,11 @@ impl SqliteWorkspaceStore {
                 return Err(Error::WorkspaceIdMismatch);
             }
             let current = load_state(&tx, workspace_id)?.ok_or_else(config_not_materialized)?;
+            if current.contract.decodal_version != DECODAL_VERSION {
+                return Err(config_conflict(
+                    "configuration toolchain refresh requires owner adoption with the observed editing head and operation ID",
+                ));
+            }
             if current.snapshot.digest != candidate.base_digest {
                 return Err(config_conflict("base content digest mismatch"));
             }
@@ -676,6 +687,24 @@ pub(crate) fn load_state(
         serde_json::from_str(&schema_bundle_json)
             .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
     let requires_toolchain_refresh = decodal_version != DECODAL_VERSION;
+    if requires_toolchain_refresh && decodal_version == "0.4.0" {
+        // A saved evaluation is evidence, not a request to evaluate with the current
+        // lexer. Keep it readable (even if refresh will fail) so the owner can
+        // preview, repair and adopt through the existing head-CAS/receipt transaction.
+        return Ok(Some(WorkspaceConfigState {
+            snapshot,
+            contract: ToolchainContract {
+                contract_version: config_source::CONFIG_SOURCE_CONTRACT_VERSION,
+                decodal_version,
+                schema_version,
+                entrypoints,
+                import_policy_version,
+                schema_bundle: stored_schema_bundle,
+                fingerprint,
+            },
+            projection_digest,
+        }));
+    }
     if requires_toolchain_refresh && !matches!(decodal_version.as_str(), "0.2.0" | "0.3.0") {
         return Err(Error::RegistryInconsistency(format!(
             "unsupported virtual config Decodal version {decodal_version} for Workspace {workspace_id}"
@@ -1392,7 +1421,7 @@ mod tests {
             )
             .unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("Decodal 0.4.0"));
+        assert!(message.contains(&format!("Decodal {DECODAL_VERSION}")));
         assert!(message.contains("main.dcdl"));
         assert!(message.contains("constraintviolation"));
         let persisted = store

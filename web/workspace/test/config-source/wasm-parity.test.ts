@@ -1,5 +1,6 @@
 /// <reference lib="deno.ns" />
 
+import unicodeCases from "../../../../resources/config-schema/unicode-values.json" with { type: "json" };
 import { createHash } from "node:crypto";
 import { assertEquals, assertThrows } from "jsr:@std/assert";
 import init, {
@@ -58,7 +59,7 @@ async function toolchainFingerprint(
 ): Promise<string> {
   return await digestText(JSON.stringify([
     2,
-    "0.4.0",
+    "0.4.1",
     1,
     entrypoints,
     1,
@@ -89,7 +90,7 @@ const emptySchemaBundle = compose_schema_bundle(
 ) as WorkspaceConfigSchemaBundle;
 const contract: ToolchainContract = {
   contract_version: 2,
-  decodal_version: "0.4.0",
+  decodal_version: "0.4.1",
   schema_version: 1,
   entrypoints: ["workspace.dcdl"],
   import_policy_version: 1,
@@ -105,6 +106,45 @@ const mainEntrypointContract: ToolchainContract = {
   entrypoints: ["main.dcdl"],
   fingerprint: await toolchainFingerprint(["main.dcdl"], emptySchemaBundle),
 };
+
+for (const fixture of unicodeCases) {
+  Deno.test(`generated WASM Unicode: ${fixture.name}`, () => {
+    const entries: ConfigTreeSnapshot["entries"] = {};
+    for (const [path, source] of Object.entries(fixture.entries)) {
+      if (source === undefined) continue;
+      entries[path] = { path, content: source, content_type: path.endsWith(".md") ? "text" : "decodal", content_digest: "unused" };
+    }
+    const tree = fixtureSnapshot({ entries });
+    const original = structuredClone(tree);
+    let result: { projections: Array<{ data_json: unknown }> } | undefined;
+    let diagnostics: Array<{ kind: string }> | undefined;
+    try {
+      result = evaluate_snapshot(tree, mainEntrypointContract);
+    } catch (error) {
+      diagnostics = error as Array<{ kind: string }>;
+    }
+    if (fixture.error) {
+      assertEquals(Array.isArray(diagnostics) && diagnostics.length > 0, true);
+      if (fixture.diagnostic_kind) assertEquals(diagnostics![0].kind, fixture.diagnostic_kind);
+    } else {
+      assertEquals(diagnostics, undefined);
+      assertEquals(result!.projections[0].data_json, fixture.expected);
+    }
+    assertEquals(tree, original);
+  });
+}
+
+Deno.test("generated WASM rejects a genuine old toolchain without changing local edits", async () => {
+  const tree = fixtureSnapshot(snapshot);
+  set_snapshot(tree);
+  const oldBundle = { ...emptySchemaBundle, fingerprint: await digestText(JSON.stringify([2, "0.4.0", [], await digestText(emptySchemaBundle.source)])) };
+  const oldContract = { ...contract, schema_bundle: oldBundle, decodal_version: "0.4.0", fingerprint: await digestText(JSON.stringify([2, "0.4.0", 1, contract.entrypoints, 1, oldBundle.fingerprint])) };
+  let rejected = false;
+  try { evaluate_snapshot(tree, oldContract); } catch { rejected = true; }
+  assertEquals(rejected, true);
+  assertEquals(apply_changes([]), tree);
+  assertEquals((evaluate_snapshot(tree, contract) as { projections: Array<{ data_json: unknown }> }).projections[0].data_json, { answer: 42 });
+});
 
 Deno.test("generated WASM evaluates the same virtual import contract", () => {
   const result = evaluate_snapshot(fixtureSnapshot(snapshot), contract) as {
@@ -207,7 +247,7 @@ function schemaSnapshot(source: string): ConfigTreeSnapshot {
 
 const schemaContract: ToolchainContract = {
   contract_version: 2,
-  decodal_version: "0.4.0",
+  decodal_version: "0.4.1",
   schema_version: 1,
   entrypoints: ["main.dcdl"],
   import_policy_version: 1,
@@ -1007,7 +1047,7 @@ Deno.test("Plugin closed preflight shares native projection and diagnostic fixtu
   }]) as WorkspaceConfigSchemaBundle;
   const contract: ToolchainContract = {
     contract_version: 2,
-    decodal_version: "0.4.0",
+    decodal_version: "0.4.1",
     schema_version: 1,
     entrypoints: ["main.dcdl"],
     import_policy_version: 1,

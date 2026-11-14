@@ -1696,6 +1696,205 @@ mod configuration_adoption_http_integration {
     }
 
     #[tokio::test]
+    async fn owner_http_refreshes_retained_decodal_040_without_rewriting_source() {
+        let f = Fixture::new().await;
+        let source = f.source().await;
+        let text =
+            "{ prompts.common.language = \"retained 雪 café 😀 é\"; } as WorkspaceConfigSchema\n";
+        f.commit(&request(
+            &source,
+            "unicode-source",
+            vec![update(&source, "main.dcdl", text)],
+        ))
+        .await;
+        // Model a persisted 0.4.0 toolchain, including the version-bound schema
+        // digest. The separate old-artifact probe demonstrates the actual lexer bug.
+        let mut state = f
+            .api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        let c = &mut state.contract;
+        c.decodal_version = "0.4.0".into();
+        let b = &mut c.schema_bundle;
+        let mut bytes = serde_json::to_vec(&(
+            c.contract_version,
+            "0.4.0",
+            b.contributions
+                .iter()
+                .map(|p| {
+                    (
+                        p.provider_id.as_str(),
+                        p.namespace.as_str(),
+                        p.version.as_str(),
+                        p.source_digest.as_str(),
+                        p.projection_validator.as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            config_source::digest_bytes(b.source.as_bytes()),
+        ))
+        .unwrap();
+        let authoring = b
+            .contributions
+            .iter()
+            .filter_map(|p| {
+                p.authoring_source
+                    .as_deref()
+                    .map(|s| (p.provider_id.as_str(), s))
+            })
+            .collect::<Vec<_>>();
+        if !authoring.is_empty() {
+            bytes.extend(serde_json::to_vec(&("authoring_sources", authoring)).unwrap());
+        }
+        b.fingerprint = config_source::digest_bytes(&bytes);
+        c.fingerprint = config_source::digest_bytes(
+            &serde_json::to_vec(&(
+                c.contract_version,
+                &c.decodal_version,
+                c.schema_version,
+                &c.entrypoints,
+                c.import_policy_version,
+                &b.fingerprint,
+            ))
+            .unwrap(),
+        );
+        let current = f
+            .api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        let mut evaluation = crate::config_source::evaluate_workspace_config_state(
+            &current,
+            current.contract.schema_bundle.clone(),
+        )
+        .unwrap();
+        evaluation.projections[0].data_json["prompts"]["common"]["language"] =
+            "retained 雪 café 😀 é"
+                .bytes()
+                .map(char::from)
+                .collect::<String>()
+                .into();
+        evaluation.projections[0].projection_digest = config_source::digest_bytes(
+            &serde_json::to_vec(&evaluation.projections[0].data_json).unwrap(),
+        );
+        state.projection_digest =
+            config_source::digest_bytes(&serde_json::to_vec(&evaluation.projections).unwrap());
+        f.api.config_store.with_immediate_transaction(|tx| {
+            tx.execute("UPDATE workspace_config_trees SET decodal_version=?2,schema_bundle_json=?3,toolchain_fingerprint=?4,projection_digest=?5 WHERE workspace_id=?1", rusqlite::params![TEST_WORKSPACE_ID, state.contract.decodal_version, serde_json::to_string(&state.contract.schema_bundle).unwrap(), state.contract.fingerprint, state.projection_digest])?;
+            Ok(())
+        }).unwrap();
+        let before = f.durable();
+        // Drop the API/router and their projection caches, then reopen the saved
+        // database through the production startup branch before any owner request.
+        let Fixture {
+            api,
+            app,
+            owner,
+            foreign,
+            owner_account,
+            cookie,
+            origin,
+            subject,
+            legacy,
+            legacy_update,
+            subject_policy,
+            runtime_identity,
+            _dir,
+        } = f;
+        let config = api.config.clone();
+        drop(app);
+        drop(legacy);
+        drop(api);
+        let mut api = WorkspaceApi::new_api_fixture(
+            config,
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        configure_runtime_request_auth(&mut api, &runtime_identity, "adoption-http-runtime");
+        let legacy = open_subjektiv_store(&api).unwrap();
+        let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+        catalog
+            .apis
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), api.clone());
+        catalog
+            .routers
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+        let f = Fixture {
+            api,
+            app: workspace_server_router(catalog),
+            owner,
+            foreign,
+            owner_account,
+            cookie,
+            origin,
+            subject,
+            legacy,
+            legacy_update,
+            subject_policy,
+            runtime_identity,
+            _dir,
+        };
+        assert_eq!(
+            f.durable(),
+            before,
+            "startup must not refresh saved evidence"
+        );
+        let old = f.source().await;
+        assert_eq!(old.state.contract.decodal_version, "0.4.0");
+        assert_eq!(
+            old.state.snapshot,
+            workspace_config_state_to_api(state.clone()).snapshot
+        );
+        let refresh = request(&old, "owner-refresh-041", vec![]);
+        let (denied, _) = f
+            .call(f.bearer(
+                &f.foreign,
+                "POST",
+                "/commit",
+                Some(serde_json::to_value(&refresh).unwrap()),
+            ))
+            .await;
+        assert_eq!(denied, StatusCode::FORBIDDEN);
+        let preview: Preview =
+            serde_json::from_value(f.owner_call("/preview", &refresh, StatusCode::OK).await)
+                .unwrap();
+        assert!(preview.changed_paths.is_empty());
+        assert_eq!(f.durable(), before);
+        let receipt = f.commit(&refresh).await;
+        assert_eq!(receipt.state, preview.state);
+        assert_eq!(receipt.state.contract.decodal_version, "0.4.1");
+        assert_eq!(receipt.state.snapshot, old.state.snapshot);
+        assert_ne!(receipt.state.projection_digest, old.state.projection_digest);
+        assert_ne!(Some(receipt.history_head.clone()), old.history_head);
+        assert_eq!(f.source().await.state, receipt.state);
+        let current = f
+            .api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        let evaluation = crate::config_source::evaluate_workspace_config_state(
+            &current,
+            current.contract.schema_bundle.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            evaluation.projections[0].data_json["prompts"]["common"]["language"],
+            "retained 雪 café 😀 é"
+        );
+        assert_eq!(f.commit(&refresh).await, receipt);
+        f.assert_subject_policy_unchanged();
+    }
+
+    #[tokio::test]
     async fn owner_http_shared_source_edit_commits_head_and_receipt_without_changing_subject_policy()
      {
         let fixture = Fixture::new().await;

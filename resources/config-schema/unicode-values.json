@@ -1,0 +1,61 @@
+[
+  {
+    "name": "literal matrix and HELP regression",
+    "entries": {
+      "main.dcdl": "{ cjk = \"retained 雪 日本語\"; accent = \"café\"; emoji = \"😀🚀\"; combining = \"é\"; mixed = \"雪\\n\\t\\\"é😀\"; ascii = \"plain ASCII\"; }"
+    },
+    "expected": {
+      "cjk": "retained 雪 日本語",
+      "accent": "café",
+      "emoji": "😀🚀",
+      "combining": "é",
+      "mixed": "雪\n\t\"é😀",
+      "ascii": "plain ASCII"
+    }
+  },
+  {
+    "name": "Unicode relative import and split source",
+    "entries": {
+      "main.dcdl": "import \"./設定/値-é😀.dcdl\"",
+      "設定/値-é😀.dcdl": "{ cjk = \"retained 雪 日本語\"; accent = \"café\"; emoji = \"😀🚀\"; combining = \"é\"; mixed = \"雪\\n\\t\\\"é😀\"; ascii = \"plain ASCII\"; }"
+    },
+    "expected": {
+      "cjk": "retained 雪 日本語",
+      "accent": "café",
+      "emoji": "😀🚀",
+      "combining": "é",
+      "mixed": "雪\n\t\"é😀",
+      "ascii": "plain ASCII"
+    }
+  },
+  {
+    "name": "Unicode regex literal",
+    "entries": { "main.dcdl": "{ value = \"日本語\" as /^(—|日本語|😀)$/; }" },
+    "error": true,
+    "diagnostic_kind": "unsupported_feature"
+  },
+  {
+    "name": "Unicode Markdown structured import",
+    "entries": {
+      "main.dcdl": "import \"./文書.md\"",
+      "文書.md": "---\ntitle: 雪😀\n---\ncafé é 日本語\n"
+    },
+    "expected": {
+      "frontmatter": { "title": "雪😀" },
+      "content": "café é 日本語\n"
+    }
+  },
+  {
+    "name": "diagnostic after multibyte literal",
+    "entries": { "main.dcdl": "{ text = \"雪😀é\"; broken = ; }" },
+    "error": true
+  },
+  {
+    "name": "diagnostic in Unicode import",
+    "entries": {
+      "main.dcdl": "import \"./設定/壊れた.dcdl\"",
+      "設定/壊れた.dcdl": "{ text = \"雪😀\"; broken = ; }"
+    },
+    "error": true
+  }
+]

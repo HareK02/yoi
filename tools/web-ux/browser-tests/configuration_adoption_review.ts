@@ -58,12 +58,12 @@ const initial: WorkspaceConfigTreeResponse = {
   },
   contract: {
     contract_version: 2,
-    decodal_version: "0.4.0",
+    decodal_version: "0.4.1",
     schema_version: 1,
     entrypoints: ["main.dcdl"],
     import_policy_version: 1,
     schema_bundle: schema,
-    fingerprint: hash(JSON.stringify([2, "0.4.0", 1, ["main.dcdl"], 1, schema.fingerprint])),
+    fingerprint: hash(JSON.stringify([2, "0.4.1", 1, ["main.dcdl"], 1, schema.fingerprint])),
   },
   projection_digest: hash("synthetic-empty-policy-projection"),
 };

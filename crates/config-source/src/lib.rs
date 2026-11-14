@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CONFIG_SOURCE_CONTRACT_VERSION: u32 = 2;
-pub const DECODAL_VERSION: &str = "0.4.0";
+pub const DECODAL_VERSION: &str = "0.4.1";
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_IMPORT_POLICY_VERSION: u32 = 1;
 pub const WORKSPACE_CONFIG_SCHEMA_GLOBAL: &str = "WorkspaceConfigSchema";
@@ -2360,6 +2360,101 @@ mod tests {
 
     fn text_entry(path_value: &str, content: &str) -> ConfigEntry {
         ConfigEntry::new(path(path_value), ConfigContentType::Text, content).unwrap()
+    }
+
+    #[test]
+    fn unicode_values_imports_and_formatter_preserve_source_semantics() {
+        // The same corpus is exercised by generated WASM; the native example emits
+        // full diagnostic/projection identities for cross-runtime comparison.
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../resources/config-schema/unicode-values.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let entries = case["entries"].as_object().unwrap();
+            let snapshot =
+                ConfigTreeSnapshot::from_entries(entries.iter().map(|(name, source)| {
+                    if name.ends_with(".md") {
+                        text_entry(name, source.as_str().unwrap())
+                    } else {
+                        entry(name, source.as_str().unwrap())
+                    }
+                }))
+                .unwrap();
+            let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+            let environment = SnapshotEnvironment::new(snapshot.clone());
+            let result = environment.evaluate_contract(&contract);
+            if case["error"] == true {
+                assert!(result.is_err(), "{}", case["name"]);
+                if let Some(kind) = case["diagnostic_kind"].as_str() {
+                    assert_eq!(result.unwrap_err()[0].kind, kind);
+                }
+                assert!(!environment.analyze(&path("main.dcdl"), None).is_empty());
+            } else {
+                assert_eq!(result.unwrap().projections[0].data_json, case["expected"]);
+                assert!(environment.analyze(&path("main.dcdl"), None).is_empty());
+                let formatted =
+                    ConfigTreeSnapshot::from_entries(snapshot.entries.values().map(|item| {
+                        if item.content_type == ConfigContentType::Decodal {
+                            entry(
+                                item.path.as_str(),
+                                &environment.format(&item.content).unwrap(),
+                            )
+                        } else {
+                            item.clone()
+                        }
+                    }))
+                    .unwrap();
+                assert_eq!(
+                    SnapshotEnvironment::new(formatted)
+                        .evaluate_contract(&contract)
+                        .unwrap()
+                        .projections[0]
+                        .data_json,
+                    case["expected"]
+                );
+            }
+            assert_eq!(environment.snapshot(), &snapshot);
+            for (name, source) in entries {
+                assert_eq!(
+                    snapshot.get(&path(name)).unwrap().content,
+                    source.as_str().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn old_decodal_contract_cannot_silently_evaluate_under_new_engine() {
+        let mut contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        let current = contract.fingerprint.clone();
+        contract.decodal_version = "0.4.0".into();
+        contract.schema_bundle.fingerprint = digest_bytes(
+            &serde_json::to_vec(&serde_json::json!([
+                CONFIG_SOURCE_CONTRACT_VERSION,
+                "0.4.0",
+                [],
+                digest_bytes(contract.schema_bundle.source.as_bytes())
+            ]))
+            .unwrap(),
+        );
+        contract.fingerprint = digest_bytes(
+            &serde_json::to_vec(&(
+                contract.contract_version,
+                &contract.decodal_version,
+                contract.schema_version,
+                &contract.entrypoints,
+                contract.import_policy_version,
+                &contract.schema_bundle.fingerprint,
+            ))
+            .unwrap(),
+        );
+        assert_ne!(current, contract.fingerprint);
+        let snapshot =
+            ConfigTreeSnapshot::from_entries([entry("main.dcdl", "{ value = \"雪\"; }")]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot.clone());
+        assert!(environment.evaluate_contract(&contract).is_err());
+        assert_eq!(environment.snapshot(), &snapshot);
     }
 
     #[test]

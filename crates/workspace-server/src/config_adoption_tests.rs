@@ -462,6 +462,9 @@ fn independent_database_connections_serialize_concurrent_web_and_cli_heads() {
     assert_native_policy(&other);
 }
 
+#[path = "config_adoption_toolchain_tests.rs"]
+mod toolchain_refresh;
+
 #[path = "config_adoption_failure_tests.rs"]
 mod failure_contract;
 
