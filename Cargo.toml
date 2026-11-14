@@ -41,6 +41,7 @@ members = [
     "crates/feature-permissions",
     "crates/workspace-drive",
     "crates/subjektiv",
+    "crates/subjektiv-api",
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
@@ -88,6 +89,7 @@ default-members = [
     "crates/feature-permissions",
     "crates/workspace-drive",
     "crates/subjektiv",
+    "crates/subjektiv-api",
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
@@ -116,6 +118,7 @@ opt-level = 2
 opt-level = 1
 
 [workspace.dependencies]
+subjektiv-api = { path = "crates/subjektiv-api" }
 # Internal crates
 client = { path = "crates/client" }
 agen = { path = "crates/agen", version = "0.2" }

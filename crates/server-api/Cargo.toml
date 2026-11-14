@@ -7,9 +7,10 @@ publish = false
 
 [features]
 default = []
-typescript = ["dep:ts-rs", "protocol/typescript", "error-contract/typescript"]
+typescript = ["subjektiv-api/typescript", "dep:ts-rs", "protocol/typescript", "error-contract/typescript"]
 
 [dependencies]
+subjektiv-api = { workspace = true, features = ["openapi"] }
 error-contract = { workspace = true, features = ["json-schema"] }
 feature-permissions.workspace = true
 api-macros = { workspace = true, features = ["reqwest", "axum", "openapi", "error-contract"] }

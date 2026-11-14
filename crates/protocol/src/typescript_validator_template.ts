@@ -1,4 +1,5 @@
 __GENERATED_PREAMBLE__
+import { validMessagingResponse, validMessagingEvent } from './chat-api.ts';
 
 import type {
   EventSubscriptionSelector,
@@ -232,7 +233,9 @@ function jsonEqual(left: unknown, right: unknown): boolean {
 
 function validateInboundFrameSemantics(frame: SubscriptionFrame): boolean {
   if (frame.protocol_version !== SUBSCRIPTION_PROTOCOL_VERSION) return false;
-  if (frame.frame === 'request' || frame.frame === 'worker_protocol') return false;
+  if (frame.frame === 'request' || frame.frame === 'worker_protocol' || frame.frame === 'messaging_request') return false;
+  if (frame.frame === 'messaging_response') return validMessagingResponse(frame.message);
+  if (frame.frame === 'messaging_event') return validMessagingEvent(frame.message);
   if (frame.frame === 'response') {
     const message = frame.message;
     if (!validateIdentifier(message.payload.request_id, MAX_CORRELATION_ID_BYTES)) return false;

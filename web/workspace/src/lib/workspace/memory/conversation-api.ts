@@ -1,4 +1,4 @@
-import { CHAT_LIMITS } from "#lib/generated/chat-api.ts";
+import { CHAT_LIMITS, chatHasText } from "#lib/generated/chat-api.ts";
 import type {
   ChatConversation,
   ChatCreateConversationRequest,
@@ -45,7 +45,7 @@ function object(value: unknown, keys: string[]): Record<string, unknown> {
 }
 function text(value: unknown, maxBytes = 512): string {
   if (
-    typeof value !== "string" || !value.trim() ||
+    typeof value !== "string" || !chatHasText(value) ||
     new TextEncoder().encode(value).length > maxBytes
   ) invalid();
   return value;
@@ -282,15 +282,18 @@ export async function sendConversationInput(
     reply_to: attempt.replyTo,
     work_ref: attempt.workRef,
   };
-  const v = object(
-    await request(
+  const value = await request(
       fetchFn,
       `${base(scope)}/${encodeURIComponent(attempt.conversationId)}/messages`,
       signal,
       body,
-    ),
-    ["message", "delivery"],
-  );
+    );
+  return parseConversationReceive(value, scope, attempt);
+}
+
+export function parseConversationReceive(value: unknown, scope: ConversationScope, attempt: ConversationAttempt): ChatReceiveResponse {
+  const body: ChatUserMessageRequest = { operation_id: attempt.operationId, text: attempt.text, reply_to: attempt.replyTo, work_ref: attempt.workRef };
+  const v = object(value, ["message", "delivery"]);
   const message = parseConversationMessage(
     v.message,
     scope,

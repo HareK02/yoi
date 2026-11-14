@@ -77,6 +77,7 @@ pub(crate) async fn serve_workspace_subscription<S>(
         }
         let _ = writer_done.send(());
     }));
+    let mut messaging = crate::workspace_messaging::MessagingLane::default();
     let mut next_subscription_id = 1_u64;
     let mut subscriptions = HashMap::<SubscriptionId, ActiveSubscription>::new();
 
@@ -93,6 +94,19 @@ pub(crate) async fn serve_workspace_subscription<S>(
                     }
                     subscriptions.retain(|_, subscription| !subscription.task.0.is_finished());
                     match frame.payload {
+                        SubscriptionFramePayload::MessagingRequest(request) => {
+                            messaging
+                                .request(
+                                    &api,
+                                    &context,
+                                    request,
+                                    &control_outbound,
+                                    &protocol_outbound,
+                                )
+                                .await;
+                        }
+                        SubscriptionFramePayload::MessagingResponse(_)
+                        | SubscriptionFramePayload::MessagingEvent(_) => break,
                         SubscriptionFramePayload::Request(
                             SubscriptionRequest::SubscribeEvents {
                                 request_id,

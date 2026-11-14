@@ -666,7 +666,8 @@
         "required": [
           "id",
           "subject_id",
-          "participant_account_id"
+          "participant_account_id",
+          "last_user_message_id"
         ],
         "type": "object"
       },
@@ -842,7 +843,10 @@
           "sequence",
           "sender",
           "text",
-          "operation_id"
+          "reply_to",
+          "work_ref",
+          "operation_id",
+          "last_user_message_id"
         ],
         "type": "object"
       },
@@ -26645,7 +26649,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:089b4f18ba38306a75a39ccf9d35d2f10d9728c2f93095006f93b74549c17ebc"
+    "x-yoi-source-digest": "sha256:b541c0580b71fcccf11071e62bf9a4fadf0359b5d4a912419e67755b0fcb658e"
   },
   "openapi": "3.1.0",
   "paths": {

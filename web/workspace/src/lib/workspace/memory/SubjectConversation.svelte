@@ -1,8 +1,10 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { CHAT_LIMITS, type ChatConversation, type ChatDelivery, type ChatMessage } from '#lib/generated/chat-api.ts';
+  import { CHAT_LIMITS, chatHasText, type ChatConversation, type ChatDelivery, type ChatMessage } from '#lib/generated/chat-api.ts';
   import { browserSession } from '#lib/workspace/auth/session-state.ts';
-  import { ConversationApiError, appendConversationMessages, getConversationPage, openSubjectConversation, sendConversationInput } from './conversation-api.ts';
+  import { ConversationApiError } from './conversation-api.ts';
+  import { ConversationMessagingClient } from './conversation-messaging.ts';
+  import { workspaceMultiplexer } from '#lib/workspace/multiplexer.ts';
   import { clearConversationAttempt, readConversationAttempt, saveConversationAttempt, type ConversationAttempt, type ConversationScope } from './conversation-attempt.ts';
 
   // 本体の現在状態・起動停止はroute側の共有SubjectBodyが所有する。会話ACKから推測しない。
@@ -24,7 +26,8 @@
   let sendError = $state<string | null>(null);
   let storageBlocked = $state(false);
   let inaccessible = $state(false);
-  let active: { scope: ConversationScope; controller: AbortController; authGeneration: number; authStamp: string | null } | null = null;
+  let connectionState = $state<'connecting' | 'open' | 'closed'>('connecting');
+  let active: { scope: ConversationScope; controller: AbortController; authGeneration: number; authStamp: string | null; client: ConversationMessagingClient | null } | null = null;
   const draftBytes = $derived(new TextEncoder().encode(draft).length);
 
   function current(context: NonNullable<typeof active>): boolean {
@@ -36,8 +39,10 @@
   }
 
   function withdrawAccess(context: NonNullable<typeof active>): void {
+    context.client?.close();
     context.controller.abort();
     inaccessible = true;
+    connectionState = 'closed';
     conversation = null;
     messages = [];
     attempt = null;
@@ -51,7 +56,7 @@
   $effect(() => {
     const scope: ConversationScope = { workspaceId, subjectId, accountId };
     return untrack(() => {
-      const context = { scope, controller: new AbortController(), authGeneration: browserSession.authenticationGeneration, authStamp: browserSession.authenticationStamp };
+      const context: NonNullable<typeof active> = { client: null, scope, controller: new AbortController(), authGeneration: browserSession.authenticationGeneration, authStamp: browserSession.authenticationStamp };
       active = context;
       conversation = null;
       messages = [];
@@ -67,12 +72,36 @@
       inaccessible = false;
       try { attempt = readConversationAttempt(sessionStorage, scope); }
       catch { storageBlocked = true; sendError = 'Saved send input cannot be read. No new send will be started.'; }
-      void refresh(context);
-      // 公開履歴だけを再取得する。内部Session購読やモデルのpollingはしない。
-      const timer = setInterval(() => { if (!document.hidden) void refresh(context); }, 4000);
-      const reconnect = () => { if (!document.hidden) void refresh(context); };
-      window.addEventListener('online', reconnect);
-      document.addEventListener('visibilitychange', reconnect);
+      reading = true;
+      connectionState = 'connecting';
+      context.client = new ConversationMessagingClient(scope, context.controller.signal, {
+        onPage: (page, restored) => {
+          if (!current(context)) return;
+          conversation = page.conversation;
+          messages = restored;
+          hasMore = page.has_more;
+          reading = false;
+          historyError = null;
+          if (attempt && attempt.conversationId !== conversation.id) {
+            storageBlocked = true;
+            sendError = 'The saved send belongs to another conversation. It has not been replaced.';
+          }
+        },
+        onStatus: status => {
+          if (!current(context)) return;
+          connectionState = status;
+          if (status === 'closed') {
+            reading = false;
+            if (!conversation) historyError = 'Conversation connection is unavailable. Confirm your session and viewing permissions, then refresh.';
+          }
+        },
+        onError: error => {
+          if (!current(context)) return;
+          historyError = error.message;
+          reading = false;
+          if ([401, 403, 404].includes(error.status ?? 0)) withdrawAccess(context);
+        },
+      }, listener => workspaceMultiplexer(scope.workspaceId).connectMessaging(listener));
       const unsubscribe = browserSession.subscribe(() => {
         // A withdrawn request keeps its actual failure; an aborted fetch is not an Account change.
         if (active !== context || context.controller.signal.aborted) return;
@@ -85,9 +114,6 @@
       return () => {
         context.controller.abort();
         if (active === context) active = null;
-        clearInterval(timer);
-        window.removeEventListener('online', reconnect);
-        document.removeEventListener('visibilitychange', reconnect);
         unsubscribe();
       };
     });
@@ -97,20 +123,9 @@
     if (!context || !current(context) || reading || inaccessible) return;
     reading = true;
     try {
-      const opened = conversation ?? await openSubjectConversation(fetch, context.scope, context.controller.signal);
+      await context.client?.refresh();
       if (!current(context)) return;
-      if (attempt && attempt.conversationId !== opened.id) {
-        storageBlocked = true;
-        sendError = 'The saved send belongs to another conversation. It has not been replaced.';
-      }
-      const after = messages.at(-1)?.sequence ?? 0;
-      const page = await getConversationPage(fetch, context.scope, opened.id, after, context.controller.signal);
-      if (!current(context)) return;
-      // POSTのmessageをcursorにしない。先行する未読の公開返信を飛ばさない。
-      conversation = page.conversation;
-      messages = appendConversationMessages(messages, page.messages);
-      hasMore = page.has_more;
-      historyError = null;
+      // onPage clears history errors only after a confirmed snapshot, including resubscription.
     } catch (error) {
       if (!current(context)) return;
       historyError = error instanceof ConversationApiError ? error.message : 'Conversation history could not be loaded.';
@@ -123,10 +138,10 @@
   async function send(retry = false): Promise<void> {
     const context = active;
     if (!context || !current(context) || sending || inaccessible || storageBlocked || !conversation) return;
-    if (!retry && (attempt || !draft.trim() || draftBytes > CHAT_LIMITS.maxTextBytes)) return;
+    if (!retry && (attempt || !chatHasText(draft) || draftBytes > CHAT_LIMITS.maxTextBytes)) return;
     const request = retry ? attempt : Object.freeze({ conversationId: conversation.id, operationId: crypto.randomUUID(), text: draft, replyTo: null, workRef: null });
     if (!request || request.conversationId !== conversation.id) return;
-    // 同期保存が成功するまでPOSTしない。unknownでの編集や再訪でも同じ全入力を使う。
+    // 同期保存が成功するまで送信しない。unknownでの編集や再訪でも同じ全入力を使う。
     try { saveConversationAttempt(sessionStorage, context.scope, request); }
     catch { storageBlocked = true; sendError = 'Send input could not be retained safely. Nothing new was dispatched.'; return; }
     attempt = request;
@@ -135,7 +150,7 @@
     delivery = null;
     sendError = null;
     try {
-      const response = await sendConversationInput(fetch, context.scope, request, context.controller.signal);
+      const response = await context.client!.post(request);
       if (!current(context)) return;
       delivery = response.delivery;
       if (response.delivery.state === 'accepted') {
@@ -147,7 +162,7 @@
           sendError = 'Runtime accepted this input, but its local retry record could not be cleared. No new send will be started.';
         }
       }
-      void refresh(context);
+      // The committed subscription page, not this ACK, advances the history cursor.
     } catch (error) {
       if (!current(context)) return;
       sendError = error instanceof ConversationApiError ? error.message : 'Send outcome unknown. Keep the saved request.';
@@ -193,6 +208,7 @@
     <h2>Conversation</h2>
     {#if !inaccessible}<button class="workspace-secondary-button" type="button" onclick={() => refresh()} disabled={reading}>{reading ? 'Loading history…' : 'Refresh history'}</button>{/if}
   </header>
+  <p class="muted" role="status">Conversation connection: {connectionState === 'open' ? 'connected' : connectionState === 'connecting' ? 'reconnecting' : 'disconnected — history is the last confirmed observation'}</p>
   {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
   {#if !conversation && !historyError && !inaccessible}<p role="status">Loading conversation…</p>{/if}
   <ol aria-label="Saved public messages">
@@ -218,14 +234,14 @@
     <p>Retry uses the same ID and full input. Runtime duplicate suppression has bounded receipt retention; it is not an indefinite delivery guarantee.</p>
     {#if !inaccessible && !storageBlocked}<button class="workspace-secondary-button" type="button" onclick={() => send(true)} disabled={sending || !conversation}>Retry same input</button>{/if}
   {/if}
-  {#if !inaccessible}
+  {#if !inaccessible && conversation}
     <form onsubmit={(event) => { event.preventDefault(); void send(); }}>
       <label for="subject-conversation-input">Message to {subjectName}</label>
       <textarea id="subject-conversation-input" bind:value={draft} rows="4" aria-describedby="conversation-constraint"></textarea>
       <p id="conversation-constraint">Text only, up to {CHAT_LIMITS.maxTextBytes} UTF-8 bytes. Attachments are not supported.</p>
       {#if draftBytes > CHAT_LIMITS.maxTextBytes}<p class="error">The message exceeds the text limit.</p>{/if}
       {#if attempt}<p>Resolve the retained send before sending another message. Your next draft remains editable.</p>{/if}
-      <button class="workspace-secondary-button" type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !draft.trim() || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
+      <button class="workspace-secondary-button" type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !chatHasText(draft) || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
     </form>
   {/if}
 </section>

@@ -135,6 +135,7 @@ pub(super) async fn receive(
             Ok((message, conversation.subject_id, reference))
         })
         .await?;
+    let _ = api.chat_changes.send(message.conversation_id.clone());
     // Delivery identity and authenticated provenance stay in the transport envelope.
     // The model needs only a resolvable conversation and the public message content.
     #[derive(serde::Serialize)]
@@ -162,7 +163,18 @@ pub(super) async fn receive(
                 .current_worker_singleton_owner(&workspace, &key)?
                 .map(|lease| lease.worker))
         })
-        .await?;
+        .await;
+    let target = match target {
+        Ok(target) => target,
+        Err(_) => {
+            return Ok(ChatReceiveResponse {
+                message,
+                delivery: ChatDelivery::Unavailable {
+                    detail: "Message saved; current body delivery could not be resolved".into(),
+                },
+            });
+        }
+    };
     let delivery = if let Some(target) = target {
         let attempt = async {
             let worker =
@@ -336,7 +348,9 @@ async fn worker_operation_inner(
     #[cfg(test)] before_feature: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)] before_host: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> ApiResult<ChatWorkerResponse> {
-    api.host_executors
+    let changes = api.chat_changes.clone();
+    let response = api
+        .host_executors
         .feature()?
         .run(move || -> ApiResult<_> {
             validate_workspace_scope(&api, &workspace)?;
@@ -452,5 +466,132 @@ async fn worker_operation_inner(
                 })
                 .map_err(domain)?
         })
+        .await?;
+    if let ChatWorkerResponse::Sent { message } = &response {
+        let _ = changes.send(message.conversation_id.clone());
+    }
+    Ok(response)
+}
+
+impl WorkspaceApi {
+    pub(crate) fn messaging_changes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.chat_changes.subscribe()
+    }
+
+    async fn messaging_context(
+        &self,
+        authority: &WorkerOperationContext,
+    ) -> ApiResult<ServerRequestContext> {
+        let WorkerOperationContext::Browser { headers, .. } = authority else {
+            return Err(Error::WorkspacePermissionDenied(
+                "messaging requires an Account connection".into(),
+            )
+            .into());
+        };
+        authority.authorize_workspace_read(self).await?;
+        let actor = resolve_actor(&ServerAuthApi::from(self), headers).await?;
+        Ok(server_request_context(
+            actor,
+            None,
+            None,
+            headers
+                .get(ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            headers,
+        ))
+    }
+
+    pub(crate) async fn messaging_page(
+        &self,
+        authority: &WorkerOperationContext,
+        selector: &MessagingSelector,
+    ) -> std::result::Result<ChatMessagePage, u16> {
+        self.messaging_page_inner(
+            authority,
+            selector,
+            ChatMessagePageQuery {
+                after_sequence: Some(selector.after_sequence),
+                limit: Some(CHAT_MAX_PAGE_LIMIT),
+            },
+        )
         .await
+        .map_err(|error| api_error_status(&error.error).as_u16())
+    }
+
+    async fn messaging_page_inner(
+        &self,
+        authority: &WorkerOperationContext,
+        selector: &MessagingSelector,
+        query: ChatMessagePageQuery,
+    ) -> ApiResult<ChatMessagePage> {
+        let context = self.messaging_context(authority).await?;
+        let page = messages(
+            self.clone(),
+            context,
+            self.workspace_id().into(),
+            selector.conversation_id.clone(),
+            query,
+        )
+        .await?;
+        if page.conversation.subject_id != selector.subject_id
+            || page.conversation.id != selector.conversation_id
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "messaging selector does not match conversation".into(),
+            )
+            .into());
+        }
+        Ok(page)
+    }
+
+    pub(crate) async fn messaging_command(
+        &self,
+        authority: &WorkerOperationContext,
+        command: MessagingCommand,
+    ) -> MessagingResult {
+        let result: ApiResult<MessagingResult> = async {
+            let context = self.messaging_context(authority).await?;
+            let workspace = self.workspace_id().to_owned();
+            match command {
+                MessagingCommand::Open { request } => {
+                    create(self.clone(), context, workspace, request)
+                        .await
+                        .map(|conversation| MessagingResult::Opened { conversation })
+                }
+                MessagingCommand::History { selector, query } => self
+                    .messaging_page_inner(authority, &selector, query)
+                    .await
+                    .map(|page| MessagingResult::History { page }),
+                MessagingCommand::Post { selector, request } => {
+                    self.messaging_page_inner(
+                        authority,
+                        &selector,
+                        ChatMessagePageQuery {
+                            after_sequence: Some(selector.after_sequence),
+                            limit: Some(1),
+                        },
+                    )
+                    .await?;
+                    receive(
+                        self.clone(),
+                        context,
+                        workspace,
+                        selector.conversation_id,
+                        request,
+                    )
+                    .await
+                    .map(|response| MessagingResult::Saved { response })
+                }
+                _ => Err(Error::InvalidInput(
+                    "subscription command must be connection-owned".into(),
+                )
+                .into()),
+            }
+        }
+        .await;
+        result.unwrap_or_else(|error| MessagingResult::Rejected {
+            status: api_error_status(&error.error).as_u16(),
+        })
+    }
 }

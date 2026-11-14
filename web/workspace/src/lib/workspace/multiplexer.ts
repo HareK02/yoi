@@ -4,6 +4,7 @@
  * 正常なsubscription_closedは対象subscriptionだけを終了または再購読する。
  * 送信Methodの実行時decodeと意味検査はRust Serverが所有する。
  */
+import type { MessagingCommand, MessagingEvent, MessagingResponse, MessagingResult } from "#lib/generated/chat-api.ts";
 import { browser } from "$app/env";
 import type {
   EventSubscriptionSelector,
@@ -43,6 +44,18 @@ export type WorkspaceMultiplexerSubscription = {
   sendWorkerMethod(method: Method): void;
 };
 
+import type { WorkspaceMessagingConnection } from "./messaging-transport.ts";
+type MessagingListener = {
+  onEvent(event: MessagingEvent): void;
+  onStatus(status: "connecting" | "open" | "closed", failure?: WorkspaceMultiplexerFailure): void;
+};
+type PendingMessaging = {
+  clientId: string;
+  command: MessagingCommand;
+  resolve(result: MessagingResult): void;
+  reject(): void;
+};
+
 const multiplexers = new Map<string, WorkspaceMultiplexer>();
 const INVALID_PROTOCOL_CLOSE_CODE = 4002;
 let nextMultiplexerSequence = 0;
@@ -75,6 +88,9 @@ export class WorkspaceMultiplexer {
   readonly #subscriptions = new Map<string, ActiveSubscription>();
   readonly #requests = new Map<string, string>();
   readonly #runtimeSubscriptions = new Map<string, string>();
+  readonly #messaging = new Map<string, MessagingListener>();
+  readonly #messagingRequests = new Map<string, PendingMessaging>();
+  readonly #messagingSubscriptions = new Map<string, string>();
   #socket: WebSocket | null = null;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #disconnectFailure: WorkspaceMultiplexerFailure | null = null;
@@ -110,13 +126,65 @@ export class WorkspaceMultiplexer {
     };
   }
 
+  connectMessaging(listener: MessagingListener): WorkspaceMessagingConnection {
+    const clientId = nextMultiplexerId("client");
+    this.#messaging.set(clientId, listener);
+    this.#closed = false;
+    if (this.#socket?.readyState === WebSocket.OPEN) {
+      queueMicrotask(() => { if (this.#messaging.has(clientId)) listener.onStatus("open"); });
+    } else this.#ensureConnected();
+    return {
+      request: (command, signal) => this.#messagingRequest(clientId, command, signal),
+      close: () => {
+        for (const [id, owner] of this.#messagingSubscriptions) {
+          if (owner !== clientId) continue;
+          if (this.#socket?.readyState === WebSocket.OPEN) this.#send({ protocol_version: 2, frame: "messaging_request", message: { request_id: nextMultiplexerId("request"), command: { kind: "unsubscribe", subscription_id: id } } });
+          this.#messagingSubscriptions.delete(id);
+        }
+        for (const pending of this.#messagingRequests.values()) if (pending.clientId === clientId) pending.reject();
+        this.#messaging.delete(clientId);
+        if (!this.#hasClients()) this.dispose();
+      },
+    };
+  }
+
+  #hasClients(): boolean { return this.#subscriptions.size > 0 || this.#messaging.size > 0; }
+
+  #messagingRequest(clientId: string, command: MessagingCommand, signal: AbortSignal): Promise<MessagingResult> {
+    if (!this.#messaging.has(clientId) || signal.aborted || this.#socket?.readyState !== WebSocket.OPEN || this.#messagingRequests.size >= 128) return Promise.reject(new Error("Messaging outcome unknown"));
+    const requestId = nextMultiplexerId("request");
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); signal.removeEventListener("abort", fail); this.#messagingRequests.delete(requestId); };
+      const fail = () => { cleanup(); reject(new Error("Messaging outcome unknown")); };
+      const timer = setTimeout(fail, 15000);
+      signal.addEventListener("abort", fail, { once: true });
+      this.#messagingRequests.set(requestId, { clientId, command, resolve: result => { cleanup(); resolve(result); }, reject: fail });
+      this.#send({ protocol_version: 2, frame: "messaging_request", message: { request_id: requestId, command } });
+    });
+  }
+
+  #receiveMessaging(response: MessagingResponse): void {
+    const pending = this.#messagingRequests.get(response.request_id);
+    if (!pending) {
+      if (response.result.kind === "subscribed") this.#send({ protocol_version: 2, frame: "messaging_request", message: { request_id: nextMultiplexerId("request"), command: { kind: "unsubscribe", subscription_id: response.result.subscription_id } } });
+      return;
+    }
+    const result = response.result;
+    if (result.kind === "subscribed") {
+      if (pending.command.kind !== "subscribe" || result.selector.subject_id !== pending.command.selector.subject_id || result.selector.conversation_id !== pending.command.selector.conversation_id || result.selector.after_sequence !== pending.command.selector.after_sequence) { this.#rejectInboundFrame(); return; }
+      this.#messagingSubscriptions.set(result.subscription_id, pending.clientId);
+    } else if (result.kind === "unsubscribed") this.#messagingSubscriptions.delete(result.subscription_id);
+    pending.resolve(result);
+  }
+
   #ensureConnected(): void {
     if (
-      !browser || this.#socket || this.#closed || this.#subscriptions.size === 0
+      !browser || this.#socket || this.#closed || !this.#hasClients()
     ) return;
     for (const subscription of this.#subscriptions.values()) {
       subscription.listener.onStatus?.("connecting");
     }
+    for (const listener of this.#messaging.values()) listener.onStatus("connecting");
     const url = new URL(
       workspaceApiPath(this.#workspaceId, "/protocol/ws"),
       window.location.origin,
@@ -126,6 +194,7 @@ export class WorkspaceMultiplexer {
     this.#socket = socket;
     socket.addEventListener("open", () => {
       if (this.#socket !== socket) return;
+      for (const listener of this.#messaging.values()) listener.onStatus("open");
       for (const subscription of this.#subscriptions.values()) {
         subscription.listener.onStatus?.("open");
         this.#sendSubscribe(subscription);
@@ -147,6 +216,9 @@ export class WorkspaceMultiplexer {
         message: "Workspace subscription disconnected",
       };
       this.#disconnectFailure = null;
+      for (const pending of this.#messagingRequests.values()) pending.reject();
+      this.#messagingSubscriptions.clear();
+      for (const listener of this.#messaging.values()) listener.onStatus("closed", failure);
       this.#requests.clear();
       this.#runtimeSubscriptions.clear();
       for (const subscription of this.#subscriptions.values()) {
@@ -154,7 +226,7 @@ export class WorkspaceMultiplexer {
         subscription.subscriptionId = null;
         subscription.listener.onStatus?.("closed", failure);
       }
-      if (!this.#closed && this.#subscriptions.size > 0) {
+      if (!this.#closed && this.#hasClients()) {
         this.#reconnectTimer = setTimeout(() => this.#ensureConnected(), 500);
       }
     });
@@ -181,6 +253,13 @@ export class WorkspaceMultiplexer {
       return;
     }
     const frame = decoded.value;
+    if (frame.frame === "messaging_response") { this.#receiveMessaging(frame.message); return; }
+    if (frame.frame === "messaging_event") {
+      const clientId = this.#messagingSubscriptions.get(frame.message.subscription_id);
+      if (clientId) this.#messaging.get(clientId)?.onEvent(frame.message);
+      if (frame.message.kind === "closed") this.#messagingSubscriptions.delete(frame.message.subscription_id);
+      return;
+    }
     if (frame.frame === "response" && frame.message.result === "subscribed") {
       const clientId = this.#requests.get(frame.message.payload.request_id);
       const subscription = clientId
@@ -292,7 +371,7 @@ export class WorkspaceMultiplexer {
       });
       this.#runtimeSubscriptions.delete(subscription.subscriptionId);
     }
-    if (this.#subscriptions.size === 0) {
+    if (!this.#hasClients()) {
       this.#closed = true;
       if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
       this.#socket?.close();
@@ -306,6 +385,10 @@ export class WorkspaceMultiplexer {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
     }
+    for (const pending of this.#messagingRequests.values()) pending.reject();
+    for (const listener of this.#messaging.values()) listener.onStatus("closed");
+    this.#messaging.clear();
+    this.#messagingSubscriptions.clear();
     this.#subscriptions.clear();
     this.#requests.clear();
     this.#runtimeSubscriptions.clear();

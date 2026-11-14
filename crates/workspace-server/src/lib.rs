@@ -70,6 +70,7 @@ pub mod worker_source;
 pub mod workspace_catalog;
 mod workspace_deletion;
 mod workspace_drive_host;
+mod workspace_messaging;
 pub mod workspace_signing_identity;
 mod workspace_subscription;
 

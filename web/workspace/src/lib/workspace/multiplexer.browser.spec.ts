@@ -261,3 +261,68 @@ test('valid subscription closure remains isolated and resubscribes only its sele
   expect(socket.closes).toEqual([]);
   multiplexer.dispose();
 });
+
+test('messaging and Worker subscriptions share one socket and terminate independently', async () => {
+  const multiplexer = new WorkspaceMultiplexer('workspace-messaging');
+  const worker = multiplexer.subscribe({ topic: 'workspace_workers' }, { onFrame: vi.fn() });
+  const onEvent = vi.fn(); const onStatus = vi.fn();
+  const chat = multiplexer.connectMessaging({ onEvent, onStatus });
+  const socket = FakeWebSocket.instances[0]; socket.open();
+  expect(FakeWebSocket.instances).toHaveLength(1);
+  const selector = { subject_id: 's', conversation_id: 'c', after_sequence: 0 };
+  const pending = chat.request({ kind: 'subscribe', selector }, new AbortController().signal);
+  const request = JSON.parse(socket.sent.at(-1)!);
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'messaging_response', message: { request_id: request.message.request_id, result: { kind: 'subscribed', subscription_id: 'chat-1', selector, page: { conversation: { id: 'c', subject_id: 's', participant_account_id: 'a', last_user_message_id: null }, messages: [], has_more: false } } } }));
+  expect((await pending).kind).toBe('subscribed');
+  worker.close(); expect(socket.closes).toEqual([]);
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'messaging_event', message: { kind: 'closed', subscription_id: 'chat-1', reason: 'lagged' } }));
+  expect(onEvent).toHaveBeenCalledWith({ kind: 'closed', subscription_id: 'chat-1', reason: 'lagged' });
+  expect(socket.closes).toEqual([]);
+  chat.close(); expect(socket.closes).toEqual([[undefined, undefined]]);
+});
+
+test('messaging-only disconnect reconnects and an aborted late subscribe is explicitly released', async () => {
+  vi.useFakeTimers();
+  const multiplexer = new WorkspaceMultiplexer('messaging-reconnect');
+  const chat = multiplexer.connectMessaging({ onEvent: vi.fn(), onStatus: vi.fn() });
+  const first = FakeWebSocket.instances[0]; first.open(); first.close();
+  vi.advanceTimersByTime(500);
+  const socket = FakeWebSocket.instances[1]; expect(socket).toBeDefined(); socket.open();
+  const controller = new AbortController();
+  const selector = { subject_id: 's', conversation_id: 'c', after_sequence: 0 };
+  const pending = chat.request({ kind: 'subscribe', selector }, controller.signal);
+  const request = JSON.parse(socket.sent.at(-1)!);
+  controller.abort(); await expect(pending).rejects.toThrow('outcome unknown');
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'messaging_response', message: { request_id: request.message.request_id, result: { kind: 'subscribed', subscription_id: 'orphan', selector, page: { conversation: { id: 'c', subject_id: 's', participant_account_id: 'a', last_user_message_id: null }, messages: [], has_more: false } } } }));
+  expect(JSON.parse(socket.sent.at(-1)!).message.command).toEqual({ kind: 'unsubscribe', subscription_id: 'orphan' });
+  chat.close();
+});
+
+test('a timed-out messaging subscribe cleans up its late ACK and a fresh subscribe remains live beside Workers', async () => {
+  vi.useFakeTimers();
+  const mux = new WorkspaceMultiplexer('workspace-messaging-timeout');
+  const workerFrames = vi.fn();
+  mux.subscribe({ topic: 'workspace_workers' }, { onFrame: workerFrames, onStatus: vi.fn() });
+  const events = vi.fn();
+  const lane = mux.connectMessaging({ onEvent: events, onStatus: vi.fn() });
+  const socket = FakeWebSocket.instances[0]; socket.open();
+  const selector = { subject_id: 's', conversation_id: 'c', after_sequence: 0 };
+  const expired = lane.request({ kind: 'subscribe', selector }, new AbortController().signal);
+  const outcome = expect(expired).rejects.toThrow('Messaging outcome unknown');
+  const old = JSON.parse(socket.sent.at(-1)!);
+  await vi.advanceTimersByTimeAsync(15001); await outcome;
+  const page = { conversation: { id: 'c', subject_id: 's', participant_account_id: 'a', last_user_message_id: null }, messages: [], has_more: false };
+  const subscribed = (request_id: string, subscription_id: string) => ({ protocol_version: 2, frame: 'messaging_response', message: { request_id, result: { kind: 'subscribed', selector, subscription_id, page } } });
+  socket.message(JSON.stringify(subscribed(old.message.request_id, 'orphan')));
+  expect(JSON.parse(socket.sent.at(-1)!).message.command).toEqual({ kind: 'unsubscribe', subscription_id: 'orphan' });
+  const fresh = lane.request({ kind: 'subscribe', selector }, new AbortController().signal);
+  const next = JSON.parse(socket.sent.at(-1)!);
+  socket.message(JSON.stringify(subscribed(next.message.request_id, 'fresh'))); await fresh;
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'messaging_event', message: { kind: 'messages', subscription_id: 'fresh', page } }));
+  expect(events).toHaveBeenCalledOnce();
+  expect(socket.closes).toEqual([]); expect(FakeWebSocket.instances).toHaveLength(1);
+  const workers = JSON.parse(socket.sent[0]);
+  socket.message(JSON.stringify({ protocol_version: 2, frame: 'response', message: { result: 'subscribed', payload: { request_id: workers.message.params.request_id, subscription_id: 'workers', selector: { topic: 'workspace_workers' }, snapshot: { topic: 'workers', data: { workers: [] } } } } }));
+  expect(workerFrames).toHaveBeenCalledOnce();
+  mux.dispose();
+});
