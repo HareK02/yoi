@@ -460,12 +460,12 @@ where
                 WorkerError::RestoreCandidateClosing,
             ));
         }
-        // Preparation's read-only authorization is not a publication grant.
-        // Revalidate current Host authority after commit, before effects/input,
-        // including a publication retry on this same private Controller.
+        // Recheck local attribution consistency before applying saved state.
+        // Controller restoration does not register or authorize the Session again;
+        // current authority remains an operation-time concern.
         initialized
             .worker
-            .validate_subjektiv_body_publication()
+            .validate_saved_subjektiv_attribution()
             .map_err(WorkerBootstrapError::Worker)?;
         if !self.effects_applied {
             self.activation_failed = true;

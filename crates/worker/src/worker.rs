@@ -9547,10 +9547,10 @@ fn worker_language(cfg: &manifest::EngineManifest) -> &str {
 }
 
 impl<C: LlmClient + 'static, St: Store + WorkerMetadataStore> Worker<C, St> {
-    /// Revalidate current body authority before Controller initialization. Historical
-    /// attribution is not a publication grant, and denial must not rewrite it.
-    /// This verification never creates attribution or fetches startup Journal context.
-    pub(crate) fn validate_subjektiv_body_publication(&self) -> Result<(), WorkerError> {
+    /// Check saved Session attribution without contacting the Host. Restoring a
+    /// Controller reconstructs existing state, not current Subject authority.
+    /// Protected operations check current authority at their own boundaries.
+    pub(crate) fn validate_saved_subjektiv_attribution(&self) -> Result<(), WorkerError> {
         if self
             .backend_job()
             .is_some_and(crate::BackendJobExecutionBinding::has_subjektiv_job_grant)
@@ -9580,19 +9580,9 @@ impl<C: LlmClient + 'static, St: Store + WorkerMetadataStore> Worker<C, St> {
                 "body publication requires separately confirmed Session attribution".into(),
             ));
         };
-        let connection = self
-            .subjektiv_host_connection()
-            .map_err(|error| denied(error.to_string()))?
-            .ok_or_else(|| {
-                denied("body publication requires authenticated Host authority".into())
-            })?;
-        let output = connection
-            .host
-            .record_session(&connection.context, false)
-            .map_err(|error| denied(error.to_string()))?;
-        if output.session_id != session_id.to_string() || output.subject_id != *subject_id {
+        if subject_id.trim().is_empty() || subject_id.chars().any(char::is_control) {
             return Err(denied(
-                "Host publication authorization does not match retained Session and Subject".into(),
+                "saved Session attribution has an invalid Subject identity".into(),
             ));
         }
         Ok(())
@@ -13863,7 +13853,7 @@ status: 200,
                 worker
                     .finalize_subjektiv_session_attribution(true, lifecycle)
                     .unwrap();
-                worker.validate_subjektiv_body_publication().unwrap();
+                worker.validate_saved_subjektiv_attribution().unwrap();
             }
             assert!(client.requests.lock().unwrap().is_empty());
             assert!(
@@ -21157,9 +21147,6 @@ permission = "write"
         Allowed,
         Denied,
         Unavailable,
-        WrongSession,
-        WrongSubject,
-        MissingHost,
     }
 
     #[derive(Default)]
@@ -21224,14 +21211,13 @@ permission = "write"
                 .lock()
                 .unwrap()
                 .push((context.clone(), create_if_missing));
-            let mut output = server_api::SubjektivRecordSessionResponse {
+            let output = server_api::SubjektivRecordSessionResponse {
                 subject_id: "publication-subject".into(),
                 session_id: context.session_id.clone(),
             };
             if !create_if_missing {
                 match *self.authorization.lock().unwrap() {
-                    BodyPublicationAuthorization::Allowed
-                    | BodyPublicationAuthorization::MissingHost => {}
+                    BodyPublicationAuthorization::Allowed => {}
                     BodyPublicationAuthorization::Denied => {
                         return Err(crate::subjektiv::SubjektivHostError::Conflict {
                             code: "body_disconnected".into(),
@@ -21242,12 +21228,6 @@ permission = "write"
                         return Err(crate::subjektiv::SubjektivHostError::Unavailable(
                             "current authority unavailable".into(),
                         ));
-                    }
-                    BodyPublicationAuthorization::WrongSession => {
-                        output.session_id = "other-session".into();
-                    }
-                    BodyPublicationAuthorization::WrongSubject => {
-                        output.subject_id = "other-subject".into();
                     }
                 }
             }
@@ -21370,24 +21350,16 @@ permission = "write"
         controller.controller_task.await.unwrap();
     }
 
-    // Production Direct/runtime-managed Controller bootstrap and FsStore; only
-    // the Host boundary and model are replaced. Host-side races are not claimed.
+    // Real bootstrap and persisted metadata; the Host and model are external fixtures.
     #[tokio::test]
-    async fn confirmed_body_publication_denial_preserves_attribution_without_controller_initialization()
-     {
+    async fn controller_rejects_inconsistent_saved_attribution_without_host_verification() {
         for runtime_managed in [false, true] {
-            for authorization in [
-                BodyPublicationAuthorization::Denied,
-                BodyPublicationAuthorization::Unavailable,
-                BodyPublicationAuthorization::WrongSession,
-                BodyPublicationAuthorization::WrongSubject,
-                BodyPublicationAuthorization::MissingHost,
-            ] {
+            for case in ["wrong-session", "empty-subject", "unconfirmed"] {
                 let temp = tempfile::tempdir().unwrap();
                 let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
                 let (manifest, store) = body_publication_fixture(&temp);
                 let host = Arc::new(BodyPublicationHost::default());
-                let mut prepared = body_publication_bootstrap(
+                let prepared = body_publication_bootstrap(
                     &temp,
                     manifest.clone(),
                     store.clone(),
@@ -21398,23 +21370,31 @@ permission = "write"
                 .await
                 .unwrap();
                 let session = prepared.worker().session_id();
+                store
+                    .update_by_name(&manifest.worker.name, |metadata| {
+                        metadata.subjektiv_session_attribution = Some(match case {
+                            "wrong-session" => SubjektivSessionAttributionState::Confirmed {
+                                session_id: session_store::new_session_id(),
+                                subject_id: "publication-subject".into(),
+                            },
+                            "empty-subject" => SubjektivSessionAttributionState::Confirmed {
+                                session_id: session,
+                                subject_id: "".into(),
+                            },
+                            _ => SubjektivSessionAttributionState::OutcomeUnknown {
+                                session_id: session,
+                                diagnostic: "registration interrupted".into(),
+                            },
+                        });
+                    })
+                    .unwrap();
                 let before = store.read_by_name(&manifest.worker.name).unwrap().unwrap();
-                assert!(matches!(
-                    before.subjektiv_session_attribution,
-                    Some(SubjektivSessionAttributionState::Confirmed { .. })
-                ));
-                *host.authorization.lock().unwrap() = authorization;
-                let missing_host =
-                    matches!(authorization, BodyPublicationAuthorization::MissingHost);
-                if missing_host {
-                    prepared.worker_mut().bind_subjektiv_host(None);
-                }
                 let error = match prepared.start().await {
                     Err(crate::WorkerBootstrapError::Controller { source, .. }) => source,
-                    Err(other) => panic!("expected publication rejection, got {other:?}"),
+                    Err(other) => panic!("expected local attribution failure, got {other:?}"),
                     Ok(controller) => {
                         stop_body_publication_controller(controller).await;
-                        panic!("denied body was exposed");
+                        panic!("inconsistent saved attribution was exposed");
                     }
                 };
                 assert!(error.to_string().contains("publication_denied"));
@@ -21428,19 +21408,18 @@ permission = "write"
                 assert!(!temp.path().join("runtime").exists());
                 assert_eq!(host.startup_calls.load(Ordering::SeqCst), 0);
                 let calls = host.calls.lock().unwrap();
-                assert_eq!(calls.len(), if missing_host { 1 } else { 2 });
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "only initial Session registration may call the Host"
+                );
                 assert!(calls[0].1);
-                if !missing_host {
-                    assert!(!calls[1].1);
-                    assert_eq!(calls[1].0.worker_id, manifest.worker.name);
-                    assert_eq!(calls[1].0.session_id, session.to_string());
-                }
             }
         }
     }
 
     #[tokio::test]
-    async fn normal_restore_revalidates_current_body_authority_without_refetching_empty_startup() {
+    async fn normal_restore_uses_saved_attribution_without_host_registration_or_startup_fetch() {
         let temp = tempfile::tempdir().unwrap();
         let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
         let (manifest, store) = body_publication_fixture(&temp);
@@ -21471,14 +21450,12 @@ permission = "write"
         stop_body_publication_controller(controller).await;
         assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
         host.startup_unavailable.store(true, Ordering::SeqCst);
-        for allowed in [true, false] {
-            *host.authorization.lock().unwrap() = if allowed {
-                BodyPublicationAuthorization::Allowed
-            } else {
-                BodyPublicationAuthorization::Denied
-            };
+        for authorization in [
+            BodyPublicationAuthorization::Unavailable,
+            BodyPublicationAuthorization::Denied,
+        ] {
+            *host.authorization.lock().unwrap() = authorization;
             let calls_before = host.calls.lock().unwrap().len();
-            let before = store.read_all(session, segment).unwrap();
             let attribution = store
                 .read_by_name(&manifest.worker.name)
                 .unwrap()
@@ -21499,37 +21476,30 @@ permission = "write"
                 calls_before,
                 "finalization of historical Confirmed attribution remains separate"
             );
-            let result = prepared.start().await;
-            let calls = host.calls.lock().unwrap().clone();
-            assert_eq!(calls.len(), calls_before + 1);
-            assert!(!calls.last().unwrap().1);
+            let controller = prepared.start().await.unwrap();
+            assert_eq!(
+                host.calls.lock().unwrap().len(),
+                calls_before,
+                "restoring saved attribution must not depend on Host availability or re-registration permission"
+            );
             assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
-            if allowed {
-                let controller = result.unwrap();
-                let entries = controller.handle.committed_entries();
-                let saved = entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        LogEntry::AnnotatedSystemItem { entry, .. }
-                            if input_schema(entry) == Some("journal:startup") =>
-                        {
-                            Some(&entry.item)
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    serde_json::to_value(saved).unwrap(),
-                    serde_json::to_value(&saved_startup).unwrap()
-                );
-                stop_body_publication_controller(controller).await;
-            } else {
-                assert!(result.is_err());
-                assert_eq!(
-                    serde_json::to_value(store.read_all(session, segment).unwrap()).unwrap(),
-                    serde_json::to_value(before).unwrap()
-                );
-            }
+            let entries = controller.handle.committed_entries();
+            let saved = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    LogEntry::AnnotatedSystemItem { entry, .. }
+                        if input_schema(entry) == Some("journal:startup") =>
+                    {
+                        Some(&entry.item)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                serde_json::to_value(saved).unwrap(),
+                serde_json::to_value(&saved_startup).unwrap()
+            );
+            stop_body_publication_controller(controller).await;
             assert_eq!(
                 store
                     .read_by_name(&manifest.worker.name)

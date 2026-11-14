@@ -1791,8 +1791,8 @@ mod restore_candidate {
                 let expected_startups = usize::from(!materialized);
                 assert_eq!(startup_calls.load(Ordering::SeqCst), expected_startups);
                 assert_eq!(memory_calls.load(Ordering::SeqCst), expected_startups);
-                assert_eq!(calls.load(Ordering::SeqCst), 2 + expected_startups,
-                    "lost receipt retry plus publication verification only for a pending head");
+                assert_eq!(calls.load(Ordering::SeqCst), 2,
+                    "explicit lost-receipt repair only; Controller startup must not reverify attribution");
                 let mut operations = authorization_operations.lock().unwrap().clone();
                 operations.sort();
                 if materialized {

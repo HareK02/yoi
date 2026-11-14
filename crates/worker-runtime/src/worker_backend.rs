@@ -9016,10 +9016,8 @@ mod tests {
             metadata.workspace_id.as_deref(),
             Some("workspace-saved-subjektiv")
         );
-        // Attribution history is already committed. Each new Controller must still
-        // obtain current publication authority, even for a Confirmed Session.
-        // This is a transport fixture for restore/stop component tests, not an
-        // assertion that a real Backend authorized a released Subject body.
+        // Transport for incomplete initial-head repair and subsequent operations.
+        // A normal materialized restore must use the saved attribution instead.
         #[cfg(feature = "http-server")]
         {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10307,10 +10305,32 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(worker_allocation)]
     #[cfg(feature = "http-server")]
-    async fn profile_factory_saved_subjektiv_manifest_survives_restart_and_explicit_restore() {
+    async fn profile_factory_saved_subjektiv_restores_without_server_communication() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store = root.path().join("runtime");
         let mut request = saved_subjektiv_restore_fixture(&runtime_store, true).await;
+        // Replace only the external Server with an unavailable endpoint. Every
+        // request is counted, so ignored errors cannot masquerade as offline restore.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        request.request.workspace_api.as_mut().unwrap().base_url =
+            format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || {
+            let calls = observed_calls.clone();
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        struct AbortServer(tokio::task::AbortHandle);
+        impl Drop for AbortServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server_cleanup = AbortServer(server.abort_handle());
         let worker_name =
             ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&request.worker_ref);
         let aggregate_dir = runtime_store
@@ -10372,6 +10392,13 @@ mod tests {
             );
             request.operation_id = crate::execution::WorkerLifecycleOperationId::new();
         }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "normal restore must not contact the Server"
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
         assert!(!root.path().join("nonexistent-current-profiles").exists());
     }
 

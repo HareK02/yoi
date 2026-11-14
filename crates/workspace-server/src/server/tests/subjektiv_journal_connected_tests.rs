@@ -1860,7 +1860,6 @@ async fn connected_restore_fixture_with_pending_head(
     } else {
         api
     };
-    let store = open_subjektiv_store(&api).unwrap();
     seed_test_delivery_binding(&api);
     let requests = Arc::new(Mutex::new(Vec::new()));
     let observed = requests.clone();
@@ -1973,129 +1972,14 @@ async fn connected_restore_fixture_with_pending_head(
         RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
     };
     if !pending_head {
+        // These tests own attribution reconstruction/repair and live operation
+        // authorization, not model execution or Journal Job completion. A real
+        // zero-input Controller provides the saved head and confirmed attribution.
+        // Pending-input preservation is covered by the Runtime restore suite.
         let handle = probe.handles.lock().unwrap()[0].clone();
-        let mut events = handle.subscribe();
-        handle
-            .send(protocol::Method::submit_text(
-                "setup-running",
-                "hold for queue setup",
-            ))
-            .await
-            .unwrap();
-        restore_auth_event(&mut events, |event| {
-            matches!(event, protocol::Event::TextDelta { .. })
-        })
-        .await;
-        let command = protocol::WorkerCommandEnvelope::new(
-            handle.shared_state.snapshot().last_command_id + 1,
-        );
-        handle
-            .send(protocol::Method::Pause { command })
-            .await
-            .unwrap();
-        restore_auth_event(&mut events, |event| {
-            matches!(event, protocol::Event::WorkerState { snapshot }
-        if snapshot.catalog_status() == protocol::WorkerStatus::Paused)
-        })
-        .await;
-        handle
-            .send(protocol::Method::submit_text(
-                "saved-submit",
-                "must remain queued",
-            ))
-            .await
-            .unwrap();
-        restore_auth_event(&mut events, |event| {
-            matches!(event, protocol::Event::SubmissionAccepted {
-        submission_request_id, disposition: protocol::SubmissionDisposition::Queued, ..
-    } if submission_request_id == "saved-submit")
-        })
-        .await;
-        handle
-            .send(protocol::Method::Notify {
-                notification_request_id: "saved-notice".into(),
-                message: "must remain queued too".into(),
-            })
-            .await
-            .unwrap();
-        restore_auth_event(&mut events, |event| {
-            matches!(event, protocol::Event::NotificationAccepted {
-        notification_request_id
-    } if notification_request_id == "saved-notice")
-        })
-        .await;
         let stopped = connected_stop_worker(&api, &worker).await.unwrap();
         assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
         assert!(handle.protocol_is_closed());
-        // Pause/Shutdown can admit real Journal work for the seed turn. Finish that
-        // owned work before measuring the restore window; it is not restore I/O.
-        let attr = store
-            .subject_session_attributions(&subject.id)
-            .unwrap()
-            .into_iter()
-            .find(|attr| attr.worker_id == worker.worker_id)
-            .unwrap();
-        let host = JournalHostContext::validated_session(&store, attr.clone()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let mut ticks = tokio::time::interval(std::time::Duration::from_millis(25));
-            loop {
-                ticks.tick().await;
-                let jobs = api
-                    .store
-                    .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
-                    .unwrap();
-                let closed = store
-                    .journal_for_session(&host)
-                    .unwrap()
-                    .is_none_or(|journal| {
-                        store
-                            .active_journal_generation(&host, &journal)
-                            .unwrap()
-                            .is_none()
-                    });
-                if closed
-                    && !store.journal_retention_required(&host).unwrap()
-                    && jobs
-                        .iter()
-                        .all(|job| job.state == BackendJobState::Completed)
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            let jobs = api
-                .store
-                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
-                .unwrap();
-            let states: Vec<_> = jobs
-                .iter()
-                .map(|job| {
-                    let attempts = api
-                        .store
-                        .list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id)
-                        .unwrap();
-                    (
-                        job.request.job_id.clone(),
-                        job.state,
-                        job.failure_category.clone(),
-                        attempts
-                            .into_iter()
-                            .map(|a| {
-                                (
-                                    a.state,
-                                    a.worker_cleanup_state,
-                                    a.worker_cleanup_failure_category,
-                                    a.worker_cleanup_failure_detail,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-            panic!("seed Journal work must settle before measuring restore: {states:?}");
-        });
     }
 
     ConnectedRestoreFixture {
@@ -2114,7 +1998,7 @@ async fn connected_restore_fixture_with_pending_head(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publication_or_queue_consumption()
+async fn confirmed_restore_preserves_attribution_with_revoked_host_trust_but_protected_read_rejects()
  {
     use session_store::WorkerMetadataStore as _;
     use std::sync::atomic::Ordering::SeqCst;
@@ -2150,24 +2034,6 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
             .unwrap()
     };
     let before = serde_json::to_value(entries()).unwrap();
-    let checkpoint = entries()
-        .into_iter()
-        .rev()
-        .find_map(|entry| match entry {
-            session_store::LogEntry::Extension {
-                domain, payload, ..
-            } if domain == "worker.pending_activations.v1" => Some(payload),
-            _ => None,
-        })
-        .expect("real Controller persisted pending activation checkpoint");
-    assert_eq!(
-        checkpoint["pending"][0]["submission_request_id"],
-        "saved-submit"
-    );
-    assert_eq!(
-        checkpoint["pending_notifications"][0]["notification_request_id"],
-        "saved-notice"
-    );
     let attributions = store.subject_session_attributions(subject_id).unwrap();
     let key = crate::subjektiv::subject_worker_singleton_key(subject_id).unwrap();
     let singleton = api
@@ -2191,6 +2057,11 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
         ),
         "the same production signer must be accepted before trust revocation"
     );
+    let connection = connected_host_reader(api, &worker, &active.session_id.to_string());
+    tokio::task::spawn_blocking(move || connection.journal_compaction_context())
+        .await
+        .unwrap()
+        .expect("the protected read must succeed before trust revocation");
     requests.lock().unwrap().clear();
     fixture.callbacks.lock().unwrap().clear();
     let runtime = api.runtime.clone();
@@ -2211,16 +2082,10 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
         "preparation must not consume saved input or append history"
     );
     assert_eq!(metadata.read_by_name(&name).unwrap().unwrap(), saved);
-    {
-        let callbacks = fixture.callbacks.lock().unwrap();
-        assert_eq!(
-            callbacks.len(),
-            1,
-            "prepare verifies current Host authority"
-        );
-        assert_eq!(callbacks[0]["create_if_missing"], false);
-        assert_eq!(callbacks[0]["session_id"], active.session_id.to_string());
-    }
+    assert!(
+        fixture.callbacks.lock().unwrap().is_empty(),
+        "normal prepare validates saved attribution without a Session callback"
+    );
     assert_eq!(probe.publications.load(SeqCst), 0);
     assert_eq!(
         store.subject_session_attributions(subject_id).unwrap(),
@@ -2250,17 +2115,12 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
         .unwrap();
     assert_eq!(
         first.state,
-        server_api::WorkerRestoreState::ReconciliationRequired,
-        "{first:?}"
+        server_api::WorkerRestoreState::Accepted,
+        "confirmed Restore must not require live Host trust: {first:?}"
     );
     assert!(
-        requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(path, status)| path.ends_with("/subjektiv/sessions")
-                && *status == StatusCode::UNAUTHORIZED),
-        "actual signed Host publication must see revoked persisted trust"
+        fixture.callbacks.lock().unwrap().is_empty(),
+        "normal publication must not re-register or remotely verify the Session"
     );
     assert_eq!(probe.prepares.load(SeqCst), 1);
     assert_eq!(probe.activations.load(SeqCst), 1);
@@ -2276,11 +2136,16 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
     .unwrap();
     assert_eq!(
         replay.state,
-        server_api::WorkerRestoreState::ReconciliationRequired,
+        server_api::WorkerRestoreState::Accepted,
         "{replay:?}"
     );
-    // Reconciliation may reconstruct after confirmed cleanup, but must never
-    // invent a new operation or repair an already confirmed attribution.
+    assert_eq!(probe.prepares.load(SeqCst), 1);
+    assert_eq!(probe.activations.load(SeqCst), 1);
+    assert!(
+        fixture.callbacks.lock().unwrap().is_empty(),
+        "accepted receipt replay must not contact Session registration either"
+    );
+    // Receipt replay retains the operation and never repairs confirmed attribution.
     assert!(
         probe
             .operations
@@ -2299,8 +2164,8 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
     );
     let worker_ref = worker_runtime::identity::WorkerRef::try_from(&worker).unwrap();
     assert!(
-        execution.worker_snapshot(&worker_ref).is_none(),
-        "no live Controller may be published"
+        execution.worker_snapshot(&worker_ref).is_some(),
+        "confirmed Restore publishes the real Controller despite revoked Host trust"
     );
     assert!(
         requests
@@ -2310,17 +2175,32 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
             .all(|(path, _)| !path.ends_with("/authorization/check")),
         "restoring saved Features must not re-admit them"
     );
-    assert_eq!(probe.publications.load(SeqCst), 0);
+    assert_eq!(probe.publications.load(SeqCst), 1);
     assert_eq!(
         probe.handles.lock().unwrap().len(),
-        1,
-        "only stopped seed Controller existed"
+        2,
+        "one stopped seed Controller and one restored Controller"
     );
-    assert_eq!(model.calls.load(SeqCst), model_before);
-    assert_eq!(
-        serde_json::to_value(entries()).unwrap(),
-        before,
-        "Host denial must not consume either saved queue or execute Tools"
+    // Successful activation may resume saved input. It must not turn the saved
+    // attribution into live authority: the next explicit protected Host read
+    // uses the same signer and Session and must observe the revoked binding.
+    let connection = connected_host_reader(api, &worker, &active.session_id.to_string());
+    assert!(
+        tokio::task::spawn_blocking(move || connection.journal_compaction_context())
+            .await
+            .unwrap()
+            .is_err(),
+        "saved Confirmed attribution must not bypass live Runtime trust"
+    );
+    assert!(
+        requests.lock().unwrap().iter().any(|(path, status)| {
+            path.ends_with("/subjektiv/journal/compaction") && *status == StatusCode::UNAUTHORIZED
+        }),
+        "actual signed protected read must reject the revoked persisted trust"
+    );
+    assert!(
+        fixture.callbacks.lock().unwrap().is_empty(),
+        "protected-operation denial must not retry Session registration"
     );
     assert_eq!(
         metadata
@@ -2340,54 +2220,38 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
             .unwrap(),
         singleton
     );
-    // Activation may already reconcile metadata/pins/allocation. Denial is not a
-    // fictitious rollback/Stopped: the same operation must retain its owner.
+    // The protected-operation denial must not undo the completed Restore or
+    // replace its durable accepted receipt with a reconciliation failure.
     let record: Value =
         serde_json::from_slice(&std::fs::read(aggregate.join("worker.json")).unwrap()).unwrap();
-    assert_eq!(
-        record["restore_guard"]["active_request_id"],
-        "restore-revoked-after-real-prepare"
-    );
+    assert!(record["restore_guard"]["active_request_id"].is_null());
     let owner = &record["restore_guard"]["owners"]["restore-revoked-after-real-prepare"];
     assert_eq!(
         owner["operation_id"], operation,
-        "the durable operation owner must survive denial and replay"
+        "the durable operation identity must survive accepted replay and read denial"
     );
-    assert_eq!(
-        record["execution_state"]["state"],
-        "reconciliation_required"
-    );
-    assert_eq!(
-        record["execution_state"]["execution"]["operation"],
-        "restore"
-    );
-    assert_eq!(
-        record["execution_state"]["execution"]["intent"]["operation_id"],
-        operation
-    );
+    assert_eq!(record["execution_state"]["state"], "available");
     assert!(
-        owner["receipt"].is_null(),
-        "no saved Accepted receipt may escape on replay"
+        !owner["receipt"].is_null(),
+        "successful Restore must retain its Accepted receipt"
     );
-    // Only this fixture's retained operation is cleaned up, after its durable
-    // evidence has been checked. Cleanup is not the restore outcome above.
-    let stop = worker_runtime::execution::WorkerExecutionStopRequest {
-        worker_ref: worker_ref.clone(),
-        operation_id: worker_runtime::execution::WorkerLifecycleOperationId::new(),
-    };
-    let cleanup = execution.stop_worker_operation(stop.clone());
-    assert!(
-        cleanup.is_accepted(),
-        "fixture restore cleanup: {cleanup:?}"
-    );
-    assert!(
-        cleanup
-            .termination
-            .as_ref()
-            .is_some_and(|receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)),
-        "fixture cleanup must join its original prepared owner: {cleanup:?}"
-    );
-    shutdown_workspace_feature_storage(&api).await.unwrap();
+    // Teardown is outside the measured Restore/read window and keeps the Host
+    // reactor runnable while the real restored Controller shuts down.
+    let stopped = connected_stop_worker(api, &worker).await.unwrap();
+    assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+    {
+        let stops = probe.stops.lock().unwrap();
+        let (stop, result) = stops.last().expect("real restored Controller Stop");
+        assert_eq!(stop.worker_ref, worker_ref);
+        assert!(result.is_accepted(), "fixture teardown: {result:?}");
+        assert!(
+            result.termination.as_ref().is_some_and(
+                |receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)
+            ),
+            "fixture cleanup must join the restored owner: {result:?}"
+        );
+    }
+    shutdown_workspace_feature_storage(api).await.unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -2870,12 +2734,15 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
                 .all(|callback| callback["session_id"] == session_id.to_string())
         );
         assert_eq!(
+            callbacks.len(),
+            2,
+            "only the initial registration recovery and its same-operation retry contact the Host"
+        );
+        assert!(
             callbacks
                 .iter()
-                .filter(|callback| callback["create_if_missing"] == true)
-                .count(),
-            2,
-            "repair retries the Session-keyed receipt; publication only verifies it"
+                .all(|callback| callback["create_if_missing"] == true),
+            "confirmed prepare/publication must not add verification callbacks after repair"
         );
     }
     let worker_ref = worker_runtime::identity::WorkerRef::try_from(worker).unwrap();

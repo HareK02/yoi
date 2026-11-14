@@ -725,7 +725,7 @@ impl WorkerController {
     {
         if worker.needs_initial_session_head_materialization() {
             worker
-                .validate_subjektiv_body_publication()
+                .validate_saved_subjektiv_attribution()
                 .map_err(std::io::Error::other)?;
             let registry = SpawnedWorkerRegistry::new_internal(
                 worker.manifest().worker.name.clone(),
@@ -888,7 +888,7 @@ impl WorkerController {
             ));
         }
         worker
-            .validate_subjektiv_body_publication()
+            .validate_saved_subjektiv_attribution()
             .map_err(std::io::Error::other)?;
 
         // === 1. Initialization (channels / RuntimeDir / worker-immutable

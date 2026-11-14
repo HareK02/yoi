@@ -1897,7 +1897,7 @@ enabled = true
         if enabled && attach {
             assert_eq!(
                 *host.attributed.lock().unwrap(),
-                vec![(expected.clone(), true), (expected.clone(), false)]
+                vec![(expected.clone(), true)]
             );
             assert!(
                 host.contexts
