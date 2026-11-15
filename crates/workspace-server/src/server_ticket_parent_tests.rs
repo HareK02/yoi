@@ -14,7 +14,6 @@ async fn parent_link_source(api: &WorkspaceApi) -> RuntimeWorkerRef {
             display_name: "Parent link fixture".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
@@ -334,7 +333,6 @@ async fn parent_reparent_requires_existing_record_and_remove_grants_on_actual_en
             display_name: "Parent linker".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

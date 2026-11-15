@@ -12,7 +12,7 @@ import "./base.dcdl" // {
         subjektiv = { enabled = true; };
         web = { enabled = true; };
         sub_worker = { enabled = true; };
-        worker = { enabled = true; direct_spawn = false; };
+        worker = { enabled = true; direct_spawn = true; };
         manage_workdir = { enabled = true; };
         ticket = { enabled = true; thread = true; workflow = true; };
         merge_request = {
@@ -22,6 +22,5 @@ import "./base.dcdl" // {
             readiness_check = true;
             complete = true;
         };
-        orchestration = { enabled = true; };
     };
 }

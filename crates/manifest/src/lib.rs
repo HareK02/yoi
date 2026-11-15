@@ -180,6 +180,8 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub merge_request: MergeRequestFeatureConfig,
     #[serde(default)]
+    /// Legacy composition bit retained in frozen Profiles/Sessions. It no longer
+    /// installs a module, including when enabled by a saved selection.
     pub orchestration: FeatureFlagConfig,
 }
 

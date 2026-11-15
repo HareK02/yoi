@@ -8,9 +8,7 @@ use std::sync::{
 };
 
 use super::*;
-use crate::feature::builtin::{
-    orchestration::orchestration_feature, worker_observation::WorkerObservationFeature,
-};
+use crate::feature::builtin::worker_observation::WorkerObservationFeature;
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, FeaturePlanError,
     FeatureRegistryBuilder, ServiceDeclaration, ServiceId, ServiceRequirement,
@@ -77,6 +75,7 @@ impl WorkerControlService for TestServices {
         _: WorkerControlSubject,
         _: String,
         _: WorkerControlInputKind,
+        _: Option<Vec<protocol::Segment>>,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         unreachable!("not a consumer operation")
     }
@@ -210,9 +209,7 @@ impl FeatureModule for TestProvider {
 }
 
 fn consumers(services: Arc<TestServices>) -> FeatureRegistryBuilder {
-    FeatureRegistryBuilder::new()
-        .with_module(orchestration_feature())
-        .with_module(WorkerObservationFeature::new(services))
+    FeatureRegistryBuilder::new().with_module(WorkerObservationFeature::new(services))
 }
 
 fn tool(tools: &[ToolDefinition], name: &str) -> Arc<dyn Tool> {
@@ -232,35 +229,6 @@ async fn consumers_install_and_execute_with_contract_only_test_provider() {
         .with_module(TestProvider::new("test-provider", services.clone()))
         .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
     assert!(!report.has_errors(), "{report:?}");
-    let result = tool(&tools, "SpawnTicketWorker").execute(
-        r#"{"ticket_id":"T-788","runtime_id":"runtime-test","profile":"builtin:coder","initial_request":"implement","orchestrator_assignment_id":"delegation-test"}"#,
-        ToolExecutionContext::new("spawn-call", "batch", 0),
-    ).await.unwrap();
-    assert_eq!(result.summary, "Spawned Worker for Ticket T-788");
-    {
-        let requests = services.spawns.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].authorization, Default::default());
-        assert_eq!(requests[0].ticket_id.as_deref(), Some("ticket-internal-id"));
-        assert_eq!(
-            requests[0].orchestrator_assignment_id.as_deref(),
-            Some("delegation-test")
-        );
-        assert_eq!(
-            requests[0].operation_id.as_deref(),
-            Some("spawn-ticket-worker:ticket-internal-id:spawn-call")
-        );
-        assert_eq!(
-            requests[0].initial_submit,
-            vec![
-                Segment::Flow {
-                    selector: "builtin:coder-review".into()
-                },
-                Segment::text("implement")
-            ]
-        );
-    }
-
     let overview = tool(&tools, "ViewSessionOverview");
     let granted = r#"{"subject":{"kind":"sub_worker","name":"child"}}"#;
     overview
@@ -292,8 +260,6 @@ fn consumer_plan_rejections_leave_no_partial_installation() {
         "missing",
         "duplicate",
         "control-version",
-        "lifecycle-version",
-        "ticket-version",
         "cycle",
         "undeclared",
     ] {

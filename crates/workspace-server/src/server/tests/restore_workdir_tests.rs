@@ -18,7 +18,6 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
             display_name: "Restore without providers".into(),
             singleton_key: None,
             profile: Some("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),

@@ -509,7 +509,7 @@ impl LaunchFixture {
             .unwrap();
     }
 
-    fn payload(&self, ticket_id: &str, operation_id: &str, profile: &str, flow: bool) -> Value {
+    fn payload(&self, _ticket_id: &str, operation_id: &str, profile: &str, flow: bool) -> Value {
         self.backend.publish_profile(&self.api, profile);
         let mut segments = vec![
             json!({"kind": "text", "content": "Research this Ticket without changing repositories."}),
@@ -522,7 +522,6 @@ impl LaunchFixture {
         }
         json!({
             "runtime_id": self.runtime_id, "display_name": "Explicit Ticket Worker", "profile": profile,
-            "ticket_assignment": {"ticket_id": ticket_id, "operation_id": operation_id},
             "initial_submit": segments, "workdir_attachments": [], "feature_connections": {},
             "authorization": { "kind": "assignment", "assignment": null },
             "control_operation_id": format!("launch-{operation_id}"),
@@ -602,572 +601,254 @@ impl LaunchFixture {
     }
 }
 
+// Ordinary Backend creation is deliberately independent of Ticket claims. These
+// tests use the real Embedded/HTTP Runtime and SQLite; only execution is scripted.
 #[tokio::test(flavor = "multi_thread")]
-async fn embedded_explicit_worker_starts_open_cases_without_phase_transitions_or_queue_requirement()
-{
-    let fixture = LaunchFixture::new(false).await;
-    for context in ["unqueued", "queued", "reopened"] {
-        let ticket_id = fixture.ticket();
-        let backend = browser_ticket_backend(&fixture.api).unwrap();
-        if context == "queued" {
-            backend
-                .queue_ready(ticket_id.clone().into(), "fixture")
-                .unwrap();
-        } else if context == "reopened" {
-            fixture.case_action(
-                &ticket_id,
-                "fixture-close",
-                ticket::TicketCaseAction::Close {
-                    reason: ticket::TicketClosureReason::NotPlanned,
-                },
+async fn ordinary_spawn_preserves_explicit_flow_and_profile_without_ticket_or_workdir() {
+    for remote in [false, true] {
+        let f = LaunchFixture::new(remote).await;
+        for (profile, flow) in [("builtin:intake", false), ("builtin:coder", true)] {
+            let key = format!("ordinary-{flow}");
+            let payload = f.payload("", &key, profile, flow);
+            assert!(payload.get("ticket_assignment").is_none());
+            let expected = payload["initial_submit"].clone();
+            let (status, body) = f.post(TEST_WORKSPACE_ID, payload.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let id = body["worker_id"].as_str().unwrap();
+            assert_eq!(body["worker"]["profile"], profile);
+            assert!(
+                f.api
+                    .store
+                    .get_active_ticket_role_assignment_for_worker(
+                        TEST_WORKSPACE_ID,
+                        &RuntimeWorkerRef::new(&f.runtime_id, id)
+                    )
+                    .unwrap()
+                    .is_none()
             );
-            fixture.case_action(
-                &ticket_id,
-                "fixture-reopen",
-                ticket::TicketCaseAction::Reopen,
+            assert_eq!(f.backend.creates_for(id).len(), 1);
+            assert_eq!(
+                serde_json::to_value(&f.backend.submits_for(id)[0].segments).unwrap(),
+                expected
             );
+            let (status, replay) = f.post(TEST_WORKSPACE_ID, payload).await;
+            assert_eq!(status, StatusCode::OK, "{replay}");
+            assert_eq!(replay["worker_id"], body["worker_id"]);
+            assert_eq!(f.backend.creates_for(id).len(), 1);
+            assert_eq!(f.backend.submits_for(id).len(), 1);
         }
-        let before = backend.show(ticket_id.clone().into()).unwrap();
-        let operation_id = format!("explicit-{context}");
-        assert!(
-            fixture
-                .api
-                .store
-                .get_current_ticket_role_assignment(
-                    TEST_WORKSPACE_ID,
-                    &ticket_id,
-                    TicketAssignmentRole::Orchestrator
-                )
-                .unwrap()
-                .is_none()
-        );
-        let payload = fixture.payload(&ticket_id, &operation_id, "builtin:companion", false);
-        let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-        assert_eq!(status, StatusCode::OK, "{context}: {body}");
-        let assignment = fixture.assert_assigned(&ticket_id, &operation_id, &body);
-        let after = backend.show(ticket_id.clone().into()).unwrap();
-        assert_eq!(after.meta.workflow_state, before.meta.workflow_state);
-        assert_eq!(after.case_history, before.case_history);
-        assert_eq!(after.closure_operation_key, before.closure_operation_key);
-        assert_eq!(
-            ticket::ticket_content_digest(&after),
-            ticket::ticket_content_digest(&before)
-        );
-        assert_eq!(body["worker"]["profile"], "builtin:companion", "{body}");
-        let creates = fixture.backend.creates_for(&assignment.worker.worker_id);
-        assert_eq!(creates.len(), 1);
-        assert!(creates[0].workdir_attachments.is_empty());
-        let submits = fixture.backend.submits_for(&assignment.worker.worker_id);
-        assert_eq!(submits.len(), 1);
-        assert_eq!(
-            serde_json::to_value(&submits[0].segments).unwrap(),
-            json!([{"kind": "text", "content": "Research this Ticket without changing repositories."}])
-        );
-        assert!(submits[0].submission_request_id.is_some());
     }
 }
-
-#[tokio::test(flavor = "multi_thread")]
-async fn real_runtime_http_worker_launch_preserves_optional_flow_profile_submit_and_assignment() {
-    let fixture = LaunchFixture::new(true).await;
-    for (profile, flow) in [("builtin:intake", false), ("builtin:coder", true)] {
-        let ticket_id = fixture.ticket();
-        let operation_id = format!("real-http-{flow}");
-        let payload = fixture.payload(&ticket_id, &operation_id, profile, flow);
-        let expected_submit = payload["initial_submit"].clone();
-        let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-        assert_eq!(status, StatusCode::OK, "{profile}: {body}");
-        fixture.assert_assigned(&ticket_id, &operation_id, &body);
-        assert_eq!(body["worker"]["profile"], profile, "{body}");
-        let creates = fixture
-            .backend
-            .creates_for(body["worker_id"].as_str().unwrap());
-        assert_eq!(creates.len(), 1);
-        let create = &creates[0];
-        assert_eq!(
-            serde_json::to_value(&create.initial_input.as_ref().unwrap().segments).unwrap(),
-            expected_submit
-        );
-        assert!(create.workdir_attachments.is_empty());
-        assert_eq!(
-            create.workspace_api.as_ref().unwrap().workspace_id,
-            TEST_WORKSPACE_ID
-        );
-        let submits = fixture
-            .backend
-            .submits_for(body["worker_id"].as_str().unwrap());
-        assert_eq!(submits.len(), 1);
-        assert_eq!(
-            serde_json::to_value(&submits[0].segments).unwrap(),
-            expected_submit
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn worker_launch_uses_published_project_profile_and_workspace_default_on_real_runtime_http() {
-    let fixture = LaunchFixture::new(true).await;
-    let state = fixture
-        .api
-        .config_store
-        .load_workspace_config(TEST_WORKSPACE_ID)
-        .unwrap()
-        .unwrap();
-    let main = config_source::VirtualPath::parse("main.dcdl").unwrap();
-    let request = crate::config_source::ConfigCommitRequest {
-        base_digest: state.snapshot.digest.clone(),
-        entrypoints: state.contract.entrypoints.clone(),
-        changes: vec![config_source::ConfigTreeChange::Update {
-            path: main.clone(),
-            expected_digest: state.snapshot.entries[&main].content_digest.clone(),
-            content: r#"{
-                profile = {
-                    default_profile = "project:research";
-                    entries = [{ selector = "project:research"; label = "Research";
-                        description = "Ticket research recipe";
-                        profile = import "$builtin/profiles/intake.dcdl";
-                    }];
-                };
-            }"#
-            .into(),
-        }],
-    };
-    adopt_test_config_as_owner(&fixture.api, &request).unwrap();
-    for explicit in [true, false] {
-        let ticket_id = fixture.ticket();
-        let operation_id = format!("project-profile-{explicit}");
-        let mut payload = fixture.payload(&ticket_id, &operation_id, "project:research", false);
-        if !explicit {
-            payload.as_object_mut().unwrap().remove("profile");
-        }
-        let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        fixture.assert_assigned(&ticket_id, &operation_id, &body);
-        assert_eq!(body["worker"]["profile"], "project:research", "{body}");
-        let creates = fixture
-            .backend
-            .creates_for(body["worker_id"].as_str().unwrap());
-        assert_eq!(creates.len(), 1);
-        assert_eq!(
-            creates[0].profile,
-            ProfileSelector::Named("project:research".into())
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn closed_ticket_launch_rejects_before_runtime_or_assignment_reservation() {
-    let fixture = LaunchFixture::new(false).await;
-    for (label, reason) in [
-        ("completed", ticket::TicketClosureReason::Completed),
-        ("not-planned", ticket::TicketClosureReason::NotPlanned),
-    ] {
-        let ticket_id = fixture.ticket();
-        fixture.case_action(
-            &ticket_id,
-            "fixture-close",
-            ticket::TicketCaseAction::Close { reason },
-        );
-        let operation_id = format!("terminal-{label}");
-        let payload = fixture.payload(&ticket_id, &operation_id, "builtin:companion", false);
-        let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(
-            body["message"].as_str().unwrap().contains("closed"),
-            "{body}"
-        );
-        assert_eq!(
-            fixture
-                .api
-                .authority
-                .ticket(&ticket_id)
-                .unwrap()
-                .state
-                .as_str(),
-            "closed"
-        );
-        assert!(
-            fixture
-                .api
-                .store
-                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket_id)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            fixture
-                .api
-                .store
-                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, &operation_id)
-                .unwrap()
-                .is_none()
-        );
-    }
-    assert!(fixture.backend.creates.lock().unwrap().is_empty());
-    assert!(fixture.backend.submits.lock().unwrap().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_exact_launch_replays_keep_one_worker_and_committed_assignment() {
-    let fixture = Arc::new(LaunchFixture::new(false).await);
-    let ticket_id = fixture.ticket();
-    let payload = fixture.payload(&ticket_id, "concurrent-launch", "builtin:companion", false);
-    let barrier = Arc::new(tokio::sync::Barrier::new(5));
-    let mut tasks = Vec::new();
-    for _ in 0..4 {
-        let fixture = fixture.clone();
-        let payload = payload.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            fixture.post(TEST_WORKSPACE_ID, payload).await
-        }));
-    }
-    barrier.wait().await;
-    let mut assigned = None;
-    for task in tasks {
-        let (status, body) = task.await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let current = fixture.assert_assigned(&ticket_id, "concurrent-launch", &body);
-        if let Some(expected) = &assigned {
-            assert_eq!(&current, expected);
-        }
-        assigned = Some(current);
-    }
-    let assigned = assigned.unwrap();
-    assert_eq!(
-        fixture
-            .backend
-            .creates_for(&assigned.worker.worker_id)
-            .len(),
-        1
-    );
-    assert_eq!(
-        fixture
-            .backend
-            .submits_for(&assigned.worker.worker_id)
-            .len(),
-        1
-    );
-    assert!(fixture.backend.execution.stops.lock().unwrap().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn undispatched_launch_rejection_settles_claim_and_allows_corrected_operation() {
-    let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket();
-    let mut rejected = fixture.payload(&ticket_id, "invalid-resources", "builtin:companion", false);
-    rejected["workdir_attachments"] =
-        json!([{"alias":"checkout","working_directory_id":"missing-workdir"}]);
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, rejected.clone()).await;
-    assert!(!status.is_success(), "{body}");
-    let receipt = fixture
-        .api
-        .store
-        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "invalid-resources")
-        .unwrap()
-        .unwrap();
-    assert_eq!(receipt.claim_state, "failed");
-    assert!(fixture.backend.creates.lock().unwrap().is_empty());
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, rejected).await;
-    assert!(
-        !status.is_success(),
-        "failed receipt cannot restart: {body}"
-    );
-    let corrected = fixture.payload(
-        &ticket_id,
-        "corrected-resources",
-        "builtin:companion",
-        false,
-    );
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, corrected).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    fixture.assert_assigned(&ticket_id, "corrected-resources", &body);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn worker_launch_retry_reuses_assignment_and_does_not_repeat_initial_submit() {
-    let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket();
-    let payload = fixture.payload(&ticket_id, "worker-retry", "builtin:companion", false);
-    let (status, first) = fixture.post(TEST_WORKSPACE_ID, payload.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{first}");
-    let assignment = fixture.assert_assigned(&ticket_id, "worker-retry", &first);
-    let (status, replay) = fixture.post(TEST_WORKSPACE_ID, payload.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{replay}");
-    assert_eq!(replay["worker_id"], first["worker_id"]);
-    assert_eq!(
-        fixture
-            .assert_assigned(&ticket_id, "worker-retry", &replay)
-            .assignment_id,
-        assignment.assignment_id
-    );
-    let mut attachment_conflict = payload.clone();
-    attachment_conflict["workdir_attachments"] = json!([{"alias":"changed", "working_directory_id":"different-workdir", "relative_cwd":"docs"}]);
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, attachment_conflict).await;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "changed attachment intent: {body}"
-    );
-    let mut conflict = payload;
-    conflict["initial_submit"][0]["content"] =
-        json!("A different operation payload must not reuse the reservation.");
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, conflict).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| !message.is_empty()),
-        "{body}"
-    );
-    assert_eq!(
-        fixture
-            .backend
-            .creates_for(&assignment.worker.worker_id)
-            .len(),
-        1
-    );
-    assert_eq!(
-        fixture
-            .backend
-            .submits_for(&assignment.worker.worker_id)
-            .len(),
-        1
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn generic_ticket_worker_unknown_input_outcome_preserves_assignment_and_launch_retry_identity()
- {
-    let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket();
-    let payload = fixture.payload(
-        &ticket_id,
-        "worker-unknown-input",
-        "builtin:companion",
-        false,
-    );
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let assignment = fixture.assert_assigned(&ticket_id, "worker-unknown-input", &body);
-    fixture
-        .backend
-        .execution
-        .reject_inputs("acceptance response unavailable");
-    let worker = WorkspaceWorker::resolve(
-        &fixture.api,
-        &assignment.worker.runtime_id,
-        &assignment.worker.worker_id,
-    )
-    .unwrap();
-    let result = worker
-        .input(
-            &WorkerOperationContext::Backend,
-            WorkerInputRequest {
-                source: None,
-                kind: WorkerInputKind::User,
-                content: "Continue Ticket research".into(),
-                submission_request_id: Some("unknown-worker-submit".into()),
-                segments: None,
-            },
+impl LaunchFixture {
+    async fn assign(&self, ticket: &str, worker: &Value, key: &str) -> (StatusCode, Value) {
+        let response = build_router(self.api.clone()).oneshot(Request::builder().method("PUT")
+            .uri(format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/worker"))
+            .header("authorization",format!("Bearer {}",self.owner_token)).header("content-type","application/json")
+            .body(Body::from(json!({"operation_id":key,"expected_assignment_id":null,"principal":{"kind":"worker","runtime_id":self.runtime_id,"worker_id":worker["worker_id"]},"workdir_bindings":[]}).to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"unparsed":String::from_utf8_lossy(&bytes)})),
         )
-        .await
-        .unwrap();
-    assert_eq!(
-        result.disposition,
-        WorkerInputDisposition::Unknown,
-        "{result:?}"
-    );
-    assert!(fixture.backend.execution.stops.lock().unwrap().is_empty());
-    let (status, replay) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-    assert_eq!(status, StatusCode::OK, "{replay}");
-    let current = fixture.assert_assigned(&ticket_id, "worker-unknown-input", &replay);
-    assert_eq!(current.assignment_id, assignment.assignment_id);
-    assert_eq!(current.worker, assignment.worker);
-    assert_eq!(
-        fixture
-            .backend
-            .creates_for(&assignment.worker.worker_id)
-            .len(),
-        1
-    );
-    assert_eq!(
-        fixture
-            .backend
-            .submits_for(&assignment.worker.worker_id)
-            .len(),
-        2,
-        "initial Submit and one outcome-unknown input; replay must not re-submit"
-    );
+    }
 }
-
 #[tokio::test(flavor = "multi_thread")]
-async fn scoped_worker_launch_rejects_foreign_workspace_and_unpublished_profile_with_body() {
-    let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket();
-    let payload = fixture.payload(&ticket_id, "scope-rejected", "builtin:companion", false);
-    let (status, body) = fixture
-        .post("019d0000-0000-7000-8000-0000000000bb", payload.clone())
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| !message.is_empty()),
-        "{body}"
+async fn existing_idle_worker_assignment_is_separate_and_replays_without_restart_or_submit() {
+    for remote in [false, true] {
+        let mut f = LaunchFixture::new(remote).await;
+        let ticket = f.ticket();
+        let before = f.api.authority.ticket(&ticket).unwrap().content_digest;
+        let mut create = f.payload("", "existing-idle", "builtin:companion", false);
+        create["initial_submit"] = json!([]);
+        let (status, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+        assert_eq!(status, StatusCode::OK, "{worker}");
+        let id = worker["worker_id"].as_str().unwrap();
+        assert!(f.backend.submits_for(id).is_empty());
+        let (status, assigned) = f.assign(&ticket, &worker, "assign-existing").await;
+        assert_eq!(status, StatusCode::OK, "{assigned}");
+        if remote {
+            // Reconstruct Backend state over reopened SQLite while the external
+            // Runtime remains alive; no process-memory receipt authorizes replay.
+            let runtime = f.api.runtime.clone();
+            let store = Arc::new(
+                SqliteWorkspaceStore::open_for_test(f.api.config.database_path.clone()).unwrap(),
+            );
+            let mut reopened = WorkspaceApi::new_with_execution_backend(
+                f.api.config.clone().with_embedded_runtime_store_root(
+                    f._temp.path().join("reopened-backend-unused-embedded"),
+                ),
+                store,
+                f.backend.clone(),
+            )
+            .await
+            .unwrap();
+            reopened.runtime = runtime;
+            f.api = reopened;
+        }
+        let (status, replay) = f.assign(&ticket, &worker, "assign-existing").await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(assigned, replay);
+        f.assert_assigned(&ticket, "assign-existing", &worker);
+        assert_eq!(
+            f.backend.creates_for(id).len(),
+            1,
+            "assignment must not restart"
+        );
+        assert!(
+            f.backend.submits_for(id).is_empty(),
+            "assignment is not input acceptance"
+        );
+        assert_eq!(
+            f.api.authority.ticket(&ticket).unwrap().content_digest,
+            before
+        );
+        let segments = json!([
+            {"kind":"flow","selector":"builtin:coder-review"},
+            {"kind":"text","content":"Implement only the now-assigned Ticket"}
+        ]);
+        let response = build_router(f.api.clone()).oneshot(Request::builder().method("POST")
+            .uri(format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{id}/input", f.runtime_id))
+            .header("authorization", format!("Bearer {}", f.owner_token))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"kind":"user", "content":"Implement only the now-assigned Ticket", "segments":segments}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(f.backend.submits_for(id).len(), 1);
+        assert_eq!(
+            serde_json::to_value(&f.backend.submits_for(id)[0].segments).unwrap(),
+            segments
+        );
+        let other = f.ticket();
+        let (status, _) = f.assign(&other, &worker, "double-assign").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn creation_success_assignment_failure_preserves_worker_and_no_initial_ticket_effect() {
+    let f = LaunchFixture::new(false).await;
+    let ticket = f.ticket();
+    f.case_action(
+        &ticket,
+        "close-before-claim",
+        ticket::TicketCaseAction::Close {
+            reason: ticket::TicketClosureReason::NotPlanned,
+        },
     );
-    let mut unknown = payload;
-    unknown["profile"] = json!("project:not-published");
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, unknown).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body["message"]
-            .as_str()
+    let mut create = f.payload("", "created-unassigned", "builtin:companion", false);
+    create["initial_submit"] = json!([]);
+    let (status, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+    assert_eq!(status, StatusCode::OK, "{worker}");
+    let (status, error) = f.assign(&ticket, &worker, "failed-claim").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    let id = worker["worker_id"].as_str().unwrap();
+    assert_eq!(f.backend.creates_for(id).len(), 1);
+    assert!(f.backend.submits_for(id).is_empty());
+    assert_eq!(
+        f.api
+            .runtime
+            .worker(&RuntimeWorkerRef::new(&f.runtime_id, id))
             .unwrap()
-            .contains("Backend-published"),
-        "{body}"
+            .state,
+        "idle"
     );
-    assert!(fixture.backend.creates.lock().unwrap().is_empty());
     assert!(
-        fixture
-            .api
+        f.api
             .store
-            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "scope-rejected")
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
             .unwrap()
             .is_none()
     );
 }
-
-// This is the capability policy boundary. The API/runtime tests above separately
-// prove transport, creation, Submit acknowledgement, and durable assignment.
-#[tokio::test]
-async fn read_only_ticket_targets_allow_extra_external_grants_without_widening_capabilities() {
-    let temp = tempfile::tempdir().unwrap();
-    let api = test_api(temp.path()).await;
-    let mut input =
-        ticket::NewTicket::new("Read-only Ticket with explicit external research grant");
-    input.targets = vec![test_ticket_target(
-        "test-repository",
-        "develop",
-        TicketTargetAccess::ReadOnly,
-    )];
-    let ticket_id = browser_ticket_backend(&api)
+#[tokio::test(flavor = "multi_thread")]
+async fn assignment_failure_keeps_same_worker_and_exact_receipt_instead_of_spawn_compensation() {
+    let f = LaunchFixture::new(false).await;
+    let ticket = f.ticket();
+    let mut create = f.payload("", "claim-fault-worker", "builtin:companion", false);
+    create["initial_submit"] = json!([]);
+    let (_, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+    rusqlite::Connection::open(&f.api.config.database_path).unwrap().execute_batch("CREATE TRIGGER fail_claim BEFORE INSERT ON ticket_current_worker_assignments WHEN NEW.role='worker' BEGIN SELECT RAISE(ABORT,'injected claim failure'); END;").unwrap();
+    let (status, _) = f.assign(&ticket, &worker, "failed-persist").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let op = f
+        .api
+        .store
+        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "failed-persist")
         .unwrap()
-        .create(input)
-        .unwrap()
-        .id;
-    let workdir = WorkdirRegistryRecord {
-        workspace_id: TEST_WORKSPACE_ID.into(),
-        workdir_id: "read-only-target".into(),
-        display_name: None,
-        source: WorkdirRegistrySource::Repository {
-            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
-            repository_id: test_repository_id(&api),
-        },
-        creation_selector: Some("develop".into()),
-        creation_ref: None,
-        creation_tree: None,
-        current_selector: Some("develop".into()),
-        current_ref: None,
-        current_tree: None,
-        observed_at_epoch_seconds: None,
-        materialization_status: "present".into(),
-        cleanliness: "clean".into(),
-        created_at: TEST_CREATED_AT.into(),
-        updated_at: TEST_CREATED_AT.into(),
-    };
-    api.store.upsert_workdir_registry(&workdir).unwrap();
-    let external = WorkdirRegistryRecord {
-        workdir_id: "external-research".into(),
-        source: WorkdirRegistrySource::ExternalGrant {
-            grant_id: "research-grant".into(),
-        },
-        creation_selector: None,
-        current_selector: None,
-        ..workdir.clone()
-    };
-    api.store
-        .create_external_workdir_grant(
-            &ExternalWorkdirGrantRecord {
-                grant_id: "research-grant".into(),
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                workdir_id: external.workdir_id.clone(),
-                provider_instance_id: "research-provider".into(),
-                display_name: "Research".into(),
-                permissions: "read_only".into(),
-                created_by: "fixture".into(),
-                created_at: TEST_CREATED_AT.into(),
-                expires_at: None,
-                generation: 1,
-                status: "pending".into(),
-                updated_at: TEST_CREATED_AT.into(),
-            },
-            &external,
+        .unwrap();
+    assert_eq!(op.claim_state, "failed");
+    let id = worker["worker_id"].as_str().unwrap();
+    assert_eq!(f.backend.creates_for(id).len(), 1);
+    assert!(f.backend.submits_for(id).is_empty());
+    assert!(
+        f.api
+            .runtime
+            .worker(&RuntimeWorkerRef::new(&f.runtime_id, id))
+            .is_ok()
+    );
+    let (status, _) = f.assign(&ticket, &worker, "failed-persist").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_claim_receipt_is_retained_and_never_reinterpreted_as_a_fresh_assignment() {
+    let f = LaunchFixture::new(false).await;
+    let ticket = f.ticket();
+    let mut create = f.payload("", "legacy-reconcile-worker", "builtin:companion", false);
+    create["initial_submit"] = json!([]);
+    let (status, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = worker["worker_id"].as_str().unwrap();
+    f.api
+        .store
+        .reserve_ticket_assignment_operation(
+            TEST_WORKSPACE_ID,
+            "legacy-operation",
+            &ticket,
+            &f.runtime_id,
+            Some(id),
+            "saved-combined-spawn-fingerprint",
+            TEST_CREATED_AT,
         )
         .unwrap();
-    let mut request = WorkerSpawnRequest {
-        requested_worker_name: Some("Read-only research Worker".into()),
-        intent: WorkerSpawnIntent::TicketRole {
-            ticket_id,
-            role: TicketWorkerRole::Worker,
-        },
-        singleton_key: None,
-        acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-            expected_segments: 1,
-        },
-        profile: ProfileSelector::Builtin("builtin:intake".into()),
-        ticket_assignment: None,
-        initial_submit: vec![Segment::text("Research without writes")],
-        workdir_attachment_requests: Vec::new(),
-        resolved_workdir_attachment_requests: Vec::new(),
-        resolved_workdir_attachments: vec![
-            WorkingDirectoryAttachmentClaim {
-                alias: workdir::WorkdirAttachmentAlias::new("target").unwrap(),
-                working_directory_id: workdir.workdir_id.clone(),
-                relative_cwd: None,
-                capabilities: workdir::WorkdirSessionCapabilities::ALL,
-            },
-            WorkingDirectoryAttachmentClaim {
-                alias: workdir::WorkdirAttachmentAlias::new("research").unwrap(),
-                working_directory_id: external.workdir_id.clone(),
-                relative_cwd: None,
-                capabilities: workdir::WorkdirSessionCapabilities::ALL,
-            },
-        ],
-        resolved_config_bundle: None,
-        resolved_worker_observation_enabled: false,
-        resolved_worker_observation_grants: Vec::new(),
-        resolved_workspace_api: None,
-        resolved_memory_settings: None,
-        resolved_subjektiv_attached: false,
-        resolved_control_operation: None,
-        resolved_execution_grant: None,
-        authorization: None,
-        resolved_core_execution_grant: None,
-    };
-    api.validate_worker_spawn_repository_scope(EMBEDDED_WORKER_RUNTIME_ID, &mut request)
-        .unwrap();
-    assert!(
-        request
-            .resolved_workdir_attachments
-            .iter()
-            .all(|claim| claim.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY)
-    );
-    // Repository targets bound allowable scope, not mandatory resources.
-    request
-        .resolved_workdir_attachments
-        .retain(|claim| claim.alias.as_str() == "research");
-    api.validate_worker_spawn_repository_scope(EMBEDDED_WORKER_RUNTIME_ID, &mut request)
+    let (status, _) = f.assign(&ticket, &worker, "legacy-operation").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let reopened = SqliteWorkspaceStore::open_for_test(f.api.config.database_path.clone()).unwrap();
+    let saved = reopened
+        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "legacy-operation")
+        .unwrap()
         .unwrap();
     assert_eq!(
-        request.resolved_workdir_attachments[0].capabilities,
-        workdir::WorkdirSessionCapabilities::READ_ONLY
+        saved.request_fingerprint.as_deref(),
+        Some("saved-combined-spawn-fingerprint")
     );
+    assert_eq!(saved.worker, Some(RuntimeWorkerRef::new(&f.runtime_id, id)));
+    assert_eq!(saved.claim_state, "pending");
+    assert!(saved.assignment_id.is_none());
+    assert_eq!(f.backend.creates_for(id).len(), 1);
+    assert!(f.backend.submits_for(id).is_empty());
 }
 
-/// Production create owner and Backend adapters share the same executor; only
-/// its response acknowledgement and cleanup boundary are fault-injected.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_worker_contract_rejects_old_combined_claim_before_creation() {
+    let f = LaunchFixture::new(false).await;
+    let mut p = f.payload("", "old-input", "builtin:companion", false);
+    p["ticket_assignment"] = json!({"ticket_id":"T-1","operation_id":"old"});
+    let response = build_router(f.api.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers"))
+                .header("authorization", format!("Bearer {}", f.owner_token))
+                .header("content-type", "application/json")
+                .body(Body::from(p.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(f.backend.creates.lock().unwrap().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn initial_input_ack_loss_preserves_creation_facts_across_embedded_and_remote() {
     use runtime_api::startup::*;
@@ -1250,471 +931,6 @@ async fn initial_input_ack_loss_preserves_creation_facts_across_embedded_and_rem
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_and_preserves_open_case()
- {
-    let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket();
-    rusqlite::Connection::open(&fixture.api.config.database_path)
-        .unwrap()
-        .execute_batch(
-            r#"
-        CREATE TRIGGER fail_generic_worker_assignment
-        BEFORE INSERT ON ticket_current_worker_assignments
-        WHEN NEW.role = 'worker'
-        BEGIN SELECT RAISE(ABORT, 'injected Worker assignment failure'); END;
-    "#,
-        )
-        .unwrap();
-    let payload = fixture.payload(&ticket_id, "compensated-worker", "builtin:companion", false);
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert_eq!(body["yoi_failure"]["domain"], "startup_boundary");
-    assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
-    let operation = &body["yoi_startup"]["operation"];
-    assert_eq!(operation["acceptance"], "accepted");
-    assert_eq!(operation["execution"], "accepted");
-    assert_eq!(operation["finalize"]["stage"], "ticket_assignment_bind");
-    assert_eq!(operation["finalize"]["compensation"], "completed");
-    assert!(body["detail"].as_str().unwrap().contains("finalization"));
-    assert!(
-        !body
-            .to_string()
-            .contains("injected Worker assignment failure")
-    );
-    let creates = fixture
-        .backend
-        .creates
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|request| request.display_name.as_deref() == Some("Explicit Ticket Worker"))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(creates.len(), 1);
-    let worker_id = creates[0].worker_id.to_string();
-    assert!(
-        fixture
-            .backend
-            .execution
-            .stops
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|worker| worker.worker_id.to_string() == worker_id)
-    );
-    assert!(
-        fixture
-            .backend
-            .execution
-            .contexts
-            .lock()
-            .unwrap()
-            .keys()
-            .all(|worker| worker.worker_id.to_string() != worker_id)
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket_id)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        fixture
-            .api
-            .authority
-            .ticket(&ticket_id)
-            .unwrap()
-            .state
-            .as_str(),
-        "open"
-    );
-    let counts: (i64, i64) = fixture.api.config_store.with_conn(|conn| Ok((
-        conn.query_row("SELECT COUNT(*) FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3", rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0))?,
-        conn.query_row("SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND state = 'reserved'", rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0))?,
-    ))).unwrap();
-    assert_eq!(counts, (0, 0));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn choosing_reviewer_profile_does_not_register_a_reviewer_child_or_grant_mr_review() {
-    let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket();
-    let payload = fixture.payload(&ticket_id, "ordinary-reviewer", "builtin:reviewer", false);
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let current = fixture.assert_assigned(&ticket_id, "ordinary-reviewer", &body);
-    assert_eq!(body["worker"]["profile"], "builtin:reviewer", "{body}");
-    let store = merge_request_store(&fixture.api, TEST_WORKSPACE_ID).unwrap();
-    let auth = merge_request::MergeRequestAuth {
-        workspace_id: TEST_WORKSPACE_ID.into(),
-        repository_id: test_repository_id(&fixture.api),
-        runtime_id: current.worker.runtime_id.clone(),
-        worker_id: current.worker.worker_id.clone(),
-        assignment_id: current.assignment_id,
-    };
-    let mr_id = "ordinary-profile-is-not-review-authority";
-    store
-        .open_merge_request(merge_request::OpenMergeRequest {
-            merge_request_id: mr_id.into(),
-            ticket_id: ticket_id.clone(),
-            repository_id: auth.repository_id.clone(),
-            selector_from: "work/research".into(),
-            selector_to: "develop".into(),
-            summary: String::new(),
-            auth: auth.clone(),
-            now: Utc::now(),
-        })
-        .unwrap();
-    let error = store
-        .request_review(merge_request::RequestMergeRequestReview {
-            merge_request_id: mr_id.into(),
-            ticket_id: ticket_id.clone(),
-            ticket_content_digest: ticket_item_checker::content_digest(
-                &browser_ticket_backend(&fixture.api)
-                    .unwrap()
-                    .show(ticket_id.clone().into())
-                    .unwrap(),
-            ),
-            ticket_merge_request_subjects: vec![merge_request::MergeRequestReviewSubject {
-                merge_request_id: mr_id.into(),
-                subject_ref: "immutable-source".into(),
-            }],
-            subject_ref: "immutable-source".into(),
-            child_session_id: current.worker.worker_id,
-            capability_token: "profile-alone-is-not-a-capability".into(),
-            auth,
-            now: Utc::now(),
-        })
-        .unwrap_err();
-    assert!(
-        matches!(error, merge_request::MergeRequestError::Unauthorized(ref message) if message == "reviewer child attestation missing"),
-        "{error}"
-    );
-    assert!(
-        store
-            .authorize_review_submission(mr_id, "profile-alone-is-not-a-capability")
-            .is_err()
-    );
-}
-
-// Narrow provider fault seam: creation succeeds and the summary is then lost,
-// while the delete default cannot confirm compensation. No product process runs.
-struct LostSpawnResponseRuntime {
-    inner: WorkdirlessFixtureRuntime,
-}
-
-impl crate::hosts::WorkspaceWorkerRuntime for LostSpawnResponseRuntime {
-    fn runtime_id(&self) -> &str {
-        self.inner.runtime_id()
-    }
-    fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary {
-        self.inner.runtime_summary(limit)
-    }
-    fn list_hosts(
-        &self,
-        limit: usize,
-    ) -> crate::hosts::RuntimeList<crate::hosts::InternalHostSummary> {
-        self.inner.list_hosts(limit)
-    }
-    fn list_workers(&self, limit: usize) -> crate::hosts::RuntimeList<InternalWorkerSummary> {
-        self.inner.list_workers(limit)
-    }
-    fn worker(&self, worker_id: &str) -> crate::hosts::WorkerLookupResult {
-        self.inner.worker(worker_id)
-    }
-    fn working_directory(&self, id: &str) -> crate::hosts::RuntimeWorkingDirectoryResult {
-        self.inner.working_directory(id)
-    }
-    fn spawn_worker(
-        &self,
-        binding: WorkerCreateBinding,
-        request: WorkerSpawnRequest,
-    ) -> WorkerSpawnResult {
-        let result = self.inner.spawn_worker(binding, request);
-        assert_eq!(result.state, InternalWorkerOperationState::Accepted);
-        assert!(result.worker.is_some());
-        WorkerSpawnResult {
-            failure: None,
-            state: InternalWorkerOperationState::Rejected,
-            worker: None,
-            acceptance_evidence: Vec::new(),
-            diagnostics: vec![RuntimeDiagnostic::new(
-                "spawn_response_lost",
-                "error",
-                "Created Worker but lost the response",
-            )],
-        }
-    }
-}
-
-#[tokio::test]
-async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_competing_start() {
-    let fixture = manual_worker_assignment_fixture().await;
-    for id in [&fixture.main_workdir_id, &fixture.docs_workdir_id] {
-        fixture
-            .api
-            .store
-            .detach_worker_workdir(
-                TEST_WORKSPACE_ID,
-                &fixture.worker,
-                Some(id),
-                TEST_CREATED_AT,
-            )
-            .unwrap();
-    }
-    sync_runtime_worker_workdir_attachments(&fixture.api, &fixture.worker).unwrap();
-    fixture
-        .api
-        .runtime
-        .register_or_replace(LostSpawnResponseRuntime {
-            inner: fixture.runtime.clone(),
-        });
-    let initial_spawns = fixture.runtime.spawn_requests().len();
-    let payload = json!({
-        "runtime_id": fixture.worker.runtime_id,
-        "display_name": "Uncertain Ticket Worker", "profile": "builtin:companion",
-        "ticket_assignment": {"ticket_id": fixture.ticket_id, "operation_id": "lost-spawn"},
-        "initial_submit": [{"kind":"text", "content":"Research the Ticket"}],
-        "workdir_attachments": [
-            {"alias":"checkout", "working_directory_id":fixture.main_workdir_id},
-            {"alias":"docs", "working_directory_id":fixture.docs_workdir_id}
-        ], "feature_connections": {},
-        "authorization": { "kind": "assignment", "assignment": null },
-        "control_operation_id": "uncertain-ticket-worker-launch"
-    });
-    let launch = |body: Value| {
-        create_workspace_worker_as_owner(
-            State(fixture.api.clone()),
-            HeaderMap::new(),
-            Json(serde_json::from_value(body).unwrap()),
-        )
-    };
-    let lost = launch(payload.clone()).await.unwrap_err();
-    assert!(
-        lost.diagnostics
-            .iter()
-            .any(|d| d.code == "worker_spawn_compensation_create_reservation_retained"),
-        "{lost:?}"
-    );
-    let receipt = fixture
-        .api
-        .store
-        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "lost-spawn")
-        .unwrap()
-        .unwrap();
-    assert_eq!(receipt.claim_state, "pending");
-    assert!(receipt.assignment_id.is_none());
-    let original_worker = receipt.worker.clone().unwrap();
-    assert!(matches!(
-        fixture.runtime.worker(&original_worker.worker_id).outcome,
-        crate::hosts::WorkerLookupOutcome::Found { .. }
-    ));
-    assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
-
-    browser_ticket_backend(&fixture.api)
-        .unwrap()
-        .edit_item(
-            fixture.ticket_id.clone().into(),
-            TicketItemEdit {
-                targets: Some(TicketTargetsEdit::Set {
-                    targets: vec![
-                        test_ticket_target(
-                            "test-repository",
-                            "changed-selector",
-                            TicketTargetAccess::ReadWrite,
-                        ),
-                        test_ticket_target("docs", "develop", TicketTargetAccess::ReadOnly),
-                    ],
-                }),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let rejected = launch(payload.clone()).await.unwrap_err();
-    assert!(
-        rejected.error.to_string().contains("selector"),
-        "{rejected:?}"
-    );
-    let retained = fixture
-        .api
-        .store
-        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "lost-spawn")
-        .unwrap()
-        .unwrap();
-    assert_eq!(retained.claim_state, "pending");
-    assert_eq!(retained.worker, Some(original_worker.clone()));
-    assert_eq!(retained.request_fingerprint, receipt.request_fingerprint);
-    assert!(retained.failure_reason.is_none());
-    let mut competing = payload;
-    competing["ticket_assignment"]["operation_id"] = json!("competing-spawn");
-    competing["control_operation_id"] = json!("competing-ticket-worker-launch");
-    let conflict = launch(competing).await.unwrap_err();
-    assert!(
-        conflict.error.to_string().contains("pending"),
-        "{conflict:?}"
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "competing-spawn")
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
-    assert!(matches!(
-        fixture.runtime.worker(&original_worker.worker_id).outcome,
-        crate::hosts::WorkerLookupOutcome::Found { .. }
-    ));
-    assert_eq!(
-        fixture
-            .api
-            .authority
-            .ticket(&fixture.ticket_id)
-            .unwrap()
-            .state
-            .as_str(),
-        "open"
-    );
-}
-
-// Direct policy composition is intentional: this protects routing interest,
-// independently of the transport/Runtime launch assertions above.
-#[tokio::test(flavor = "multi_thread")]
-async fn assignment_inputs_replace_queue_interest_without_reviving_released_work() {
-    let fixture = LaunchFixture::new(false).await;
-    let backend = browser_ticket_backend(&fixture.api).unwrap();
-    let queued_id = fixture.ticket();
-    assign_test_orchestrator(&fixture.api, &queued_id);
-    assert!(
-        fixture
-            .api
-            .store
-            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
-            .unwrap()
-            .iter()
-            .any(|input| input.ticket_id == queued_id)
-            == true
-    );
-    backend
-        .queue_ready(queued_id.clone().into(), "fixture")
-        .unwrap();
-    assert!(
-        fixture
-            .api
-            .store
-            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
-            .unwrap()
-            .iter()
-            .any(|input| input.ticket_id == queued_id)
-            == true
-    );
-    fixture.case_action(
-        &queued_id,
-        "queue-case-close",
-        ticket::TicketCaseAction::Close {
-            reason: ticket::TicketClosureReason::Completed,
-        },
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
-            .unwrap()
-            .iter()
-            .any(|input| input.ticket_id == queued_id)
-            == false
-    );
-    fixture.case_action(
-        &queued_id,
-        "queue-case-reopen",
-        ticket::TicketCaseAction::Reopen,
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
-            .unwrap()
-            .iter()
-            .any(|input| input.ticket_id == queued_id)
-            == false
-    );
-
-    let active_id = fixture.ticket();
-    assign_test_orchestrator(&fixture.api, &active_id);
-    let payload = fixture.payload(
-        &active_id,
-        "routing-active-work",
-        "builtin:companion",
-        false,
-    );
-    let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    fixture.assert_assigned(&active_id, "routing-active-work", &body);
-    let active = backend.show(active_id.clone().into()).unwrap();
-    assert!(
-        active
-            .events
-            .iter()
-            .all(|event| !event.attributes.contains_key("queue_root_ticket"))
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
-            .unwrap()
-            .iter()
-            .any(|input| input.ticket_id == active_id)
-            == true
-    );
-    fixture.case_action(
-        &active_id,
-        "active-case-close",
-        ticket::TicketCaseAction::Close {
-            reason: ticket::TicketClosureReason::NotPlanned,
-        },
-    );
-    fixture.case_action(
-        &active_id,
-        "active-case-reopen",
-        ticket::TicketCaseAction::Reopen,
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &active_id)
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &active_id)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        fixture
-            .api
-            .store
-            .list_pending_ticket_assignment_deliveries(TEST_WORKSPACE_ID, 100)
-            .unwrap()
-            .iter()
-            .any(|input| input.ticket_id == active_id)
-            == false
-    );
-}
-
-// Real Git publication, signed HTTP, Runtime source reads, and SQLite capture.
-// Execution is the deterministic fixture backend; no LLM/reviewer is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mr_open_retains_source_before_first_review_and_observed_result() {
     let fixture = LaunchFixture::new(true).await;
@@ -1775,7 +991,6 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
             display_name: "source-observation-coder".into(),
             singleton_key: None,
             profile: Some("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: vec![server_api::BrowserWorkerWorkingDirectorySelection {
                 alias: "checkout".into(),
@@ -1962,78 +1177,3 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
 
 // Real Runtime creation and SQLite finalization fail independently; only Stop is
 // injected. Reconciliation must retain the create reservation while absence is unknown.
-#[tokio::test(flavor = "multi_thread")]
-async fn accepted_creation_finalize_and_failed_stop_retain_unknown_compensation_and_reservation() {
-    let fixture = LaunchFixture::new(false).await;
-    let ticket_id = fixture.ticket();
-    rusqlite::Connection::open(&fixture.api.config.database_path).unwrap().execute_batch(
-        "CREATE TRIGGER fail_startup_finalize BEFORE INSERT ON ticket_current_worker_assignments WHEN NEW.role='worker' BEGIN SELECT RAISE(ABORT, 'TEST_ONLY_PRIVATE_DB_CREDENTIAL'); END;"
-    ).unwrap();
-    fixture
-        .backend
-        .fail_stop
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let (status, body) = fixture
-        .post(
-            TEST_WORKSPACE_ID,
-            fixture.payload(
-                &ticket_id,
-                "unknown-compensation",
-                "builtin:companion",
-                false,
-            ),
-        )
-        .await;
-    fixture
-        .backend
-        .fail_stop
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
-    let operation = &body["yoi_startup"]["operation"];
-    assert_eq!(operation["acceptance"], "accepted");
-    assert_eq!(operation["execution"], "accepted");
-    assert_eq!(operation["finalize"]["compensation"], "unknown");
-    assert!(
-        operation["correlation"]
-            .as_str()
-            .unwrap()
-            .starts_with("worker-")
-    );
-    for secret in [
-        "TEST_ONLY_PRIVATE_STOP_CREDENTIAL",
-        "/private/path",
-        "TEST_ONLY_PRIVATE_DB_CREDENTIAL",
-    ] {
-        assert!(!body.to_string().contains(secret), "{body}");
-    }
-    assert_eq!(
-        fixture
-            .api
-            .authority
-            .ticket(&ticket_id)
-            .unwrap()
-            .state
-            .as_str(),
-        "open"
-    );
-    let created = fixture.backend.creates.lock().unwrap();
-    let created: Vec<_> = created
-        .iter()
-        .filter(|request| request.display_name.as_deref() == Some("Explicit Ticket Worker"))
-        .collect();
-    assert_eq!(created.len(), 1);
-    let worker_id = created[0].worker_id.to_string();
-    let reserved: i64 = fixture.api.config_store.with_conn(|conn| conn.query_row(
-        "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='reserved'",
-        rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0),
-    ).map_err(Error::from)).unwrap();
-    // A reservation may already be completed by Runtime admission, but it must
-    // remain present (never released as absent) until Runtime absence is confirmed.
-    let retained: i64 = fixture.api.config_store.with_conn(|conn| conn.query_row(
-        "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
-        rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0),
-    ).map_err(Error::from)).unwrap();
-    assert_eq!(retained, 1);
-    assert!(reserved <= retained);
-}

@@ -79,10 +79,6 @@ fn contracts_and_consumers_do_not_depend_on_provider_namespaces() {
     for (name, source) in [
         ("contracts", include_str!("../src/feature/contracts.rs")),
         (
-            "orchestration",
-            include_str!("../src/feature/builtin/orchestration.rs"),
-        ),
-        (
             "worker_observation",
             include_str!("../src/feature/builtin/worker_observation.rs"),
         ),

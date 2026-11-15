@@ -74,7 +74,7 @@ struct Context {
     spawned: Option<RuntimeWorkerRef>,
     ticket: Option<String>,
     denials: Vec<(String, Value, String)>,
-    spawn_refusals: std::collections::BTreeMap<String, (StatusCode, Value)>,
+    assignment_refusals: std::collections::BTreeMap<String, (StatusCode, Value)>,
 }
 #[derive(Clone)]
 struct DelegationModel {
@@ -89,21 +89,38 @@ struct DelegationModel {
     lose_spawn_ack: bool,
 }
 impl DelegationModel {
-    fn assert_spawn_refusal(&self, error: bool, text: &str, operation: &str, reason: &str) {
+    fn assert_assignment_refusal(&self, error: bool, text: &str, operation: &str, reason: &str) {
         assert!(error, "public {operation} must refuse: {text}");
-        let public: Value = serde_json::from_str(text).expect("public control failure JSON");
         let context = self.context.lock().unwrap();
         let (status, response) = context
-            .spawn_refusals
+            .assignment_refusals
             .get(operation)
             .unwrap_or_else(|| panic!("missing Backend refusal for {operation}"));
         assert!(
             status.is_client_error(),
             "{operation}: {status}: {response}"
         );
-        assert_eq!(public["result"]["status"], status.as_u16(), "{text}");
-        // The Tool does not redisclose legacy Backend prose. Check the intended
-        // domain fence at the real HTTP boundary, without rewriting its response.
+        assert!(text.contains(&status.as_u16().to_string()), "{text}");
+        // Revoked control edges conceal the known target using the same typed
+        // missing-Worker result as ordinary Worker control operations.
+        if reason == "permission" && *status == StatusCode::NOT_FOUND {
+            assert_eq!(
+                response["yoi_failure"]["reason"], "worker_missing",
+                "{response}"
+            );
+            return;
+        }
+        // The same candidate is claimed successfully below. Scoped authorization
+        // may refuse another Ticket before its target details can be disclosed.
+        if *status == StatusCode::FORBIDDEN && response.get("yoi_failure").is_some() {
+            assert_eq!(
+                response["yoi_failure"]["category"], "authorization",
+                "{response}"
+            );
+            return;
+        }
+        // Check the intended domain fence at the real HTTP boundary, without
+        // rewriting its response or depending on the general spawn error DTO.
         assert!(
             response["message"]
                 .as_str()
@@ -112,32 +129,84 @@ impl DelegationModel {
         );
     }
 
-    fn spawn(&self, page: &Value, request: &agen::llm_client::Request) -> Value {
+    fn work_input(&self, page: &Value) -> String {
         let c = self.context.lock().unwrap();
         let message = page["conversation"]["last_user_message_id"]
             .as_str()
             .unwrap();
-        let mut input = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:chat-background",
+        format!("{CHILD}; conversation={}; message={message}", c.a)
+    }
+    fn spawn(&self, page: &Value) -> Value {
+        let work = self.work_input(page);
+        let c = self.context.lock().unwrap();
+        let message = page["conversation"]["last_user_message_id"]
+            .as_str()
+            .unwrap();
+        let attachments = c
+            .workdir
+            .iter()
+            .map(|id| json!({"alias":"checkout","working_directory_id":id}))
+            .collect::<Vec<_>>();
+        let input = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:chat-background",
             "operation_id":format!("chat:{}:{message}", c.a),
             "display_name":"Bounded background chat work",
-            "initial_submit":[{"kind":"text","content":format!("{CHILD}; conversation={}; message={message}", c.a)}],
+            "initial_submit":if c.ticket.is_some() {json!([])} else {json!([{"kind":"text","content":work}])},
+            "workdir_attachments":attachments,
             "authorization":{"kind":"policy","policy_id":c.policy.as_ref().unwrap().policy_id,"policy_authorization_key":c.policy.as_ref().unwrap().authorization_key}});
-        if let Some(id) = &c.workdir {
-            input["working_directory_id"] = json!(id);
-        }
-        if let Some(ticket) = &c.ticket {
-            let current = value(request, "ticket-current");
-            let assignment = current["assignment_tracking"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|row| row["role"] == "orchestrator")
-                .expect("current Subject responsibility");
-            assert_eq!(assignment["principal"]["kind"], "subject");
-            input["ticket_id"] = json!(ticket);
-            input["orchestrator_assignment_id"] = assignment["assignment_id"].clone();
+        for removed in [
+            "ticket_id",
+            "orchestrator_assignment_id",
+            "flow",
+            "initial_request",
+            "working_directory_id",
+        ] {
+            assert!(
+                input.get(removed).is_none(),
+                "general spawn must not carry {removed}"
+            );
         }
         input
+    }
+    fn ticket_worker(&self, request: &agen::llm_client::Request) -> Value {
+        let spawned = value(request, "spawn-retry");
+        let listed = value(request, "ticket-connections");
+        assert_eq!(listed["truncated"], false);
+        let workers = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|worker| {
+                worker["subject"]["kind"] == "runtime_worker"
+                    && worker["subject"]["runtime_id"] == spawned["runtime_id"]
+                    && worker["subject"]["worker_id"] == spawned["worker_id"]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(workers.len(), 1, "claim the same created Worker: {listed}");
+        workers[0].clone()
+    }
+    fn assign(&self, request: &agen::llm_client::Request, operation: &str) -> Value {
+        let worker = self.ticket_worker(request);
+        let current = value(request, "ticket-current");
+        let assignment = current["assignment_tracking"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["role"] == "orchestrator")
+            .expect("current Subject responsibility");
+        assert_eq!(assignment["principal"]["kind"], "subject");
+        let c = self.context.lock().unwrap();
+        let connections = worker["workdir_connections"].as_array().unwrap();
+        assert_eq!(connections.len(), 1);
+        let bindings = connections.iter().map(|connection| {
+            assert_eq!(connection["alias"], "checkout");
+            assert_eq!(connection["working_directory_id"], json!(c.workdir));
+            assert!(!connection["connection_id"].as_str().unwrap().is_empty());
+            json!({"alias":connection["alias"],"working_directory_id":connection["working_directory_id"],
+                "connection_id":connection["connection_id"]})
+        }).collect::<Vec<_>>();
+        json!({"ticket":c.ticket,"runtime_id":worker["subject"]["runtime_id"],
+            "worker_id":worker["subject"]["worker_id"],"orchestrator_assignment_id":assignment["assignment_id"],
+            "operation_id":operation,"workdir_bindings":bindings})
     }
     fn send(
         &self,
@@ -212,23 +281,63 @@ impl agen::llm_client::LlmClient for DelegationModel {
             } else if ticket.is_some() && phase == 0 && output(&request, "ticket-current").is_none()
             {
                 Some(call("ticket-current", "ShowTicket", json!({"id":ticket})))
-            } else if ticket.is_some() && phase == 1 {
-                let denials = self.context.lock().unwrap().denials.clone();
-                let mut next = None;
-                for (id, overrides, reason) in denials {
-                    if let Some((error, text)) = output(&request, &id) {
-                        self.assert_spawn_refusal(error, &text, &id, &reason);
-                    } else {
-                        let mut input = self.spawn(&value(&request, "origin-read"), &request);
-                        for (name, value) in overrides.as_object().unwrap() {
-                            input[name] = value.clone();
+            } else if ticket.is_some() && phase == 4 {
+                // Ticket work is not submitted until the idle Worker is claimed
+                // using the observed body row and its exact live connections.
+                if output(&request, "ticket-connections").is_none() {
+                    Some(call("ticket-connections", "WorkerList", json!({})))
+                } else {
+                    let denials = self.context.lock().unwrap().denials.clone();
+                    let mut next = None;
+                    for (id, overrides, reason) in denials {
+                        if let Some((error, text)) = output(&request, &id) {
+                            self.assert_assignment_refusal(error, &text, &id, &reason);
+                        } else {
+                            let mut input = self.assign(&request, &id);
+                            for (name, value) in overrides.as_object().unwrap() {
+                                input[name] = value.clone();
+                            }
+                            next = Some(call(&id, "TicketWorkerAssign", input));
+                            break;
                         }
-                        input["operation_id"] = json!(id);
-                        next = Some(call(&id, "WorkerSpawn", input));
-                        break;
+                    }
+                    if next.is_some() {
+                        next
+                    } else if output(&request, "ticket-claim").is_none() {
+                        Some(call(
+                            "ticket-claim",
+                            "TicketWorkerAssign",
+                            self.assign(&request, "chat-ticket-claim"),
+                        ))
+                    } else {
+                        let claimed = value(&request, "ticket-claim");
+                        let worker = self.ticket_worker(&request);
+                        assert_eq!(claimed["ticket_id"], json!(ticket));
+                        assert_eq!(claimed["assignment"]["role"], "worker");
+                        assert!(claimed["assignment"]["assignment_id"].is_string());
+                        assert_eq!(
+                            claimed["assignment"]["principal"],
+                            json!({"kind":"worker",
+                            "runtime_id":worker["subject"]["runtime_id"],"worker_id":worker["subject"]["worker_id"]})
+                        );
+                        if output(&request, "ticket-submit").is_none() {
+                            assert_eq!(
+                                self.child_phase.load(Ordering::SeqCst),
+                                0,
+                                "idle spawn and assignment must not start Ticket work"
+                            );
+                            Some(call(
+                                "ticket-submit",
+                                "WorkerSendInput",
+                                json!({"subject":worker["subject"],
+                                "content":self.work_input(&value(&request, "origin-read"))}),
+                            ))
+                        } else {
+                            assert_eq!(value(&request, "ticket-submit")["state"], "accepted");
+                            None
+                        }
                     }
                 }
-                next
             } else if ticket.is_some()
                 && phase == 8
                 && output(&request, "ticket-evaluate").is_none()
@@ -266,8 +375,8 @@ impl agen::llm_client::LlmClient for DelegationModel {
                 if current["assignment_tracking"][0]["assignment_id"]
                     != initial["assignment_tracking"][0]["assignment_id"]
                 {
-                    if let Some((error, text)) = output(&request, "old-report-spawn") {
-                        self.assert_spawn_refusal(
+                    if let Some((error, text)) = output(&request, "old-report-claim") {
+                        self.assert_assignment_refusal(
                             error,
                             &text,
                             "old-ticket-report-new-attempt",
@@ -277,9 +386,11 @@ impl agen::llm_client::LlmClient for DelegationModel {
                         self.completed.try_send(()).unwrap();
                         Some(done())
                     } else {
-                        let mut input = self.spawn(&value(&request, "origin-read"), &request);
-                        input["operation_id"] = json!("old-ticket-report-new-attempt");
-                        Some(call("old-report-spawn", "WorkerSpawn", input))
+                        Some(call(
+                            "old-report-claim",
+                            "TicketWorkerAssign",
+                            self.assign(&request, "old-ticket-report-new-attempt"),
+                        ))
                     }
                 } else if output(&request, "a-send").is_none() {
                     Some(call(
@@ -289,6 +400,24 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     ))
                 } else {
                     None
+                }
+            } else if ticket.is_some() && phase == 12 {
+                let (error, text) = output(&request, "revoked-notify").unwrap();
+                assert!(error, "revoked Notify must refuse: {text}");
+                if let Some((error, text)) = output(&request, "revoked-ticket-claim") {
+                    self.assert_assignment_refusal(
+                        error,
+                        &text,
+                        "revoked-ticket-claim",
+                        "permission",
+                    );
+                    None
+                } else {
+                    Some(call(
+                        "revoked-ticket-claim",
+                        "TicketWorkerAssign",
+                        self.assign(&request, "revoked-ticket-claim"),
+                    ))
                 }
             } else {
                 None
@@ -396,7 +525,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                 1 => call(
                     "spawn-first",
                     "WorkerSpawn",
-                    self.spawn(&value(&request, "origin-read"), &request),
+                    self.spawn(&value(&request, "origin-read")),
                 ),
                 2 => {
                     let (error, text) = output(&request, "spawn-first").unwrap();
@@ -411,7 +540,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     call(
                         "spawn-retry",
                         "WorkerSpawn",
-                        self.spawn(&value(&request, "origin-read"), &request),
+                        self.spawn(&value(&request, "origin-read")),
                     )
                 }
                 3 => {
@@ -425,7 +554,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     call(
                         "spawn-exact-replay",
                         "WorkerSpawn",
-                        self.spawn(&value(&request, "origin-read"), &request),
+                        self.spawn(&value(&request, "origin-read")),
                     )
                 }
                 4 => {
@@ -645,7 +774,10 @@ async fn connected_chat_delegation(scenario: Scenario) {
                     let spawn = request.method() == axum::http::Method::POST
                         && request.uri().path()
                             == format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
-                    if !spawn {
+                    let claim = request.method() == axum::http::Method::PUT
+                        && request.uri().path().starts_with(&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/"))
+                        && request.uri().path().ends_with("/assignments/worker");
+                    if !spawn && !claim {
                         return next.run(request).await;
                     }
                     let (parts, body) = request.into_parts();
@@ -654,16 +786,16 @@ async fn connected_chat_delegation(scenario: Scenario) {
                     let response = next
                         .run(Request::from_parts(parts, Body::from(bytes)))
                         .await;
-                    if response.status().is_client_error() {
+                    if claim && response.status().is_client_error() {
                         let (parts, body) = response.into_parts();
                         let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
-                        observed.lock().unwrap().spawn_refusals.insert(
-                            input["control_operation_id"].as_str().unwrap().into(),
+                        observed.lock().unwrap().assignment_refusals.insert(
+                            input["operation_id"].as_str().unwrap().into(),
                             (parts.status, serde_json::from_slice(&bytes).unwrap()),
                         );
                         return Response::from_parts(parts, Body::from(bytes));
                     }
-                    if response.status().is_success()
+                    if spawn && response.status().is_success()
                         && lose_spawn_ack
                         && !dropped.swap(true, Ordering::SeqCst)
                     {
@@ -754,10 +886,12 @@ async fn connected_chat_delegation(scenario: Scenario) {
     .collect::<Vec<_>>();
     execution.extend([
         operation("worker.create", true),
+        operation("worker.list", true),
         operation("worker.messaging", false),
     ]);
     let mut foreign = None;
     if ticket_mode {
+        execution.push(operation("worker.send_input", false));
         let mut input = NewTicket::new("Chat requested Ticket work");
         set_test_ticket_target(&mut input, "test-repository", selector);
         let ticket = browser_ticket_backend(&h.api)
@@ -783,6 +917,7 @@ async fn connected_chat_delegation(scenario: Scenario) {
             (&ticket, "ticket.relation.read"),
             (&ticket, "ticket.assignment.assign"),
             (&ticket, "ticket.implementation_result.read"),
+            (&other_ticket, "ticket.read"),
             (&other_ticket, "ticket.assignment.assign"),
         ] {
             execution.push(ScopedPermission {
@@ -806,18 +941,33 @@ async fn connected_chat_delegation(scenario: Scenario) {
                 },
             });
         }
-        let wrong = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"repository_key":"test-repository","selector":"HEAD","operation_id":"wrong-chat-workdir"}))).await;
-        let wrong = wrong["item"]["working_directory_id"].as_str().unwrap();
+        let mut input = NewTicket::new("Chat Ticket with incompatible target");
+        set_test_ticket_target(&mut input, "test-repository", "HEAD");
+        let wrong_ticket = browser_ticket_backend(&h.api)
+            .unwrap()
+            .create(input)
+            .unwrap()
+            .id;
+        let wrong_assignment = account_request(&h,"PUT",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{wrong_ticket}/assignments/orchestrator"),Some(json!({"operation_id":"wrong-target-ticket-assign","expected_assignment_id":null,"principal":{"kind":"subject","subject_id":subject}}))).await;
+        for name in ["ticket.read", "ticket.assignment.assign"] {
+            execution.push(ScopedPermission {
+                operation: name.into(),
+                resource: PermissionResource::Ticket {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    ticket_id: wrong_ticket.clone(),
+                },
+            });
+        }
         context.lock().unwrap().ticket = Some(ticket);
         context.lock().unwrap().denials = vec![
             (
                 "chat-denied-other-assignee".into(),
-                json!({"ticket_id":other_ticket,"orchestrator_assignment_id":other_assignment}),
+                json!({"ticket":other_ticket,"orchestrator_assignment_id":other_assignment}),
                 "target Subject".into(),
             ),
             (
                 "chat-denied-wrong-target".into(),
-                json!({"working_directory_id":wrong}),
+                json!({"ticket":wrong_ticket,"orchestrator_assignment_id":wrong_assignment["assignment"]["assignment_id"]}),
                 "selector".into(),
             ),
         ];

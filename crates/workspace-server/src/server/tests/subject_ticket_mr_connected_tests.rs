@@ -71,6 +71,102 @@ fn waiting(ticket: &str, row: &Value, key: &str) -> Value {
             "result":null}})
 }
 
+// Creation is deliberately idle and Ticket-free. Observe the exact live
+// connections through the public Tool, confirm the claim, then submit typed input.
+fn assign_and_submit(
+    request: &agen::llm_client::Request,
+    prefix: &str,
+    ticket: &str,
+    row: &Value,
+    spawned: &Value,
+    spawn: &Value,
+    segments: Value,
+) -> Option<Vec<Event>> {
+    assert_eq!(spawn["initial_submit"], json!([]));
+    for removed in [
+        "ticket_id",
+        "orchestrator_assignment_id",
+        "initial_request",
+        "flow",
+        "working_directory_id",
+    ] {
+        assert!(
+            spawn.get(removed).is_none(),
+            "general spawn must not carry {removed}"
+        );
+    }
+    let list_id = format!("{prefix}-connections");
+    let Some(listed) = success(request, &list_id) else {
+        return Some(call(request, &list_id, "WorkerList", json!({})));
+    };
+    assert_eq!(
+        listed["truncated"], false,
+        "all known connections must be observable"
+    );
+    let workers: Vec<_> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| {
+            item["subject"]["kind"] == "runtime_worker"
+                && item["subject"]["runtime_id"] == spawned["runtime_id"]
+                && item["subject"]["worker_id"] == spawned["worker_id"]
+        })
+        .collect();
+    assert_eq!(
+        workers.len(),
+        1,
+        "use the one Worker just created, not a replacement"
+    );
+    let worker = workers[0];
+    let connections = worker["workdir_connections"].as_array().unwrap();
+    let attachments = spawn["workdir_attachments"].as_array().unwrap();
+    assert_eq!(connections.len(), attachments.len());
+    let bindings: Vec<_> = connections.iter().map(|connection| {
+        assert!(attachments.iter().any(|attachment| {
+            attachment["alias"] == connection["alias"]
+                && attachment["working_directory_id"] == connection["working_directory_id"]
+        }), "only the selected Workdir attachments may be claimed: {connection}");
+        assert!(!connection["connection_id"].as_str().unwrap().is_empty());
+        json!({"alias":connection["alias"],"working_directory_id":connection["working_directory_id"],
+            "connection_id":connection["connection_id"]})
+    }).collect();
+    let claim_id = format!("{prefix}-claim");
+    let Some(claimed) = success(request, &claim_id) else {
+        return Some(call(
+            request,
+            &claim_id,
+            "TicketWorkerAssign",
+            json!({
+            "ticket":ticket,"runtime_id":spawned["runtime_id"],"worker_id":spawned["worker_id"],
+            "orchestrator_assignment_id":row["assignment_id"],
+            "operation_id":format!("{prefix}-claim-{ticket}"),"workdir_bindings":bindings}),
+        ));
+    };
+    assert_eq!(claimed["ticket_id"], ticket);
+    assert_eq!(claimed["assignment"]["role"], "worker");
+    assert!(claimed["assignment"]["assignment_id"].is_string());
+    assert_eq!(
+        claimed["assignment"]["principal"],
+        json!({"kind":"worker",
+        "runtime_id":spawned["runtime_id"],"worker_id":spawned["worker_id"]})
+    );
+    let submit_id = format!("{prefix}-submit");
+    let Some(accepted) = success(request, &submit_id) else {
+        return Some(call(
+            request,
+            &submit_id,
+            "WorkerSendInput",
+            json!({
+            "subject":worker["subject"],"content":"Implement the confirmed Ticket assignment",
+            "segments":segments}),
+        ));
+    };
+    // Input acceptance is distinct from the saved result inspected by the caller.
+    assert_eq!(accepted["state"], "accepted", "{accepted}");
+    None
+}
+
 impl MrModel {
     async fn coder(&self, request: &agen::llm_client::Request, input: Value) -> Vec<Event> {
         let ticket = input["ticket"].as_str().unwrap();
@@ -88,8 +184,8 @@ impl MrModel {
                 .unwrap()
                 .contains("MR normal requirement")
         );
-        // Omission, not flow:null, selected the actual builtin recipe. Tool
-        // publication alone is not evidence of this Flow being active.
+        // Explicit post-assignment Flow input selected the actual builtin recipe.
+        // Tool publication alone is not evidence of this Flow being active.
         let context = format!(
             "{}\n{}",
             request.system_prompt.as_deref().unwrap_or_default(),
@@ -97,7 +193,7 @@ impl MrModel {
         );
         assert!(
             context.contains("This is an optional code recipe"),
-            "default coder-review implement instructions missing"
+            "explicit coder-review implement instructions missing"
         );
         assert!(
             !request
@@ -210,14 +306,25 @@ impl MrModel {
         let row = tracking.as_array().unwrap().first().unwrap();
         assert_eq!(row["principal"]["subject_id"], input["subject"]);
         let Some(spawned) = success(request, "mr-body-spawn") else {
-            let mut spawn = input["spawn"].clone();
-            assert!(
-                spawn.get("flow").is_none(),
-                "Flow must be omitted, not null"
+            return call(
+                request,
+                "mr-body-spawn",
+                "WorkerSpawn",
+                input["spawn"].clone(),
             );
-            spawn["orchestrator_assignment_id"] = row["assignment_id"].clone();
-            return call(request, "mr-body-spawn", "SpawnTicketWorker", spawn);
         };
+        if let Some(events) = assign_and_submit(
+            request,
+            "mr-body",
+            ticket,
+            row,
+            &spawned,
+            &input["spawn"],
+            json!([{"kind":"flow","selector":"builtin:coder-review"},
+                {"kind":"text","content":format!("{CODER}{}",json!({"ticket":ticket}))}]),
+        ) {
+            return events;
+        }
         // Discover the saved result through the real business notification, not
         // a shared model channel or test-driver WorkerNotify.
         let incoming = text(request);
@@ -366,7 +473,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn ordinary_subject_default_coder_review_publishes_mr_and_preserves_unreviewed_wait() {
+async fn ordinary_subject_explicit_coder_review_publishes_mr_and_preserves_unreviewed_wait() {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
     crate::restore_test_environment::require_restore_test_environment();
     let (evaluated, mut evaluations) = tokio::sync::mpsc::channel(2);
@@ -453,9 +560,8 @@ async fn ordinary_subject_default_coder_review_publishes_mr_and_preserves_unrevi
             { namespace = "merge_request"; keys = ["merge_request.open"]; }
         ]; }"#,
     );
-    let spawn = json!({"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
-        "orchestrator_assignment_id":assigned["assignment"]["assignment_id"],
-        "initial_request":format!("{CODER}{}",json!({"ticket":ticket})),
+    let spawn = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
+        "operation_id":"mr-connected-spawn","initial_submit":[],
         "workdir_attachments":[{"alias":"checkout","working_directory_id":wd}],
         "authorization":{"kind":"assignment","assignment":assignment}});
     assert!(spawn.get("flow").is_none());
@@ -988,7 +1094,7 @@ impl FullModel {
         );
         assert!(
             context.contains("optional code recipe"),
-            "actual default builtin coder-review Flow missing"
+            "actual explicit builtin coder-review Flow missing"
         );
         if let Some(terminal) = success(request, "full-coder-flow-done") {
             assert_eq!(terminal["entered_state"], "done", "{terminal}");
@@ -1242,11 +1348,25 @@ impl FullModel {
         let row = tracking.as_array().unwrap().first().unwrap();
         assert_eq!(row["principal"]["subject_id"], input["subject"]);
         let Some(coder) = success(request, "full-body-spawn-coder") else {
-            let mut spawn = input["spawn"].clone();
-            assert!(spawn.get("flow").is_none());
-            spawn["orchestrator_assignment_id"] = row["assignment_id"].clone();
-            return call(request, "full-body-spawn-coder", "SpawnTicketWorker", spawn);
+            return call(
+                request,
+                "full-body-spawn-coder",
+                "WorkerSpawn",
+                input["spawn"].clone(),
+            );
         };
+        if let Some(events) = assign_and_submit(
+            request,
+            "full-body",
+            ticket,
+            row,
+            &coder,
+            &input["spawn"],
+            json!([{"kind":"flow","selector":"builtin:coder-review"},
+                {"kind":"text","content":format!("{FULL_CODER}{}",json!({"ticket":ticket}))}]),
+        ) {
+            return events;
+        }
         let Some(result_id) = result_id_from_notification(request) else {
             return done();
         };
@@ -1810,14 +1930,13 @@ async fn full_mr_scenario(replace_body: bool) {
             { namespace = "worker"; keys = ["worker.list"]; }
         ]; }"#,
     );
-    let spawn = json!({"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
-        "orchestrator_assignment_id":assignment["assignment"]["assignment_id"],
-        "initial_request":format!("{FULL_CODER}{}",json!({"ticket":ticket})),
+    let spawn = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
+        "operation_id":"full-r2-spawn-coder","initial_submit":[],
         "workdir_attachments":[{"alias":"checkout","working_directory_id":coder_wd}],
         "authorization":{"kind":"assignment","assignment":coder_assignment}});
     assert!(
         spawn.get("flow").is_none(),
-        "default builtin coder-review is selected by omission"
+        "Flow belongs to post-assignment input"
     );
     let adopter_assignment = standalone_assignment(
         r#"{ namespaces = [
@@ -1826,8 +1945,9 @@ async fn full_mr_scenario(replace_body: bool) {
             { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; }
         ]; }"#,
     );
-    let adoption_spawn = json!({"runtime_id":CONNECTED_RUNTIME,"working_directory_id":adopt_wd,
-        "operation_id":"full-r2-generic-adopter","profile":"builtin:coder","ticket_id":null,
+    let adoption_spawn = json!({"runtime_id":CONNECTED_RUNTIME,
+        "workdir_attachments":[{"alias":"workdir","working_directory_id":adopt_wd}],
+        "operation_id":"full-r2-generic-adopter","profile":"builtin:coder",
         "display_name":"Bounded isolated exact-source Git adopter","initial_submit":[],
         "authorization":{"kind":"assignment","assignment":adopter_assignment}});
     let input = json!({"subject":subject,"ticket":ticket,"spawn":spawn,"adoption_spawn":adoption_spawn,

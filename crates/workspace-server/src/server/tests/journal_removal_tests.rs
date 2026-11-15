@@ -471,7 +471,6 @@ impl RemovalFixture {
                 display_name: "saved-history-source".into(),
                 singleton_key: None,
                 profile: Some("builtin:companion".into()),
-                ticket_assignment: None,
                 initial_submit: if live {
                     vec![protocol::Segment::Text {
                         content: "pending-original-model-turn".into(),
@@ -2822,7 +2821,6 @@ async fn nonjournal_stopped_real_worker_removes_without_journal_scope_or_recordi
             display_name: "plain-nonjournal-source".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest::default(),

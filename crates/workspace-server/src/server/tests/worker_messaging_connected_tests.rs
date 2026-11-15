@@ -447,7 +447,6 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
             display_name: "Public WorkerSpawn Subject origin".into(),
             singleton_key: None,
             profile: Some("project:messaging-origin".into()),
-            ticket_assignment: None,
             initial_submit: vec![protocol::Segment::Text {
                 content: ORIGIN.into(),
             }],

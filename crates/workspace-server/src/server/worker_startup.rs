@@ -72,9 +72,6 @@ pub(super) fn finalize_failure(
         WorkerSpawnFinalizeStage::WorkspaceApiBinding => FinalizeStage::WorkspaceApiBinding,
         WorkerSpawnFinalizeStage::CreateReservation => FinalizeStage::CreateReservation,
         WorkerSpawnFinalizeStage::WorkerRegistry => FinalizeStage::WorkerRegistry,
-        WorkerSpawnFinalizeStage::TicketAssignmentBind => FinalizeStage::TicketAssignmentBind,
-        WorkerSpawnFinalizeStage::TicketAssignmentCurrent => FinalizeStage::TicketAssignmentCurrent,
-        WorkerSpawnFinalizeStage::TicketStateAccept => FinalizeStage::TicketStateAccept,
         WorkerSpawnFinalizeStage::WorkdirRegistry => FinalizeStage::WorkdirRegistry,
         WorkerSpawnFinalizeStage::WorkdirAttachment => FinalizeStage::WorkdirAttachment,
     };

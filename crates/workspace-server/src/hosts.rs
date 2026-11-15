@@ -807,15 +807,7 @@ pub(crate) fn worker_spawn_idempotency(
             operation.input_fingerprint.clone(),
         )));
     }
-    let Some(assignment) = request.ticket_assignment.as_ref() else {
-        return Ok(None);
-    };
-    let encoded = serde_json::to_vec(&(request, request.resolved_workdir_attachments.as_slice()))
-        .map_err(|error| format!("serialize Worker spawn idempotency input: {error}"))?;
-    Ok(Some((
-        assignment.operation_id.clone(),
-        format!("sha256:{}", digest_hex(&encoded, 64)),
-    )))
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -854,8 +846,6 @@ pub struct WorkerSpawnRequest {
     pub authorization: Option<server_api::launch_policy::WorkerCreationAuthorization>,
     #[serde(skip, default)]
     pub resolved_core_execution_grant: Option<server_api::authorization::CoreWorkerExecutionGrant>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_submit: Vec<Segment>,
     /// Safe working-directory materialization requests, keyed by stable Worker-local aliases.
@@ -904,19 +894,6 @@ pub enum WorkerSpawnIntent {
         subjektiv_consolidation: bool,
         subjektiv_journal: bool,
     },
-    TicketRole {
-        ticket_id: String,
-        role: TicketWorkerRole,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketWorkerRole {
-    Intake,
-    Orchestrator,
-    Worker,
-    Reviewer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -9003,12 +8980,6 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
         WorkerSpawnIntent::WorkspaceOrchestrator => "workspace_orchestrator",
         WorkerSpawnIntent::WorkspaceCoding => "workspace_coding",
         WorkerSpawnIntent::BackendJob { .. } => "backend_job",
-        WorkerSpawnIntent::TicketRole { role, .. } => match role {
-            TicketWorkerRole::Intake => "ticket_intake",
-            TicketWorkerRole::Orchestrator => "ticket_orchestrator",
-            TicketWorkerRole::Worker => "ticket_worker",
-            TicketWorkerRole::Reviewer => "ticket_reviewer",
-        },
     }
 }
 
@@ -9602,24 +9573,23 @@ mod tests {
     }
 
     #[test]
-    fn ticket_worker_spawn_intent_uses_worker_wire_role() {
-        let intent = WorkerSpawnIntent::TicketRole {
-            ticket_id: "ticket".into(),
-            role: TicketWorkerRole::Worker,
-        };
-        let encoded = json!({"kind": "ticket_role", "ticket_id": "ticket", "role": "worker"});
+    fn ordinary_spawn_intent_never_reinterprets_legacy_ticket_launches() {
+        let intent = WorkerSpawnIntent::WorkspaceCoding;
+        let encoded = json!({"kind":"workspace_coding"});
         assert_eq!(serde_json::to_value(&intent).unwrap(), encoded);
         assert_eq!(
             serde_json::from_value::<WorkerSpawnIntent>(encoded).unwrap(),
             intent
         );
-        assert!(
-            serde_json::from_value::<WorkerSpawnIntent>(
-                json!({"kind": "ticket_role", "ticket_id": "ticket", "role": "coder"})
-            )
-            .is_err()
-        );
-        assert_eq!(worker_spawn_intent_label(&intent), "ticket_worker");
+        for role in ["intake", "orchestrator", "worker", "reviewer", "coder"] {
+            assert!(
+                serde_json::from_value::<WorkerSpawnIntent>(
+                    json!({"kind":"ticket_role","ticket_id":"ticket","role":role})
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(worker_spawn_intent_label(&intent), "workspace_coding");
     }
 
     #[test]
@@ -10678,17 +10648,13 @@ mod tests {
 
     fn embedded_spawn_request() -> WorkerSpawnRequest {
         WorkerSpawnRequest {
-            intent: WorkerSpawnIntent::TicketRole {
-                ticket_id: "00001KVZSGT0Q".to_string(),
-                role: TicketWorkerRole::Worker,
-            },
+            intent: WorkerSpawnIntent::WorkspaceCoding,
             requested_worker_name: None,
             singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -10861,11 +10827,6 @@ mod tests {
     #[test]
     fn worker_spawn_idempotency_fingerprint_covers_canonical_initial_submit() {
         let mut request = embedded_spawn_request();
-        request.ticket_assignment = Some(WorkerTicketAssignmentRequest {
-            orchestrator_assignment_id: None,
-            ticket_id: "00001KVZSGT0Q".to_string(),
-            operation_id: "operation-1".to_string(),
-        });
         request.initial_submit = vec![
             Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
@@ -10876,15 +10837,14 @@ mod tests {
             expected_segments: request.initial_submit.len(),
         };
 
-        let first = worker_spawn_idempotency(&request).unwrap().unwrap();
-        let repeated = worker_spawn_idempotency(&request).unwrap().unwrap();
+        let first = worker_spawn_create_fingerprint(&request).unwrap();
+        let repeated = worker_spawn_create_fingerprint(&request).unwrap();
         assert_eq!(first, repeated);
-        assert_eq!(first.0, "operation-1");
 
         let mut changed = request.clone();
         changed.initial_submit[1] = Segment::text("Different instruction");
-        let changed = worker_spawn_idempotency(&changed).unwrap().unwrap();
-        assert_ne!(first.1, changed.1);
+        let changed = worker_spawn_create_fingerprint(&changed).unwrap();
+        assert_ne!(first, changed);
     }
 
     #[test]
@@ -11099,17 +11059,13 @@ mod tests {
                 EMBEDDED_RUNTIME_ID,
                 test_create_binding(),
                 WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::TicketRole {
-                        ticket_id: "00001KVZSGT0Q".to_string(),
-                        role: TicketWorkerRole::Worker,
-                    },
+                    intent: WorkerSpawnIntent::WorkspaceCoding,
                     requested_worker_name: Some("friendly-name-is-not-authority".to_string()),
                     singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
                     initial_submit: Vec::new(),
                     workdir_attachment_requests: Vec::new(),
                     resolved_workdir_attachment_requests: Vec::new(),
@@ -11217,17 +11173,13 @@ mod tests {
                 EMBEDDED_RUNTIME_ID,
                 test_create_binding(),
                 WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::TicketRole {
-                        ticket_id: "00001KVZSGT0Q".to_string(),
-                        role: TicketWorkerRole::Worker,
-                    },
+                    intent: WorkerSpawnIntent::WorkspaceCoding,
                     requested_worker_name: None,
                     singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
                     initial_submit: Vec::new(),
                     workdir_attachment_requests: Vec::new(),
                     resolved_workdir_attachment_requests: Vec::new(),
@@ -11271,7 +11223,6 @@ mod tests {
                     singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: ProfileSelector::Builtin("builtin:companion".to_string()),
-                    ticket_assignment: None,
                     initial_submit: Vec::new(),
                     workdir_attachment_requests: Vec::new(),
                     resolved_workdir_attachment_requests: Vec::new(),

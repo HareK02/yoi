@@ -49,7 +49,6 @@ pub(super) async fn attach_memory_job_source(
             display_name: "Memory Job authority source".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -695,7 +694,6 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE.into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachment_requests: vec![],
             resolved_workdir_attachment_requests: vec![],

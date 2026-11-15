@@ -66,7 +66,6 @@ test("zero-repository Workspace launches a normal embedded Worker request withou
     runtime_id: "embedded",
     profile: null,
     workdir_attachments: [],
-    ticket_assignment: null,
     authorization: { kind: "assignment", assignment: null },
   });
   expect(body).not.toHaveProperty("repository_key");

@@ -159,7 +159,6 @@ fn request_from_selection(selection: Selection) -> BackendCreateWorkerRequest {
         profile: Some(selection.profile),
         initial_submit: Vec::new(),
         workdir_attachments: Vec::new(),
-        ticket_assignment: None,
         feature_connections: Default::default(),
         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
         authorization: client::BackendWorkerCreationAuthorization::Assignment { assignment: None },

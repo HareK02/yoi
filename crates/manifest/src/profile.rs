@@ -1816,7 +1816,7 @@ mod tests {
         assert!(feature.merge_request.readiness_check);
         assert!(feature.merge_request.complete);
         assert!(feature.manage_workdir.enabled);
-        assert!(feature.orchestration.enabled);
+        assert!(!feature.orchestration.enabled);
         assert_eq!(
             manifest.web.as_ref().and_then(|web| web.enabled),
             Some(false)
@@ -1892,7 +1892,7 @@ mod tests {
 
         assert!(feature.sub_worker.enabled);
         assert!(feature.worker.enabled);
-        assert!(!feature.worker.direct_spawn);
+        assert!(feature.worker.direct_spawn);
         assert!(feature.manage_workdir.enabled);
         assert!(feature.merge_request.show);
         assert!(feature.merge_request.readiness_check);

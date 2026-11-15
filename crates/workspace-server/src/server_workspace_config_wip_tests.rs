@@ -1534,7 +1534,6 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
             display_name: "Production config adapter".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),

@@ -439,6 +439,25 @@ pub(super) fn contract(op: &str) -> Contract {
             "Read dependency diagnostics; do not start dependencies or infer execution permission.",
             vec![],
         ),
+        "worker_assign" => (
+            "worker_assign",
+            "Assign an existing idle Worker; generation, assignment, and input acceptance are separate. Exact retries retain the current Subject observation and every live Workdir connection.",
+            vec![
+                p("runtime_id", true, Shape::String),
+                p("worker_id", true, Shape::String),
+                p("orchestrator_assignment_id", true, Shape::String),
+                p("operation_id", true, Shape::String),
+                p(
+                    "workdir_bindings",
+                    true,
+                    list(record(vec![
+                        p("alias", true, Shape::String),
+                        p("working_directory_id", true, Shape::String),
+                        p("connection_id", true, Shape::String),
+                    ])),
+                ),
+            ],
+        ),
         "orchestrator_assign" => (
             "orchestrator_assign",
             "Delegate or explicitly reissue responsibility; no Worker starts. Observed null means unassigned, not unknown. Exact retries retain operation identity and full input.",

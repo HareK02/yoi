@@ -18,7 +18,6 @@ export async function verifyStartupHttpCaptures(log: string) {
     runtime_id: "embedded",
     display_name: "HTTP contract check",
     profile: null,
-    ticket_assignment: null,
     initial_submit: [],
     workdir_attachments: [],
     feature_connections: {},

@@ -9935,10 +9935,6 @@ pub enum RuntimeWorkerSpawnIntent {
     WorkspaceCompanion,
     WorkspaceOrchestrator,
     WorkspaceCoding,
-    TicketRole {
-        ticket_id: String,
-        role: RuntimeTicketWorkerRole,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10001,8 +9997,6 @@ pub struct RuntimeWorkerSpawnRequest {
     pub singleton_key: Option<String>,
     pub acceptance: RuntimeWorkerSpawnAcceptanceRequirement,
     pub profile: RuntimeProfileSelector,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ticket_assignment: Option<RuntimeWorkerTicketAssignmentRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_submit: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -10669,6 +10663,7 @@ pub struct WorkerControlSubject {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerControlRecord {
+    pub workdir_connections: Vec<CurrentWorkerWorkdirAttachmentItem>,
     pub subject: WorkerControlSubject,
     pub relation: String,
     pub origin: String,
@@ -11413,18 +11408,6 @@ pub struct BrowserWorkerWorkingDirectorySelection {
     pub relative_cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
-    /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orchestrator_assignment_id: Option<String>,
-
-    pub ticket_id: String,
-    pub operation_id: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -11452,8 +11435,6 @@ pub struct CreateWorkspaceWorkerRequest {
     pub singleton_key: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
-    #[serde(default)]
-    pub ticket_assignment: Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
     #[serde(default)]
     pub initial_submit: Vec<protocol::Segment>,
     #[serde(default)]
@@ -12664,7 +12645,6 @@ pub fn worker_launch_api_typescript() -> String {
         WorkingDirectoryRepositoryOption::decl(&config),
         WorkerLaunchOptionsResponse::decl(&config),
         BrowserWorkerWorkingDirectorySelection::decl(&config),
-        CreateWorkspaceWorkerTicketAssignmentRequest::decl(&config),
         SubjektivWorkerConnectionRequest::decl(&config),
         WorkspaceWorkerFeatureConnectionsRequest::decl(&config),
         CreateWorkspaceWorkerRequest::decl(&config),
@@ -14147,7 +14127,6 @@ mod tests {
             display_name: "Worker A".to_string(),
             singleton_key: Some("subjektiv:subject-a".to_string()),
             profile: None,
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
@@ -14164,7 +14143,6 @@ mod tests {
                 "display_name": "Worker A",
                 "singleton_key": "subjektiv:subject-a",
                 "profile": null,
-                "ticket_assignment": null,
                 "initial_submit": [],
                 "workdir_attachments": [],
                 "feature_connections": {},

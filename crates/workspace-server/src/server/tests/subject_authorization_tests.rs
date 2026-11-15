@@ -316,7 +316,6 @@ impl Fixture {
                 display_name: "Read-only Subject body".into(),
                 singleton_key: None,
                 profile: Some("project:authority-source".into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -1614,7 +1613,6 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
             display_name: "Explicitly assigned ordinary Worker".into(),
             singleton_key: None,
             profile: Some("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
@@ -3546,7 +3544,6 @@ async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source(
             display_name: "Raw hint target".into(),
             singleton_key: None,
             profile: Some("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
@@ -3981,7 +3978,7 @@ impl Drop for ConnectedRuntimeServer {
 }
 
 #[tokio::test]
-async fn delegated_subject_child_cannot_downgrade_ticket_start_to_manual_by_omitting_assignment() {
+async fn delegated_subject_child_cannot_assign_existing_worker_by_omitting_subject_assignment() {
     let f = Fixture::new().await;
     let grandchild_policy = seed_owner_launch_policy(
         &f.api,
@@ -3996,14 +3993,22 @@ async fn delegated_subject_child_cannot_downgrade_ticket_start_to_manual_by_omit
         &f.owner,
         "ticket-parent",
         &["builtin:coder"],
-        key_assignment(&["worker.create", "worker.launch.ticket-grandchild"]),
+        key_assignment(&[
+            "worker.create",
+            "worker.launch.ticket-grandchild",
+            "ticket.assignment.assign",
+        ]),
     )
     .await;
     owner_subject_policy(
         &f.api,
         &f.owner,
         &f.subject,
-        key_assignment(&["worker.create", "worker.launch.ticket-parent"]),
+        key_assignment(&[
+            "worker.create",
+            "worker.launch.ticket-parent",
+            "ticket.assignment.assign",
+        ]),
     )
     .await;
     let request = policy_create_request(
@@ -4033,18 +4038,28 @@ async fn delegated_subject_child_cannot_downgrade_ticket_start_to_manual_by_omit
         .unwrap();
     assign_test_orchestrator(&f.api, &ticket.id);
     let spawns = f.runtime.spawn_requests().len();
-    let mut request = policy_create_request(
-        &child.runtime_id,
-        "child-ticket-control",
-        &grandchild_policy,
-    );
-    request["ticket_assignment"] = json!({
-        "ticket_id": ticket.id, "operation_id":"child-ticket-start-without-assignment",
+    let request = json!({
+        "operation_id":"child-ticket-start-without-assignment", "expected_assignment_id":null,
+        "principal":{"kind":"worker", "runtime_id":ordinary["runtime_id"], "worker_id":ordinary["worker_id"]},
+        "workdir_bindings":[],
     });
-    let (status, denied) = f.spawn(&child, request).await;
+    let (status, denied) = response(
+        &f.api,
+        runtime_source_request(
+            &f.identity,
+            Some(&child.worker_id),
+            "PUT",
+            &format!(
+                "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
+                ticket.id
+            ),
+            serde_json::to_vec(&request).unwrap(),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-    assert!(
-        denied["message"].as_str().unwrap().contains("Subject body"),
+    assert_eq!(
+        denied["yoi_failure"]["category"], "authorization",
         "{denied}"
     );
     assert_eq!(f.runtime.spawn_requests().len(), spawns);
@@ -4568,7 +4583,6 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
             display_name: "Connected read-only Subject body".into(),
             singleton_key: None,
             profile: Some("project:authority-source".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -4624,7 +4638,6 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
         display_name: "Connected ordinary editing Profile child".into(),
         singleton_key: None,
         profile: Some("project:authority-editor".into()),
-        ticket_assignment: None,
         initial_submit: vec![protocol::Segment::Text {
             content: "Read README.md, then attempt the denied Write.".into(),
         }],
@@ -4754,6 +4767,8 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
 #[derive(Clone)]
 struct ConcurrentTicketAuthorizationModel {
     overlap: Arc<tokio::sync::Barrier>,
+    delegated: tokio::sync::mpsc::Sender<Value>,
+    reported: Arc<Mutex<std::collections::BTreeSet<String>>>,
     completed: tokio::sync::mpsc::Sender<(String, Vec<(String, bool, String)>)>,
 }
 
@@ -4798,6 +4813,86 @@ impl agen::llm_client::LlmClient for ConcurrentTicketAuthorizationModel {
                 Event::text_block_stop(0, Some(StopReason::EndTurn)),
             ]
         };
+        let delegation = request.items.iter().find_map(|item| {
+            let Item::Message { content, .. } = item else {
+                return None;
+            };
+            content.iter().find_map(|part| {
+                let ContentPart::Text { text } = part else {
+                    return None;
+                };
+                text.strip_prefix("connected-ticket-delegation:")
+                    .map(|json| serde_json::from_str::<Value>(json).unwrap())
+            })
+        });
+        if let Some(input) = delegation {
+            let result = |id: &str| {
+                request.items.iter().find_map(|item| match item {
+                    Item::ToolResult {
+                        call_id,
+                        is_error,
+                        content,
+                        summary,
+                        ..
+                    } if call_id == id => {
+                        assert!(!is_error, "public {id} failed: {summary}; {content:?}");
+                        Some(
+                            serde_json::from_str::<Value>(content.as_ref().unwrap_or(summary))
+                                .unwrap(),
+                        )
+                    }
+                    _ => None,
+                })
+            };
+            let ticket = input["assign"]["ticket"].as_str().unwrap();
+            let tool = if let Some(sent) = result("delegate-send") {
+                if self.reported.lock().unwrap().insert(ticket.into()) {
+                    self.delegated
+                        .try_send(
+                            json!({"ticket":ticket, "assigned":result("delegate-assign").unwrap(),
+                        "sent":sent}),
+                        )
+                        .unwrap();
+                }
+                return Ok(Box::pin(futures::stream::iter(end().into_iter().map(Ok))));
+            } else if let Some(replay) = result("delegate-replay") {
+                assert_eq!(
+                    replay,
+                    result("delegate-assign").unwrap(),
+                    "exact claim replay must preserve its receipt"
+                );
+                ("delegate-send", "WorkerSendInput", input["send"].clone())
+            } else if result("delegate-assign").is_some() {
+                (
+                    "delegate-replay",
+                    "TicketWorkerAssign",
+                    input["assign"].clone(),
+                )
+            } else {
+                (
+                    "delegate-assign",
+                    "TicketWorkerAssign",
+                    input["assign"].clone(),
+                )
+            };
+            assert!(
+                request
+                    .tools
+                    .iter()
+                    .any(|tool_definition| tool_definition.name == tool.1),
+                "Profile must expose {}",
+                tool.1
+            );
+            return Ok(Box::pin(futures::stream::iter(
+                vec![
+                    Event::tool_use_start(0, tool.0, tool.1),
+                    Event::tool_input_delta(0, tool.2.to_string()),
+                    Event::tool_use_stop(0),
+                ]
+                .into_iter()
+                .map(Ok),
+            )));
+        }
         let Some(input) = input else {
             // Bodies may receive normal lifecycle/notification input. That must
             // never run the child script or count as a concurrent child turn.
@@ -4910,8 +5005,11 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
         request: Value,
     }
     let (completed, mut completion) = tokio::sync::mpsc::channel(2);
+    let (delegated, mut delegations) = tokio::sync::mpsc::channel(2);
     let f = ConnectedWorkerHarness::start(ConcurrentTicketAuthorizationModel {
         overlap: Arc::new(tokio::sync::Barrier::new(2)),
+        delegated,
+        reported: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         completed,
     })
     .await;
@@ -5003,6 +5101,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
                 "journal.startup.supply",
                 "ticket.assignment.assign",
                 "worker.create",
+                "worker.send_input",
                 &format!("worker.launch.parallel-{label}"),
             ]),
         )
@@ -5052,9 +5151,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
         let content = format!("connected {label} result");
         let request = json!({"runtime_id":CONNECTED_RUNTIME,
             "display_name":format!("{label} delegated Ticket editor"), "profile":"project:authority-editor",
-            "ticket_assignment":{"ticket_id":ticket.id, "operation_id":format!("parallel-{label}-start"),
-                "orchestrator_assignment_id":delegation},
-            "initial_submit":[{"kind":"text", "content":format!("connected-ticket-case:{}", json!({"ticket":ticket.id,"content":content}))}],
+            "initial_submit":[],
             "workdir_attachments":[{"alias":"workdir", "working_directory_id":workdir}],
             "feature_connections":{}, "control_operation_id":format!("parallel-{label}-control"),
             "authorization":{"kind":"policy", "policy_id":launch.policy_id, "policy_authorization_key":launch.authorization_key}});
@@ -5110,7 +5207,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
         assert_eq!(
             status,
             StatusCode::OK,
-            "signed Ticket spawn: {child}; Runtime: {:?}",
+            "signed empty ordinary spawn: {child}; Runtime: {:?}",
             f.runtime_errors.lock().unwrap()
         );
         let child = RuntimeWorkerRef::new(
@@ -5134,12 +5231,22 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
                 .unwrap()
                 .is_none()
         );
-        let assigned = api
-            .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &case.ticket)
-            .unwrap()
-            .unwrap();
-        assert_eq!(assigned.worker, child);
+        assert!(
+            api.store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &case.ticket)
+                .unwrap()
+                .is_none(),
+            "ordinary creation must not claim the Ticket"
+        );
+        assert_eq!(
+            api.runtime.worker(&child).unwrap().state,
+            "idle",
+            "empty spawn must not start a turn"
+        );
+        assert_eq!(
+            fs::read_to_string(case.root.join("README.md")).unwrap(),
+            "clean\n"
+        );
         let links = api
             .store
             .list_worker_workdir_links(TEST_WORKSPACE_ID, &child)
@@ -5149,6 +5256,77 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
         children.push(child);
     }
     assert_ne!(children[0], children[1]);
+    // Workdir identities come from the authoritative live links, not a guessed
+    // alias or a key permission. The Subject then invokes real public Tools:
+    // independent assignment (and exact replay) followed by typed user input.
+    for (case, child) in cases.iter().zip(&children) {
+        let links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, child)
+            .unwrap();
+        let bindings: Vec<_> = links.iter().map(|link| json!({
+            "alias":link.alias, "working_directory_id":link.workdir_id, "connection_id":link.connection_id,
+        })).collect();
+        let content = format!(
+            "connected-ticket-case:{}",
+            json!({"ticket":case.ticket,"content":case.content})
+        );
+        let input = json!({
+            "assign":{"ticket":case.ticket, "runtime_id":child.runtime_id, "worker_id":child.worker_id,
+                "orchestrator_assignment_id":case.delegation, "operation_id":format!("{}-existing-worker",case.subject),
+                "workdir_bindings":bindings},
+            "send":{"subject":{"kind":"runtime_worker", "runtime_id":child.runtime_id,"worker_id":child.worker_id},
+                "content":content,"segments":[{"kind":"text","content":content}]},
+        });
+        let (status, accepted) = f
+            .human(
+                reqwest::Method::POST,
+                &format!(
+                    "/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{}/input",
+                    case.source.runtime_id, case.source.worker_id
+                ),
+                json!({"kind":"user", "content":format!("connected-ticket-delegation:{input}")}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+    }
+    for _ in 0..2 {
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(45), delegations.recv())
+            .await
+            .expect("public assignment and input must finish")
+            .expect("delegation receipt");
+        let case = cases
+            .iter()
+            .find(|case| case.ticket == receipt["ticket"])
+            .unwrap();
+        let child = &children[cases
+            .iter()
+            .position(|other| other.ticket == case.ticket)
+            .unwrap()];
+        let assigned = api
+            .store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &case.ticket)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&assigned.worker, child);
+        assert_eq!(
+            receipt["assigned"]["assignment"]["assignment_id"],
+            assigned.assignment_id
+        );
+        let operation = api
+            .store
+            .get_ticket_assignment_operation(
+                TEST_WORKSPACE_ID,
+                &format!("{}-existing-worker", case.subject),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.worker.as_ref(), Some(child));
+        assert_eq!(
+            operation.assignment_id.as_deref(),
+            Some(assigned.assignment_id.as_str())
+        );
+    }
     let mut completions = std::collections::BTreeMap::new();
     for _ in 0..2 {
         let (ticket, results) =
@@ -5387,7 +5565,6 @@ async fn ordinary_bound_attachment_returns_concrete_resource_and_rejects_replace
             display_name: "Explicitly assigned attachment owner".into(),
             singleton_key: None,
             profile: Some("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
@@ -5679,7 +5856,6 @@ async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_r
             display_name: "Replacement Job origin".into(),
             singleton_key: None,
             profile: Some("project:authority-source".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

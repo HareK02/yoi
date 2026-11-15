@@ -106,7 +106,6 @@ fn delivery_create_request(subject: Option<&str>, profile: &str) -> CreateWorksp
         display_name: "Artifact consumer".into(),
         singleton_key: None,
         profile: Some(profile.into()),
-        ticket_assignment: None,
         initial_submit: vec![],
         workdir_attachments: vec![],
         feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

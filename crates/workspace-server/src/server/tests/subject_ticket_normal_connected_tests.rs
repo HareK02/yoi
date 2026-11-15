@@ -1,7 +1,7 @@
 //! Ordinary Subject create -> canonical configuration -> body start -> public
 //! Ticket/Coder tools -> real Workdir edit/command/result -> current body tracking.
 //! Signed Backend/Runtime, builtin Profiles, Controller, policy and stores are real;
-//! only model decisions are scripted. This no-MR scenario explicitly disables Flow;
+//! only model decisions are scripted. This no-MR scenario submits no Flow;
 //! it is not evidence of live-model behavior or of MR review/integration.
 use super::*;
 #[path = "subject_ticket_conversation_policy_tests.rs"]
@@ -68,6 +68,101 @@ fn handling(ticket: &str, row: &Value, key: &str, result: &str) -> Value {
         "tracking":{"status":"done","waiting_reason":null,"progress":null,
             "next_action":null,"result":result}})
 }
+// Creation is deliberately idle and Ticket-free. Observe the exact live
+// connections through the public Tool, confirm the claim, then submit typed input.
+fn assign_and_submit(
+    request: &agen::llm_client::Request,
+    prefix: &str,
+    ticket: &str,
+    row: &Value,
+    spawned: &Value,
+    spawn: &Value,
+    segments: Value,
+) -> Option<Vec<Event>> {
+    assert_eq!(spawn["initial_submit"], json!([]));
+    for removed in [
+        "ticket_id",
+        "orchestrator_assignment_id",
+        "initial_request",
+        "flow",
+        "working_directory_id",
+    ] {
+        assert!(
+            spawn.get(removed).is_none(),
+            "general spawn must not carry {removed}"
+        );
+    }
+    let list_id = format!("{prefix}-connections");
+    let Some(listed) = success(request, &list_id) else {
+        return Some(call(request, &list_id, "WorkerList", json!({})));
+    };
+    assert_eq!(
+        listed["truncated"], false,
+        "all known connections must be observable"
+    );
+    let workers: Vec<_> = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| {
+            item["subject"]["kind"] == "runtime_worker"
+                && item["subject"]["runtime_id"] == spawned["runtime_id"]
+                && item["subject"]["worker_id"] == spawned["worker_id"]
+        })
+        .collect();
+    assert_eq!(
+        workers.len(),
+        1,
+        "use the one Worker just created, not a replacement"
+    );
+    let worker = workers[0];
+    let connections = worker["workdir_connections"].as_array().unwrap();
+    let attachments = spawn["workdir_attachments"].as_array().unwrap();
+    assert_eq!(connections.len(), attachments.len());
+    let bindings: Vec<_> = connections.iter().map(|connection| {
+        assert!(attachments.iter().any(|attachment| {
+            attachment["alias"] == connection["alias"]
+                && attachment["working_directory_id"] == connection["working_directory_id"]
+        }), "only the selected Workdir attachments may be claimed: {connection}");
+        assert!(!connection["connection_id"].as_str().unwrap().is_empty());
+        json!({"alias":connection["alias"],"working_directory_id":connection["working_directory_id"],
+            "connection_id":connection["connection_id"]})
+    }).collect();
+    let claim_id = format!("{prefix}-claim");
+    let Some(claimed) = success(request, &claim_id) else {
+        return Some(call(
+            request,
+            &claim_id,
+            "TicketWorkerAssign",
+            json!({
+            "ticket":ticket,"runtime_id":spawned["runtime_id"],"worker_id":spawned["worker_id"],
+            "orchestrator_assignment_id":row["assignment_id"],
+            "operation_id":format!("{prefix}-claim-{ticket}"),"workdir_bindings":bindings}),
+        ));
+    };
+    assert_eq!(claimed["ticket_id"], ticket);
+    assert_eq!(claimed["assignment"]["role"], "worker");
+    assert!(claimed["assignment"]["assignment_id"].is_string());
+    assert_eq!(
+        claimed["assignment"]["principal"],
+        json!({"kind":"worker",
+        "runtime_id":spawned["runtime_id"],"worker_id":spawned["worker_id"]})
+    );
+    let submit_id = format!("{prefix}-submit");
+    let Some(accepted) = success(request, &submit_id) else {
+        return Some(call(
+            request,
+            &submit_id,
+            "WorkerSendInput",
+            json!({
+            "subject":worker["subject"],"content":"Implement the confirmed Ticket assignment",
+            "segments":segments}),
+        ));
+    };
+    // Input acceptance is distinct from the saved result inspected by the caller.
+    assert_eq!(accepted["state"], "accepted", "{accepted}");
+    None
+}
 impl NormalModel {
     async fn body(
         &self,
@@ -129,25 +224,40 @@ impl NormalModel {
                     return call(
                         request,
                         "normal-no-delegation",
-                        "SpawnTicketWorker",
+                        "WorkerSpawn",
                         input["spawn"].clone(),
                     );
                 }
                 let denial = tool_result(request, "normal-no-delegation").unwrap().1;
-                assert!(
-                    denial.contains("403"),
-                    "visible SpawnTicketWorker must reach authorization, not input rejection: {denial}"
+                let failure: Value = serde_json::from_str(&denial).unwrap();
+                assert_eq!(
+                    failure["failure"]["category"], "authorization",
+                    "visible WorkerSpawn must reach authorization, not input rejection: {denial}"
                 );
                 if self.seen.lock().unwrap().insert(format!("denied:{ticket}")) {
                     self.evaluated.send(json!({"denied":ticket})).await.unwrap();
                 }
                 return done();
             }
-            let Some(_) = success(request, "normal-spawn") else {
-                let mut spawn = input["spawn"].clone();
-                spawn["orchestrator_assignment_id"] = row["assignment_id"].clone();
-                return call(request, "normal-spawn", "SpawnTicketWorker", spawn);
+            let Some(spawned) = success(request, "normal-spawn") else {
+                return call(
+                    request,
+                    "normal-spawn",
+                    "WorkerSpawn",
+                    input["spawn"].clone(),
+                );
             };
+            if let Some(events) = assign_and_submit(
+                request,
+                "normal",
+                ticket,
+                row,
+                &spawned,
+                &input["spawn"],
+                json!([{"kind":"text","content":format!("{EDITOR}{}",json!({"ticket":ticket,"content":input["content"]}))}]),
+            ) {
+                return events;
+            }
             // The ordinary business notification contains the stable saved ID.
             // No direct WorkerNotify or shared model side channel supplies it.
             let text = messages(request);
@@ -509,7 +619,7 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
             .meta
             .resource_key
             .unwrap();
-        let assigned = ok(&h, "PUT", &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
+        let _assigned = ok(&h, "PUT", &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
             json!({"operation_id":format!("ordinary-assign-{label}"),"expected_assignment_id":null,"principal":{"kind":"subject","subject_id":subject}})).await;
         let conversation = ok(
             &h,
@@ -534,9 +644,8 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
             );
             assignment.grants.extend(handling.grants);
         }
-        let spawn = json!({"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder","flow":null,
-            "orchestrator_assignment_id":assigned["assignment"]["assignment_id"],
-            "initial_request":format!("{EDITOR}{}",json!({"ticket":ticket,"content":content})),
+        let spawn = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
+            "operation_id":format!("ordinary-spawn-{label}"),"initial_submit":[],
             "workdir_attachments":[{"alias":"checkout","working_directory_id":wd}],
             "authorization":{"kind":"assignment","assignment":assignment}});
         let input = json!({"subject":subject,"ticket":ticket,"spawn":spawn,"content":content,"related":related});

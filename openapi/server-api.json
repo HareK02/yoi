@@ -2030,17 +2030,6 @@
               "null"
             ]
           },
-          "ticket_assignment": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/CreateWorkspaceWorkerTicketAssignmentRequest"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null
-          },
           "workdir_attachments": {
             "default": [],
             "items": {
@@ -2053,29 +2042,6 @@
           "runtime_id",
           "display_name",
           "feature_connections"
-        ],
-        "type": "object"
-      },
-      "CreateWorkspaceWorkerTicketAssignmentRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "operation_id": {
-            "type": "string"
-          },
-          "orchestrator_assignment_id": {
-            "description": "Observed delegation required for Orchestrator Ticket starts; manual starts omit it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ticket_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "ticket_id",
-          "operation_id"
         ],
         "type": "object"
       },
@@ -14992,15 +14958,6 @@
         ],
         "type": "object"
       },
-      "RuntimeTicketWorkerRole": {
-        "enum": [
-          "intake",
-          "orchestrator",
-          "worker",
-          "reviewer"
-        ],
-        "type": "string"
-      },
       "RuntimeTrustAuditAction": {
         "enum": [
           "created",
@@ -15622,27 +15579,6 @@
               "kind"
             ],
             "type": "object"
-          },
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "const": "ticket_role",
-                "type": "string"
-              },
-              "role": {
-                "$ref": "#/components/schemas/RuntimeTicketWorkerRole"
-              },
-              "ticket_id": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "ticket_id",
-              "role"
-            ],
-            "type": "object"
           }
         ]
       },
@@ -15684,16 +15620,6 @@
             "type": [
               "string",
               "null"
-            ]
-          },
-          "ticket_assignment": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeWorkerTicketAssignmentRequest"
-              },
-              {
-                "type": "null"
-              }
             ]
           },
           "workdir_attachment_requests": {
@@ -26649,7 +26575,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:b541c0580b71fcccf11071e62bf9a4fadf0359b5d4a912419e67755b0fcb658e"
+    "x-yoi-source-digest": "sha256:90175d2e303b305715d36cb87581f8d3340323fe7219910b92bc090185a787e5"
   },
   "openapi": "3.1.0",
   "paths": {

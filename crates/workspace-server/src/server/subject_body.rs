@@ -567,7 +567,6 @@ pub(super) async fn start(
                 display_name: subject_record.role.as_str().into(),
                 singleton_key: None,
                 profile: Some(server_api::authorization::SUBJECT_CONVERSATION_PROFILE.into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

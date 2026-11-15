@@ -80,11 +80,21 @@ pub(super) fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
             json!({"ticket":"T-743", "assignment_id":"delegation", "expected_last_event_id":"waiting", "operation_key":"answer-1", "body":"Proceed with option A"}),
             json!({"assignment_id":"delegation", "input_event_id":"ticket-event:8", "event_index":8}),
         ),
+        (
+            PublicAssignmentKind::WorkerAssign,
+            json!({"ticket":"T-743","runtime_id":"runtime-a","worker_id":"worker-b","orchestrator_assignment_id":"subject-assignment","operation_id":"worker-claim","workdir_bindings":[]}),
+            json!({"workspace_id":"workspace","ticket_id":"T-743","assignment":null}),
+        ),
     ]
 }
 // Paired inputs exercise the two public contracts against identical domain requests.
 pub(super) fn native_args(kind: PublicAssignmentKind, input: &Value) -> BTreeMap<String, WipValue> {
     let value = match kind {
+        PublicAssignmentKind::WorkerAssign => {
+            let mut value = input.clone();
+            value.as_object_mut().unwrap().remove("ticket");
+            value
+        }
         PublicAssignmentKind::Assign => {
             let mut principal = input["principal"].clone();
             let case = principal.as_object_mut().unwrap().remove("kind").unwrap();
@@ -149,6 +159,11 @@ async fn public_assignment_schemas_require_observations_and_exclude_model_actor_
             "worker_id",
             "authentication_binding_id",
         ] {
+            if matches!(kind, PublicAssignmentKind::WorkerAssign)
+                && matches!(actor_claim, "runtime_id" | "worker_id")
+            {
+                continue;
+            }
             let mut forged = input.clone();
             forged[actor_claim] = json!("authority");
             assert!(
@@ -212,7 +227,7 @@ async fn assign_reissue_and_clear_forward_observed_identity_and_exact_retry_with
                 .starts_with("/api/w/workspace/tickets/T-743/assignments/orchestrator")
         );
         match kind {
-            PublicAssignmentKind::Assign => {
+            PublicAssignmentKind::WorkerAssign | PublicAssignmentKind::Assign => {
                 assert_eq!(requests[0].method, WorkspaceRequestMethod::Put);
                 let body: Value =
                     serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
@@ -432,7 +447,10 @@ fn implementation_result_guidance_keeps_retry_identity_host_owned() {
 
 #[tokio::test]
 async fn continuing_answer_forwards_same_assignment_event_cas_and_saved_receipt() {
-    let (kind, input, response) = cases().pop().unwrap();
+    let (kind, input, response) = cases()
+        .into_iter()
+        .find(|(kind, _, _)| matches!(kind, PublicAssignmentKind::Answer))
+        .unwrap();
     let client = transport(200, response.clone());
     let (_, tool) = definition(client.clone(), kind)();
     for _ in 0..2 {

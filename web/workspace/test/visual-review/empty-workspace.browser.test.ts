@@ -191,9 +191,37 @@ Deno.test("production empty Workspace supports optional Git validation, reopenin
             await page.getByRole("button", { name: "Start Worker" }).click();
             const body = (await submitted).postDataJSON();
             assertEquals(body.workdir_attachments, []);
-            assertEquals(body.ticket_assignment, null);
+            assertEquals("ticket_assignment" in body, false);
             assertEquals(body.runtime_id, "embedded");
             await page.waitForURL("**/w/home-empty");
+            const ticketPage = await page.goto(
+              scenario.baseUrl! + "/w/home-empty/workers/new?ticketId=T-868&ticketTitle=Independent%20Worker%20assignment",
+            );
+            await page.locator(".worker-launch-form").waitFor();
+            assert(await page.getByLabel("Initial request", { exact: true }).isDisabled());
+            const ticketCreated = page.waitForRequest((request) =>
+              request.url().endsWith("/api/w/home-empty/workers") && request.method() === "POST"
+            );
+            await page.getByRole("button", { name: "Create Worker", exact: true }).click();
+            const ticketBody = (await ticketCreated).postDataJSON();
+            assertEquals(ticketBody.initial_submit, []);
+            assertEquals("ticket_assignment" in ticketBody, false);
+            await page.locator(".worker-created").waitFor();
+            assert((await page.locator(".worker-created").innerText()).includes("Not assigned; no work request sent"));
+            assert(await page.getByRole("button", { name: "Create Worker", exact: true }).isDisabled());
+            assertEquals(await page.getByRole("link", { name: "Assign this existing Worker on the Ticket" }).getAttribute("href"), "/w/home-empty/tickets/T-868");
+            const resultOutput = new URL("../../../../target/web-ux/t868/browser-result/", import.meta.url).pathname;
+            await Deno.mkdir(resultOutput, { recursive: true });
+            const image = await page.screenshot({ path: resultOutput + colorScheme + "-" + width + ".png", fullPage: true });
+            const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(image)))].map((n) => n.toString(16).padStart(2, "0")).join("");
+            await Deno.writeTextFile(resultOutput + colorScheme + "-" + width + "-review-context.json", JSON.stringify({
+              source: Deno.env.get("YOI_REVIEW_SOURCE") ?? "dirty test invocation; see validation evidence",
+              scenario: "ordinary creation from Ticket context; assignment and input not sent",
+              viewport: { width, height: 900 }, theme: colorScheme,
+              document: { url: page.url(), status: ticketPage?.status() },
+              screenshot_sha256: hash, errors, snapshot: await page.locator("body").ariaSnapshot(),
+              request: ticketBody,
+            }, null, 2));
             assertEquals(errors, []);
           } finally {
             await context.close();

@@ -26,7 +26,7 @@ function equal(actual: unknown, expected: unknown) {
   }
 }
 
-Deno.test("generic Ticket request keeps conclusion and review instructions as natural text with no mandatory Flow or profile", () => {
+Deno.test("ordinary request keeps conclusion and review instructions as natural text with no mandatory Flow or profile", () => {
   for (
     const text of [
       "Review is unnecessary.",
@@ -37,19 +37,15 @@ Deno.test("generic Ticket request keeps conclusion and review instructions as na
     const request = buildCreateWorkspaceWorkerRequest({
       ...form,
       initial_text: text,
-      ticket_assignment: { ticket_id: "T-720", operation_id: "launch-720" },
     });
-    equal(request.ticket_assignment, {
-      ticket_id: "T-720",
-      operation_id: "launch-720",
-    });
+    equal("ticket_assignment" in request, false);
     equal(request.profile, null);
     equal(request.workdir_attachments, []);
     equal(request.initial_submit, [{ kind: "text", content: text }]);
   }
 });
 
-Deno.test("explicit Flow and resource selections remain separate from the Ticket request", () => {
+Deno.test("explicit Flow and resource selections remain independent of Ticket assignment", () => {
   const request = buildCreateWorkspaceWorkerRequest({
     ...form,
     runtime_id: "remote",
@@ -57,7 +53,6 @@ Deno.test("explicit Flow and resource selections remain separate from the Ticket
     initial_text: "  Review is unnecessary.\nReturn without conclusion.  ",
     flow: " project:investigate ",
     subjektiv_subject_id: "subject-1",
-    ticket_assignment: { ticket_id: "T-720", operation_id: "launch-720" },
     workdir_attachments: [{
       alias: "sessions",
       working_directory_id: "read-only-grant",

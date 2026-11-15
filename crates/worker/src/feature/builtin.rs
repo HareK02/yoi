@@ -33,7 +33,6 @@ pub mod merge_request;
 mod native_contract;
 pub(crate) mod notification_permissions;
 pub mod objective;
-pub mod orchestration;
 pub(crate) mod plugin_host_permissions;
 pub(crate) mod repository_permissions;
 mod resource_projection;

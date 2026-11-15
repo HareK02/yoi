@@ -319,7 +319,6 @@ impl RegistrationFixture {
             display_name: "Connected Session registration".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

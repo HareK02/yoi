@@ -198,7 +198,6 @@ async fn create_test_assignment_body(
             display_name: "Assignment Subject".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -272,7 +271,6 @@ async fn start_attention_test_orchestrator(
                             display_name: "Assignment Subject".into(),
                             singleton_key: None,
                             profile: Some("builtin:companion".into()),
-                            ticket_assignment: None,
                             initial_submit: vec![],
                             workdir_attachments: vec![],
                             feature_connections:

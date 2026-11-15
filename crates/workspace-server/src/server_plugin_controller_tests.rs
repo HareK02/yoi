@@ -447,7 +447,6 @@ mod plugin_controller_tests {
             display_name: "Plugin controller".into(),
             singleton_key: None,
             profile: Some(profile.into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
