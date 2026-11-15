@@ -5,6 +5,8 @@ import { EditorView } from "@codemirror/view";
 import type { FeatureInvocationDescriptor, Segment } from "#lib/generated/protocol.ts";
 import { redo, undo } from "@codemirror/commands";
 import ComposerInput from "./ComposerInput.svelte";
+import type { ComposerDraftSnapshot } from "#lib/workspace/composer/composer-draft.ts";
+import { composerHistoryStorageKey } from "./composer-history.ts";
 
 afterEach(cleanup);
 function editor(container: HTMLElement) {
@@ -541,4 +543,163 @@ test("pasted invocation text remains literal after descriptor selection", async 
   await waitFor(() => expect(ui.container.querySelectorAll(".composer-typed-chip")).toHaveLength(1));
   await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => ' /run("pasted")', items: [] } });
   expect(ui.component.snapshot().segments.map((segment) => segment.kind)).toEqual(["feature_invoke", "text"]);
+});
+
+test("text-only composer keeps commands, paths and Features literal and preserves submit/IME keys", async () => {
+  const oncommand = vi.fn(), onsubmit = vi.fn(), onclientadapter = vi.fn();
+  const resolver = vi.fn(async () => [{ value: "run", invocation: invocationDescriptor }]);
+  const ui = render(ComposerInput, {
+    historyScope: "chat-literal", workerFeatures: false, oncommand, onsubmit, onclientadapter,
+    resolveFileCompletions: resolver, resolveFeatureCompletions: resolver,
+    resolveFeatureArgumentCompletions: resolver,
+  });
+  const cm = editor(ui.container);
+  for (const text of [":cancel", "@path", '/run("literal")']) {
+    type(cm, text);
+    await Promise.resolve();
+    await fireEvent.keyDown(cm.contentDOM, { key: "Tab" });
+    expect(ui.queryByRole("listbox")).toBeNull();
+    expect(ui.component.snapshot().content).toBe(text);
+  }
+  type(cm, ":cancel");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(cm.state.doc.toString()).toBe(":cancel\n");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", shiftKey: true });
+  expect(onsubmit).not.toHaveBeenCalled();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ctrlKey: true, isComposing: true, keyCode: 229 });
+  expect(onsubmit).not.toHaveBeenCalled();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ctrlKey: true });
+  expect(onsubmit).toHaveBeenCalledOnce();
+  expect(oncommand).not.toHaveBeenCalled();
+  expect(resolver).not.toHaveBeenCalled();
+  expect(onclientadapter).not.toHaveBeenCalled();
+  expect(ui.component.insertSegment(invocationSegment)).toBe(false);
+  expect(ui.component.reserveUpload("image.png")).toBeNull();
+  const before = ui.component.snapshot().content;
+  expect(() => ui.component.restoreSegments([uploadedSegment])).toThrow("only supports text");
+  expect(ui.component.snapshot().content).toBe(before);
+});
+
+test("text-only paste exposes complete text through neutral snapshots, copy, undo, history and restore", async () => {
+  const snapshots: ComposerDraftSnapshot[] = [];
+  const ui = render(ComposerInput, {
+    historyScope: "chat-paste", workerFeatures: false,
+    onchange: (snapshot: ComposerDraftSnapshot) => snapshots.push(snapshot),
+  });
+  const cm = editor(ui.container);
+  const short = "短い\r\n🙂 ", long = "資料🙂\r\n".repeat(100);
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => short } });
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => long } });
+  expect(ui.container.querySelectorAll(".composer-paste-chip")).toHaveLength(1);
+  const content = short + long;
+  expect(ui.component.snapshot().content).toBe(content);
+  expect(snapshots.at(-1)?.content).toBe(content);
+  expect(ui.component.snapshot().document).not.toBe(content);
+  expect(undo(cm)).toBe(true);
+  expect(ui.component.snapshot().content).toBe(short);
+  expect(redo(cm)).toBe(true);
+  expect(ui.component.snapshot().content).toBe(content);
+  cm.contentDOM.blur();
+  cm.dispatch({ selection: { anchor: 0, head: cm.state.doc.length } });
+  const setData = vi.fn();
+  await fireEvent.copy(cm.contentDOM, { clipboardData: { setData } });
+  expect(setData).toHaveBeenCalledWith("text/plain", content);
+  ui.component.recordHistory(ui.component.snapshot());
+  ui.component.clear();
+  cm.focus();
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(ui.component.snapshot().content).toBe(content);
+  expect(ui.container.querySelectorAll(".composer-paste-chip")).toHaveLength(1);
+  cm.dispatch({ selection: { anchor: cm.state.doc.length } });
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowDown" });
+  expect(ui.component.snapshot().content).toBe("");
+  ui.component.restoreText(content);
+  expect(ui.component.snapshot().content).toBe(content);
+  expect(cm.hasFocus).toBe(true);
+  ui.component.recordHistory(content);
+  ui.component.clear();
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(ui.component.snapshot().content).toBe(content);
+});
+
+test("text-only image paste rejects unsupported files without deleting selection and still pastes alternate text", async () => {
+  const onpasteimages = vi.fn(), onunsupportedpaste = vi.fn();
+  const ui = render(ComposerInput, {
+    historyScope: "chat-images", workerFeatures: false, onpasteimages, onunsupportedpaste,
+  });
+  const cm = editor(ui.container);
+  ui.component.restoreText("keep selected draft");
+  cm.contentDOM.blur();
+  cm.dispatch({ selection: { anchor: 0, head: cm.state.doc.length } });
+  const image = new File(["image"], "image.png", { type: "image/png" });
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "", files: [image] } });
+  expect(ui.component.snapshot().content).toBe("keep selected draft");
+  expect(onunsupportedpaste).toHaveBeenCalledOnce();
+  expect(onpasteimages).not.toHaveBeenCalled();
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "alternate text", files: [image] } });
+  expect(ui.component.snapshot().content).toBe("alternate text");
+  expect(onpasteimages).not.toHaveBeenCalled();
+});
+
+test("text-only history stays scoped and does not restore Worker atoms from storage", async () => {
+  const scopeA = "chat-account-workspace-conversation-a", scopeB = "chat-account-workspace-conversation-b";
+  localStorage.setItem(composerHistoryStorageKey(scopeA), JSON.stringify({
+    version: 1, entries: [{ segments: [invocationSegment], preserveExactText: false }],
+  }));
+  const ui = render(ComposerInput, { historyScope: scopeA, workerFeatures: false });
+  const cm = editor(ui.container);
+  cm.focus();
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(ui.component.snapshot().content).toBe("");
+  ui.component.recordHistory("conversation A");
+  await ui.rerender({ historyScope: scopeB });
+  ui.component.clear();
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(ui.component.snapshot().content).toBe("");
+  ui.component.recordHistory("conversation B");
+  await ui.rerender({ historyScope: scopeA });
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(ui.component.snapshot().content).toBe("conversation A");
+  localStorage.removeItem(composerHistoryStorageKey(scopeA));
+  localStorage.removeItem(composerHistoryStorageKey(scopeB));
+});
+
+test("initial text restores once without emitting an empty draft and empty restore cannot duplicate subsequent typing", () => {
+  const onchange = vi.fn();
+  const text = "  restored\r\n日本語  ";
+  const ui = render(ComposerInput, { historyScope: "initial-chat", workerFeatures: false, initialText: text, onchange });
+  expect(ui.component.snapshot().content).toBe(text);
+  expect(onchange.mock.calls.map(([snapshot]) => snapshot.content)).toEqual([text]);
+  ui.component.restoreText("");
+  type(editor(ui.container), "first input");
+  expect(ui.component.snapshot().content).toBe("first input");
+});
+
+test("chat history can stay in tab storage without reading Console local history", async () => {
+  const scope = "tab-chat-history";
+  localStorage.setItem(composerHistoryStorageKey(scope), JSON.stringify({ version: 1, entries: [{ segments: [{ kind: "text", content: "other tab" }], preserveExactText: true }] }));
+  const ui = render(ComposerInput, { historyScope: scope, historyStorage: "session", workerFeatures: false });
+  const cm = editor(ui.container); cm.focus();
+  await fireEvent.keyDown(cm.contentDOM, { key: "ArrowUp" });
+  expect(ui.component.snapshot().content).toBe("");
+  ui.component.recordHistory("this tab");
+  expect(sessionStorage.getItem(composerHistoryStorageKey(scope))).toContain("this tab");
+  expect(localStorage.getItem(composerHistoryStorageKey(scope))).not.toContain("this tab");
+  localStorage.removeItem(composerHistoryStorageKey(scope));
+  sessionStorage.removeItem(composerHistoryStorageKey(scope));
+});
+
+test("disabling Worker capabilities aborts open completions and ignores late results", async () => {
+  const request = deferred<Array<{ value: string; invocation: FeatureInvocationDescriptor }>>();
+  const resolver = vi.fn(() => request.promise);
+  const ui = render(ComposerInput, { historyScope: "chat-capability-switch", resolveFeatureCompletions: resolver });
+  const cm = editor(ui.container);
+  type(cm, "/ru");
+  await waitFor(() => expect(resolver).toHaveBeenCalledOnce());
+  await ui.rerender({ workerFeatures: false });
+  request.resolve([{ value: "run", invocation: invocationDescriptor }]);
+  await Promise.resolve();
+  expect(ui.queryByRole("listbox")).toBeNull();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(ui.component.snapshot().content).toBe("/ru\n");
 });

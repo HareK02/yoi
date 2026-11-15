@@ -551,7 +551,7 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
       consolePage.includes("consoleProjector.append(eventBatch)") &&
       consolePage.includes("{#each lines as item (item.id)}") &&
       !consolePage.includes("projectConsole(observedEvents.map") &&
-      !consolePage.includes("/transcript") &&
+      ! /\/transcript(?:[?"'`]|$)/.test(consolePage) &&
       !consolePage.includes("WorkerTranscriptProjection"),
     "Console should render raw protocol replay/live events directly from the unified protocol WS",
   );
@@ -1218,7 +1218,7 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
     "Worker detail should use the scoped backend Worker detail API",
   );
   assert(
-    !consolePage.includes("/transcript") &&
+    ! /\/transcript(?:[?"'`]|$)/.test(consolePage) &&
       consolePage.includes("workspaceMultiplexer") &&
       consolePage.includes("sendWorkerMethod") &&
       !consolePage.includes("/events" + "/ws") &&

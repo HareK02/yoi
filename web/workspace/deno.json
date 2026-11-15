@@ -17,6 +17,7 @@
     "test:browser:worker-failure": "deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/visual-review/worker-failure.browser.test.ts",
     "test:browser:drive": "deno test --config test/drive-browser/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/drive-browser/drive.browser.test.ts",
     "test:browser:subject-navigation": "cd ../.. && deno run --config tools/web-ux/deno.json -A tools/web-ux/browser-tests/subject_navigation_review.ts web/workspace/build navigation-task",
+    "test:browser:chat": "cd ../.. && deno run --config tools/web-ux/deno.json -A tools/web-ux/browser-tests/chat_ui_review.ts after",
     "test:browser:permissions": "mkdir -p .svelte-kit/permissions-tmp && TMPDIR=$PWD/.svelte-kit/permissions-tmp deno test --unstable-sloppy-imports --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/visual-review/permissions.browser.test.ts",
     "test:browser:subject-handling": "deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/visual-review/subject-handling.browser.test.ts",
     "test:ticket:real-api": "cd ../.. && deno task test:ticket:real-api",

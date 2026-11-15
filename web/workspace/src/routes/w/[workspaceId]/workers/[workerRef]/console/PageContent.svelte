@@ -6,6 +6,7 @@
     import { prefersReducedMotion } from "svelte/motion";
     import { fly } from "svelte/transition";
     import ConsoleLineItem from "#lib/workspace/console/ConsoleLineItem.svelte";
+    import { captureTranscriptAnchor, restoreTranscriptAnchor, isNearTranscriptBottom, followTranscriptTail, observeTranscriptSize, type TranscriptAnchor } from "#lib/workspace/transcript/scroll.ts";
     import ConsoleTurnNavigation from "#lib/workspace/console/ConsoleTurnNavigation.svelte";
     import ConsoleDisplayStateView from "#lib/workspace/console/ConsoleDisplayState.svelte";
     import ConsoleTasks from "#lib/workspace/console/ConsoleTasks.svelte";
@@ -462,21 +463,13 @@
         }
     }
 
-    type HistoryAnchor = { id: string; top: number };
+    type HistoryAnchor = TranscriptAnchor;
     type HistoryAnchors = {
         transcript: HistoryAnchor | null;
         navigation: HistoryAnchor | null;
     };
 
-    function captureElementAnchor(
-        container: HTMLElement | null,
-        selector: string,
-        dataKey: "consoleLineId" | "turnId",
-    ): HistoryAnchor | null {
-        const first = container?.querySelector<HTMLElement>(selector);
-        const id = first?.dataset[dataKey] ?? "";
-        return first && id ? { id, top: first.getBoundingClientRect().top } : null;
-    }
+    const captureElementAnchor = captureTranscriptAnchor;
 
     function captureHistoryAnchors(): HistoryAnchors {
         return {
@@ -493,16 +486,7 @@
         };
     }
 
-    function restoreElementAnchor(
-        container: HTMLElement | null,
-        selector: string,
-        anchor: HistoryAnchor | null,
-    ) {
-        if (!anchor || !container) return;
-        const target = container.querySelector<HTMLElement>(selector);
-        if (!target) return;
-        container.scrollTop += target.getBoundingClientRect().top - anchor.top;
-    }
+    const restoreElementAnchor = restoreTranscriptAnchor;
 
     function restoreHistoryAnchors(anchors: HistoryAnchors | null) {
         if (!anchors) return;
@@ -1795,10 +1779,7 @@
     }
 
     function isNearConsoleBottom(element: HTMLElement): boolean {
-        return (
-            element.scrollHeight - element.scrollTop - element.clientHeight <=
-            CONSOLE_BOTTOM_THRESHOLD_PX
-        );
+        return isNearTranscriptBottom(element, CONSOLE_BOTTOM_THRESHOLD_PX);
     }
 
     function selectConsoleTurn(id: string) {
@@ -1833,18 +1814,17 @@
     async function scrollConsoleToBottom() {
         if (!consoleWorkerViewSelectionIsResolved()) return;
         const sessionId = selectedWorkerView.sessionId;
-        await tick();
-        if (
-            !consoleBodyElement ||
-            !autoFollowConsole ||
-            !consoleWorkerViewSelectionIsResolved() ||
-            selectedWorkerView.sessionId !== sessionId
-        ) {
-            return;
-        }
-        consoleBodyElement.scrollTop = consoleBodyElement.scrollHeight;
-        autoFollowConsole = true;
-        rememberConsoleWorkerViewScroll();
+        const element = consoleBodyElement;
+        const followed = await followTranscriptTail(element, () =>
+            element === consoleBodyElement && autoFollowConsole &&
+            consoleWorkerViewSelectionIsResolved() &&
+            selectedWorkerView.sessionId === sessionId,
+        );
+        if (followed) rememberConsoleWorkerViewScroll();
+    }
+
+    function observeConsoleContent(element: HTMLElement) {
+        return { destroy: observeTranscriptSize(element, () => { if (autoFollowConsole) void scrollConsoleToBottom(); }, consoleBodyElement) };
     }
 
     const scrollFollowKey = $derived(
@@ -1992,7 +1972,7 @@
                 />
 
                 {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
-                    <ol class="console-log">
+                    <ol class="console-log" use:observeConsoleContent>
                         {#each lines as item (item.id)}
                             <ConsoleLineItem {item} viewMode={consoleViewMode} {attachmentUrl} rewindSelected={rewindEntryId !== null && item.entryId === rewindEntryId} />
                         {/each}

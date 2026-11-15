@@ -1,5 +1,8 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import ComposerInput from '#lib/workspace/console/ComposerInput.svelte';
+  import ConversationHistory from './ConversationHistory.svelte';
+  import { conversationDraftKey, readConversationDraft, saveConversationDraft } from './conversation-draft.ts';
   import { CHAT_LIMITS, chatHasText, type ChatConversation, type ChatDelivery, type ChatMessage } from '#lib/generated/chat-api.ts';
   import { browserSession } from '#lib/workspace/auth/session-state.ts';
   import { ConversationApiError } from './conversation-api.ts';
@@ -20,6 +23,19 @@
   let reading = $state(false);
   let sending = $state(false);
   let draft = $state('');
+  let draftKey = $state<string | null>(null);
+  let draftStorageError = $state<string | null>(null);
+  let composer = $state<ReturnType<typeof ComposerInput> | null>(null);
+
+  function editDraft(text: string): void {
+    const context = active;
+    if (!context || !current(context) || !draftKey || text === draft) return;
+    draft = text;
+    try {
+      saveConversationDraft(sessionStorage, draftKey, text);
+      draftStorageError = null;
+    } catch { draftStorageError = 'Your draft is editable but could not be saved in this tab. Keep this page open or copy the text before leaving.'; }
+  }
   let attempt = $state<ConversationAttempt | null>(null);
   let delivery = $state<ChatDelivery | null>(null);
   let historyError = $state<string | null>(null);
@@ -48,6 +64,9 @@
     attempt = null;
     delivery = null;
     draft = '';
+    draftKey = null;
+
+    draftStorageError = null;
     sending = false;
     reading = false;
     storageBlocked = false;
@@ -64,6 +83,9 @@
       reading = false;
       sending = false;
       draft = '';
+      draftKey = null;
+
+      draftStorageError = null;
       attempt = null;
       delivery = null;
       historyError = null;
@@ -77,6 +99,13 @@
       context.client = new ConversationMessagingClient(scope, context.controller.signal, {
         onPage: (page, restored) => {
           if (!current(context)) return;
+          const nextDraftKey = conversationDraftKey(context.scope, page.conversation.id);
+          if (nextDraftKey !== draftKey) {
+            draftKey = nextDraftKey;
+
+            try { draft = readConversationDraft(sessionStorage, nextDraftKey); }
+            catch { draft = ''; draftStorageError = 'The saved draft could not be read. It has not been replaced.'; }
+          }
           conversation = page.conversation;
           messages = restored;
           hasMore = page.has_more;
@@ -145,7 +174,11 @@
     try { saveConversationAttempt(sessionStorage, context.scope, request); }
     catch { storageBlocked = true; sendError = 'Send input could not be retained safely. Nothing new was dispatched.'; return; }
     attempt = request;
-    if (!retry) draft = '';
+    if (!retry) {
+      if (composer) composer.recordHistory(composer.snapshot());
+      composer?.clear();
+      editDraft('');
+    }
     sending = true;
     delivery = null;
     sendError = null;
@@ -211,15 +244,9 @@
   <p class="muted" role="status">Conversation connection: {connectionState === 'open' ? 'connected' : connectionState === 'connecting' ? 'reconnecting' : 'disconnected — history is the last confirmed observation'}</p>
   {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
   {#if !conversation && !historyError && !inaccessible}<p role="status">Loading conversation…</p>{/if}
-  <ol aria-label="Saved public messages">
-    {#each messages as message (message.id)}
-      <li>
-        <strong>{message.sender.kind === 'user' ? 'You' : subjectName}</strong>
-        <p class="message-text">{message.text}</p>
-      </li>
-    {/each}
-  </ol>
-  {#if conversation && messages.length === 0}<p>No public messages yet.</p>{/if}
+  {#if conversation}
+    {#key draftKey}<ConversationHistory {messages} {accountId} {subjectName} />{/key}
+  {/if}
   {#if hasMore && !inaccessible}<button class="workspace-secondary-button" type="button" onclick={() => refresh()} disabled={reading}>Load newer messages</button>{/if}
 
   <div class="send-status" aria-live="polite">
@@ -236,9 +263,17 @@
   {/if}
   {#if !inaccessible && conversation}
     <form onsubmit={(event) => { event.preventDefault(); void send(); }}>
-      <label for="subject-conversation-input">Message to {subjectName}</label>
-      <textarea id="subject-conversation-input" bind:value={draft} rows="4" aria-describedby="conversation-constraint"></textarea>
-      <p id="conversation-constraint">Text only, up to {CHAT_LIMITS.maxTextBytes} UTF-8 bytes. Attachments are not supported.</p>
+      <span id="conversation-input-label">Message to {subjectName}</span>
+      <div class="conversation-editor">
+      {#key draftKey}
+        <ComposerInput bind:this={composer} initialText={draft} historyScope={draftKey ?? ''} historyStorage="session" workerFeatures={false}
+          ariaLabel={`Message to ${subjectName}`} ariaDescribedBy="conversation-constraint" onchange={(snapshot) => editDraft(snapshot.content)}
+          onunsupportedpaste={() => { sendError = 'Attachments are not supported in this conversation. Paste text instead.'; }}
+          onsubmit={() => { void send(); }} />
+      {/key}
+      </div>
+      <p id="conversation-constraint">Text only, up to {CHAT_LIMITS.maxTextBytes} UTF-8 bytes. Attachments are not supported. Ctrl/⌘+Enter to send.</p>
+      {#if draftStorageError}<p class="error" role="alert">{draftStorageError}</p>{/if}
       {#if draftBytes > CHAT_LIMITS.maxTextBytes}<p class="error">The message exceeds the text limit.</p>{/if}
       {#if attempt}<p>Resolve the retained send before sending another message. Your next draft remains editable.</p>{/if}
       <button class="workspace-secondary-button" type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !chatHasText(draft) || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
@@ -251,14 +286,15 @@
   header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-3); }
   h2, p { margin: 0; }
   h2 { font-size: var(--font-size-body); }
-  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-5); }
-  li { display: grid; gap: var(--space-1); }
   .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
   form { display: grid; gap: var(--space-2); }
-  textarea { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line-strong); padding: var(--space-2); }
+  .conversation-editor { min-width: 0; border: 1px solid var(--line-strong); padding: var(--space-2); }
+  .conversation-editor:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .conversation-editor :global(.cm-content) { min-height: 4rem; }
+  .conversation-editor :global(.cm-scroller) { max-height: 12rem; overflow-y: auto; }
   button { justify-self: start; font-size: var(--font-size-body); line-height: var(--line-height-body); border-radius: var(--radius-soft); }
   button:hover:not(:disabled) { background: var(--interactive-hover); }
   button:active:not(:disabled) { background: var(--interactive-selected); }
-  button:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .error { color: var(--danger); }
 </style>

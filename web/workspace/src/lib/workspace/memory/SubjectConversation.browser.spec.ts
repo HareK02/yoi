@@ -1,7 +1,17 @@
 // @vitest-environment happy-dom
-// 本番component/API adapterと接続し、HTTPとbrowser storage障害だけを代替する。
+// 本番component/messaging clientと接続し、multiplexerの外側とbrowser storage障害だけを代替する。
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { EditorView } from "@codemirror/view";
+import type { MessagingCommand, MessagingEvent, MessagingResult } from "#lib/generated/chat-api.ts";
+const transport = vi.hoisted(() => ({ request: vi.fn<(command: MessagingCommand) => Promise<MessagingResult>>(), listener: null as null | { onStatus(status: string): void; onEvent(event: MessagingEvent): void } }));
+vi.mock("#lib/workspace/multiplexer.ts", () => ({ workspaceMultiplexer: () => ({
+  connectMessaging(listener: NonNullable<typeof transport.listener>) {
+    transport.listener = listener;
+    queueMicrotask(() => listener.onStatus("open"));
+    return { request: (command: MessagingCommand) => transport.request(command), close: vi.fn() };
+  },
+}) }));
 import SubjectConversation from "./SubjectConversation.svelte";
 import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
@@ -58,52 +68,35 @@ function harness() {
     participant_account_id: props.accountId,
     last_user_message_id: null as string | null,
   };
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: string, init?: RequestInit) => {
-      const url = new URL(String(input), "http://fixture.invalid");
-      if (url.pathname.endsWith("/conversations")) {
-        return Response.json({ ...conversation, last_user_message_id: null });
+  const page = (after = 0) => {
+    const newer = messages.filter(m => m.sequence > after);
+    return { conversation: { ...conversation }, messages: structuredClone(newer.slice(0, 100)), has_more: newer.length > 100 };
+  };
+  transport.request.mockImplementation(async command => {
+    if (command.kind === "open") return { kind: "opened", conversation: { ...conversation } };
+    if (command.kind === "post") {
+      const body = command.request;
+      posts.push(structuredClone(body));
+      if (mode === "conflict" || mode === "failed") return { kind: "rejected", status: mode === "conflict" ? 409 : 500 };
+      let message = messages.find(m => m.operation_id === body.operation_id);
+      if (!message) {
+        message = { id: "m" + (messages.length + 1), conversation_id: "c", sequence: messages.length + 1,
+          sender: { kind: "user", account_id: props.accountId }, ...body, last_user_message_id: "m" + (messages.length + 1) };
+        messages.push(message);
       }
-      if (init?.method === "POST") {
-        const body = JSON.parse(String(init.body)) as ChatUserMessageRequest;
-        posts.push(body);
-        if (mode === "conflict" || mode === "failed") {
-          return new Response(null, {
-            status: mode === "conflict" ? 409 : 500,
-          });
-        }
-        let message = messages.find((m) => m.operation_id === body.operation_id);
-        if (!message) {
-          message = {
-            id: `m${messages.length + 1}`,
-            conversation_id: "c",
-            sequence: messages.length + 1,
-            sender: { kind: "user", account_id: props.accountId },
-            ...body,
-            last_user_message_id: `m${messages.length + 1}`,
-          };
-          messages.push(message);
-        }
-        conversation.last_user_message_id = message.id;
-        if (mode === "lost") throw new TypeError("ACK lost after persistence");
-        const delivery = mode === "no_current_body"
-          ? { state: mode }
-          : mode === "accepted"
-          ? { state: mode, runtime_id: "r", worker_id: "w" }
-          : { state: mode, runtime_id: "r", worker_id: "w", detail: "fixture" };
-        return Response.json({ message, delivery });
-      }
-      if (readStatus !== 200) return new Response(null, { status: readStatus });
-      const after = Number(url.searchParams.get("after_sequence") ?? 0);
-      const newer = messages.filter((m) => m.sequence > after);
-      return Response.json({
-        conversation,
-        messages: newer.slice(0, 100),
-        has_more: newer.length > 100,
-      });
-    }),
-  );
+      conversation.last_user_message_id = message.id;
+      if (mode === "lost") throw new Error("ACK lost after persistence");
+      const delivery = mode === "no_current_body" ? { state: mode } : mode === "accepted"
+        ? { state: mode, runtime_id: "r", worker_id: "w" }
+        : { state: mode, runtime_id: "r", worker_id: "w", detail: "fixture" };
+      transport.listener?.onEvent({ kind: "messages", subscription_id: "sub", page: page() });
+      return { kind: "saved", response: { message, delivery } };
+    }
+    if (readStatus !== 200) return { kind: "rejected", status: readStatus };
+    if (command.kind === "subscribe") return { kind: "subscribed", subscription_id: "sub", selector: command.selector, page: page(command.selector.after_sequence) };
+    if (command.kind === "history") return { kind: "history", page: page(command.query.after_sequence ?? 0) };
+    throw new Error("unexpected command");
+  });
   function reply(text: string) {
     messages.push({
       id: `m${messages.length + 1}`,
@@ -120,6 +113,7 @@ function harness() {
   return {
     messages,
     posts,
+    reconnect: () => { transport.listener?.onStatus("closed"); transport.listener?.onStatus("open"); },
     reply,
     mode: (next: typeof mode) => {
       mode = next;
@@ -131,8 +125,12 @@ function harness() {
 }
 const input = () => screen.getByRole("textbox", { name: "Message to Research companion" });
 const send = () => screen.getByRole("button", { name: "Send message" });
+function typeDraft(text: string) {
+  const editor = EditorView.findFromDOM(input())!;
+  editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: text } });
+}
 async function compose(text: string) {
-  await fireEvent.input(input(), { target: { value: text } });
+  typeDraft(text);
   await fireEvent.click(send());
 }
 async function ready() {
@@ -167,7 +165,7 @@ test("acceptance allows Busy follow-up without inventing a reply; multiple and d
   await refresh();
   await screen.findByText("Explicit second reply");
   h.reply("Later evaluated background result");
-  await fireEvent(window, new Event("online"));
+  h.reconnect();
   await screen.findByText("Later evaluated background result");
   expect(screen.queryByText("internal assistant output")).toBeNull();
   expect(screen.getAllByText("Research companion", { exact: true }))
@@ -182,7 +180,7 @@ test("ACK loss keeps full input across reload while the next draft stays editabl
   const original = "  original input\n日本語  ";
   await compose(original);
   await screen.findByText(/request outcome could not be confirmed/i);
-  await fireEvent.input(input(), { target: { value: "edited next draft" } });
+  typeDraft("edited next draft");
   expect((send() as HTMLButtonElement).disabled).toBe(true);
   expect(readConversationAttempt(sessionStorage, props)?.text).toBe(original);
   view.unmount();
@@ -241,7 +239,7 @@ for (
         "Runtime accepted this input. Processing and replies are not confirmed.",
       ),
     ).toBeNull();
-    await fireEvent.input(input(), { target: { value: "do not replace" } });
+    typeDraft("do not replace");
     expect((send() as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(
       screen.getByRole("button", { name: "Retry same input" }),
@@ -268,7 +266,7 @@ test("storage write refusal dispatches nothing, preserves the draft and can be r
     "Send input could not be retained safely. Nothing new was dispatched.",
   );
   expect(h.posts).toHaveLength(0);
-  expect((input() as HTMLTextAreaElement).value).toBe("unsent draft");
+  expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe("unsent draft");
   vi.stubGlobal("sessionStorage", originalStorage);
   await fireEvent.click(
     screen.getByRole("button", { name: "Recheck retry storage" }),
@@ -314,7 +312,7 @@ test("more than one page follows saved sequence, reconnect adds only unseen mess
     screen.getByRole("button", { name: "Load newer messages" }),
   );
   await screen.findByText("Public reply 105");
-  await fireEvent(window, new Event("online"));
+  h.reconnect();
   await waitFor(() =>
     expect(screen.getAllByText("Research companion", { exact: true }))
       .toHaveLength(105)

@@ -4,6 +4,14 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import PageContent from "./PageContent.svelte";
 import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
+import type { MessagingCommand, MessagingResult } from '#lib/generated/chat-api.ts';
+const messaging = vi.hoisted(() => ({ request: vi.fn<(command: MessagingCommand) => Promise<MessagingResult>>() }));
+vi.mock('#lib/workspace/multiplexer.ts', () => ({ workspaceMultiplexer: () => ({
+  connectMessaging(listener: { onStatus(status: string): void }) {
+    queueMicrotask(() => listener.onStatus('open'));
+    return { request: (command: MessagingCommand) => messaging.request(command), close: vi.fn() };
+  },
+}) }));
 
 const calls: string[] = [];
 function routeData(
@@ -33,15 +41,16 @@ beforeEach(() => {
       session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
     },
   };
+  messaging.request.mockReset();
+  messaging.request.mockImplementation(async command => {
+    const conversation = { id: 'conversation', subject_id: 'subject-a', participant_account_id: authUser.account_id, last_user_message_id: null };
+    if (command.kind === 'open') return { kind: 'opened', conversation };
+    if (command.kind === 'subscribe') return { kind: 'subscribed', subscription_id: 'sub', selector: command.selector, page: { conversation, messages: [], has_more: false } };
+    throw new Error('unexpected messaging command');
+  });
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), "https://fixture.invalid");
     calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
-    const conversation = {
-      id: "conversation",
-      subject_id: "subject-a",
-      participant_account_id: authUser.account_id,
-      last_user_message_id: null,
-    };
     if (url.pathname.endsWith("/body")) {
       return Promise.resolve(Response.json({
         workspace_id: "w",
@@ -52,12 +61,7 @@ beforeEach(() => {
         can_stop: true,
       }));
     }
-    if (url.pathname.endsWith("/conversations")) {
-      return Promise.resolve(Response.json(conversation));
-    }
-    return Promise.resolve(
-      Response.json({ conversation, messages: [], has_more: false }),
-    );
+    throw new Error(`unexpected HTTP request ${url.pathname}`);
   });
 });
 afterEach(() => {
@@ -84,8 +88,8 @@ test("canonical chat hosts Body and public conversation as siblings with a canon
   expect(body.parentElement).toBe(conversation.parentElement);
   expect(body.contains(conversation)).toBe(false);
   expect(calls).toContain("GET /api/w/w/subjektiv/subjects/subject-a/body");
-  expect(calls.some((call) => call.includes("/api/w/w/chat/conversations")))
-    .toBe(true);
+  expect(messaging.request.mock.calls.map(([command]) => command.kind)).toEqual(['open', 'subscribe']);
+  expect(calls.some((call) => call.includes('/chat/conversations'))).toBe(false);
   expect(calls.some((call) => /\/body\/(start|stop)/.test(call))).toBe(false);
 });
 

@@ -63,7 +63,12 @@
   interface Props {
     ariaLabel?: string;
     ariaKeyShortcuts?: string;
+    ariaDescribedBy?: string;
+    historyStorage?: 'local' | 'session';
+    initialText?: string;
     historyScope: string;
+    workerFeatures?: boolean;
+    onunsupportedpaste?: () => void;
     onchange?: (snapshot: ComposerDraftSnapshot) => void;
     onkeydown?: (event: KeyboardEvent) => void;
     onsubmit?: (event: KeyboardEvent) => void;
@@ -85,7 +90,12 @@
   let {
     ariaLabel = "Message",
     ariaKeyShortcuts = "Meta+Enter Control+Enter",
+    ariaDescribedBy,
+    historyStorage = 'local',
+    initialText = '',
     historyScope,
+    workerFeatures = true,
+    onunsupportedpaste,
     onchange,
     onkeydown,
     onsubmit,
@@ -166,7 +176,7 @@
     if (!force && context === completionContext) return;
     completionContext = context;
     closeCompletion();
-    if (!view.hasFocus || view.composing || !selection.empty) return;
+    if (!workerFeatures || !view.hasFocus || view.composing || !selection.empty) return;
     const token = completionTokenAt(
       document,
       selection.head,
@@ -209,7 +219,7 @@
   }
 
   function acceptCompletion(action: "tab" | "accept", index = completionSelected): void {
-    if (!view || !completionToken) return;
+    if (!workerFeatures || !view || !completionToken) return;
     const token = completionToken;
     const document = view.state.doc.toString();
     if (token.kind === "command" && index === null) {
@@ -252,7 +262,7 @@
   }
 
   function completionKeydown(event: KeyboardEvent): boolean {
-    if (event.isComposing || view?.composing || event.keyCode === 229) return false;
+    if (!workerFeatures || event.isComposing || view?.composing || event.keyCode === 229) return false;
     if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false;
     if (event.key === "Escape" && completionToken) {
       event.preventDefault(); closeCompletion(); return true;
@@ -281,7 +291,7 @@
     const activeId = completionSelected === null ? undefined : completionId + "-" + completionSelected;
     const open = completionToken !== null;
     if (!view) return;
-    view.contentDOM.setAttribute("aria-autocomplete", "list");
+    view.contentDOM.setAttribute("aria-autocomplete", workerFeatures ? "list" : "none");
     if (open) view.contentDOM.setAttribute("aria-controls", completionId);
     else view.contentDOM.removeAttribute("aria-controls");
     if (open && activeId) view.contentDOM.setAttribute("aria-activedescendant", activeId);
@@ -290,6 +300,7 @@
 
   $effect(() => {
     void completionScope;
+    void workerFeatures;
     selectedFeatureInvocations.clear();
     closeCompletion();
     completionContext = "";
@@ -493,7 +504,7 @@
     segment: Segment,
     options: { from?: number; to?: number; cleanup?: boolean; label?: string; uploadReservation?: boolean } = {},
   ): number | null {
-    if (!view) return null;
+    if (!workerFeatures || !view) return null;
     const selection = view.state.selection.main;
     const from = options.from ?? selection.from;
     const to = options.to ?? selection.to;
@@ -515,7 +526,7 @@
   }
 
   function chipifySelectedInvocation(strict = false): void {
-    if (!view || view.composing) return;
+    if (!workerFeatures || !view || view.composing) return;
     // Only completion-selected or explicitly edited calls become structured input.
     // Descriptor discovery must never promote unrelated typed or pasted prose.
     for (const selected of [...view.state.field(selectedInvocationState)].reverse()) {
@@ -543,7 +554,7 @@
   let editVersion = 0;
   let editorGeneration = 0;
   async function editInvocation(key: number): Promise<void> {
-    if (!view) return;
+    if (!workerFeatures || !view) return;
     const scope = completionScope;
     const version = ++editVersion;
     const document = view.state.doc.toString();
@@ -560,7 +571,7 @@
         descriptor = entries.find((entry) => entry.invocation?.identity === invocation.identity)?.invocation ?? undefined;
       } catch { return; }
     }
-    if (!descriptor || !view || version !== editVersion || scope !== completionScope ||
+    if (!workerFeatures || !descriptor || !view || version !== editVersion || scope !== completionScope ||
         generation !== editorGeneration || document !== view.state.doc.toString() ||
         selection.from !== view.state.selection.main.from || selection.to !== view.state.selection.main.to) return;
     atom = composerTypedAtoms(view.state.doc.toString(), view.state.field(typedRegistry))
@@ -591,8 +602,9 @@
     );
   }
 
+  let initializing = true;
   function emitChange(): void {
-    onchange?.(currentSnapshot());
+    if (!initializing) onchange?.(currentSnapshot());
   }
 
   function historyEntry(state: EditorState): ComposerHistoryEntry {
@@ -668,9 +680,17 @@
   }
 
   function handlePasteEvent(event: ClipboardEvent): boolean {
-    if (handleComposerImagePaste(event, onpasteimages)) return true;
+    if (handleComposerImagePaste(event, onpasteimages, workerFeatures)) return true;
     const content = event.clipboardData?.getData("text/plain");
-    if (!content) return false;
+    if (!content) {
+      if (!workerFeatures && (event.clipboardData?.files?.length ||
+          Array.from(event.clipboardData?.items ?? []).some((item) => item.kind === "file"))) {
+        // CodeMirrorの空文字pasteで選択中の下書きを削除しない。添付として受理もしない。
+        onunsupportedpaste?.();
+        return true;
+      }
+      return false;
+    }
     const measurement = measureComposerPaste(content);
     event.preventDefault();
     if (measurement.presentation === "chip") {
@@ -729,7 +749,11 @@
   }
 
   $effect(() => {
-    composerHistory = loadComposerHistory(localStorage, historyScope);
+    const loaded = loadComposerHistory(historyStorage === 'session' ? sessionStorage : localStorage, historyScope);
+    composerHistory = workerFeatures ? loaded : new ComposerHistory(
+      loaded.entries.filter((entry) => entry.segments.every((segment) =>
+        segment.kind === "text" || segment.kind === "paste")),
+    );
   });
 
   onMount(() => {
@@ -773,6 +797,7 @@
           EditorView.lineWrapping,
           EditorView.contentAttributes.of({
             "aria-label": ariaLabel,
+            ...(ariaDescribedBy ? { "aria-describedby": ariaDescribedBy } : {}),
             "aria-keyshortcuts": ariaKeyShortcuts,
             "aria-multiline": "true",
             role: "textbox",
@@ -859,6 +884,7 @@
                   mode: "mod-enter",
                   modKey: "auto",
                   enabled: true,
+                  isComposing: view?.composing,
                 })
               ) {
                 event.preventDefault();
@@ -877,6 +903,8 @@
         ],
       }),
     });
+    if (initialText) restoreText(initialText);
+    initializing = false;
     emitChange();
 
     return () => {
@@ -894,14 +922,19 @@
     return currentSnapshot();
   }
 
-  export function recordHistory(value: ComposerDraftSnapshot): void {
-    const entry: ComposerHistoryEntry = {
+  export function recordHistory(value: ComposerDraftSnapshot | string): void {
+    const entry: ComposerHistoryEntry = typeof value === "string" ? {
+      segments: [{ kind: "text", content: value }],
+      preserveExactText: true,
+    } : {
       // Uploaded references are Worker-owned and must not leak through workspace-wide history.
-      segments: value.segments.filter((segment) => segment.kind !== "uploaded_file"),
+      segments: value.segments.filter((segment) => workerFeatures
+        ? segment.kind !== "uploaded_file"
+        : segment.kind === "text" || segment.kind === "paste"),
       preserveExactText: value.textPastes.length > 0,
     };
     if (composerHistory.record(entry)) {
-      saveComposerHistory(localStorage, historyScope, composerHistory);
+      saveComposerHistory(historyStorage === 'session' ? sessionStorage : localStorage, historyScope, composerHistory);
     }
   }
 
@@ -935,7 +968,7 @@
   }
 
   export function completeUpload(key: number, segment: Segment): boolean {
-    if (!view || !pendingUploads.has(key) ||
+    if (!workerFeatures || !view || !pendingUploads.has(key) ||
         !view.state.field(typedRegistry).get(key)?.uploadReservation ||
         !composerTypedAtoms(view.state.doc.toString(), view.state.field(typedRegistry)).some((atom) => atom.key === key)) return false;
     pendingUploads.delete(key);
@@ -971,12 +1004,19 @@
     emitChange();
   }
 
+  export function restoreText(content: string): void {
+    restoreSegments([{ kind: "text", content }], true);
+  }
+
   export function restoreSegments(
     segments: readonly Segment[],
     preserveExactText = false,
     ownStagedUploads = false,
   ): void {
     if (!view) return;
+    if (!workerFeatures && segments.some((segment) => segment.kind !== "text" && segment.kind !== "paste")) {
+      throw new Error("This composer only supports text.");
+    }
     clear(false, restoringHistory);
     let document = "";
     const pasteEffects: StateEffect<{ key: number; paste: ComposerPaste }>[] = [];
@@ -988,7 +1028,7 @@
         const rendered = view.state.toText(segment.content).toString();
         const from = document.length;
         document += rendered;
-        if (preserveExactText) {
+        if (preserveExactText && rendered.length > 0) {
           textEffects.push(registerTextPaste.of({
             from,
             to: from + rendered.length,

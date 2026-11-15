@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { EditorView } from "@codemirror/view";
 import SubjectConversation from "./SubjectConversation.svelte";
 import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
@@ -80,9 +81,7 @@ for (const status of [401, 403, 404]) {
     });
     render(SubjectConversation, props);
     await screen.findByText("No public messages yet.");
-    await fireEvent.input(screen.getByRole("textbox"), {
-      target: { value: "retained private text" },
-    });
+    EditorView.findFromDOM(screen.getByRole("textbox"))!.dispatch({ changes: { from: 0, insert: "retained private text" } });
     await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(posted).toBe(true));
     const attempt = readConversationAttempt(sessionStorage, props)!;
@@ -151,7 +150,7 @@ test("authentication change while POST is in flight never clears the former Acco
   });
   render(SubjectConversation, props);
   await screen.findByText("No public messages yet.");
-  await fireEvent.input(screen.getByRole("textbox"), { target: { value: "former account input" } });
+  EditorView.findFromDOM(screen.getByRole("textbox"))!.dispatch({ changes: { from: 0, insert: "former account input" } });
   await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   await waitFor(() => expect(posted).toBe(true));
   const attempt = readConversationAttempt(sessionStorage, props)!;
