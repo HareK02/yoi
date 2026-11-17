@@ -70,6 +70,7 @@ pub struct WorkerManifestConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct FeatureConfigPartial {
     #[serde(default)]
     pub filesystem: Option<FeatureFlagConfigPartial>,
@@ -190,6 +191,7 @@ impl FeatureConfigPartial {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct FeatureFlagConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -206,6 +208,7 @@ impl FeatureFlagConfigPartial {
 /// Activation only: no Workspace/grant/source/permission fields are accepted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct ActivationFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -235,7 +238,7 @@ impl From<FeatureFlagConfig> for ActivationFeatureConfigPartial {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, config_schema_derive::ConfigSchema)]
 pub struct WorkerFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -263,6 +266,7 @@ impl From<WorkerFeatureConfigPartial> for WorkerFeatureConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct MemoryFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -278,6 +282,7 @@ pub struct MemoryFeatureConfigPartial {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct MemoryResidentProfileConfigPartial {
     #[serde(default)]
     pub inject_summary: Option<bool>,
@@ -285,6 +290,7 @@ pub struct MemoryResidentProfileConfigPartial {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct MemoryExtractionProfileConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -300,6 +306,7 @@ pub struct MemoryExtractionProfileConfigPartial {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct MemoryConsolidationProfileConfigPartial {
     #[serde(default)]
     pub request_enabled: Option<bool>,
@@ -307,6 +314,7 @@ pub struct MemoryConsolidationProfileConfigPartial {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct SubjektivFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -379,6 +387,7 @@ impl MemoryExtractionProfileConfigPartial {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct TicketFeatureConfigPartial {
     pub enabled: Option<bool>,
     pub authoring: Option<bool>,
@@ -401,6 +410,7 @@ impl TicketFeatureConfigPartial {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct MergeRequestFeatureConfigPartial {
     pub show: Option<bool>,
     pub open: Option<bool>,
@@ -706,7 +716,7 @@ pub struct WorkerMetaConfig {
     pub mode: Option<crate::WorkerMode>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, config_schema_derive::ConfigSchema)]
 pub struct EngineManifestConfig {
     #[serde(default)]
     pub instruction: Option<String>,
@@ -734,7 +744,7 @@ pub struct EngineManifestConfig {
     pub file_upload: FileUploadLimitsPartial,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, config_schema_derive::ConfigSchema)]
 pub struct ToolOutputLimitsPartial {
     #[serde(default)]
     pub default_max_bytes: Option<usize>,
@@ -742,19 +752,19 @@ pub struct ToolOutputLimitsPartial {
     pub per_tool: HashMap<String, usize>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, config_schema_derive::ConfigSchema)]
 pub struct FileUploadLimitsPartial {
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, config_schema_derive::ConfigSchema)]
 pub struct SessionConfigPartial {
     #[serde(default)]
     pub record_event_trace: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, config_schema_derive::ConfigSchema)]
 pub struct CompactionConfigPartial {
     #[serde(default)]
     pub prune_enabled: Option<bool>,

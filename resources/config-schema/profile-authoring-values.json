@@ -1,5 +1,20 @@
 [
   {
+    "name": "derived_filesystem_and_command_flags",
+    "profile": {
+      "feature": {
+        "filesystem": { "enabled": false },
+        "filesystem_write": { "enabled": false },
+        "bash": { "enabled": false }
+      }
+    },
+    "manifest_expect": {
+      "/feature/filesystem/enabled": false,
+      "/feature/filesystem_write/enabled": false,
+      "/feature/bash/enabled": false
+    }
+  },
+  {
     "name": "canonical_compaction_tokens",
     "profile": {
       "compaction": {

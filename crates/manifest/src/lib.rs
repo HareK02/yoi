@@ -2,6 +2,7 @@
 
 mod builtin_profile;
 mod config;
+mod config_schema;
 pub mod defaults;
 mod model;
 pub mod model_catalog;
@@ -29,8 +30,8 @@ pub use profile::{
     ProfileDiscovery, ProfileError, ProfileExecutionTarget, ProfileManifestSnapshot,
     ProfileMetadata, ProfileRegistry, ProfileRegistryEntry, ProfileRegistrySource,
     ProfileResolveOptions, ProfileResolver, ProfileSelector, ProfileSource, ResolvedProfile,
-    WorkspaceAuthorityRequirement, resolve_profile_artifact, resolve_profile_artifact_value,
-    validate_profile_execution_target,
+    WorkspaceAuthorityRequirement, profile_authoring_schema_source, resolve_profile_artifact,
+    resolve_profile_artifact_value, validate_profile_execution_target,
 };
 pub use protocol::{Permission, ScopeRule, SymlinkPolicy};
 pub use scope::{DelegationScope, Scope, ScopeError, SharedScope};
@@ -565,7 +566,7 @@ impl MergeRequestFeatureConfig {
 /// loaded *only* from the directories listed here — there is no
 /// implicit `$config_dir/skills/` or builtin probe. Profile and Manifest
 /// resolution may compose these entries before validation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, config_schema_derive::ConfigSchema)]
 pub struct SkillsConfig {
     /// Skills *roots*. Children of each root must be individual
     /// `<name>/SKILL.md` bundles; the directory itself is not a skill.
@@ -582,6 +583,7 @@ pub struct SkillsConfig {
 /// process authority separate from Plugin permissions and `worker::feature` flags.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct McpConfig {
     /// Named local stdio servers. The list form keeps declarations explicit and
     /// lets validation reject duplicate names after profile/override merging.
@@ -591,6 +593,7 @@ pub struct McpConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct McpStdioServerConfig {
     /// Stable profile-local name used by later lifecycle/tool-surface code.
     pub name: String,
@@ -613,6 +616,7 @@ pub struct McpStdioServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub enum McpStdioCwdPolicy {
     /// Leave cwd selection to the lifecycle caller.
     Inherit,
@@ -622,6 +626,7 @@ pub enum McpStdioCwdPolicy {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct McpEnvConfig {
     /// Host environment variable names to copy explicitly at spawn time.
     #[serde(default)]
@@ -633,6 +638,7 @@ pub struct McpEnvConfig {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub enum McpEnvValue {
     /// Literal value. Use only for non-secret values; Debug/diagnostics redact
     /// it defensively because env values often become credentials over time.
@@ -666,7 +672,9 @@ impl fmt::Debug for McpEnvValue {
 /// Network tools are fail-closed: absent config or `enabled = false` disables
 /// both tools. Per-tool `enabled = false` can disable a tool under an enabled
 /// global section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, config_schema_derive::ConfigSchema,
+)]
 pub struct WebConfig {
     /// Global opt-in for web tools. Defaults to false when omitted.
     #[serde(default)]
@@ -682,12 +690,15 @@ pub struct WebConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(config_schema_derive::ConfigSchema)]
 pub enum WebSearchProvider {
     Brave,
 }
 
 /// WebSearch provider configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, config_schema_derive::ConfigSchema,
+)]
 pub struct WebSearchConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -716,7 +727,9 @@ pub struct WebSearchConfig {
 }
 
 /// WebFetch HTTP client limits and policy.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, config_schema_derive::ConfigSchema,
+)]
 pub struct WebFetchConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -770,6 +783,7 @@ pub struct WorkerMeta {
 /// discover/inspect/call Worldspace client while retaining the same host authority.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(config_schema_derive::ConfigSchema)]
 pub enum WorkerMode {
     #[default]
     Tools,
@@ -782,6 +796,7 @@ pub enum WorkerMode {
 /// so completion order and externally allocated identifiers are not ordered.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(config_schema_derive::ConfigSchema)]
 pub enum ToolCallDispatchMode {
     /// Wait for the whole response stream before starting any tools.
     AfterResponse,

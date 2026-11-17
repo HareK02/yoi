@@ -19,4 +19,5 @@ thiserror.workspace = true
 ts-rs = "12.0.1"
 
 [dev-dependencies]
+manifest.workspace = true
 pretty_assertions = "1"

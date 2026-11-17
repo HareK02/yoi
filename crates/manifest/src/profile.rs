@@ -674,6 +674,7 @@ fn resolve_profile_value(
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 struct ProfileConfig {
     #[serde(default)]
     slug: Option<String>,
@@ -698,6 +699,7 @@ struct ProfileConfig {
     #[serde(default)]
     plugins: Option<crate::PluginProfileConfig>,
     #[serde(default)]
+    #[config_schema(as_type = "ProfileCompactionSchema")]
     compaction: Option<serde_json::Value>,
     #[serde(default)]
     web: Option<WebConfig>,
@@ -707,6 +709,7 @@ struct ProfileConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 struct ProfileWorkerConfig {
     #[serde(default)]
     mode: Option<crate::WorkerMode>,
@@ -720,6 +723,7 @@ enum ProfileScopeConfig {
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 struct ProfileScopeTable {
     intent: ProfileScopeIntent,
     #[serde(default)]
@@ -729,6 +733,7 @@ struct ProfileScopeTable {
 }
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(config_schema_derive::ConfigSchema)]
 enum ProfileScopeIntent {
     WorkspaceRead,
     WorkspaceWrite,
@@ -736,6 +741,7 @@ enum ProfileScopeIntent {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 struct RatioCompaction {
     #[allow(dead_code)]
     kind: String,
@@ -745,6 +751,46 @@ struct RatioCompaction {
     request_threshold: Option<f64>,
     #[serde(default, alias = "worker")]
     worker_context_max_tokens: Option<f64>,
+}
+
+/// Generate the editor's shape from the same declarations used to decode Profiles.
+/// The storage envelope remains independent: it deliberately stores partial values.
+pub fn profile_authoring_schema_source() -> String {
+    use crate::config_schema::ConfigSchema;
+    let envelope = include_str!("../../../resources/config-schema/profile.dcdl");
+    let slot = "profile = { ...Unknown };";
+    assert_eq!(
+        envelope.matches(slot).count(),
+        1,
+        "storage schema must contain one Profile value slot"
+    );
+    envelope.replacen(
+        slot,
+        &format!(
+            "profile = {};",
+            crate::config_schema::source(ProfileConfig::config_schema())
+        ),
+        1,
+    )
+}
+
+impl crate::config_schema::ConfigSchema for ProfileScopeConfig {
+    fn config_schema() -> decodal::Value {
+        // String or table, with the table exposed as a completion hint only.
+        decodal::Value::unknown()
+            .default(ProfileScopeTable::config_schema())
+            .expect("scope completion hint is a valid default")
+    }
+}
+
+struct ProfileCompactionSchema;
+impl crate::config_schema::ConfigSchema for ProfileCompactionSchema {
+    fn config_schema() -> decodal::Value {
+        crate::config_schema::merge_shapes([
+            crate::CompactionConfigPartial::config_schema(),
+            RatioCompaction::config_schema(),
+        ])
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -3050,10 +3050,111 @@ mod tests {
             include_str!("../../../resources/config-schema/profile.dcdl"),
         )
         .unwrap()
-        .with_authoring_source(include_str!(
-            "../../../resources/config-schema/profile-authoring.dcdl"
-        ))])
+        .with_authoring_source(manifest::profile_authoring_schema_source())])
         .unwrap()
+    }
+
+    #[test]
+    fn derived_profile_schema_accepts_every_builtin_through_editor_analysis() {
+        let catalog = manifest::builtin_profile_catalog_snapshot();
+        // Include base as well as every launchable entrypoint. Imports retain
+        // their real composition; do not use hand-maintained feature fixtures.
+        for resource in catalog.sources.keys() {
+            let source = format!(
+                r#"{{ profile.entries = [{{ selector = "project:derived"; profile = import "$builtin/{resource}"; }}]; }} as WorkspaceConfigSchema"#
+            );
+            let schema = actual_profile_schema();
+            let contract = ToolchainContract::with_schema_bundle(
+                1,
+                vec![path("main.dcdl")],
+                1,
+                schema.clone(),
+            );
+            let environment = SnapshotEnvironment::new(
+                ConfigTreeSnapshot::from_entries([entry("main.dcdl", &source)]).unwrap(),
+            )
+            .with_schema_bundle(schema);
+            let before = environment.evaluate_contract(&contract).unwrap();
+            let diagnostics = environment.analyze(&path("main.dcdl"), None);
+            assert!(diagnostics.is_empty(), "{resource}: {diagnostics:?}");
+            assert_eq!(environment.evaluate_contract(&contract).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn derived_profile_features_are_typed_completed_and_do_not_supply_defaults() {
+        for feature in ["filesystem", "filesystem_write", "bash", "orchestration"] {
+            let schema = actual_profile_schema();
+            let contract = ToolchainContract::with_schema_bundle(
+                1,
+                vec![path("main.dcdl")],
+                1,
+                schema.clone(),
+            );
+            let source = format!(
+                r#"{{ profile.entries = [{{ selector = "project:flags"; profile.feature.{feature} = {{ enabled = false; }}; }}]; }} as WorkspaceConfigSchema"#
+            );
+            let environment = SnapshotEnvironment::new(
+                ConfigTreeSnapshot::from_entries([entry("main.dcdl", &source)]).unwrap(),
+            )
+            .with_schema_bundle(schema);
+            assert!(
+                environment.analyze(&path("main.dcdl"), None).is_empty(),
+                "{feature}"
+            );
+            let projection = environment.evaluate_contract(&contract).unwrap();
+            assert_eq!(
+                projection.projections[0].data_json["profile"]["entries"][0]["profile"],
+                serde_json::json!({"feature": {(feature): {"enabled": false}}})
+            );
+            for invalid in ["42", "\"yes\""] {
+                let diagnostics = environment
+                    .analyze(&path("main.dcdl"), Some(&source.replace("false", invalid)));
+                assert!(!diagnostics.is_empty(), "{feature}: {invalid}");
+                assert!(
+                    diagnostics.iter().any(|d| matches!(
+                        d.kind.as_str(),
+                        "constraint_violation" | "type_mismatch"
+                    )),
+                    "{diagnostics:?}"
+                );
+            }
+            let marked = format!(
+                "{{ profile.entries = [{{ profile.feature = {{ {feature}| }}; }}]; }} as WorkspaceConfigSchema"
+            );
+            let cursor = marked.find('|').unwrap();
+            let result = environment
+                .complete_config(&path("main.dcdl"), &marked.replace('|', ""), cursor, true)
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.items.iter().any(|item| item.label == feature),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_profile_schema_rejects_unknown_and_removed_fields() {
+        for recipe in [
+            "{ feature = { filesytem = {}; }; }",
+            "{ feature = { filesystem = { enable = true; }; }; }",
+            "{ permissions = { default_action = \"allow\"; }; }",
+            "{ model = { auth = { kind = \"secret_ref\"; typo = \"x\"; }; }; }",
+        ] {
+            let source = format!(
+                r#"{{ profile.entries = [{{ selector = "project:invalid"; profile = {recipe}; }}]; }} as WorkspaceConfigSchema"#
+            );
+            let environment = SnapshotEnvironment::new(
+                ConfigTreeSnapshot::from_entries([entry("main.dcdl", &source)]).unwrap(),
+            )
+            .with_schema_bundle(actual_profile_schema());
+            let diagnostics = environment.analyze(&path("main.dcdl"), None);
+            assert!(
+                diagnostics.iter().any(|d| d.kind == "constraint_violation"),
+                "{recipe}: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]

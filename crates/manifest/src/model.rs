@@ -26,7 +26,9 @@ pub use agen::llm_client::capability::{ModelCapability, ReasoningControl, Reason
 /// [`crate::model_catalog::resolve_model_manifest`] determines which forms are valid.
 /// This crate only represents configuration sources; it does not raise hard errors
 /// merely because fields are unset.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, config_schema_derive::ConfigSchema,
+)]
 pub struct ModelManifest {
     /// Catalog reference in `<provider_id>/<model_id_in_ref>` form. Splits at
     /// the first `/` to look up the provider catalog. For model IDs containing
@@ -81,6 +83,7 @@ impl ModelManifest {
 /// Supported wire scheme kinds.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(config_schema_derive::ConfigSchema)]
 pub enum SchemeKind {
     /// Anthropic Messages API (`/v1/messages`), also used for Ollama `/v1/messages`.
     Anthropic,
@@ -98,6 +101,7 @@ pub enum SchemeKind {
 /// OAuth refresh, etc.). This is only a declaration of where to obtain them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(config_schema_derive::ConfigSchema)]
 pub enum AuthRef {
     /// No authentication required (e.g. local Ollama).
     #[default]

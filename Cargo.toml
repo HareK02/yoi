@@ -30,6 +30,7 @@ members = [
     "crates/flow",
     "crates/builtin-source",
     "crates/config-source",
+    "crates/config-schema-derive",
     "crates/config-source-wasm",
     "crates/content-history",
     "crates/content-history-store",
@@ -78,6 +79,7 @@ default-members = [
     "crates/flow",
     "crates/builtin-source",
     "crates/config-source",
+    "crates/config-schema-derive",
     "crates/config-source-wasm",
     "crates/content-history",
     "crates/content-history-store",
@@ -170,7 +172,7 @@ base64 = "0.22.1"
 bytes = "1"
 # Keep the evaluator/authoring tools aligned with config-source::DECODAL_VERSION.
 # Changing evaluation semantics requires an explicit saved-toolchain refresh.
-decodal = "=0.4.1"
+decodal = { version = "=0.4.1", features = ["derive"] }
 decodal-language-service = "=0.4.1"
 decodal-language-tools = "=0.4.1"
 fs4 = "0.13"

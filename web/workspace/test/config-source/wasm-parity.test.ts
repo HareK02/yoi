@@ -623,7 +623,9 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
   );
   const authoring_source = await Deno.readTextFile(
     new URL(
-      "../../../../resources/config-schema/profile-authoring.dcdl",
+      // Produced from Rust types by `deno task generate:profile-schema` (also
+      // run by the main test task), not a separately maintained schema fixture.
+      "../../../../target/profile-authoring-schema.dcdl",
       import.meta.url,
     ),
   );

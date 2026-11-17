@@ -29,11 +29,7 @@ pub struct ProfileConfigSchemaProvider;
 impl WorkspaceConfigSchemaProvider for ProfileConfigSchemaProvider {
     fn contribution(&self) -> Result<ConfigSchemaContribution> {
         ConfigSchemaContribution::new("builtin:profile", "profile", "2", PROFILE_SCHEMA_SOURCE)
-            .map(|schema| {
-                schema.with_authoring_source(include_str!(
-                    "../../../resources/config-schema/profile-authoring.dcdl"
-                ))
-            })
+            .map(|schema| schema.with_authoring_source(manifest::profile_authoring_schema_source()))
             .map_err(|error| Error::Config(error.to_string()))
     }
 }

@@ -799,6 +799,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "config-schema-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "config-source"
 version = "0.1.0"
 dependencies = [
@@ -806,6 +815,7 @@ dependencies = [
  "decodal",
  "decodal-language-service",
  "decodal-language-tools",
+ "manifest",
  "minijinja",
  "pretty_assertions",
  "serde",
@@ -1270,6 +1280,20 @@ name = "decodal"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa240084ed31e869e0e8ca5b2a532b782c7db5cdb678e2ce9c6d4fdd7b488afc"
+dependencies = [
+ "decodal-derive",
+]
+
+[[package]]
+name = "decodal-derive"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04b6fa396ff9de52c48de35bba8ca6c996ffd2317ba95bf5fb2cc822ee0b3974"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "decodal-language-service"
@@ -2866,6 +2890,7 @@ dependencies = [
  "agen",
  "arc-swap",
  "builtin-source",
+ "config-schema-derive",
  "crc32fast",
  "decodal",
  "feature-permissions",

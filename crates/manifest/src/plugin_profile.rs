@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// discovery, dynamic registration, or guest execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct PluginProfileConfig {
     #[serde(default)]
     pub selections: Vec<PluginProfileSelection>,
@@ -32,6 +33,7 @@ impl PluginProfileConfig {
 /// cannot certify that arbitrary package-specific values are non-secret or valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct PluginProfileSelection {
     pub installation_id: String,
     #[serde(default)]
@@ -56,6 +58,7 @@ pub struct PluginProfileSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(config_schema_derive::ConfigSchema)]
 pub struct PluginTicketDataGrant {
     pub collection: String,
     pub schema_id: String,
