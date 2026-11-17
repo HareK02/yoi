@@ -27,6 +27,10 @@ impl ResidentAuthenticator {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "shared fixture; only multi-credential tests select a resident key"
+    )]
     pub fn select(&mut self, credential_id: &[u8]) {
         assert!(
             self.resident.contains_key(credential_id),

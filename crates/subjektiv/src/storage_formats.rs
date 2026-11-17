@@ -22,6 +22,8 @@ const CONVERGENCE_20: &str = "converge published Journal scope and consolidation
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
     Common(usize),
+    // Retired layout is constructed only by rejection fixtures.
+    #[cfg(test)]
     Permission18,
     Consolidation18,
     Fixed18,
@@ -129,6 +131,7 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
     static SHAPES: [OnceLock<Vec<SchemaObject>>; 52] = [const { OnceLock::new() }; 52];
     let index = match format {
         Format::Common(count) => count,
+        #[cfg(test)]
         Format::Permission18 => 18,
         Format::Consolidation18 => 19,
         Format::Fixed18 => 20,
@@ -163,6 +166,7 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
     // Preserve ALTER/rebuild provenance: sqlite_schema text can differ for equal columns.
     match format {
         Format::Common(_) => {}
+        #[cfg(test)]
         Format::Permission18 => {
             tx.execute_batch(PERMISSION_SEAL_SQL)?;
             for table in PERMISSION_FENCE_TABLES {
@@ -198,6 +202,7 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
     Ok(shape)
 }
 
+#[cfg(test)]
 const PERMISSION_FENCE_TABLES: [&str; 4] = [
     "subject_permissions",
     "subject_permission_changes",
@@ -214,6 +219,7 @@ const PERMISSION_FENCE_TABLES: [&str; 4] = [
 // journal/final_scope/cancellation.sql}. Receipt provenance follows that ref's recognizer;
 // no permission-seal -> 20 history is published there.
 
+#[cfg(test)]
 const PERMISSION_SEAL_SQL: &str = r#"CREATE TABLE permission_authority_seal (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             transfer_id TEXT NOT NULL CHECK(length(transfer_id)>0),

@@ -658,12 +658,6 @@ pub(super) fn verify(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Reuse the storage owner's exact published-family fixtures in its normal suite.
-#[cfg(test)]
-pub(super) fn assert_published_fixture_for_test(conn: &Connection) {
-    tests::assert_published_fixture(conn);
-}
-
 #[cfg(test)]
 #[path = "backend_job_upgrade_tests.rs"]
 mod tests;

@@ -39,10 +39,12 @@ use wip_protocol::{
     ParameterDeclaration, ProtocolError, ProtocolErrorCode, ReturnDeclaration, TypeExpr, Value,
 };
 
+#[cfg(test)]
+use crate::wip::wip_to_json;
 use crate::wip::{
     WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
     WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
-    WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
+    WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use server_api::authorization::PermissionResource;

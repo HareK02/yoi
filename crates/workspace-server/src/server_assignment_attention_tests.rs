@@ -1583,7 +1583,7 @@ async fn subject_assignment_cached_send_rechecks_policy_after_runtime_target_loo
             &target,
         )
         .unwrap();
-    let content = api
+    let _content = api
         .store
         .prepare_ticket_assignment_delivery_content(
             TEST_WORKSPACE_ID,
@@ -1595,7 +1595,7 @@ async fn subject_assignment_cached_send_rechecks_policy_after_runtime_target_loo
     let delivery = OrchestratorAttentionDelivery {
         fingerprint: input.delivery_id.clone(),
         request_id: input.request_id.clone(),
-        content,
+        content: _content,
         input,
     };
     let state = orchestrator_attention_state(&api, &body);

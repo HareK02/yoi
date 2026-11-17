@@ -5,7 +5,9 @@
 //! grant lineage, then check the current resolver and each Feature's resources.
 //! Runtime dispatch is not part of this SQL transaction.
 
-use feature_permissions::{PermissionDefinition, PermissionKey};
+use feature_permissions::PermissionDefinition;
+#[cfg(test)]
+use feature_permissions::PermissionKey;
 use rusqlite::{Connection, OptionalExtension, params};
 use server_api::authorization::{
     CoreWorkerExecutionGrant, CoreWorkerGrantParent, CoreWorkerGrantSource,
@@ -381,6 +383,7 @@ pub(crate) fn revoke_core_grant(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn bounded_current_keys(
     grant: &CoreWorkerExecutionGrant,
     current: impl IntoIterator<Item = PermissionKey>,

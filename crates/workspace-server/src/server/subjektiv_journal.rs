@@ -630,6 +630,7 @@ pub(super) fn close(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn bind_host_session(
     api: &WorkspaceApi,
     attr: crate::subjektiv::SubjectSessionAttribution,
@@ -640,6 +641,7 @@ pub(super) fn bind_host_session(
 
 pub(super) enum SessionRegistrationCaller<'a> {
     Signed(&'a server_api::ServerRuntimeSource),
+    #[cfg(test)]
     InternalRecovery,
 }
 
@@ -683,6 +685,7 @@ pub(super) fn bind_host_session_for_registration(
                 source,
             )
         }
+        #[cfg(test)]
         SessionRegistrationCaller::InternalRecovery => store,
     };
     if store
@@ -2942,7 +2945,7 @@ pub(super) fn resume_after_execution_cleanup(
 /// Host operation/cleanup from one of them must not affect the next owner. The root
 /// checks exact Runtime/Controller, Feature/background, Host-drain and cleanup evidence
 /// without waiting under this Subject gate or reconstructing empty live ownership.
-pub(super) fn require_job_effects_ended(api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()> {
+pub(super) fn require_job_effects_ended(_api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()> {
     if matches!(
         job.state,
         BackendJobState::Pending | BackendJobState::Finalizing

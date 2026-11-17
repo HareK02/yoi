@@ -520,7 +520,7 @@ impl WipOperationHandler for CollectionHandler {
         match self.provider.inventory(self.domain) {
             Ok(items) => {
                 for raw in items {
-                    if let Some(id) = raw.get(self.domain.identity_field()).and_then(Json::as_str)
+                    if let Some(_) = raw.get(self.domain.identity_field()).and_then(Json::as_str)
                         && let Ok(value) = self.provider.projected(self.domain, &raw)
                     {
                         digest.update(value.to_string());
@@ -599,8 +599,7 @@ impl WipOperationHandler for CollectionHandler {
                     }
                     let mut items = Vec::new();
                     for raw in raws {
-                        let id = raw
-                            .get(self.domain.identity_field())
+                        raw.get(self.domain.identity_field())
                             .and_then(Json::as_str)
                             .ok_or_else(|| {
                                 WipOperationError::OutcomeUnknown(
@@ -642,8 +641,7 @@ impl WipOperationHandler for CollectionHandler {
                 }
                 let mut items = Vec::new();
                 for raw in self.provider.inventory(self.domain)? {
-                    let id = raw
-                        .get(self.domain.identity_field())
+                    raw.get(self.domain.identity_field())
                         .and_then(Json::as_str)
                         .ok_or_else(|| {
                             WipOperationError::OutcomeUnknown("inventory identity missing".into())

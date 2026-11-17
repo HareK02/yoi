@@ -447,12 +447,6 @@ impl Fixture {
         assert_eq!(after.history_head, before.history_head);
     }
 
-    fn policy_path(&self) -> String {
-        format!(
-            "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
-            self.subject
-        )
-    }
     // Historical scoped restrictions are storage fixture input, not a management
     // payload. Model the adopted Server row; the native legacy writer is sealed.
     fn seed_saved_policy(

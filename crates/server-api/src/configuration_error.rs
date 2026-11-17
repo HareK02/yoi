@@ -216,6 +216,11 @@ impl api_macros::reqwest::HttpClientError for ConfigurationApiError {
     }
 }
 
+// Schema-only wrapper: its field defines the OpenAPI payload, not a runtime value.
+#[expect(
+    dead_code,
+    reason = "payload field is consumed by JsonSchema generation"
+)]
 #[derive(JsonSchema)]
 #[serde(transparent)]
 struct ConfigurationProblem(ProblemDetails<ConfigurationFailureDetails>);

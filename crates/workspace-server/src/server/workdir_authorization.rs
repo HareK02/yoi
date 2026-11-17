@@ -94,6 +94,7 @@ fn require(
     }
 }
 
+#[cfg(test)]
 fn authorize_permissions(
     permissions: Option<&[ScopedPermission]>,
     working_directory_id: &str,

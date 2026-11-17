@@ -2121,7 +2121,6 @@ fn protocol_error(code: ProtocolErrorCode, message: impl Into<String>) -> Protoc
 }
 
 struct CompatibilityHandler {
-    name: String,
     schema: Json,
     tool: Arc<dyn Tool>,
 }
@@ -2263,7 +2262,6 @@ fn compatibility_projection(
         }],
     };
     let handler = Arc::new(CompatibilityHandler {
-        name: meta.name.clone(),
         schema: meta.input_schema,
         tool,
     });

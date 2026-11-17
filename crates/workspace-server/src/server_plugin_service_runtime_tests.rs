@@ -559,7 +559,7 @@ mod service_connection {
     async fn service_lifecycle_response_loss_survives_driver_loss_and_reopened_authorized_query() {
         for remote in [false, true] {
             for commit_completion in [false, true] {
-                let mut peer = Peer::new(HOST, vec![response(200, &[], b"accepted")]).await;
+                let peer = Peer::new(HOST, vec![response(200, &[], b"accepted")]).await;
                 let f = fixture(&peer).await;
                 let ticket = create_ticket(&f);
                 let (artifacts, delivery_server) = artifact_source(&f, remote).await;

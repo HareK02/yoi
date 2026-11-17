@@ -1190,39 +1190,6 @@ fn fresh_creation_and_empty_retained_upgrade_have_identical_job_ddl() {
     assert_eq!(objects(&migrated), objects(&fresh));
 }
 
-// The storage-format fixture owner can call this for EVERY real published stage
-// and convergence predecessor. It snapshots all rows, so policy/root/erasure and
-// existing T820 history/cleanup invocation evidence must survive byte-for-byte.
-pub(super) fn assert_published_fixture(conn: &Connection) {
-    let tables = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
-        .query_map([],|row| row.get::<_,String>(0)).unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
-    let saved = tables
-        .iter()
-        .map(|name| {
-            let columns = store_owner::table_columns(conn, name)
-                .unwrap()
-                .into_iter()
-                .filter(|column| {
-                    !["backend_jobs", "backend_job_attempts"].contains(&name.as_str())
-                        || !["state", "failure_category", "failure_detail"]
-                            .contains(&column.as_str())
-                })
-                .map(|column| quoted(&column))
-                .collect::<Vec<_>>()
-                .join(",");
-            let query = format!("SELECT {columns} FROM {} ORDER BY {columns}", quoted(name));
-            let before = rows(conn, &query);
-            (name.clone(), query, before)
-        })
-        .collect::<Vec<_>>();
-    apply_leaf(conn).unwrap();
-    verify(conn).unwrap();
-    for (name, query, before) in saved {
-        assert_eq!(before, rows(conn, &query), "changed {name}");
-    }
-}
-
 #[test]
 fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forged_later() {
     let dir = tempfile::tempdir().unwrap();

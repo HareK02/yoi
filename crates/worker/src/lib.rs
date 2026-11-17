@@ -20,9 +20,6 @@ mod paste_artifact_tool;
 pub mod plugin;
 pub mod profile_manifest;
 pub mod prompt;
-#[cfg(test)]
-#[path = "../../../tests/support/restore_environment.rs"]
-mod restore_test_environment;
 pub mod runtime;
 pub mod segment_log_sink;
 mod session_capture;

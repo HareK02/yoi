@@ -8,7 +8,9 @@ use super::*;
 #[cfg(test)]
 use crate::jobs::JobInputDisposition;
 use crate::jobs::{JobAttemptState, JobInputRetirementReason, JobSnapshot, JobState};
-use session_store::capture::{CaptureDto, CaptureLimits, RecordingPosition};
+#[cfg(test)]
+use session_store::capture::CaptureLimits;
+use session_store::capture::{CaptureDto, RecordingPosition};
 use subjektiv::api::JobAttemptBinding;
 use subjektiv::journal::recording::JournalInput;
 use subjektiv::journal::transport::*;
@@ -1112,6 +1114,7 @@ impl LocalSubjectHost {
         Ok(result)
     }
 
+    #[cfg(test)]
     fn recording_capture(&self, session: &str) -> Result<CaptureDto, SubjektivHostError> {
         self.with_recording_boundary(session, |sessions, session_id, active, guard| {
             session_store::capture::capture_recording_fs_guarded(

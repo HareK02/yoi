@@ -2830,6 +2830,7 @@ impl Runtime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn restore_worker_under_lock(
         &self,
         worker_ref: &WorkerRef,

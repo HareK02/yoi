@@ -2138,9 +2138,10 @@ struct OrchestratorAttentionState {
 
 #[derive(Clone)]
 struct OrchestratorAttentionDelivery {
+    #[cfg(test)]
+    content: String,
     fingerprint: String,
     request_id: String,
-    content: String,
     input: crate::store::TicketAssignmentDelivery,
 }
 
@@ -5656,6 +5657,7 @@ impl WorkspaceApi {
         }
     }
 
+    #[cfg(test)]
     fn finish_backend_job_attempt(
         &self,
         job_id: &str,
@@ -6189,15 +6191,6 @@ impl WorkspaceApi {
         let _ = self.schedule_backend_job_worker_cleanup(&acceptance.attempt);
         self.drain_reserved_backend_jobs();
         Ok(acceptance)
-    }
-
-    #[cfg(test)]
-    fn deliver_backend_job_result(
-        &self,
-        acceptance: &BackendJobResultAcceptance,
-        _target: &RuntimeWorkerRef,
-    ) {
-        notification_delivery::deliver_job_result(self, acceptance);
     }
 
     fn register_workspace_runtime_binding(&self, binding: WorkspaceRuntimeBinding) -> Result<()> {
@@ -17077,6 +17070,7 @@ async fn scoped_commit_workspace_config_tree(
 /// config CAS commits. An error here therefore does not promise that every
 /// auxiliary side effect was rolled back. Prompt publication is best effort,
 /// exactly as it is for UI saves, and must not turn a committed save into an error.
+#[cfg(test)]
 fn commit_workspace_config_tree(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -17105,6 +17099,7 @@ fn prepare_workspace_config_tree(
     Ok(candidate)
 }
 
+#[cfg(test)]
 fn persist_workspace_config_candidate(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -19751,47 +19746,6 @@ async fn scoped_get_ticket_record(
     })
 }
 
-async fn scoped_create_ticket_record(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    headers: HeaderMap,
-    Json(input): Json<ticket::NewTicket>,
-) -> ApiResult<Json<ticket::TicketRef>> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &path.workspace_id,
-        headers,
-        TicketBackendOperation::Create { input },
-    )
-    .await?;
-    ticket_rest_result(result, |result| match result {
-        TicketBackendOperationResult::TicketRef(ticket) => Some(ticket),
-        _ => None,
-    })
-}
-
-async fn scoped_edit_ticket_record_item(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
-    headers: HeaderMap,
-    Json(edit): Json<TicketItemEdit>,
-) -> ApiResult<Json<ticket::Ticket>> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &workspace_id,
-        headers,
-        TicketBackendOperation::EditItem {
-            id: TicketIdOrSlug::Query(id),
-            edit,
-        },
-    )
-    .await?;
-    ticket_rest_result(result, |result| match result {
-        TicketBackendOperationResult::Ticket(ticket) => Some(ticket),
-        _ => None,
-    })
-}
-
 async fn scoped_ticket_dependency_check(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
@@ -19812,6 +19766,7 @@ async fn scoped_ticket_dependency_check(
     })
 }
 
+#[cfg(test)]
 async fn scoped_add_ticket_thread_event(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
@@ -24658,7 +24613,7 @@ fn check_orchestrator_assignment_attention(
             record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             continue;
         }
-        let content = match api.store.prepare_ticket_assignment_delivery_content(
+        let _content = match api.store.prepare_ticket_assignment_delivery_content(
             &api.config.workspace_id,
             &input.delivery_id,
             &content,
@@ -24673,7 +24628,8 @@ fn check_orchestrator_assignment_attention(
         let delivery = OrchestratorAttentionDelivery {
             fingerprint: input.delivery_id.clone(),
             request_id: input.request_id.clone(),
-            content,
+            #[cfg(test)]
+            content: _content,
             input,
         };
         state.lock().unwrap_or_else(|p| p.into_inner()).pending = Some(delivery.clone());
@@ -24841,22 +24797,6 @@ fn require_merge_request_completion_grant(
         return Err(Error::WorkspacePermissionDenied("Merge Request completion requires an explicit operation grant; legacy role names are not authority".into()));
     }
     Ok(())
-}
-
-fn find_online_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWorkerSummary> {
-    let owner = api
-        .store
-        .current_worker_singleton_owner(
-            &api.config.workspace_id,
-            crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
-        )
-        .ok()
-        .flatten()?;
-    let mut worker = api.runtime.worker(&owner.worker).ok()?;
-    worker.singleton_key = Some(owner.key);
-    (is_dedicated_workspace_orchestrator(&worker, &api.config.workspace_id)
-        && matches!(worker.state.as_str(), "idle" | "running" | "paused"))
-    .then_some(worker)
 }
 
 fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWorkerSummary> {
@@ -29912,17 +29852,6 @@ fn workspace_orchestrator_is_online(worker: &InternalWorkerSummary) -> bool {
     matches!(worker.state.as_str(), "idle" | "running" | "paused")
 }
 
-#[cfg(test)]
-async fn scoped_create_workspace_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    headers: HeaderMap,
-    Json(request): Json<CreateWorkspaceWorkerRequest>,
-) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    create_workspace_worker(State(api), headers, Json(request)).await
-}
-
 async fn scoped_get_worker_launch_options(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -32945,21 +32874,6 @@ fn recover_workdir_removals(api: &WorkspaceApi) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-async fn set_worker_retention(
-    api: WorkspaceApi,
-    runtime_id: String,
-    runtime_worker_id: String,
-    pinned: bool,
-) -> ApiResult<Json<WorkerRetentionResponse>> {
-    let worker = WorkspaceWorker::resolve_async(&api, &runtime_id, &runtime_worker_id).await?;
-    Ok(Json(
-        worker
-            .set_pinned(&WorkerOperationContext::Backend, pinned)
-            .await?,
-    ))
-}
-
 fn cleanup_workdir_decision(
     file_status: CleanupWorkdirFileStatus,
     cleanliness: CleanupWorkdirCleanliness,
@@ -33660,16 +33574,6 @@ async fn scoped_list_runtime_workers(
 ) -> ApiResult<Json<server_api::RuntimeWorkerListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_runtime_workers(State(api), AxumPath(path.runtime_id), Query(query)).await
-}
-
-#[cfg(test)]
-async fn scoped_create_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimePath>,
-    Json(request): Json<server_api::RuntimeWorkerSpawnRequest>,
-) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    create_runtime_worker(State(api), AxumPath(path.runtime_id), Json(request)).await
 }
 
 async fn scoped_sync_runtime_config_bundle(
@@ -36090,26 +35994,6 @@ fn validate_caller_worker_singleton_key(singleton_key: Option<&str>) -> Result<(
     Ok(())
 }
 
-#[cfg(test)]
-async fn create_workspace_worker(
-    State(api): State<WorkspaceApi>,
-    headers: HeaderMap,
-    Json(request): Json<CreateWorkspaceWorkerRequest>,
-) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    create_workspace_worker_inner(api, headers, request, None).await
-}
-
-#[cfg(test)]
-async fn create_workspace_worker_inner(
-    api: WorkspaceApi,
-    headers: HeaderMap,
-    request: CreateWorkspaceWorkerRequest,
-    resolved_control_operation: Option<WorkerControlOperation>,
-) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    create_workspace_worker_authenticated(api, headers, request, resolved_control_operation, None)
-        .await
-}
-
 async fn create_workspace_worker_authenticated(
     api: WorkspaceApi,
     headers: HeaderMap,
@@ -37619,15 +37503,6 @@ fn runtime_diagnostics_message(diagnostics: &[RuntimeDiagnostic]) -> String {
             .collect::<Vec<_>>()
             .join("; ")
     }
-}
-
-#[cfg(test)]
-async fn create_runtime_worker(
-    api: State<WorkspaceApi>,
-    runtime_id: AxumPath<String>,
-    request: Json<server_api::RuntimeWorkerSpawnRequest>,
-) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
-    create_runtime_worker_authenticated(api, runtime_id, request, None).await
 }
 
 async fn create_runtime_worker_authenticated(

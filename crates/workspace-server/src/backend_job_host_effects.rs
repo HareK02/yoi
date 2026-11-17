@@ -179,7 +179,7 @@ impl JobHostEffects {
             .checked_add(1)
             .ok_or_else(|| Error::Store("Job Host request count overflow".into()))?;
         Ok(JobHostRequestLease {
-            request: Arc::new(AdmittedRequest {
+            _request: Arc::new(AdmittedRequest {
                 effects: self.clone(),
                 _admission: file,
             }),
@@ -233,7 +233,8 @@ impl JobHostEffects {
 /// Only the last real owner ends it. Returning/dropping the async waiter alone is insufficient.
 #[derive(Clone)]
 pub(crate) struct JobHostRequestLease {
-    request: Arc<AdmittedRequest>,
+    // Ownership keeps the admission alive until the last lease is dropped.
+    _request: Arc<AdmittedRequest>,
 }
 
 impl DbOperationLifetime for JobHostRequestLease {

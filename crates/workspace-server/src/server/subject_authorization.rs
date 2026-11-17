@@ -480,6 +480,7 @@ impl WorkerAuthorityView {
         ))
     }
 
+    #[cfg(test)]
     fn subject_permissions(
         &self,
         worker: &RuntimeWorkerRef,
@@ -892,8 +893,7 @@ pub(super) fn has_subject_authority(
         || authority.current_body_subject(worker)?.is_some())
 }
 
-/// None is explicitly the preexisting non-Subject contract, not an all-powerful
-/// grant. Existing Workdir/provider/Ticket checks still apply to those Workers.
+#[cfg(test)]
 pub(super) fn worker_permissions(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,

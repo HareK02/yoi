@@ -919,6 +919,7 @@ impl JobStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(
         &mut self,
         job_id: &str,

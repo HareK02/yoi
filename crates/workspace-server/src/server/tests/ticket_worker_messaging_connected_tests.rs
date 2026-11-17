@@ -12,14 +12,6 @@ use agen::llm_client::{
 };
 use worker_runtime::worker_backend::RuntimeWorkerFactory;
 
-fn operation(name: &str) -> ScopedPermission {
-    ScopedPermission {
-        operation: name.into(),
-        resource: PermissionResource::WorkerOperation {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        },
-    }
-}
 fn collection(name: &str) -> ScopedPermission {
     ScopedPermission {
         operation: name.into(),

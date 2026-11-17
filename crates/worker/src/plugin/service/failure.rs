@@ -5,12 +5,54 @@ use yoi_plugin_runtime::{ExecutionError, ServiceInvocationResult};
 
 #[derive(Clone, Debug, Default)]
 pub(in crate::plugin) struct ServiceDriverObservations {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained Service diagnostic observation; asserted by driver tests"
+        )
+    )]
     pub event_id: Option<String>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained Service diagnostic observation; asserted by driver tests"
+        )
+    )]
     pub invocation_id: Option<String>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained Service diagnostic observation; asserted by driver tests"
+        )
+    )]
     pub attempt: Option<u32>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained Service diagnostic observation; asserted by driver tests"
+        )
+    )]
     pub result: Option<PluginServiceEventResult>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained Service diagnostic observation; asserted by driver tests"
+        )
+    )]
     pub invocation_cause: Option<PluginServiceFailure>,
     pub invocation_failure: Option<PluginServiceFailureAttachment>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained Service diagnostic observation; asserted by driver tests"
+        )
+    )]
     pub attachment_unavailable: bool,
     pub completion: Option<PluginServiceFailure>,
     pub stop: Option<PluginServiceFailure>,

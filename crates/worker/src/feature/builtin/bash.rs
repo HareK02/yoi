@@ -182,7 +182,6 @@ impl WipSubtreeProvider for Arc<Provider> {
                 provider: self.clone(),
                 id,
                 stream,
-                path: path.into(),
                 validator,
             }),
         };
@@ -277,7 +276,6 @@ struct File {
     provider: Arc<Provider>,
     id: String,
     stream: Option<CommandStream>,
-    path: String,
     validator: Vec<u8>,
 }
 impl File {
@@ -448,7 +446,6 @@ mod tests {
             provider,
             id: "retained".into(),
             stream: None,
-            path: "/bash-output/retained/order".into(),
             validator: vec![1],
         };
         for operation in ["read_bytes", "read_lines", "search_text"] {

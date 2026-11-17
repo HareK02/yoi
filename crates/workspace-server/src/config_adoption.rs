@@ -87,9 +87,6 @@ fn during(operation: FailureOperation, error: Error) -> Error {
         other => other,
     }
 }
-fn conflict(message: &str) -> Error {
-    Error::WorkspaceConfigConflict(message.into())
-}
 fn json<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|e| Error::Store(e.to_string()))
 }

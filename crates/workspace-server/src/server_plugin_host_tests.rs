@@ -18,7 +18,7 @@ use crate::plugin_https::{
     test_support::{HOST, Peer, response},
 };
 use crate::plugin_plan::{PlanPinState, PluginPlanCreateReceipt};
-use server_api::authorization::{PermissionResource, ScopedPermission, SubjectPermissionsUpdate};
+use server_api::authorization::{PermissionResource, ScopedPermission};
 use server_api::{
     PluginConsumer, PluginHostError, PluginHostErrorCode, PluginHostOperation, PluginHostRequest,
     PluginHostResponse, PluginHttpMethod, PluginHttpRequest,
