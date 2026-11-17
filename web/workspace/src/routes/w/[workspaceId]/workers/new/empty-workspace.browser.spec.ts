@@ -93,7 +93,7 @@ test.each(["embedded", "remote"].flatMap((runtime) =>
     "Return without a conclusion.",
   ].map((text) => ({ runtime, text }))
 ))(
-  "$runtime Ticket launch retains natural request without attachments: $text",
+  "$runtime Ticket-context creation retains the request but dispatches neither assignment nor work: $text",
   async ({ runtime, text }) => {
     const options = emptyLaunchOptions("empty");
     if (runtime === "remote") options.runtimes.reverse();
@@ -117,7 +117,7 @@ test.each(["embedded", "remote"].flatMap((runtime) =>
       ticketTitle: "Investigate launch",
       initialInput: text,
     });
-    const start = await screen.findByRole("button", { name: "Start Worker" });
+    const start = await screen.findByRole("button", { name: "Create Worker" });
     expect((start as HTMLButtonElement).disabled).toBe(false);
     expect(screen.queryByRole("option", { name: "Trusted Reviewer" }))
       .toBeNull();
@@ -127,13 +127,12 @@ test.each(["embedded", "remote"].flatMap((runtime) =>
     );
     const request = JSON.parse(String(api.mock.calls[1][1]?.body));
     expect(request.runtime_id).toBe(runtime);
-    expect(request.ticket_assignment.ticket_id).toBe("T-720");
-    expect(request.ticket_assignment.operation_id).toMatch(/^[0-9a-f-]{36}$/);
-    expect(request.initial_submit).toEqual([{ kind: "text", content: text }]);
+    expect(request).not.toHaveProperty("ticket_assignment");
+    expect(request.initial_submit).toEqual([]);
+    expect((screen.getByLabelText("Initial request") as HTMLTextAreaElement).value).toBe(text);
     expect(request.authorization).toEqual({ kind: "assignment", assignment: null });
     expect(request.profile).toBeNull();
     expect(request.workdir_attachments).toEqual([]);
-    expect(request.ticket_assignment).not.toHaveProperty("role");
   },
 );
 
@@ -168,7 +167,7 @@ test("read-only Workdir requires an explicit selection and keeps backend permiss
     initialInput: "Return without a conclusion.",
   });
   const start = await screen.findByRole("button", {
-    name: "Start Worker",
+    name: "Create Worker",
   }) as HTMLButtonElement;
   expect(start.disabled).toBe(false);
   await fireEvent.click(screen.getByRole("button", { name: "Add attachment" }));
@@ -213,7 +212,7 @@ test.each(["backend", "network"])(
       ticketTitle: "Investigate launch",
       initialInput: "Return without a conclusion.",
     });
-    const start = await screen.findByRole("button", { name: "Start Worker" });
+    const start = await screen.findByRole("button", { name: "Create Worker" });
     await fireEvent.input(screen.getByLabelText("Flow (optional)"), {
       target: { value: "project:investigate" },
     });
@@ -223,10 +222,9 @@ test.each(["backend", "network"])(
     );
     expect((start as HTMLButtonElement).disabled).toBe(true);
     const request = JSON.parse(String(api.mock.calls[1][1]?.body));
-    expect(request.initial_submit).toEqual([{
-      kind: "text",
-      content: "Return without a conclusion.",
-    }, { kind: "flow", selector: "project:investigate" }]);
+    expect(request.initial_submit).toEqual([]);
+    expect(request).not.toHaveProperty("ticket_assignment");
+    expect((screen.getByLabelText("Flow (optional)") as HTMLInputElement).value).toBe("project:investigate");
     await fireEvent.click(start);
     expect(api).toHaveBeenCalledTimes(2);
   },
@@ -250,7 +248,7 @@ test.each(["denial", "lost", "rejected", "compensation"] as const)(
       ticketTitle: "Keep draft",
       initialInput: "Keep this request unchanged",
     });
-    const start = await screen.findByRole("button", { name: "Start Worker" });
+    const start = await screen.findByRole("button", { name: "Create Worker" });
     await fireEvent.click(start);
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain(body.detail);
@@ -365,6 +363,65 @@ test.each([false, true])(
       expect(screen.getByRole("link", { name: "Check Workers" })).toBeTruthy();
     }
     await fireEvent.click(start);
+    expect(api).toHaveBeenCalledTimes(2);
+  },
+);
+
+test.each(["embedded", "remote"])(
+  "%s Ticket-context creation stops at a confirmed Worker result without assigning or sending input",
+  async (runtime) => {
+    const options = emptyLaunchOptions("empty");
+    if (runtime === "remote") options.runtimes.reverse();
+    const api = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) =>
+      String(input).endsWith("/launch-options")
+        ? Response.json(options)
+        : Response.json({
+          workspace_id: "empty",
+          runtime_id: runtime,
+          worker_id: "worker-a",
+          console_href: "/w/empty/workers/W-1/console",
+          diagnostics: [],
+          worker: {
+            runtime_id: runtime,
+            worker_id: "worker-a",
+            host_id: "host-a",
+            display_name: "Worker",
+            label: "worker-a",
+            profile: null,
+            singleton_key: null,
+            tags: [],
+            workspace: { visibility: "workspace", identity: "empty", workspace_id: "empty" },
+            state: "idle",
+            last_seen_at: null,
+            pinned: false,
+            retention_state: "active",
+            implementation: { kind: "runtime", display_hint: "Runtime Worker" },
+            diagnostics: [],
+          },
+        })
+    );
+    vi.stubGlobal("fetch", api);
+    mount({ ticketId: "T-720", ticketTitle: "Keep separate", initialInput: "Assign before work" });
+    await fireEvent.input(await screen.findByLabelText("Flow (optional)"), {
+      target: { value: "project:investigate" },
+    });
+    const create = await screen.findByRole("button", { name: "Create Worker" });
+    await fireEvent.click(create);
+    const notice = await screen.findByRole("status", { name: "Worker creation result" });
+    expect(notice.textContent).toContain("Not assigned; no work request sent.");
+    expect(screen.getByRole("link", { name: "Assign this existing Worker on the Ticket" }).getAttribute("href"))
+      .toBe("/w/empty/tickets/T-720");
+    expect(screen.getByRole("link", { name: "Open Worker console" }).getAttribute("href"))
+      .toBe("/w/empty/workers/W-1/console");
+    expect(goto).not.toHaveBeenCalled();
+    const request = JSON.parse(String(api.mock.calls[1][1]?.body));
+    expect(request.runtime_id).toBe(runtime);
+    expect(request.initial_submit).toEqual([]);
+    expect(request).not.toHaveProperty("ticket_assignment");
+    expect((screen.getByLabelText("Initial request") as HTMLTextAreaElement).value).toBe("Assign before work");
+    expect((screen.getByLabelText("Flow (optional)") as HTMLInputElement).value).toBe("project:investigate");
+    expect((create as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(create);
     expect(api).toHaveBeenCalledTimes(2);
   },
 );

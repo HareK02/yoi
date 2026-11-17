@@ -17325,17 +17325,9 @@ async fn start_manual_ticket_worker_assignment_on_host(
         }
         if operation.assignment_id.is_none() {
             let saved = recovery.as_ref().ok_or_else(|| Error::TicketAssignmentConflict("pending manual claim has no admitted recovery context; reconciliation required".into()))?;
-            if saved.original_links == saved.effective_links {
-                return finalize_unchanged_ticket_worker_claim(
-                    api,
-                    record,
-                    operation_id,
-                    &binding_fingerprint,
-                    &content_digest,
-                    &worker,
-                    &selected,
-                );
-            }
+            // Legacy claims stopped/restored even unchanged bindings. Equality is
+            // not a durable no-effects phase: reconcile the exact pinned intent,
+            // or keep an intent-less pending receipt unresolved without dispatch.
             let request_id = format!("manual-worker-restore:{operation_id}");
             let request=api.config_store.get_internal_worker_restore_intent(&api.config.workspace_id,&worker,&request_id)?.ok_or_else(|| Error::TicketAssignmentConflict("pending manual claim has no pinned restore intent; reconciliation required before any Runtime effects".into()))?;
             let binding = ManualTicketWorkerWorkdirBinding {
