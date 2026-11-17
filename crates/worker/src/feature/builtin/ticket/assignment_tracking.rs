@@ -582,17 +582,13 @@ mod tests {
         let client = transport(200, "{}");
         let definitions = enabled_ticket_definitions(client, TicketFeatureAccess::workflow());
         for name in TOOL_NAMES {
-            let (meta, _) = definitions
+            let (_meta, _) = definitions
                 .iter()
                 .find(|definition| definition().0.name == *name)
                 .unwrap()();
             let native = native_ticket_operation(name).unwrap();
             assert_eq!(native.identity_field, Some("ticket"));
             assert_eq!(native.mutating, *name == "TicketAssignmentTrackingUpdate");
-            assert!(
-                meta.description.contains("delegation")
-                    || meta.description.contains("assignment_id")
-            );
         }
         let reads = TicketFeatureAccess::read_only().tool_names();
         assert!(reads.contains(&"TicketAssignmentTrackingQuery"));

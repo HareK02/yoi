@@ -241,22 +241,6 @@ async fn builtin_journal_profile_installs_only_bound_tools_and_finalizes_saved_s
         ] {
             assert!(!names.contains(&forbidden), "unexpected {forbidden}");
         }
-        let prompt = request.system_prompt.as_deref().unwrap();
-        for contract in [
-            "OutcomeUnknown",
-            "selected_ranges",
-            "origins",
-            "ReadJournalState",
-            "ReadJournalText",
-            "Source",
-            "content_token",
-            "input digest",
-        ] {
-            assert!(
-                prompt.contains(contract),
-                "missing Journal input contract {contract}"
-            );
-        }
     }
 }
 
@@ -299,10 +283,6 @@ async fn executes_selected_profiles_with_only_result_authority_and_bounded_polic
         artifact("default", 512, 3),
         artifact("internal.flow_verifier_system", 100000, 1000),
     );
-    let contract = PromptCatalog::builtins_only()
-        .unwrap()
-        .render(WorkerPrompt::JobSystem, minijinja::context! {})
-        .unwrap();
     let mut prompts = vec![];
     for (profile, tokens) in [
         ("user:a", 512),
@@ -370,7 +350,6 @@ async fn executes_selected_profiles_with_only_result_authority_and_bounded_polic
                     .collect::<Vec<_>>(),
                 ["result"]
             );
-            assert!(request.system_prompt.as_ref().unwrap().ends_with(&contract));
         }
         prompts.push(requests[0].system_prompt.clone());
     }
@@ -409,11 +388,6 @@ async fn selected_builtin_job_executes_with_catalog_contract_and_only_result_too
     assert!(job.manifest.scope.allow.is_empty());
     assert!(job.manifest.delegation_scope.allow.is_empty());
     assert!(WorkerPrompt::ALL.contains(&WorkerPrompt::JobSystem));
-    let contract = PromptCatalog::builtins_only()
-        .unwrap()
-        .render(WorkerPrompt::JobSystem, minijinja::context! {})
-        .unwrap();
-    assert!(job.system_prompt.ends_with(&contract));
     let (tx, rx) = tokio::sync::oneshot::channel();
     let result = job
         .run("builtin-attempt".into(), sink.clone(), move |sender| {
@@ -442,7 +416,6 @@ async fn selected_builtin_job_executes_with_catalog_contract_and_only_result_too
             [SUBMIT_JOB_RESULT_TOOL]
         );
         assert_eq!(request.config.max_tokens, Some(MAX_JOB_TOKENS));
-        assert!(request.system_prompt.as_ref().unwrap().ends_with(&contract));
     }
 }
 

@@ -7,6 +7,7 @@
 該当する作業の前に、次の文書を読み、その規則に従う。
 
 - 文書・説明コメントを追加、変更、削除する → [文書管理規則](docs/README.md)
+- LLM向けPromptを追加・変更する → [Prompt記述規則](docs/development/llm-prompting.md)
 - 正本、権限、状態の競合制御、LLM入力・履歴を扱う → [正本・権限・実行の原則](docs/principle/authority-and-history.md)
 - 永続操作、外部副作用、再試行・復旧を設計する → [永続操作の原則](docs/principle/durable-operations.md)
 - テストを追加・変更する → [テスト設計規則](docs/development/rust-testing-strategy.md)

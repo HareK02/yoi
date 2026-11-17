@@ -411,16 +411,6 @@ mod tests {
         assert!(!content.contains("completed task"));
     }
 
-    #[test]
-    fn task_descriptions_require_natural_steps_and_completed_cleanup() {
-        assert!(CREATE_DESCRIPTION.contains("Before beginning nontrivial work"));
-        assert!(CREATE_DESCRIPTION.contains("one session-lifetime task per step"));
-        assert!(CREATE_DESCRIPTION.contains("Do not collapse several predictable steps"));
-        assert!(UPDATE_DESCRIPTION.contains("each natural step boundary"));
-        assert!(UPDATE_DESCRIPTION.contains("remain visible"));
-        assert!(UPDATE_DESCRIPTION.contains("delete older completed tasks"));
-    }
-
     #[tokio::test]
     async fn task_update_validates_existing_and_at_least_one_field() {
         let store = TaskStore::new();

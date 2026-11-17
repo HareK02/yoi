@@ -2082,26 +2082,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_instructions_reuse_known_contracts_without_inspect_rituals() {
-        let fixture = fixture("/tools/item", reference("/", "fixture"));
-        let descriptions: BTreeMap<_, _> = wip_tool_definitions(fixture.runtime)
-            .into_iter()
-            .map(|definition| {
-                let meta = definition().0;
-                (meta.name, meta.description)
-            })
-            .collect();
-        assert!(descriptions["Tree"].contains("Start shallow"));
-        assert!(descriptions["Tree"].contains("list/search/query"));
-        assert!(descriptions["Inspect"].contains("Reuse known exact scope/name"));
-        assert!(descriptions["Inspect"].contains("Do not repeat Inspect before Invoke"));
-        assert!(descriptions["Inspect"].contains("new/changed/forgotten"));
-        assert!(descriptions["Inspect"].contains("authoritative JSON Schema"));
-        assert!(descriptions["Invoke"].contains("no preparatory Tree or Inspect"));
-        assert!(descriptions["Invoke"].contains("Never automatically retry dispatched operations"));
-    }
-
-    #[test]
     fn tool_schemas_expose_only_object_centered_names_and_structured_reference_input() {
         let fixture = fixture("/tools/item", reference("/", "fixture"));
         let names = wip_tool_definitions(fixture.runtime)

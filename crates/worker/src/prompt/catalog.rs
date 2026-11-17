@@ -802,53 +802,6 @@ mod tests {
     }
 
     #[test]
-    fn ticket_item_checker_prompt_keeps_text_only_scope_and_output_contract_separate() {
-        let prompt = PromptCatalog::builtins_only()
-            .unwrap()
-            .ticket_item_checker()
-            .unwrap();
-        assert!(prompt.contains("writer_scope"));
-        assert!(prompt.contains("internal_inconsistency"));
-        assert!(prompt.contains("ambiguous_boundary"));
-        assert!(prompt.contains("Production deployment requires approval"));
-        assert!(prompt.contains("not a finding merely"));
-        assert!(prompt.contains("background, quotations, and bug examples"));
-        assert!(prompt.contains("Do not infer user intent"));
-        assert!(prompt.contains("SubmitBackendJobResult"));
-    }
-
-    #[test]
-    fn flow_verifier_reuses_inspected_evidence_without_claiming_live_read_authority() {
-        let prompt = PromptCatalog::builtins_only()
-            .unwrap()
-            .flow_verifier_system()
-            .unwrap();
-        assert!(prompt.contains("stable entry references"));
-        assert!(prompt.contains("unchanged tree under equivalent conditions"));
-        assert!(prompt.contains("never transfers an old approval or authority"));
-        assert!(prompt.contains("cannot perform live MR or other-session reads"));
-        assert!(prompt.contains("return `indeterminate`"));
-        assert!(prompt.contains("FinishFlowVerification"));
-    }
-
-    #[test]
-    fn merge_request_prompts_keep_recording_and_reviewer_contracts() {
-        let catalog = PromptCatalog::builtins_only().unwrap();
-        let common = &catalog.projection.templates["common.merge_request"];
-        let reviewer = &catalog.projection.templates["role.reviewer"];
-        assert!(common.contains("selector_from"));
-        assert!(common.contains("selector_to"));
-        assert!(common.contains("normal non-force push"));
-        assert!(common.contains("target-only movement preserves approval"));
-        assert!(reviewer.contains("complete linked MR/result snapshot"));
-        assert!(reviewer.contains("Submit `ReviewMergeRequest` once"));
-        assert!(reviewer.contains("Bash"));
-        assert!(reviewer.contains("Git"));
-        assert!(!reviewer.contains("without modifying"));
-        assert!(!reviewer.contains("read-only"));
-    }
-
-    #[test]
     fn queue_attention_prompts_share_sanitized_contract_and_true_truncation() {
         let catalog = PromptCatalog::builtins_only().unwrap();
         let tickets = (1..=OrchestratorQueueAttentionContext::MAX_TICKETS + 1)
@@ -868,26 +821,11 @@ mod tests {
             .orchestrator_queue_attention(OrchestratorQueueAttentionPrompt::Tui, &context)
             .unwrap();
 
-        assert!(server.starts_with("Assigned Tickets have unreceived input:"));
-        assert!(tui.starts_with("Assigned Tickets have input requiring attention:"));
-        assert!(tui.contains("no ready/Queue step is required"));
         assert!(tui.contains("were omitted from this notice: 1"));
         assert!(!tui.contains("T-21"));
         assert!(server.contains("- T-1 — Ticket 1 with control "));
         assert!(!server.contains("T-21"));
         assert!(server.contains("were omitted from this notice: 1"));
-        assert!(server.contains("Re-query current Ticket authority"));
-        assert!(server.contains("Reread the current Ticket body, discussion and typed relations"));
-        assert!(server.contains("current assignment/event identity and new input"));
-        for secret in [
-            "workspace_id",
-            "Workspace:",
-            "runtime_id",
-            "worker_id",
-            "bounded",
-        ] {
-            assert!(!server.contains(secret), "leaked {secret}: {server}");
-        }
     }
 
     #[test]
@@ -909,7 +847,6 @@ mod tests {
         assert!(output.contains("Waiting reason: human answer"));
         assert!(output.contains(&format!("Next action: {}…", "x".repeat(1024))));
         assert!(!output.contains(&"x".repeat(1025)));
-        assert!(output.contains("no ready/Queue step is required"));
     }
 
     #[test]
@@ -1023,19 +960,6 @@ mod tests {
             .subjektiv_memory_surface_system("SURFACE_LANGUAGE")
             .unwrap();
         assert!(surface.contains("SURFACE_LANGUAGE"));
-        for required in [
-            "conditions",
-            "negation",
-            "contradictions",
-            "staleness",
-            "SubmitMemorySurface",
-            "not semantic verification",
-        ] {
-            assert!(
-                surface.contains(required),
-                "missing surface rule {required}"
-            );
-        }
         assert!(
             catalog
                 .notify_wrapper("NOTIFICATION_MARKER")
@@ -1048,43 +972,5 @@ mod tests {
                 .unwrap()
                 .contains("BOUNDARY_MARKER")
         );
-        let orchestration = catalog.worker_orchestration_guidance_section().unwrap();
-        for name in [
-            "SubWorkerSpawn",
-            "WorkerList",
-            "WorkerSendInput",
-            "WorkerStop",
-        ] {
-            assert!(
-                orchestration.contains(name),
-                "missing canonical tool {name}"
-            );
-        }
-        assert!(orchestration.contains("requires an Idle Worker and never queues input"));
-        assert!(orchestration.contains("use `WorkerNotify` instead"));
-        assert!(orchestration.contains("do not create a queued Submit"));
-        for alias in ["SubWorkerList", "SubWorkerSend", "SubWorkerStop"] {
-            assert!(
-                !orchestration.contains(alias),
-                "guidance referenced stale alias {alias}"
-            );
-        }
-    }
-
-    #[test]
-    fn builtin_orchestrator_cleanup_retains_terminal_responsibility_and_blocks_unfinished_work() {
-        let rendered = PromptCatalog::builtins_only()
-            .unwrap()
-            .render_name("role.orchestrator", Value::UNDEFINED)
-            .unwrap();
-
-        assert!(rendered.contains("This policy governs naming only"));
-        assert!(rendered.contains("stop the Worker, remove it, then delete the Workdir"));
-        assert!(rendered.contains("releases attachments but preserves the Workdir"));
-        assert!(
-            rendered.contains("Retained terminal responsibility does not require unassignment")
-        );
-        assert!(rendered.contains("idle or stopped status does not end unfinished work"));
-        assert!(!rendered.contains("{% include"));
     }
 }

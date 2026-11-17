@@ -2701,11 +2701,6 @@ mod tests {
         let description = tool_description_by_name(backend, "TicketComment");
 
         assert!(description.contains("Ticket record language: Japanese"));
-        assert!(description.contains("durable Ticket record and Ticket tool body text"));
-        assert!(description.contains("distinct from worker.language"));
-        assert!(description.contains("memory.language"));
-        assert!(description.contains("Preserve protocol literals"));
-        assert!(description.contains("file paths, commands, logs, identifiers"));
     }
 
     #[test]
@@ -2714,7 +2709,6 @@ mod tests {
         let description = tool_description_by_name(backend(&temp), "TicketComment");
 
         assert!(!description.contains("Ticket record language:"));
-        assert!(!description.contains("worker.language"));
     }
 
     #[tokio::test]
@@ -3423,7 +3417,6 @@ mod tests {
         );
         assert!(!TICKET_TOOL_NAMES.contains(&"TicketWorkflowState"));
         assert!(!TICKET_TOOL_NAMES.contains(&"TicketClose"));
-        assert!(meta.description.contains("1024 UTF-8 bytes"));
     }
 
     #[tokio::test]

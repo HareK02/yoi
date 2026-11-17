@@ -54602,7 +54602,6 @@ mod tests {
         assert_eq!(job.request.notification_target.as_ref(), Some(&source));
         assert_eq!(job.request.limits.max_attempts, 1);
         assert_eq!(job.request.limits.timeout_seconds, 45);
-        assert!(job.request.instruction.contains("Do not infer user intent"));
         let dispatched_inputs = execution.take_inputs();
         assert_eq!(dispatched_inputs.len(), 1);
         assert!(

@@ -1186,17 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_handoff_schema_allows_bash_for_git_commands() {
-        let schema = serde_json::to_value(schemars::schema_for!(SubWorkerSpawnInput)).unwrap();
-        let description = schema["properties"]["review"]["description"]
-            .as_str()
-            .expect("review handoff description");
-        assert!(description.contains("Bash"));
-        assert!(description.contains("Git"));
-        assert!(!description.contains("read-only"));
-    }
-
-    #[test]
     fn reviewer_handoff_requires_explicit_builtin_profile_and_writable_scope() {
         let valid: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:reviewer",

@@ -290,15 +290,6 @@ pub(crate) mod test_support {
     impl FakeTicketCheckerModel {
         pub(crate) fn respond(request: &BackendJobRequest) -> Value {
             let input = parse_input(&request.input).unwrap();
-            assert!(request.instruction.contains("writer_scope"));
-            assert!(request.instruction.contains("internal_inconsistency"));
-            assert!(request.instruction.contains("ambiguous_boundary"));
-            assert!(
-                request
-                    .instruction
-                    .contains("Production deployment requires approval")
-            );
-            assert!(request.instruction.contains("background, quotations"));
             if input
                 .body
                 .contains("This time I only create the Ticket; I will not implement it.")

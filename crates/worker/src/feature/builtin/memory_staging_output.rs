@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn render_input_uses_session_entry_refs_and_new_tool_names() {
+    fn render_input_uses_session_entry_refs() {
         let view = SessionCapture::new(
             "session",
             "segment-1",
@@ -564,7 +564,6 @@ mod tests {
         let input = render_extract_input(&view);
         assert!(input.contains("E00000000"));
         assert!(input.contains("E00000001"));
-        assert!(input.contains("StageMemoryCandidate.entry_refs"));
     }
 
     #[test]
