@@ -33,24 +33,34 @@
 <svelte:head><title>{subject?.role ?? 'Subject'} · Conversation · Yoi Workspace</title></svelte:head>
 
 <section class="conversation-page" aria-labelledby="conversation-subject-heading">
-  <a href={subjectHref(data.workspaceId, data.subjectId)}>← Subject details</a>
+  <header>
+    <h1 id="conversation-subject-heading">{subject?.role ?? 'Subject conversation'}</h1>
+    <a href={subjectHref(data.workspaceId, data.subjectId)}>← Subject details</a>
+  </header>
   {#if subject}
-    <h1 id="conversation-subject-heading">{subject.role}</h1>
     {#if accountConfirmed}
       {#key JSON.stringify([data.accountId, data.workspaceId, subject.id])}
-        <SubjectBody accountId={data.accountId} workspaceId={data.workspaceId} subjectId={subject.id} />
+        <details class="body-controls">
+          <summary>Subject controls</summary>
+          <div class="body-panel"><SubjectBody accountId={data.accountId} workspaceId={data.workspaceId} subjectId={subject.id} /></div>
+        </details>
         <SubjectConversation accountId={data.accountId} workspaceId={data.workspaceId} subjectId={subject.id} subjectName={subject.role} />
       {/key}
     {:else}
       <p role="alert">The conversation account could not be confirmed. Reopen this page after confirming your session.</p>
     {/if}
   {:else}
-    <h1 id="conversation-subject-heading">Subject conversation</h1>
     <p role="alert">{data.subject.error ?? 'The Subject is unavailable. No conversation input was sent.'}</p>
   {/if}
 </section>
 
 <style>
-  .conversation-page { display: grid; gap: var(--space-4); padding: var(--space-4); width: 100%; box-sizing: border-box; max-width: 960px; min-width: 0; margin-inline: auto; }
-  h1 { margin: 0; overflow-wrap: anywhere; }
+  .conversation-page { display: flex; flex-direction: column; flex: 1 1 0; gap: var(--space-2); width: 100%; max-width: 920px; min-width: 0; min-height: 0; margin-inline: auto; }
+  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-2); }
+  h1 { margin: 0; overflow-wrap: anywhere; font-size: var(--font-size-body); line-height: var(--line-height-body); }
+  a, summary { font-size: var(--font-size-compact); line-height: var(--line-height-compact); color: var(--text-muted); }
+  .body-controls { flex: 0 0 auto; }
+  summary { cursor: pointer; width: fit-content; }
+  summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .body-panel { max-height: 35dvh; overflow-y: auto; padding-block: var(--space-2); }
 </style>

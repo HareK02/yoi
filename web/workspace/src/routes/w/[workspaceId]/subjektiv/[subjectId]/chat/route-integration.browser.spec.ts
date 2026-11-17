@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { cleanup, render, screen, waitFor } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import PageContent from "./PageContent.svelte";
 import { browserSession } from "#lib/workspace/auth/session-state.ts";
@@ -7,6 +7,7 @@ import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
 import type { MessagingCommand, MessagingResult } from '#lib/generated/chat-api.ts';
 const messaging = vi.hoisted(() => ({ request: vi.fn<(command: MessagingCommand) => Promise<MessagingResult>>() }));
 vi.mock('#lib/workspace/multiplexer.ts', () => ({ workspaceMultiplexer: () => ({
+  subscribe: () => ({ close: vi.fn() }),
   connectMessaging(listener: { onStatus(status: string): void }) {
     queueMicrotask(() => listener.onStatus('open'));
     return { request: (command: MessagingCommand) => messaging.request(command), close: vi.fn() };
@@ -71,21 +72,23 @@ afterEach(() => {
   localStorage.clear();
 });
 
-test("canonical chat hosts Body and public conversation as siblings with a canonical return link", async () => {
-  render(PageContent, { data: routeData() } as never);
-  await screen.findByText("No current conversation body.");
-  await screen.findByRole("textbox", {
-    name: "Message to Companion subject-a",
-  });
+test("canonical chat keeps Subject controls collapsed and independent from the conversation", async () => {
+  const ui = render(PageContent, { data: routeData() } as never);
+  await screen.findByRole("textbox", { name: "Message to Companion subject-a" });
+  const disclosure = ui.container.querySelector('details.body-controls')!;
+  expect(disclosure.hasAttribute('open')).toBe(false);
+  await fireEvent.click(screen.getByText('Subject controls'));
+  await screen.findByRole("button", { name: "Start Subject" });
   expect(
     screen.getByRole("link", { name: "← Subject details" }).getAttribute(
       "href",
     ),
   ).toBe("/w/w/subjektiv/subject-a");
-  const body = screen.getByRole("heading", { name: "Conversation body" })
+  const body = screen.getByRole("region", { name: "Subject controls" })
     .closest("section")!;
   const conversation = screen.getByRole("textbox").closest("section")!;
-  expect(body.parentElement).toBe(conversation.parentElement);
+  expect(disclosure.contains(body)).toBe(true);
+  expect(disclosure.contains(conversation)).toBe(false);
   expect(body.contains(conversation)).toBe(false);
   expect(calls).toContain("GET /api/w/w/subjektiv/subjects/subject-a/body");
   expect(messaging.request.mock.calls.map(([command]) => command.kind)).toEqual(['open', 'subscribe']);
@@ -99,7 +102,7 @@ test("auth-generation change removes both children even when the account snapsho
   browserSession.invalidate(true);
   await screen.findByRole("alert");
   expect(screen.queryByRole("textbox")).toBeNull();
-  expect(screen.queryByRole("heading", { name: "Conversation body" }))
+  expect(screen.queryByRole("region", { name: "Subject controls" }))
     .toBeNull();
   expect(screen.getByRole("alert").textContent).toContain("Reopen this page");
 });
@@ -118,7 +121,7 @@ test("route reuse with an unconfirmed account never mounts controls or reads the
     } as never,
   );
   await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
-  expect(screen.queryByRole("heading", { name: "Conversation body" }))
+  expect(screen.queryByRole("region", { name: "Subject controls" }))
     .toBeNull();
   expect(
     screen.getByRole("link", { name: "← Subject details" }).getAttribute(

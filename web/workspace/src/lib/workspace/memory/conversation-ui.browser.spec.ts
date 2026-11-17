@@ -8,12 +8,15 @@ import {
   readConversationDraft,
   saveConversationDraft,
 } from "./conversation-draft.ts";
-import { conversationMessageView } from "./conversation-view.ts";
+import { conversationMessageView, type ConversationOutgoing } from "./conversation-view.ts";
 import {
   captureTranscriptAnchor,
   followTranscriptTail,
   restoreTranscriptAnchor,
 } from "#lib/workspace/transcript/scroll.ts";
+
+// happy-domはWeb Animations非対応。ボタンの描画・配置はChromiumで検証する。
+vi.mock("svelte/motion", () => ({ prefersReducedMotion: { current: true } }));
 
 afterEach(() => {
   cleanup();
@@ -54,6 +57,58 @@ test("public messages use identity-based bubbles and safe shared Markdown, never
   expect(ui.container.querySelector('a[href^="javascript:"]')).toBeNull();
 });
 
+test('delivery stays below its own bubble, retries its operation, and does not treat a saved message as delivered', async () => {
+  const saved = message(1, 'identical text', true);
+  const outgoing: ConversationOutgoing[] = [{
+    request: { conversationId: 'c', operationId: 'pending', text: 'identical text', replyTo: null, workRef: null },
+    state: 'retry',
+  }];
+  const onretry = vi.fn();
+  const ui = render(ConversationHistory, { ...props, messages: [saved], outgoing, onretry });
+  expect(ui.container.querySelectorAll('.chat-message')).toHaveLength(2);
+  expect(ui.container.querySelector('[data-message-id="m1"] .chat-delivery')).toBeNull();
+  const retry = ui.getByRole('button', { name: 'Retry message' });
+  expect(retry.closest('[data-local]')).not.toBeNull();
+  expect(retry.closest('.chat-bubble')).toBeNull();
+  expect(retry.querySelector('svg')).not.toBeNull();
+  expect(retry.textContent?.trim()).toBe('');
+  await fireEvent.click(retry);
+  expect(onretry).toHaveBeenCalledWith('pending');
+  await ui.rerender({ retryDisabled: true });
+  expect((retry as HTMLButtonElement).disabled).toBe(true);
+  await fireEvent.click(retry);
+  expect(onretry).toHaveBeenCalledTimes(1);
+
+  const confirmed = { ...message(2, 'identical text', true), operation_id: 'pending' };
+  await ui.rerender({ messages: [saved, confirmed] });
+  expect(ui.container.querySelectorAll('.chat-message')).toHaveLength(2);
+  expect(ui.container.querySelector('[data-local]')).toBeNull();
+  expect(ui.getByRole('button', { name: 'Retry message' }).closest('li')?.dataset.messageId).toBe('m2');
+  await ui.rerender({ outgoing: [{ ...outgoing[0], state: 'delivered' }] });
+  const delivered = ui.getByText('delivered');
+  expect(delivered.closest('li')?.dataset.messageId).toBe('m2');
+  expect(delivered.closest('.chat-bubble')).toBeNull();
+  expect(ui.queryByRole('button', { name: 'Retry message' })).toBeNull();
+});
+
+test('delivery matching requires the same conversation and owning account, not operation alone', () => {
+  const outgoing: ConversationOutgoing[] = [{
+    request: { conversationId: 'c', operationId: 'op1', text: 'pending own message', replyTo: null, workRef: null },
+    state: 'sending',
+  }];
+  const ui = render(ConversationHistory, {
+    ...props, outgoing,
+    messages: [
+      message(1),
+      { ...message(2, 'other account', true), operation_id: 'op1', sender: { kind: 'user', account_id: 'other' } },
+      { ...message(3, 'other conversation', true), operation_id: 'op1', conversation_id: 'other' },
+    ],
+  });
+  expect(ui.container.querySelectorAll('.chat-message')).toHaveLength(4);
+  expect(ui.getByText('sending').closest('[data-local]')).not.toBeNull();
+  expect(ui.container.querySelectorAll('.chat-delivery')).toHaveLength(1);
+});
+
 test("new messages follow only at the tail and jump-to-latest resumes following", async () => {
   let height = 1000;
   vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(() => height);
@@ -66,7 +121,10 @@ test("new messages follow only at the tail and jump-to-latest resumes following"
   height = 1400;
   await ui.rerender({ messages: [message(1), message(2)] });
   expect(scroll.scrollTop).toBe(200);
-  await fireEvent.click(ui.getByRole("button", { name: "Jump to latest" }));
+  const jump = ui.getByRole("button", { name: "Jump to latest" });
+  expect(jump.querySelector('svg')).not.toBeNull();
+  expect(jump.textContent?.trim()).toBe('');
+  await fireEvent.click(jump);
   await waitFor(() => expect(scroll.scrollTop).toBe(1400));
   height = 1600;
   await ui.rerender({ messages: [message(1), message(2), message(3)] });

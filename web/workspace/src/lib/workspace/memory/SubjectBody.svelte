@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { SubjectBodyMutationResponse, SubjectBodyResponse, SubjectBodyStopOutcomeResponse } from '#lib/generated/subject-body-api.ts';
-  import { liveWorkerState } from '#lib/workspace/sidebar/worker-state.ts';
+  import type { SubjectBodyMutationResponse, SubjectBodyResponse } from '#lib/generated/subject-body-api.ts';
+  import { workspaceMultiplexer } from '#lib/workspace/multiplexer.ts';
   import {
     clearSubjectBodyAttempt, createSubjectBodyAttempt, getSubjectBody, getSubjectBodyStopOutcome,
     readSubjectBodyAttempt, saveSubjectBodyAttempt, startSubjectBody,
@@ -9,11 +9,9 @@
   } from './subject-body.ts';
 
   let { accountId, workspaceId, subjectId }: { accountId: string; workspaceId: string; subjectId: string } = $props();
-  const headingId = $props.id();
   let body = $state.raw<SubjectBodyResponse | null>(null);
   let attempt = $state.raw<SubjectBodyAttempt | null>(null);
   let receipt = $state.raw<SubjectBodyMutationResponse | null>(null);
-  let stopOutcome = $state.raw<SubjectBodyStopOutcomeResponse | null>(null);
   let outcomeError = $state<string | null>(null);
   let checkingOutcome = $state(false);
   let loadError = $state<string | null>(null);
@@ -31,8 +29,7 @@
   let snapshot = $derived(visible ? body : null);
   let controls = $derived(snapshot ? subjectBodyControls(snapshot) : { start: false, stop: false, recover: false });
   let retryAuthorized = $derived(snapshot && attempt && (attempt.action === 'stop' ? snapshot.can_stop : snapshot.can_start));
-  let worker = $derived(snapshot?.observation.kind === 'available' ? snapshot.observation.worker : null);
-  let workerDiagnostics = $derived(worker?.diagnostics ?? []);
+  let updatesUnavailable = $state(false);
 
   function current(generation: number, account: string, workspace: string, subject: string): boolean {
     return routeGeneration === generation && accountId === account && workspaceId === workspace && subjectId === subject;
@@ -42,14 +39,13 @@
     const account = accountId;
     const workspace = workspaceId;
     const subject = subjectId;
-    untrack(() => {
+    const stop = untrack(() => {
       routeGeneration += 1;
       observationRequest += 1;
       activeRoute = identityKey(account, workspace, subject);
       body = null;
       attempt = null;
       receipt = null;
-      stopOutcome = null;
       outcomeError = null;
       checkingOutcome = false;
       loadError = null;
@@ -58,12 +54,54 @@
       sending = false;
       loading = false;
       fresh = false;
+      updatesUnavailable = false;
       if (typeof account !== 'string' || account.length === 0) return;
       try { attempt = readSubjectBodyAttempt(sessionStorage, account, workspace, subject); }
-      catch { storageError = 'The saved body request cannot be read. Do not create a replacement request. Restore access to this tab’s session storage and reload.'; }
+      catch { storageError = 'Could not read the operation. Check browser storage before trying again.'; }
+      const generation = routeGeneration;
+      let disposed = false;
+      let queued = false;
+      const invalidate = () => {
+        if (disposed || !current(generation, account, workspace, subject)) return;
+        fresh = false;
+        observationRequest += 1;
+        if (queued) return;
+        queued = true;
+        queueMicrotask(() => {
+          queued = false;
+          if (!disposed && current(generation, account, workspace, subject)) void refresh();
+        });
+      };
+      // Worker通知は再取得の契機だけに使い、Subjectの所有・操作権限を推定しない。
+      const subscription = workspaceMultiplexer(workspace).subscribe({ topic: 'workspace_workers' }, {
+        onFrame(frame) {
+          if (disposed || !current(generation, account, workspace, subject)) return;
+          if ((frame.frame === 'response' && frame.message.result === 'subscribed') ||
+              (frame.frame === 'event' && frame.message.event === 'event')) {
+            updatesUnavailable = false;
+            invalidate();
+          } else if ((frame.frame === 'response' && frame.message.result === 'subscription_rejected') ||
+                     (frame.frame === 'event' && frame.message.event === 'subscription_closed')) {
+            updatesUnavailable = true;
+            fresh = false;
+            loading = false;
+            observationRequest += 1;
+          }
+        },
+        onStatus(status) {
+          if (disposed || !current(generation, account, workspace, subject)) return;
+          if (status !== 'open') {
+            updatesUnavailable = true;
+            fresh = false;
+            loading = false;
+            observationRequest += 1;
+          }
+        },
+      });
       void refresh();
+      return () => { disposed = true; subscription.close(); };
     });
-    return () => { routeGeneration += 1; observationRequest += 1; };
+    return () => { stop?.(); routeGeneration += 1; observationRequest += 1; };
   });
 
   async function refresh(): Promise<void> {
@@ -81,10 +119,10 @@
       const next = await getSubjectBody(fetch, workspace, subject);
       if (!latest()) return;
       body = next;
-      fresh = true;
-    } catch (cause) {
+      fresh = !updatesUnavailable;
+    } catch {
       if (!latest()) return;
-      loadError = (cause instanceof SubjectBodyApiError ? `${cause.message}. ` : '') + 'Body state could not be confirmed. Check your connection and viewing permissions, then refresh.';
+      loadError = 'Subject controls are temporarily unavailable.';
     } finally {
       if (latest()) loading = false;
     }
@@ -95,17 +133,13 @@
     const rejected = cause.request;
     if (rejected.workspace_id !== frozen.workspaceId || rejected.subject_id !== frozen.subjectId || rejected.request_id !== frozen.request.request_id) return null;
     receipt = null;
-    stopOutcome = null;
     try {
       clearSubjectBodyAttempt(sessionStorage, accountId, frozen);
       attempt = null;
     } catch {
       storageError = 'The request rejection was confirmed, but its saved input could not be cleared. Restore session storage access and reload before another action.';
     }
-    return (rejected.resolution === 'superseded'
-      ? 'Request superseded. The body target changed, so this saved intent can no longer act on the current body. This does not determine whether an earlier operation took effect. '
-      : 'Request not accepted. The saved observation was stale and this request was not admitted. ')
-      + cause.message + '. Refresh the current body before choosing a new explicit action.';
+    return 'The Subject changed. Try again.';
   }
 
   async function submit(action?: 'start' | 'stop' | 'recover'): Promise<void> {
@@ -128,7 +162,6 @@
     sending = true;
     operationError = null;
     receipt = null;
-    stopOutcome = null;
     outcomeError = null;
     fresh = false;
     const observation = ++observationRequest;
@@ -170,11 +203,9 @@
     const frozen = attempt;
     checkingOutcome = true;
     outcomeError = null;
-    stopOutcome = null;
     try {
       const result = await getSubjectBodyStopOutcome(fetch, workspace, subject, frozen.request);
       if (!current(generation, account, workspace, subject)) return;
-      stopOutcome = result;
       // 停止照会のbodyは表示状態へ転記しない。現在の本体は独立したGETで更新する。
       if (result.outcome === 'stopped') {
         receipt = null;
@@ -199,117 +230,57 @@
   }
 </script>
 
-<section class="subject-body" aria-labelledby={headingId}>
-  <header>
-    <h2 id={headingId}>Conversation body</h2>
-    {#if hasAccount}<button type="button" class="workspace-secondary-button" disabled={!visible || loading} onclick={() => { void refresh(); }}>Refresh body state</button>{/if}
-  </header>
+<section class="subject-body" aria-label="Subject controls" aria-busy={loading || sending || checkingOutcome}>
   {#if !hasAccount}
-    <p role="status">Sign in to view this conversation body.</p>
-  {:else if !visible || (!snapshot && loading)}
-    <p role="status">Loading body state…</p>
-  {:else if snapshot}
-    {#if !fresh}<p class="muted">{loading ? 'Updating body state…' : 'Last confirmed observation; refresh before acting.'}</p>{/if}
-    {#if snapshot.observation.kind === 'absent'}
-      <p>No current conversation body.</p>
-    {:else if snapshot.observation.kind === 'failed_create'}
-      <p><strong>Body creation failed; reservation retained.</strong> Confirm Runtime cleanup to release this reservation. This does not start a new body or change Subject permissions.</p>
-    {:else if snapshot.observation.kind === 'unavailable'}
-      <p><strong>Body owner present; observation unavailable.</strong> This is not an absent or stopped body. A replacement will not be started.</p>
-      {#each snapshot.observation.diagnostics as diagnostic}
-        <p class="workspace-callout" role="status">{diagnostic.message}</p>
-      {/each}
-    {:else if worker}
-      {#if worker.availability !== 'observed'}
-        <p><strong>Body owner present; Worker observation unavailable.</strong> Running or stopped state is not confirmed.</p>
-      {:else if liveWorkerState(worker) === 'stopped'}
-        <p><strong>Body stopped.</strong> Start restores this body; retained conversation and Memory remain available.</p>
-      {:else if worker.worker_state}
-        <dl><div><dt>Worker lifecycle</dt><dd>{worker.state}</dd></div><div><dt>Live execution</dt><dd>{liveWorkerState(worker)}</dd></div></dl>
-      {:else}
-        <p><strong>Body owner present; live execution not confirmed.</strong> Refresh before acting.</p>
-      {/if}
-      {#if worker.availability === 'observed' && !worker.restore_observation_token}
-        <p class="muted">Lifecycle controls are unavailable until the current body’s observation token can be confirmed. Refresh body state before acting.</p>
-      {/if}
-      {#each workerDiagnostics as diagnostic}
-        <p class="workspace-callout" role="status">{diagnostic.message}</p>
-      {/each}
+    <p role="status">Sign in to use Subject controls.</p>
+  {:else if visible}
+    {#if sending || checkingOutcome}
+      <p role="status">Working…</p>
+    {:else if storageError}
+      <p role="alert">Could not save the operation. Check browser storage before trying again.</p>
+    {:else if loadError || updatesUnavailable || snapshot?.observation.kind === "unavailable"}
+      <p role="status">Subject controls are temporarily unavailable.</p>
+    {:else if operationError === "The Subject changed. Try again." || outcomeError === "The Subject changed. Try again."}
+      <p role="alert">The Subject changed. Try again.</p>
+    {:else if attempt}
+      <p role="status">Could not confirm the operation.</p>
+    {:else if receipt?.disposition === "rejected"}
+      <p role="alert">Could not complete the operation.</p>
+    {:else if !snapshot && loading}
+      <p role="status">Loading…</p>
+    {:else if snapshot && !snapshot.can_start && !snapshot.can_stop}
+      <p role="status">Subject controls are unavailable.</p>
     {/if}
-    {#if !snapshot.can_start || !snapshot.can_stop}
-      <p class="muted">{!snapshot.can_start && !snapshot.can_stop ? 'You do not have permission to start or stop this body.' : !snapshot.can_start ? 'You do not have permission to start this body.' : 'You do not have permission to stop this body.'} Ask a Workspace administrator to review access; this control does not add permissions.</p>
-    {/if}
-    {#if !attempt}
-      <div class="actions">
+    <div class="actions">
+      {#if attempt}
+        {#if attempt.action === "stop" && snapshot?.can_stop}
+          <button type="button" class="workspace-secondary-button" disabled={loading || sending || checkingOutcome || !!storageError} onclick={() => { void checkStopOutcome(); }}>Check result</button>
+        {/if}
+        {#if retryAuthorized}
+          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || checkingOutcome || !!storageError} onclick={() => { void submit(); }}>Retry</button>
+        {/if}
+      {:else if snapshot}
         {#if controls.start}
-          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit('start'); }}>{snapshot.current ? 'Restart conversation body' : 'Start conversation body'}</button>
+          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit("start"); }}>Start Subject</button>
         {/if}
         {#if controls.recover}
-          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit('recover'); }}>Release failed start reservation</button>
+          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit("recover"); }}>Recover start</button>
         {/if}
         {#if controls.stop}
-          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit('stop'); }}>Stop conversation body</button>
+          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit("stop"); }}>Stop Subject</button>
         {/if}
-      </div>
-      {#if controls.stop}<p class="muted">Stopping ends the body Worker, not the Subject. Conversation and Memory are retained.</p>{/if}
-    {/if}
-  {/if}
-  {#if visible}
-    {#if loadError}<p class="workspace-callout is-error" role="alert">{loadError}</p>{/if}
-    {#if storageError}<p class="workspace-callout is-error" role="alert">{storageError}</p>{/if}
-    {#if sending}<p role="status">Sending request; body state is not yet confirmed.</p>{/if}
-    {#if receipt}
-      <div role="status">
-        {#if receipt.disposition === 'accepted'}
-          <p><strong>Request accepted.</strong> Acceptance is not confirmation of running or stopped state. Check the body observation above.</p>
-        {:else if receipt.disposition === 'rejected'}
-          <p><strong>Request rejected.</strong> Review the diagnostics and refresh before a new action. Check Subject permissions, the default profile and model configuration; no permissions were added.</p>
-        {:else}
-          <p><strong>Request outcome unknown.</strong> {attempt?.action === 'stop' ? 'Check the saved stop outcome without sending another stop, or explicitly retry the same saved request.' : 'Refresh observations, then retry the same saved request to reconcile.'} Refresh alone does not settle this receipt.</p>
-        {/if}
-        {#each receipt.diagnostics as diagnostic}<p class="workspace-callout">{diagnostic.message}</p>{/each}
-      </div>
-    {/if}
-    {#if checkingOutcome}<p role="status">Checking saved stop outcome… No stop request is sent.</p>{/if}
-    {#if stopOutcome}
-      <div role="status">
-        {#if stopOutcome.outcome === 'stopped'}
-          <p><strong>Historical stop confirmed.</strong> This settles the saved stop operation, not the current body’s state. The body may have been restored since then; see the current observation above.</p>
-        {:else if stopOutcome.outcome === 'pending'}
-          <p><strong>Stop outcome pending.</strong> Stopping is not confirmed. The complete saved request is retained; check again or explicitly retry the same request.</p>
-        {:else}
-          <p><strong>No stop receipt found.</strong> This does not prove that stopping failed or that the current body is stopped. The complete saved request is retained; check again or explicitly retry the same request.</p>
-        {/if}
-      </div>
-    {/if}
-    {#if outcomeError}<p class="workspace-callout is-error" role="alert">{outcomeError}</p>{/if}
-    {#if operationError}<p class="workspace-callout is-error" role="alert">{operationError}</p>{/if}
-    {#if attempt && !sending}
-      {#if !receipt && !operationError && stopOutcome?.outcome !== 'stopped'}<p role="status">An unresolved {attempt.action} request is retained in this tab. Refresh and retry the same request; do not create a replacement.</p>{/if}
-      {#if attempt.action === 'stop' && snapshot?.can_stop}
-        <button type="button" class="workspace-secondary-button" disabled={checkingOutcome || !!storageError} onclick={() => { void checkStopOutcome(); }}>Check stop outcome</button>
       {/if}
-      {#if retryAuthorized}
-        <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || checkingOutcome || !!storageError} onclick={() => { void submit(); }}>Retry same {attempt.action} request</button>
-      {/if}
-      <details><summary>Request diagnostics</summary><p>Request ID: <code>{attempt.request.request_id}</code></p><p>The complete frozen request is retained across reloads in this tab. Retrying does not use a new request ID or a newer observation token.</p></details>
-    {/if}
+    </div>
   {/if}
 </section>
 
 <style>
   .subject-body { min-width: 0; overflow-wrap: anywhere; }
-  header, .actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); }
-  header { justify-content: space-between; }
-  h2 { margin: 0; font-size: var(--font-size-body); line-height: var(--line-height-body); }
-  p, dl, details { margin-block: var(--space-3); }
-  .muted, dt { color: var(--text-muted); }
-  dl > div { display: flex; flex-wrap: wrap; gap: var(--space-3); }
-  dd { margin: 0; }
-  code { font-family: var(--font-mono); }
-  summary { cursor: pointer; }
+  .actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+  p { margin: 0 0 var(--space-2); }
+  [role="alert"] { color: var(--danger); }
   button { font-size: var(--font-size-body); line-height: var(--line-height-body); border-radius: var(--radius-soft); }
   button:hover:not(:disabled) { background: var(--interactive-hover); }
   button:active:not(:disabled) { background: var(--interactive-selected); }
-  button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>

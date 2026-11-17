@@ -1,0 +1,57 @@
+.composer-input-shell {
+  position: relative;
+  border: 1px solid transparent;
+  border-radius: 18px;
+  background: var(--bg-raised);
+  cursor: text;
+  padding: var(--space-1);
+}
+
+.composer-input-shell:focus-within {
+  border-color: var(--line);
+}
+
+.composer-input-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: end;
+  min-height: 2.35rem;
+  padding: 0 var(--space-1) var(--space-1) var(--space-2);
+}
+
+.composer-footer-slot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.composer-send-button {
+  display: inline-grid;
+  width: 2.35rem;
+  height: 2.35rem;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg);
+  cursor: pointer;
+  padding: 0;
+  pointer-events: auto;
+}
+
+.composer-send-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.composer-send-icon {
+  width: 1.2rem;
+  height: 1.2rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}

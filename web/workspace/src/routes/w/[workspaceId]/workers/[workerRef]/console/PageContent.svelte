@@ -1,10 +1,10 @@
 <script lang="ts">
+    import "#lib/workspace/composer/composer-shell.css";
+    import JumpToLatest from "#lib/workspace/transcript/JumpToLatest.svelte";
     // transcriptの表示対象と操作対象を分離する。direct SubWorkerを閲覧しても、
     // Composerとrun controlはrouteの親Workerへ送る。表示切替で操作権限を変えない。
     import { invalidateAll } from "$app/navigation";
     import { tick, untrack, type SvelteComponent } from "svelte";
-    import { prefersReducedMotion } from "svelte/motion";
-    import { fly } from "svelte/transition";
     import ConsoleLineItem from "#lib/workspace/console/ConsoleLineItem.svelte";
     import { captureTranscriptAnchor, restoreTranscriptAnchor, isNearTranscriptBottom, followTranscriptTail, observeTranscriptSize, type TranscriptAnchor } from "#lib/workspace/transcript/scroll.ts";
     import ConsoleTurnNavigation from "#lib/workspace/console/ConsoleTurnNavigation.svelte";
@@ -1995,18 +1995,7 @@
                 bind:element={turnNavigationElement}
             />
             {#if !autoFollowConsole && lines.length > 0 && (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale")}
-                <button
-                    class="console-jump-latest"
-                    transition:fly={{ y: 6, duration: prefersReducedMotion.current ? 0 : 160 }}
-                    type="button"
-                    aria-label="Jump to latest"
-                    title="Jump to latest"
-                    onclick={jumpToLatest}
-                >
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M12 4V16M7 11L12 16L17 11M5 20H19" />
-                    </svg>
-                </button>
+                <JumpToLatest onclick={jumpToLatest} />
             {/if}
         </section>
 
@@ -2492,56 +2481,6 @@
         scrollbar-width: none;
     }
 
-    .console-jump-latest {
-        grid-area: 1 / 1;
-        align-self: end;
-        justify-self: center;
-        z-index: 2;
-        display: grid;
-        place-items: center;
-        width: 36px;
-        height: 36px;
-        padding: 0;
-        margin-bottom: var(--space-3);
-        border: 1px solid var(--line);
-        border-radius: 50%;
-        background: var(--bg-raised);
-        color: var(--text-strong);
-        box-shadow: var(--shadow-overlay);
-        cursor: pointer;
-    }
-
-    .console-jump-latest:hover {
-        color: var(--tui-cyan);
-        border-color: var(--tui-cyan);
-    }
-
-    @media (prefers-reduced-motion: no-preference) {
-        .console-jump-latest {
-            transition: translate 140ms ease-out, color 140ms ease-out,
-                border-color 140ms ease-out;
-        }
-
-        .console-jump-latest:hover {
-            translate: 0 -2px;
-        }
-    }
-
-    .console-jump-latest:focus-visible {
-        outline: 2px solid var(--tui-cyan);
-        outline-offset: 2px;
-    }
-
-    .console-jump-latest svg {
-        width: 20px;
-        height: 20px;
-        fill: none;
-        stroke: currentColor;
-        stroke-width: 1.75;
-        stroke-linecap: round;
-        stroke-linejoin: round;
-    }
-
     .console-scroll::-webkit-scrollbar {
         display: none;
     }
@@ -2775,20 +2714,6 @@
         background: var(--bg);
     }
 
-    .composer-input-shell {
-        position: relative;
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        background: var(--bg-raised);
-        cursor: text;
-        padding: var(--space-1);
-    }
-
-    .composer-input-shell:focus-within {
-        border-color: color-mix(in srgb, var(--tui-cyan) 60%, var(--line));
-        box-shadow: 0 0 0 1px color-mix(in srgb, var(--tui-cyan) 18%, transparent);
-    }
-
     .composer-input-shell.dragging-files {
         border-color: var(--accent);
         background: color-mix(in srgb, var(--accent) 8%, var(--bg-raised));
@@ -2877,51 +2802,15 @@
         opacity: 0.55;
     }
 
-    .composer-input-footer {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
-        gap: var(--space-2);
-        align-items: end;
-        min-height: 2.35rem;
-        padding: 0 var(--space-1) var(--space-1) var(--space-2);
-    }
-
-    .composer-footer-slot {
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-        min-width: 0;
-    }
-
-    .composer-send-button {
-        display: inline-grid;
-        width: 2.35rem;
-        height: 2.35rem;
-        place-items: center;
-        border: 0;
-        border-radius: 999px;
-        background: var(--accent);
-        color: var(--bg);
-        cursor: pointer;
-        padding: 0;
-        pointer-events: auto;
-    }
-
     .composer-send-button.stop {
         background: var(--danger);
         color: var(--bg);
     }
 
-    .composer-send-button:disabled {
-        cursor: not-allowed;
-        opacity: 0.55;
-    }
-
     .composer-attach-icon,
     .composer-retry-icon,
     .composer-queue-icon,
-    .composer-notify-icon,
-    .composer-send-icon {
+    .composer-notify-icon {
         width: 1.2rem;
         height: 1.2rem;
         fill: none;

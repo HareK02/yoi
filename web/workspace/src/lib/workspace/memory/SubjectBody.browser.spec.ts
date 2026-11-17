@@ -19,6 +19,22 @@ import {
 } from "./subject-body.ts";
 
 // component・client/parser・sessionStorageは本番実装を使い、HTTP境界だけを置き換える。
+const updates = vi.hoisted(() => ({ listeners: [] as Array<{ onFrame(frame: any): void; onStatus(status: string): void }>, closes: [] as ReturnType<typeof vi.fn>[] }));
+vi.mock("#lib/workspace/multiplexer.ts", () => ({ workspaceMultiplexer: () => ({
+  subscribe(_selector: unknown, listener: (typeof updates.listeners)[number]) {
+    updates.listeners.push(listener);
+    const close = vi.fn(); updates.closes.push(close);
+    return { close };
+  },
+}) }));
+async function ready() {
+  await tick();
+  await waitFor(() => expect(screen.getByRole("region", { name: "Subject controls" }).getAttribute("aria-busy")).toBe("false"));
+}
+async function emitUpdate() {
+  updates.listeners.at(-1)!.onFrame({ frame: "event", message: { event: "event", data: { subscription_id: "body", payload: { event: "worker_upserted" } } } });
+  await tick();
+}
 const props = {
   accountId: "account-a",
   workspaceId: "workspace",
@@ -129,6 +145,8 @@ function deferred<T>() {
 // Happy DOM Storage is a Proxy with bound own methods; spy on a plain adapter
 // rather than its unrelated Storage.prototype or non-restorable proxy properties.
 beforeEach(() => {
+  updates.listeners.length = 0;
+  updates.closes.length = 0;
   const storage = sessionStorage;
   vi.stubGlobal("sessionStorage", {
     getItem: storage.getItem.bind(storage),
@@ -163,8 +181,8 @@ test("unavailable owner is not absence and cannot invite a replacement start", a
     ),
   );
   render(SubjectBody, props);
-  await screen.findByText("Body owner present; observation unavailable.");
-  expect(screen.getByText("Runtime cannot be observed")).toBeTruthy();
+  await screen.findByText("Subject controls are temporarily unavailable.");
+  expect(screen.queryByText("Runtime cannot be observed")).toBeNull();
   expect(
     screen.queryByRole("button", {
       name: /^(Start|Restart|Stop) conversation body$/,
@@ -183,13 +201,12 @@ test("unauthorized controls are hidden and permission diagnosis stays visible", 
     ),
   );
   render(SubjectBody, props);
-  await screen.findByText(/You do not have permission to start or stop/);
-  expect(screen.queryByRole("button", { name: "Start conversation body" }))
+  await screen.findByText(/Subject controls are unavailable/);
+  expect(screen.queryByRole("button", { name: "Start Subject" }))
     .toBeNull();
-  expect(screen.queryByRole("button", { name: "Stop conversation body" }))
+  expect(screen.queryByRole("button", { name: "Stop Subject" }))
     .toBeNull();
-  expect(screen.getByRole("button", { name: "Refresh body state" }))
-    .toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Refresh body state" })).toBeNull();
 });
 
 test("unknown survives refresh and remount and retries the complete original request", async () => {
@@ -211,13 +228,14 @@ test("unknown survives refresh and remount and retries the complete original req
   );
   const first = render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Start conversation body" }),
+    await screen.findByRole("button", { name: "Start Subject" }),
   );
-  await screen.findByText("Request outcome unknown.");
+  await screen.findByText("Could not confirm the operation.");
+  await ready();
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {
-        name: "Retry same start request",
+        name: "Retry",
       }) as HTMLButtonElement).disabled,
     ).toBe(false)
   );
@@ -230,10 +248,8 @@ test("unknown survives refresh and remount and retries the complete original req
     expected_observation_token: null,
   });
   observation = available("stopped", "new-observation");
-  await fireEvent.click(
-    screen.getByRole("button", { name: "Refresh body state" }),
-  );
-  await screen.findByText("Body stopped.");
+  await emitUpdate();
+  await ready();
   expect(
     sessionStorage.getItem(
       subjectBodyStorageKey(
@@ -246,18 +262,18 @@ test("unknown survives refresh and remount and retries the complete original req
   expect(posts).toHaveLength(1);
   first.unmount();
   render(SubjectBody, props);
-  await screen.findByText(/An unresolved start request is retained/);
+  await screen.findByText(/Could not confirm the operation/);
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {
-        name: "Retry same start request",
+        name: "Retry",
       }) as HTMLButtonElement).disabled,
     ).toBe(false)
   );
-  expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+  expect(screen.queryByRole("button", { name: "Start Subject" }))
     .toBeNull();
   await fireEvent.click(
-    screen.getByRole("button", { name: "Retry same start request" }),
+    screen.getByRole("button", { name: "Retry" }),
   );
   await waitFor(() => expect(posts).toHaveLength(2));
   expect(posts[1]).toBe(posts[0]);
@@ -284,13 +300,13 @@ test("transport loss retains the sent input without automatic resubmission", asy
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Restart conversation body" }),
+    await screen.findByRole("button", { name: "Start Subject" }),
   );
-  await screen.findByText(/Request outcome unknown\. The request may/);
+  await screen.findByText(/Could not confirm the operation/);
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {
-        name: "Retry same start request",
+        name: "Retry",
       }) as HTMLButtonElement).disabled,
     ).toBe(false)
   );
@@ -331,32 +347,24 @@ test("accepted stop receipt does not display a stopped body before observation",
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Stop conversation body" }),
+    await screen.findByRole("button", { name: "Stop Subject" }),
   );
-  await screen.findByText("Request accepted.");
-  await waitFor(() =>
-    expect(
-      (screen.getByRole("button", {
-        name: "Refresh body state",
-      }) as HTMLButtonElement).disabled,
-    ).toBe(false)
-  );
+  await ready();
+  await ready();
   expect(screen.queryByText("Body stopped.")).toBeNull();
-  expect(screen.getByText("Live execution")).toBeTruthy();
+  expect(screen.queryByText("Live execution")).toBeNull();
   expect(JSON.parse(posts[0])).toMatchObject({
     expected_current: owner,
     expected_observation_token: "observation-1",
   });
   stopped = true;
-  await fireEvent.click(
-    screen.getByRole("button", { name: "Refresh body state" }),
-  );
-  await screen.findByText("Body stopped.");
+  await emitUpdate();
+  await ready();
   expect(
-    screen.getByText(
+    screen.queryByText(
       /Start restores this body; retained conversation and Memory/,
     ),
-  ).toBeTruthy();
+  ).toBeNull();
 });
 
 test("structured configuration rejection is visible without inventing running state", async () => {
@@ -379,12 +387,12 @@ test("structured configuration rejection is visible without inventing running st
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Start conversation body" }),
+    await screen.findByRole("button", { name: "Start Subject" }),
   );
-  await screen.findByText("Required permission session.record is missing");
-  expect(screen.getByText("Request rejected.")).toBeTruthy();
-  expect(screen.getByText("No current conversation body."))
-    .toBeTruthy();
+  await screen.findByText("Could not complete the operation.");
+  expect(screen.queryByText("Required permission session.record is missing")).toBeNull();
+  expect(screen.getByText("Could not complete the operation.")).toBeTruthy();
+  expect(screen.queryByText("No current conversation body.")).toBeNull();
 });
 
 test("storage write failure sends nothing and exposes a recovery diagnostic", async () => {
@@ -392,13 +400,13 @@ test("storage write failure sends nothing and exposes a recovery diagnostic", as
   vi.stubGlobal("fetch", fetch);
   render(SubjectBody, props);
   const start = await screen.findByRole("button", {
-    name: "Start conversation body",
+    name: "Start Subject",
   });
   vi.spyOn(sessionStorage, "setItem").mockImplementation(() => {
     throw new Error("storage denied");
   });
   await fireEvent.click(start);
-  await screen.findByText(/The exact request could not be retained/);
+  await screen.findByText(/Could not save the operation/);
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
@@ -418,21 +426,20 @@ test("late GET for an old route cannot overwrite the selected Subject", async ()
   );
   const view = render(SubjectBody, props);
   await waitFor(() =>
-    expect(screen.getByText("Loading body state…")).toBeTruthy()
+    expect(screen.getByText("Loading…")).toBeTruthy()
   );
   await view.rerender({ ...props, subjectId: "other" });
-  await screen.findByText(/You do not have permission to start or stop/);
+  await screen.findByText(/Subject controls are unavailable/);
   const response = Response.json(available());
   const consumed = afterBodyRead(response);
   old.resolve(response);
   await consumed;
   await tick();
   await waitFor(() =>
-    expect(screen.getByText("No current conversation body."))
-      .toBeTruthy()
+    expect(screen.queryByText("No current conversation body.")).toBeNull()
   );
   expect(screen.queryByText("Body stopped.")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+  expect(screen.queryByRole("button", { name: "Start Subject" }))
     .toBeNull();
 });
 
@@ -455,17 +462,17 @@ test("late old-route mutation receipt cannot update new route or discard old rec
   );
   const view = render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Start conversation body" }),
+    await screen.findByRole("button", { name: "Start Subject" }),
   );
-  await screen.findByText("Sending request; body state is not yet confirmed.");
+  await screen.findByText("Working…");
   const saved = sessionStorage.getItem(
     subjectBodyStorageKey(props.accountId, props.workspaceId, props.subjectId),
   );
   await view.rerender({ ...props, subjectId: "other" });
-  await screen.findByText(/You do not have permission to start or stop/);
+  await screen.findByText(/Subject controls are unavailable/);
   // 同じrouteへ戻っても、以前のmount世代の応答を採用しない。
   await view.rerender(props);
-  await screen.findByText(/An unresolved start request is retained/);
+  await screen.findByText(/Could not confirm the operation/);
   const response = Response.json({
     request_id: requestId,
     disposition: "accepted",
@@ -477,8 +484,7 @@ test("late old-route mutation receipt cannot update new route or discard old rec
   await consumed;
   await tick();
   await waitFor(() =>
-    expect(screen.getByText("No current conversation body."))
-      .toBeTruthy()
+    expect(screen.queryByText("No current conversation body.")).toBeNull()
   );
   expect(screen.queryByText("Request accepted.")).toBeNull();
   expect(screen.queryByText("Body stopped.")).toBeNull();
@@ -513,13 +519,11 @@ test("a newer refresh observation is not replaced by an older mutation body", as
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Start conversation body" }),
+    await screen.findByRole("button", { name: "Start Subject" }),
   );
-  await screen.findByText("Sending request; body state is not yet confirmed.");
-  await fireEvent.click(
-    screen.getByRole("button", { name: "Refresh body state" }),
-  );
-  await screen.findByText("Live execution");
+  await screen.findByText("Working…");
+  await emitUpdate();
+  await waitFor(() => expect(gets).toBe(2));
   mutation.resolve(
     Response.json({
       request_id: requestId,
@@ -528,18 +532,13 @@ test("a newer refresh observation is not replaced by an older mutation body", as
       body: available(),
     }),
   );
-  await screen.findByText("Request accepted.");
   await waitFor(() => expect(gets).toBe(3));
+  expect(screen.getByRole("button", { name: "Stop Subject" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Start Subject" })).toBeNull();
   expect(screen.queryByText("Body stopped.")).toBeNull();
-  expect(screen.getByText("Live execution")).toBeTruthy();
+  expect(screen.queryByText("Live execution")).toBeNull();
   finalRefresh.resolve(Response.json(available("idle")));
-  await waitFor(() =>
-    expect(
-      (screen.getByRole("button", {
-        name: "Refresh body state",
-      }) as HTMLButtonElement).disabled,
-    ).toBe(false)
-  );
+  await ready();
 });
 
 test.each(["not_found", "pending"])(
@@ -572,10 +571,11 @@ test.each(["not_found", "pending"])(
     );
     const view = render(SubjectBody, props);
     await fireEvent.click(
-      await screen.findByRole("button", { name: "Stop conversation body" }),
+      await screen.findByRole("button", { name: "Stop Subject" }),
     );
-    await screen.findByText("Request outcome unknown.");
-    await screen.findByText("Body stopped.");
+    await screen.findByText("Could not confirm the operation.");
+  await ready();
+    await ready();
     const key = subjectBodyStorageKey(
       props.accountId,
       props.workspaceId,
@@ -583,44 +583,21 @@ test.each(["not_found", "pending"])(
     );
     const saved = sessionStorage.getItem(key);
     expect(saved).not.toBeNull();
-    await waitFor(() =>
-      expect(
-        (screen.getByRole("button", {
-          name: "Refresh body state",
-        }) as HTMLButtonElement).disabled,
-      ).toBe(false)
-    );
-    await fireEvent.click(
-      screen.getByRole("button", { name: "Refresh body state" }),
-    );
-    await waitFor(() =>
-      expect(
-        (screen.getByRole("button", {
-          name: "Refresh body state",
-        }) as HTMLButtonElement).disabled,
-      ).toBe(false)
-    );
+    await ready();
+    await emitUpdate();
+    await ready();
     expect(sessionStorage.getItem(key)).toBe(saved);
-    expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+    expect(screen.queryByRole("button", { name: "Start Subject" }))
       .toBeNull();
     // 再読込み相当のremount後も、初回停止時の全入力で照会する。
     view.unmount();
     render(SubjectBody, props);
     await fireEvent.click(
-      await screen.findByRole("button", { name: "Check stop outcome" }),
+      await screen.findByRole("button", { name: "Check result" }),
     );
-    await screen.findByText(
-      outcome === "pending"
-        ? "Stop outcome pending."
-        : "No stop receipt found.",
-    );
-    await waitFor(() =>
-      expect(
-        (screen.getByRole("button", {
-          name: "Refresh body state",
-        }) as HTMLButtonElement).disabled,
-      ).toBe(false)
-    );
+    await ready();
+    expect(screen.getByText("Could not confirm the operation.")).toBeTruthy();
+    await ready();
     expect(posts.filter((request) => request.path.endsWith("/stop")))
       .toHaveLength(1);
     const checks = posts.filter((request) =>
@@ -633,9 +610,9 @@ test.each(["not_found", "pending"])(
       expected_observation_token: "observation-1",
     });
     expect(sessionStorage.getItem(key)).toBe(saved);
-    expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+    expect(screen.queryByRole("button", { name: "Start Subject" }))
       .toBeNull();
-    expect(screen.getByRole("button", { name: "Retry same stop request" }))
+    expect(screen.getByRole("button", { name: "Retry" }))
       .toBeTruthy();
   },
 );
@@ -667,18 +644,19 @@ test("historical stopped outcome settles only the old request while restored bod
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Stop conversation body" }),
+    await screen.findByRole("button", { name: "Stop Subject" }),
   );
-  await screen.findByText("Request outcome unknown.");
+  await screen.findByText("Could not confirm the operation.");
+  await ready();
   await fireEvent.click(
-    screen.getByRole("button", { name: "Check stop outcome" }),
+    screen.getByRole("button", { name: "Check result" }),
   );
-  await screen.findByText("Historical stop confirmed.");
-  await screen.findByText("running");
+  await ready();
+  await ready();
   expect(screen.queryByText("Body stopped.")).toBeNull();
-  expect(screen.queryByText("Request outcome unknown.")).toBeNull();
-  expect(screen.getByText(/The body may have been restored since then/))
-    .toBeTruthy();
+  expect(screen.queryByText("Could not confirm the operation.")).toBeNull();
+  expect(screen.queryByText(/The body may have been restored since then/)).toBeNull();
+  expect(screen.getByRole("button", { name: "Stop Subject" })).toBeTruthy();
   expect(
     sessionStorage.getItem(
       subjectBodyStorageKey(
@@ -741,9 +719,10 @@ test.each([
     );
     render(SubjectBody, props);
     await fireEvent.click(
-      await screen.findByRole("button", { name: "Stop conversation body" }),
+      await screen.findByRole("button", { name: "Stop Subject" }),
     );
-    await screen.findByText("Request outcome unknown.");
+    await screen.findByText("Could not confirm the operation.");
+  await ready();
     const key = subjectBodyStorageKey(
       props.accountId,
       props.workspaceId,
@@ -751,9 +730,9 @@ test.each([
     );
     const saved = sessionStorage.getItem(key);
     await fireEvent.click(
-      screen.getByRole("button", { name: "Check stop outcome" }),
+      screen.getByRole("button", { name: "Check result" }),
     );
-    await screen.findByText(/Stop outcome could not be checked/);
+    await screen.findByText(/Could not confirm the operation/);
     expect(screen.queryByText("No stop receipt found.")).toBeNull();
     expect(screen.queryByText("Stop outcome pending.")).toBeNull();
     expect(screen.queryByText("Historical stop confirmed.")).toBeNull();
@@ -790,14 +769,15 @@ test("late stop outcome cannot settle an old route request after navigation", as
   );
   const view = render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Stop conversation body" }),
+    await screen.findByRole("button", { name: "Stop Subject" }),
   );
-  await screen.findByText("Request outcome unknown.");
+  await screen.findByText("Could not confirm the operation.");
+  await ready();
   await fireEvent.click(
-    screen.getByRole("button", { name: "Check stop outcome" }),
+    screen.getByRole("button", { name: "Check result" }),
   );
   await screen.findByText(
-    "Checking saved stop outcome… No stop request is sent.",
+    "Working…",
   );
   const key = subjectBodyStorageKey(
     props.accountId,
@@ -806,7 +786,7 @@ test("late stop outcome cannot settle an old route request after navigation", as
   );
   const saved = sessionStorage.getItem(key);
   await view.rerender({ ...props, subjectId: "other" });
-  await screen.findByText(/You do not have permission to start or stop/);
+  await screen.findByText(/Subject controls are unavailable/);
   const response = Response.json({
     request_id: requestId,
     outcome: "stopped",
@@ -817,7 +797,7 @@ test("late stop outcome cannot settle an old route request after navigation", as
   await consumed;
   await tick();
   expect(screen.queryByText("Historical stop confirmed.")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Check stop outcome" }))
+  expect(screen.queryByRole("button", { name: "Check result" }))
     .toBeNull();
   expect(sessionStorage.getItem(key)).toBe(saved);
 });
@@ -863,26 +843,27 @@ test("account switch hides old body and retry input while same-account reload pr
     }),
   );
   const view = render(SubjectBody, props);
-  await screen.findByText("Body stopped.");
-  await screen.findByText(/An unresolved stop request is retained/);
+  await ready();
+  await screen.findByText(/Could not confirm the operation/);
   const reads = vi.spyOn(sessionStorage, "getItem");
   reads.mockClear();
   account = accountB.accountId;
   await view.rerender(accountB);
-  await screen.findByText("Loading body state…");
+  await screen.findByText("Loading…");
   expect(screen.queryByText("Body stopped.")).toBeNull();
-  expect(screen.queryByText(/An unresolved stop request is retained/))
+  expect(screen.queryByText(/Could not confirm the operation/))
     .toBeNull();
   expect(screen.queryByText(first.request.request_id)).toBeNull();
-  expect(screen.queryByRole("button", { name: "Retry same stop request" }))
+  expect(screen.queryByRole("button", { name: "Retry" }))
     .toBeNull();
   expect(reads).toHaveBeenCalledWith(keyB);
   expect(reads).not.toHaveBeenCalledWith(keyA);
   pendingB.resolve(Response.json(absent()));
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Start conversation body" }),
+    await screen.findByRole("button", { name: "Start Subject" }),
   );
-  await screen.findByText("Request outcome unknown.");
+  await screen.findByText("Could not confirm the operation.");
+  await ready();
   const rawB = sessionStorage.getItem(keyB);
   expect(rawB).not.toBeNull();
   expect(JSON.parse(rawB!)).toMatchObject({ accountId: accountB.accountId });
@@ -894,9 +875,9 @@ test("account switch hides old body and retry input while same-account reload pr
   expect(JSON.parse(posts[0].body)).not.toHaveProperty("accountId");
   view.unmount();
   const reloadedB = render(SubjectBody, accountB);
-  await screen.findByText(/An unresolved start request is retained/);
+  await screen.findByText(/Could not confirm the operation/);
   expect(screen.queryByText(first.request.request_id)).toBeNull();
-  expect(screen.queryByRole("button", { name: "Check stop outcome" }))
+  expect(screen.queryByRole("button", { name: "Check result" }))
     .toBeNull();
   expect(posts).toHaveLength(1);
   reloadedB.unmount();
@@ -905,12 +886,12 @@ test("account switch hides old body and retry input while same-account reload pr
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {
-        name: "Retry same stop request",
+        name: "Retry",
       }) as HTMLButtonElement).disabled,
     ).toBe(false)
   );
   await fireEvent.click(
-    screen.getByRole("button", { name: "Retry same stop request" }),
+    screen.getByRole("button", { name: "Retry" }),
   );
   await waitFor(() => expect(posts).toHaveLength(2));
   expect(posts[1].path.endsWith("/stop")).toBe(true);
@@ -933,15 +914,15 @@ test("late GET from another account cannot replace the same route's new observat
   await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
   account = "account-b";
   await view.rerender({ ...props, accountId: account });
-  await screen.findByText(/You do not have permission to start or stop/);
+  await screen.findByText(/Subject controls are unavailable/);
   const oldResponse = Response.json(available());
   const consumed = afterBodyRead(oldResponse);
   pendingA.resolve(oldResponse);
   await consumed;
   await tick();
-  expect(screen.getByText("No current conversation body.")).toBeTruthy();
+  expect(screen.queryByText("No current conversation body.")).toBeNull();
   expect(screen.queryByText("Body stopped.")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+  expect(screen.queryByRole("button", { name: "Start Subject" }))
     .toBeNull();
   expect(fetch).toHaveBeenCalledTimes(2);
 });
@@ -977,10 +958,10 @@ test.each([false, true])(
     );
     const view = render(SubjectBody, props);
     await fireEvent.click(
-      await screen.findByRole("button", { name: "Start conversation body" }),
+      await screen.findByRole("button", { name: "Start Subject" }),
     );
     await screen.findByText(
-      "Sending request; body state is not yet confirmed.",
+      "Working…",
     );
     const keyA = subjectBodyStorageKey(
       props.accountId,
@@ -991,19 +972,14 @@ test.each([false, true])(
     account = accountB.accountId;
     await view.rerender(accountB);
     expect(
-      screen.queryByText("Sending request; body state is not yet confirmed."),
+      screen.queryByText("Working…"),
     ).toBeNull();
     await fireEvent.click(
-      await screen.findByRole("button", { name: "Start conversation body" }),
+      await screen.findByRole("button", { name: "Start Subject" }),
     );
-    await screen.findByText("Request outcome unknown.");
-    await waitFor(() =>
-      expect(
-        (screen.getByRole("button", {
-          name: "Refresh body state",
-        }) as HTMLButtonElement).disabled,
-      ).toBe(false)
-    );
+    await screen.findByText("Could not confirm the operation.");
+  await ready();
+    await ready();
     const keyB = subjectBodyStorageKey(
       accountB.accountId,
       props.workspaceId,
@@ -1013,15 +989,9 @@ test.each([false, true])(
     if (roundTrip) {
       account = props.accountId;
       await view.rerender(props);
-      await screen.findByText(/An unresolved start request is retained/);
-      expect(screen.queryByText("Request outcome unknown.")).toBeNull();
-      await waitFor(() =>
-        expect(
-          (screen.getByRole("button", {
-            name: "Refresh body state",
-          }) as HTMLButtonElement).disabled,
-        ).toBe(false)
-      );
+      await screen.findByText(/Could not confirm the operation/);
+      expect(screen.queryByText("Request accepted.")).toBeNull();
+      await ready();
     }
     const removals = vi.spyOn(sessionStorage, "removeItem");
     const getsBeforeResponse = gets;
@@ -1076,15 +1046,15 @@ test("late stop outcome from another account cannot settle or clear either accou
   );
   const view = render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Check stop outcome" }),
+    await screen.findByRole("button", { name: "Check result" }),
   );
   await screen.findByText(
-    "Checking saved stop outcome… No stop request is sent.",
+    "Working…",
   );
   await view.rerender({ ...props, accountId: second.accountId });
-  await screen.findByText(/An unresolved stop request is retained/);
+  await screen.findByText(/Could not confirm the operation/);
   expect(
-    screen.queryByText("Checking saved stop outcome… No stop request is sent."),
+    screen.queryByText("Working…"),
   ).toBeNull();
   const removals = vi.spyOn(sessionStorage, "removeItem");
   const oldResponse = Response.json({
@@ -1098,7 +1068,7 @@ test("late stop outcome from another account cannot settle or clear either accou
   await tick();
   expect(screen.queryByText("Historical stop confirmed.")).toBeNull();
   expect(screen.queryByText("Body stopped.")).toBeNull();
-  expect(screen.getByRole("button", { name: "Check stop outcome" }))
+  expect(screen.getByRole("button", { name: "Check result" }))
     .toBeTruthy();
   expect(removals).not.toHaveBeenCalled();
   expect(posts).toEqual([JSON.stringify(first.request)]);
@@ -1118,15 +1088,15 @@ test("signout hides body and request details and never falls back to a dummy ide
   const fetch = vi.fn(async () => Response.json(available()));
   vi.stubGlobal("fetch", fetch);
   const view = render(SubjectBody, props);
-  await screen.findByText("Body stopped.");
-  expect(screen.getByText(first.request.request_id)).toBeTruthy();
+  await ready();
+  expect(screen.queryByText(first.request.request_id)).toBeNull();
   const reads = vi.spyOn(sessionStorage, "getItem");
   reads.mockClear();
   await view.rerender({ ...props, accountId: "" });
-  await screen.findByText("Sign in to view this conversation body.");
+  await screen.findByText("Sign in to use Subject controls.");
   expect(screen.queryByText("Body stopped.")).toBeNull();
   expect(screen.queryByText(first.request.request_id)).toBeNull();
-  expect(screen.queryByRole("button", { name: "Check stop outcome" }))
+  expect(screen.queryByRole("button", { name: "Check result" }))
     .toBeNull();
   expect(screen.queryByRole("button", { name: "Refresh body state" }))
     .toBeNull();
@@ -1160,7 +1130,7 @@ test("Workspace switch fences late mutation even when the Subject ID is identica
   );
   const view = render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Start conversation body" }),
+    await screen.findByRole("button", { name: "Start Subject" }),
   );
   const key = subjectBodyStorageKey(
     props.accountId,
@@ -1169,7 +1139,7 @@ test("Workspace switch fences late mutation even when the Subject ID is identica
   );
   const retained = sessionStorage.getItem(key);
   await view.rerender(other);
-  await screen.findByText(/You do not have permission to start or stop/);
+  await screen.findByText(/Subject controls are unavailable/);
   const response = Response.json({
     request_id: requestId,
     disposition: "accepted",
@@ -1192,7 +1162,7 @@ test("Workspace switch fences late mutation even when the Subject ID is identica
     ),
   ).toBeNull();
   await view.rerender(props);
-  await screen.findByText(/An unresolved start request is retained/);
+  await screen.findByText(/Could not confirm the operation/);
 });
 
 test("double click sends only one retained request, never a conversation ACK", async () => {
@@ -1208,7 +1178,7 @@ test("double click sends only one retained request, never a conversation ACK", a
   );
   render(SubjectBody, props);
   const start = await screen.findByRole("button", {
-    name: "Start conversation body",
+    name: "Start Subject",
   });
   await fireEvent.click(start);
   await fireEvent.click(start);
@@ -1221,7 +1191,7 @@ test("double click sends only one retained request, never a conversation ACK", a
   const consumed = afterBodyRead(response);
   pending.resolve(response);
   await consumed;
-  await screen.findByText(/Request outcome unknown\. The request may/);
+  await screen.findByText(/Could not confirm the operation/);
   expect(
     readSubjectBodyAttempt(
       sessionStorage,
@@ -1268,12 +1238,10 @@ test("old generation rejection stays distinct from fresh body and requires a fre
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Stop conversation body" }),
+    await screen.findByRole("button", { name: "Stop Subject" }),
   );
-  await screen.findByText(/^Request superseded\./);
-  await screen.findByText(
-    /The current body generation changed\. Refresh before acting\./,
-  );
+  await screen.findByText(/The Subject changed/);
+  expect(screen.queryByText(/The current body generation changed/)).toBeNull();
   expect(
     readSubjectBodyAttempt(
       sessionStorage,
@@ -1285,7 +1253,7 @@ test("old generation rejection stays distinct from fresh body and requires a fre
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {
-        name: "Stop conversation body",
+        name: "Stop Subject",
       }) as HTMLButtonElement).disabled,
     ).toBe(false)
   );
@@ -1293,7 +1261,7 @@ test("old generation rejection stays distinct from fresh body and requires a fre
   expect(posts[0].expected_current.generation).toBe("17");
   expect(screen.queryByText("Body stopped.")).toBeNull();
   await fireEvent.click(
-    screen.getByRole("button", { name: "Stop conversation body" }),
+    screen.getByRole("button", { name: "Stop Subject" }),
   );
   await waitFor(() => expect(posts).toHaveLength(2));
   expect(posts[1].expected_current.generation).toBe("18");
@@ -1327,36 +1295,30 @@ test("unknown stop cannot restart on GET alone; confirmed outcome permits restar
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Stop conversation body" }),
+    await screen.findByRole("button", { name: "Stop Subject" }),
   );
-  await screen.findByText("Request outcome unknown.");
-  await waitFor(() =>
-    expect(
-      (screen.getByRole("button", {
-        name: "Refresh body state",
-      }) as HTMLButtonElement).disabled,
-    ).toBe(false)
-  );
+  await screen.findByText("Could not confirm the operation.");
+  await ready();
+  await ready();
   observation = available("stopped", "after-confirmed-stop");
-  await fireEvent.click(
-    screen.getByRole("button", { name: "Refresh body state" }),
-  );
-  await screen.findByText("Body stopped.");
-  expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+  await emitUpdate();
+  await ready();
+  expect(screen.queryByRole("button", { name: "Start Subject" }))
     .toBeNull();
   await fireEvent.click(
-    screen.getByRole("button", { name: "Check stop outcome" }),
+    screen.getByRole("button", { name: "Check result" }),
   );
-  await screen.findByText("Stop outcome pending.");
-  expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+  await ready();
+  expect(screen.getByText("Could not confirm the operation.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Start Subject" }))
     .toBeNull();
   outcome = "stopped";
   await fireEvent.click(
-    screen.getByRole("button", { name: "Check stop outcome" }),
+    screen.getByRole("button", { name: "Check result" }),
   );
-  await screen.findByText("Historical stop confirmed.");
+  await ready();
   const restart = await screen.findByRole("button", {
-    name: "Restart conversation body",
+    name: "Start Subject",
   });
   await waitFor(() =>
     expect((restart as HTMLButtonElement).disabled).toBe(false)
@@ -1396,17 +1358,17 @@ test.each(["stale-token", "concurrent-absent-start"])(
     await fireEvent.click(
       await screen.findByRole("button", {
         name: scenario === "stale-token"
-          ? "Stop conversation body"
-          : "Start conversation body",
+          ? "Stop Subject"
+          : "Start Subject",
       }),
     );
     await screen.findByText(
       scenario === "stale-token"
-        ? /^Request not accepted\./
-        : /^Request superseded\./,
+        ? /The Subject changed/
+        : /The Subject changed/,
     );
     const stop = await screen.findByRole("button", {
-      name: "Stop conversation body",
+      name: "Stop Subject",
     });
     await waitFor(() =>
       expect((stop as HTMLButtonElement).disabled).toBe(false)
@@ -1424,7 +1386,7 @@ test.each(["stale-token", "concurrent-absent-start"])(
     view.unmount();
     render(SubjectBody, props);
     const reloaded = await screen.findByRole("button", {
-      name: "Stop conversation body",
+      name: "Stop Subject",
     });
     expect(posts).toHaveLength(1);
     await fireEvent.click(reloaded);
@@ -1467,9 +1429,9 @@ test.each(["busy", "generic-conflict", "foreign-request", "unauthorized"])(
     );
     const view = render(SubjectBody, props);
     await fireEvent.click(
-      await screen.findByRole("button", { name: "Stop conversation body" }),
+      await screen.findByRole("button", { name: "Stop Subject" }),
     );
-    await screen.findByText(/Request outcome unknown\. The request may/);
+    await screen.findByText(/Could not confirm the operation/);
     const key = subjectBodyStorageKey(
       props.accountId,
       props.workspaceId,
@@ -1478,7 +1440,7 @@ test.each(["busy", "generic-conflict", "foreign-request", "unauthorized"])(
     const saved = sessionStorage.getItem(key);
     expect(saved).not.toBeNull();
     const retry = await screen.findByRole("button", {
-      name: "Retry same stop request",
+      name: "Retry",
     });
     await waitFor(() =>
       expect((retry as HTMLButtonElement).disabled).toBe(false)
@@ -1486,28 +1448,14 @@ test.each(["busy", "generic-conflict", "foreign-request", "unauthorized"])(
     await fireEvent.click(retry);
     await waitFor(() => expect(posts).toHaveLength(2));
     expect(posts[1]).toBe(posts[0]);
-    await waitFor(() =>
-      expect(
-        (screen.getByRole("button", {
-          name: "Refresh body state",
-        }) as HTMLButtonElement).disabled,
-      ).toBe(false)
-    );
-    await fireEvent.click(
-      screen.getByRole("button", { name: "Refresh body state" }),
-    );
-    await waitFor(() =>
-      expect(
-        (screen.getByRole("button", {
-          name: "Refresh body state",
-        }) as HTMLButtonElement).disabled,
-      ).toBe(false)
-    );
+    await ready();
+    await emitUpdate();
+    await ready();
     expect(sessionStorage.getItem(key)).toBe(saved);
     view.unmount();
     render(SubjectBody, props);
-    await screen.findByRole("button", { name: "Retry same stop request" });
-    expect(screen.queryByRole("button", { name: "Stop conversation body" }))
+    await screen.findByRole("button", { name: "Retry" });
+    expect(screen.queryByRole("button", { name: "Stop Subject" }))
       .toBeNull();
     expect(sessionStorage.getItem(key)).toBe(saved);
     expect(posts).toHaveLength(2);
@@ -1533,27 +1481,27 @@ test("lost stop stays unknown until an identity-bound supersession from outcome 
   );
   render(SubjectBody, props);
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Stop conversation body" }),
+    await screen.findByRole("button", { name: "Stop Subject" }),
   );
-  await screen.findByText(/Request outcome unknown\. The request may/);
+  await screen.findByText(/Could not confirm the operation/);
   const key = subjectBodyStorageKey(
     props.accountId,
     props.workspaceId,
     props.subjectId,
   );
   expect(sessionStorage.getItem(key)).not.toBeNull();
-  expect(screen.queryByRole("button", { name: "Stop conversation body" }))
+  expect(screen.queryByRole("button", { name: "Stop Subject" }))
     .toBeNull();
   await fireEvent.click(
-    await screen.findByRole("button", { name: "Check stop outcome" }),
+    await screen.findByRole("button", { name: "Check result" }),
   );
-  await screen.findByText(/^Request superseded\./);
+  await screen.findByText(/The Subject changed/);
   expect(sessionStorage.getItem(key)).toBeNull();
   expect(posts).toHaveLength(2);
   expect(posts[1].body).toBe(posts[0].body);
   expect(screen.queryByText("Historical stop confirmed.")).toBeNull();
   const stop = await screen.findByRole("button", {
-    name: "Stop conversation body",
+    name: "Stop Subject",
   });
   await waitFor(() => expect((stop as HTMLButtonElement).disabled).toBe(false));
   await fireEvent.click(stop);
@@ -1592,11 +1540,11 @@ test("failed creation offers fenced recovery, retaining exact input across reloa
   const view = render(SubjectBody, { props });
   await fireEvent.click(
     await screen.findByRole("button", {
-      name: "Release failed start reservation",
+      name: "Recover start",
     }),
   );
-  await screen.findByRole("button", { name: "Retry same recover request" });
-  expect(screen.queryByRole("button", { name: "Start conversation body" }))
+  await screen.findByRole("button", { name: "Retry" });
+  expect(screen.queryByRole("button", { name: "Start Subject" }))
     .toBeNull();
   const saved = readSubjectBodyAttempt(
     sessionStorage,
@@ -1610,11 +1558,11 @@ test("failed creation offers fenced recovery, retaining exact input across reloa
   view.unmount();
   render(SubjectBody, { props });
   const retry = await screen.findByRole("button", {
-    name: "Retry same recover request",
+    name: "Retry",
   });
   await waitFor(() => expect(retry.hasAttribute("disabled")).toBe(false));
   await fireEvent.click(retry);
-  await screen.findByRole("button", { name: "Start conversation body" });
+  await screen.findByRole("button", { name: "Start Subject" });
   expect(posts).toHaveLength(2);
   expect(posts[1]).toEqual(posts[0]);
   expect(posts[0].path).toMatch(/\/body\/recover$/);
@@ -1642,8 +1590,76 @@ test("failed creation without authority exposes no recovery control", async () =
     ),
   );
   render(SubjectBody, { props });
-  await screen.findByText("Body creation failed; reservation retained.");
+  await screen.findByText("Subject controls are unavailable.");
+  expect(screen.queryByText("Body creation failed; reservation retained.")).toBeNull();
   expect(
-    screen.queryByRole("button", { name: "Release failed start reservation" }),
+    screen.queryByRole("button", { name: "Recover start" }),
   ).toBeNull();
+});
+
+test("worker events refresh Subject controls without a manual refresh or state projection", async () => {
+  let observation = absent() as unknown;
+  const fetcher = vi.fn(async () => Response.json(observation));
+  vi.stubGlobal('fetch', fetcher);
+  render(SubjectBody, props);
+  await screen.findByRole('button', { name: 'Start Subject' });
+  expect(screen.queryByRole('button', { name: 'Refresh body state' })).toBeNull();
+  expect(screen.queryByText('No current conversation body.')).toBeNull();
+  observation = available('idle');
+  await emitUpdate();
+  await screen.findByRole('button', { name: 'Stop Subject' });
+  expect(screen.queryByRole('button', { name: 'Start Subject' })).toBeNull();
+  expect(fetcher.mock.calls).toHaveLength(2);
+});
+
+test("disconnect fences a pending observation and reconnect snapshot obtains fresh controls", async () => {
+  const late = deferred<Response>();
+  let calls = 0;
+  const fetcher = vi.fn(async () => ++calls === 2 ? late.promise : Response.json(absent()));
+  vi.stubGlobal('fetch', fetcher);
+  render(SubjectBody, props);
+  await screen.findByRole('button', { name: 'Start Subject' });
+  await emitUpdate();
+  await waitFor(() => expect(calls).toBe(2));
+  updates.listeners.at(-1)!.onStatus('closed');
+  await tick();
+  late.resolve(Response.json(available('idle')));
+  await ready();
+  expect(screen.queryByRole('button', { name: 'Stop Subject' })).toBeNull();
+  expect((screen.getByRole('button', { name: 'Start Subject' }) as HTMLButtonElement).disabled).toBe(true);
+  updates.listeners.at(-1)!.onFrame({ frame: 'response', message: { result: 'subscribed' } });
+  await waitFor(() => expect(calls).toBe(3));
+  await ready();
+  expect((screen.getByRole('button', { name: 'Start Subject' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+test("rejected subscriptions disable controls and disposed routes ignore old notifications", async () => {
+  const fetcher = vi.fn(async (path: string) => Response.json(absent(path.includes('/other/') ? 'other' : props.subjectId)));
+  vi.stubGlobal('fetch', fetcher);
+  const view = render(SubjectBody, props);
+  await screen.findByRole('button', { name: 'Start Subject' });
+  const old = updates.listeners[0];
+  old.onFrame({ frame: 'response', message: { result: 'subscription_rejected' } });
+  await tick();
+  expect((screen.getByRole('button', { name: 'Start Subject' }) as HTMLButtonElement).disabled).toBe(true);
+  await view.rerender({ ...props, subjectId: 'other' });
+  await ready();
+  expect(updates.closes[0]).toHaveBeenCalledTimes(1);
+  const count = fetcher.mock.calls.length;
+  old.onFrame({ frame: 'event', message: { event: 'event' } });
+  await tick();
+  expect(fetcher.mock.calls).toHaveLength(count);
+});
+
+test("Worker and operation diagnostics never become user-facing prose", async () => {
+  const observation = available('idle');
+  Object.assign(observation.observation.worker, { diagnostics: [{ code: 'identity_projection', severity: 'info', message: 'Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private' }] });
+  const saved = savedStop();
+  sessionStorage.setItem(subjectBodyStorageKey(props.accountId, props.workspaceId, props.subjectId), JSON.stringify(saved));
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json(observation)));
+  const ui = render(SubjectBody, props);
+  await ready();
+  expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
+  expect(ui.container.textContent).not.toMatch(/runtime_id|worker_id|Request ID|Request diagnostics|frozen|retained|observation token|Worker lifecycle|Live execution/);
+  expect(ui.container.textContent).not.toContain(saved.request.request_id);
 });

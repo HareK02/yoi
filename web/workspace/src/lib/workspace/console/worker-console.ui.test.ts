@@ -944,7 +944,9 @@ Deno.test("Worker Console composer separates the editor from its icon toolbar", 
   const composerInput = await Deno.readTextFile(
     new URL("./ComposerInput.svelte", import.meta.url),
   );
-  const footerStyle = consolePage.match(/\.composer-input-footer\s*\{([^}]+)\}/)
+  const composerShell = await Deno.readTextFile(new URL('../composer/composer-shell.css', import.meta.url));
+  assert(consolePage.includes('#lib/workspace/composer/composer-shell.css'), 'Console must use the shared composer shell styles');
+  const footerStyle = composerShell.match(/\.composer-input-footer\s*\{([^}]+)\}/)
     ?.[1];
   assert(
     footerStyle?.includes("display: grid") &&

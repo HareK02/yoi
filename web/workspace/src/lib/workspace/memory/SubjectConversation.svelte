@@ -1,7 +1,9 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import '#lib/workspace/composer/composer-shell.css';
   import ComposerInput from '#lib/workspace/console/ComposerInput.svelte';
   import ConversationHistory from './ConversationHistory.svelte';
+  import type { ConversationOutgoing } from './conversation-view.ts';
   import { conversationDraftKey, readConversationDraft, saveConversationDraft } from './conversation-draft.ts';
   import { CHAT_LIMITS, chatHasText, type ChatConversation, type ChatDelivery, type ChatMessage } from '#lib/generated/chat-api.ts';
   import { browserSession } from '#lib/workspace/auth/session-state.ts';
@@ -37,6 +39,15 @@
     } catch { draftStorageError = 'Your draft is editable but could not be saved in this tab. Keep this page open or copy the text before leaving.'; }
   }
   let attempt = $state<ConversationAttempt | null>(null);
+  let outgoing = $state<ConversationOutgoing[]>([]);
+  function updateOutgoing(request: ConversationAttempt, state: ConversationOutgoing['state']): void {
+    const previous = outgoing.findIndex(item => item.request.operationId === request.operationId);
+    if (previous < 0) outgoing = [...outgoing, { request, state }];
+    else outgoing = outgoing.map((item, index) => index === previous ? { request, state } : item);
+  }
+  function retryMessage(operationId: string): void {
+    if (attempt?.operationId === operationId) void send(true);
+  }
   let delivery = $state<ChatDelivery | null>(null);
   let historyError = $state<string | null>(null);
   let sendError = $state<string | null>(null);
@@ -62,6 +73,7 @@
     conversation = null;
     messages = [];
     attempt = null;
+    outgoing = [];
     delivery = null;
     draft = '';
     draftKey = null;
@@ -87,13 +99,17 @@
 
       draftStorageError = null;
       attempt = null;
+      outgoing = [];
       delivery = null;
       historyError = null;
       sendError = null;
       storageBlocked = false;
       inaccessible = false;
-      try { attempt = readConversationAttempt(sessionStorage, scope); }
-      catch { storageBlocked = true; sendError = 'Saved send input cannot be read. No new send will be started.'; }
+      try {
+        attempt = readConversationAttempt(sessionStorage, scope);
+        if (attempt) updateOutgoing(attempt, 'retry');
+      }
+      catch { storageBlocked = true; sendError = 'Saved message could not be read. Sending is paused.'; }
       reading = true;
       connectionState = 'connecting';
       context.client = new ConversationMessagingClient(scope, context.controller.signal, {
@@ -113,7 +129,7 @@
           historyError = null;
           if (attempt && attempt.conversationId !== conversation.id) {
             storageBlocked = true;
-            sendError = 'The saved send belongs to another conversation. It has not been replaced.';
+            sendError = 'Saved message belongs to another conversation. Sending is paused.';
           }
         },
         onStatus: status => {
@@ -126,7 +142,7 @@
         },
         onError: error => {
           if (!current(context)) return;
-          historyError = error.message;
+          historyError = [401, 403, 404].includes(error.status ?? 0) ? error.message : 'Conversation history could not be loaded.';
           reading = false;
           if ([401, 403, 404].includes(error.status ?? 0)) withdrawAccess(context);
         },
@@ -157,7 +173,7 @@
       // onPage clears history errors only after a confirmed snapshot, including resubscription.
     } catch (error) {
       if (!current(context)) return;
-      historyError = error instanceof ConversationApiError ? error.message : 'Conversation history could not be loaded.';
+      historyError = error instanceof ConversationApiError && [401, 403, 404].includes(error.status ?? 0) ? error.message : 'Conversation history could not be loaded.';
       if (error instanceof ConversationApiError && [401, 403, 404].includes(error.status ?? 0)) {
         withdrawAccess(context);
       }
@@ -172,8 +188,9 @@
     if (!request || request.conversationId !== conversation.id) return;
     // 同期保存が成功するまで送信しない。unknownでの編集や再訪でも同じ全入力を使う。
     try { saveConversationAttempt(sessionStorage, context.scope, request); }
-    catch { storageBlocked = true; sendError = 'Send input could not be retained safely. Nothing new was dispatched.'; return; }
+    catch { storageBlocked = true; sendError = 'Message could not be saved in this tab. Nothing was sent.'; return; }
     attempt = request;
+    updateOutgoing(request, 'sending');
     if (!retry) {
       if (composer) composer.recordHistory(composer.snapshot());
       composer?.clear();
@@ -186,20 +203,23 @@
       const response = await context.client!.post(request);
       if (!current(context)) return;
       delivery = response.delivery;
+      updateOutgoing(request, response.delivery.state === 'accepted' ? 'delivered' : 'retry');
       if (response.delivery.state === 'accepted') {
         try {
           clearConversationAttempt(sessionStorage, context.scope, request);
           attempt = null;
         } catch {
           storageBlocked = true;
-          sendError = 'Runtime accepted this input, but its local retry record could not be cleared. No new send will be started.';
+          sendError = 'Local storage could not be updated. Sending is paused.';
         }
       }
       // The committed subscription page, not this ACK, advances the history cursor.
     } catch (error) {
       if (!current(context)) return;
-      sendError = error instanceof ConversationApiError ? error.message : 'Send outcome unknown. Keep the saved request.';
+      updateOutgoing(request, 'retry');
+      sendError = 'Delivery could not be confirmed.';
       if (error instanceof ConversationApiError && [401, 403, 404].includes(error.status ?? 0)) {
+        sendError = error.message;
         withdrawAccess(context);
       }
     } finally { if (current(context)) sending = false; }
@@ -220,81 +240,65 @@
         }
       } else attempt = saved;
       if (attempt && conversation && attempt.conversationId !== conversation.id) throw new Error();
+      if (attempt) updateOutgoing(attempt, 'retry');
       storageBlocked = false;
       sendError = null;
-    } catch { sendError = 'The original send input still cannot be retained or reconciled safely. No new send was started.'; }
-  }
-
-  function deliveryLabel(value: ChatDelivery): string {
-    switch (value.state) {
-      case 'accepted': return 'Runtime accepted this input. Processing and replies are not confirmed.';
-      case 'no_current_body': return 'Message saved; no current body was available. Start the Subject, then retry this same input.';
-      case 'rejected': return 'Message saved; Runtime did not accept this input. Check the body state before retrying.';
-      case 'unknown': return 'Message saved; Runtime acceptance is unknown. Retry only this same input.';
-      case 'unavailable': return 'Message saved; delivery is unavailable. Retry only this same input.';
-    }
+    } catch { sendError = 'Local storage is still unavailable. Sending is paused.'; }
   }
 </script>
 
 <section class="subject-conversation" aria-label="Conversation with {subjectName}">
   <header>
-    <h2>Conversation</h2>
+    <p class="muted" role="status">Conversation connection: {connectionState === 'open' ? 'connected' : connectionState === 'connecting' ? 'reconnecting' : 'disconnected — history is the last confirmed observation'}</p>
     {#if !inaccessible}<button class="workspace-secondary-button" type="button" onclick={() => refresh()} disabled={reading}>{reading ? 'Loading history…' : 'Refresh history'}</button>{/if}
   </header>
-  <p class="muted" role="status">Conversation connection: {connectionState === 'open' ? 'connected' : connectionState === 'connecting' ? 'reconnecting' : 'disconnected — history is the last confirmed observation'}</p>
   {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
   {#if !conversation && !historyError && !inaccessible}<p role="status">Loading conversation…</p>{/if}
   {#if conversation}
-    {#key draftKey}<ConversationHistory {messages} {accountId} {subjectName} />{/key}
+    {#key draftKey}
+      <ConversationHistory {messages} {accountId} {subjectName}
+        outgoing={outgoing.filter(item => item.request.conversationId === conversation?.id)}
+        onretry={retryMessage} retryDisabled={sending || storageBlocked || inaccessible} />
+    {/key}
   {/if}
   {#if hasMore && !inaccessible}<button class="workspace-secondary-button" type="button" onclick={() => refresh()} disabled={reading}>Load newer messages</button>{/if}
 
-  <div class="send-status" aria-live="polite">
-    {#if sending}<p>Sending saved input…</p>
-    {:else if delivery}<p>{deliveryLabel(delivery)}</p>
-    {:else if attempt}<p>Previous send outcome is unknown. Its original input is retained.</p>{/if}
-  </div>
   {#if sendError}<p class="error" role="alert">{sendError}</p>{/if}
-  {#if storageBlocked}<button class="workspace-secondary-button" type="button" onclick={recheckStorage} disabled={sending}>Recheck retry storage</button>{/if}
-  {#if attempt}
-    <details><summary>Retained send input</summary><p class="message-text">{attempt.text}</p></details>
-    <p>Retry uses the same ID and full input. Runtime duplicate suppression has bounded receipt retention; it is not an indefinite delivery guarantee.</p>
-    {#if !inaccessible && !storageBlocked}<button class="workspace-secondary-button" type="button" onclick={() => send(true)} disabled={sending || !conversation}>Retry same input</button>{/if}
-  {/if}
+  {#if storageBlocked}<button class="workspace-secondary-button" type="button" onclick={recheckStorage} disabled={sending}>Recheck local storage</button>{/if}
   {#if !inaccessible && conversation}
     <form onsubmit={(event) => { event.preventDefault(); void send(); }}>
-      <span id="conversation-input-label">Message to {subjectName}</span>
-      <div class="conversation-editor">
-      {#key draftKey}
-        <ComposerInput bind:this={composer} initialText={draft} historyScope={draftKey ?? ''} historyStorage="session" workerFeatures={false}
-          ariaLabel={`Message to ${subjectName}`} ariaDescribedBy="conversation-constraint" onchange={(snapshot) => editDraft(snapshot.content)}
-          onunsupportedpaste={() => { sendError = 'Attachments are not supported in this conversation. Paste text instead.'; }}
-          onsubmit={() => { void send(); }} />
-      {/key}
+      <div class="composer-input-shell" role="group" aria-label={`Message to ${subjectName}`}>
+        {#key draftKey}
+          <ComposerInput bind:this={composer} initialText={draft} historyScope={draftKey ?? ''} historyStorage="session" workerFeatures={false}
+            ariaLabel={`Message to ${subjectName}`} ariaDescribedBy="conversation-constraint" onchange={(snapshot) => editDraft(snapshot.content)}
+            onunsupportedpaste={() => { sendError = 'Attachments are not supported in this conversation. Paste text instead.'; }}
+            onsubmit={() => { void send(); }} />
+        {/key}
+        <div class="composer-input-footer">
+          <div class="composer-footer-slot"><span class="muted">Text only · Ctrl/⌘+Enter</span></div>
+          <button class="composer-send-button" type="submit" aria-label="Send message" title="Send message"
+            disabled={sending || !!attempt || storageBlocked || !conversation || !chatHasText(draft) || draftBytes > CHAT_LIMITS.maxTextBytes}>
+            <svg class="composer-send-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M8 6L12 2L16 6" /><path d="M12 2V22" /></svg>
+          </button>
+        </div>
       </div>
-      <p id="conversation-constraint">Text only, up to {CHAT_LIMITS.maxTextBytes} UTF-8 bytes. Attachments are not supported. Ctrl/⌘+Enter to send.</p>
+      <p class="visually-hidden" id="conversation-constraint">Text only, up to {CHAT_LIMITS.maxTextBytes} UTF-8 bytes. Attachments are not supported. Ctrl/⌘+Enter to send.</p>
       {#if draftStorageError}<p class="error" role="alert">{draftStorageError}</p>{/if}
-      {#if draftBytes > CHAT_LIMITS.maxTextBytes}<p class="error">The message exceeds the text limit.</p>{/if}
-      {#if attempt}<p>Resolve the retained send before sending another message. Your next draft remains editable.</p>{/if}
-      <button class="workspace-secondary-button" type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !chatHasText(draft) || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
+      {#if draftBytes > CHAT_LIMITS.maxTextBytes}<p class="error" role="alert">The message exceeds the text limit ({CHAT_LIMITS.maxTextBytes} UTF-8 bytes).</p>{/if}
     </form>
   {/if}
 </section>
 
 <style>
-  .subject-conversation { display: grid; gap: var(--space-4); font-size: var(--font-size-body); line-height: var(--line-height-body); min-width: 0; }
-  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-3); }
-  h2, p { margin: 0; }
-  h2 { font-size: var(--font-size-body); }
-  .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-  form { display: grid; gap: var(--space-2); }
-  .conversation-editor { min-width: 0; border: 1px solid var(--line-strong); padding: var(--space-2); }
-  .conversation-editor:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .conversation-editor :global(.cm-content) { min-height: 4rem; }
-  .conversation-editor :global(.cm-scroller) { max-height: 12rem; overflow-y: auto; }
-  button { justify-self: start; font-size: var(--font-size-body); line-height: var(--line-height-body); border-radius: var(--radius-soft); }
-  button:hover:not(:disabled) { background: var(--interactive-hover); }
-  button:active:not(:disabled) { background: var(--interactive-selected); }
-  button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .subject-conversation { display: flex; flex-direction: column; flex: 1 1 0; gap: var(--space-2); font-size: var(--font-size-body); line-height: var(--line-height-body); min-width: 0; min-height: 0; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); flex: 0 0 auto; }
+  p { margin: 0; }
+  .muted { color: var(--text-muted); font-size: var(--font-size-compact); line-height: var(--line-height-compact); }
+  form { display: grid; gap: var(--space-2); flex: 0 0 auto; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .workspace-secondary-button { align-self: start; flex-shrink: 0; font-size: var(--font-size-compact); line-height: var(--line-height-compact); border-radius: var(--radius-soft); }
+  .workspace-secondary-button:hover:not(:disabled) { background: var(--interactive-hover); }
+  .workspace-secondary-button:active:not(:disabled) { background: var(--interactive-selected); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .error { color: var(--danger); }
 </style>

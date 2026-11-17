@@ -3,6 +3,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
+import { tick } from 'svelte';
 import type { MessagingCommand, MessagingEvent, MessagingResult } from "#lib/generated/chat-api.ts";
 const transport = vi.hoisted(() => ({ request: vi.fn<(command: MessagingCommand) => Promise<MessagingResult>>(), listener: null as null | { onStatus(status: string): void; onEvent(event: MessagingEvent): void } }));
 vi.mock("#lib/workspace/multiplexer.ts", () => ({ workspaceMultiplexer: () => ({
@@ -50,9 +51,11 @@ afterEach(() => {
   sessionStorage.clear();
   localStorage.clear();
 });
-function harness() {
+function harness(scope = props) {
   const messages: ChatMessage[] = [];
   const posts: ChatUserMessageRequest[] = [];
+  let publishOnPost = true;
+  let postGate: Promise<void> | null = null;
   let mode:
     | "accepted"
     | "lost"
@@ -60,12 +63,13 @@ function harness() {
     | "failed"
     | "no_current_body"
     | "unknown"
+    | "unavailable"
     | "rejected" = "accepted";
   let readStatus = 200;
   const conversation = {
     id: "c",
-    subject_id: props.subjectId,
-    participant_account_id: props.accountId,
+    subject_id: scope.subjectId,
+    participant_account_id: scope.accountId,
     last_user_message_id: null as string | null,
   };
   const page = (after = 0) => {
@@ -81,15 +85,16 @@ function harness() {
       let message = messages.find(m => m.operation_id === body.operation_id);
       if (!message) {
         message = { id: "m" + (messages.length + 1), conversation_id: "c", sequence: messages.length + 1,
-          sender: { kind: "user", account_id: props.accountId }, ...body, last_user_message_id: "m" + (messages.length + 1) };
+          sender: { kind: "user", account_id: scope.accountId }, ...body, last_user_message_id: "m" + (messages.length + 1) };
         messages.push(message);
       }
       conversation.last_user_message_id = message.id;
       if (mode === "lost") throw new Error("ACK lost after persistence");
-      const delivery = mode === "no_current_body" ? { state: mode } : mode === "accepted"
+      const delivery = mode === "no_current_body" ? { state: mode } : mode === 'unavailable' ? { state: mode, detail: 'fixture' } : mode === "accepted"
         ? { state: mode, runtime_id: "r", worker_id: "w" }
         : { state: mode, runtime_id: "r", worker_id: "w", detail: "fixture" };
-      transport.listener?.onEvent({ kind: "messages", subscription_id: "sub", page: page() });
+      if (publishOnPost) transport.listener?.onEvent({ kind: "messages", subscription_id: "sub", page: page() });
+      if (postGate) await postGate;
       return { kind: "saved", response: { message, delivery } };
     }
     if (readStatus !== 200) return { kind: "rejected", status: readStatus };
@@ -102,7 +107,7 @@ function harness() {
       id: `m${messages.length + 1}`,
       conversation_id: "c",
       sequence: messages.length + 1,
-      sender: { kind: "subject", subject_id: props.subjectId },
+      sender: { kind: "subject", subject_id: scope.subjectId },
       text,
       reply_to: null,
       work_ref: null,
@@ -113,6 +118,13 @@ function harness() {
   return {
     messages,
     posts,
+    publish: () => transport.listener?.onEvent({ kind: 'messages', subscription_id: 'sub', page: page() }),
+    deferPublication: () => { publishOnPost = false; },
+    holdPost: () => {
+      let release!: () => void;
+      postGate = new Promise<void>(resolve => { release = resolve; });
+      return release;
+    },
     reconnect: () => { transport.listener?.onStatus("closed"); transport.listener?.onStatus("open"); },
     reply,
     mode: (next: typeof mode) => {
@@ -148,11 +160,13 @@ test("acceptance allows Busy follow-up without inventing a reply; multiple and d
   await ready();
   await compose("first input while working");
   await screen.findByText(
-    "Runtime accepted this input. Processing and replies are not confirmed.",
+    "delivered",
   );
   await compose("second input before any reply");
   await waitFor(() => expect(h.posts).toHaveLength(2));
   await waitFor(() => expect(readConversationAttempt(sessionStorage, props)).toBeNull());
+  await waitFor(() => expect(screen.getAllByText('delivered')).toHaveLength(2));
+  expect(screen.queryByText(/Runtime accepted|Processing and replies|Retained send input|Retry uses the same ID|Resolve the retained send/)).toBeNull();
   expect(screen.queryByText("Explicit first reply")).toBeNull();
   await waitFor(() =>
     expect((screen.getByRole("button", { name: "Refresh history" }) as HTMLButtonElement).disabled)
@@ -179,40 +193,47 @@ test("ACK loss keeps full input across reload while the next draft stays editabl
   await ready();
   const original = "  original input\n日本語  ";
   await compose(original);
-  await screen.findByText(/request outcome could not be confirmed/i);
+  await screen.findByText('Delivery could not be confirmed.');
+  expect(screen.getAllByText('You', { exact: true })).toHaveLength(1);
+  expect(screen.getByRole('button', { name: 'Retry message' }).closest('li')?.dataset.local).toBe('true');
+  expect(screen.queryByText('delivered')).toBeNull();
   typeDraft("edited next draft");
   expect((send() as HTMLButtonElement).disabled).toBe(true);
   expect(readConversationAttempt(sessionStorage, props)?.text).toBe(original);
   view.unmount();
   render(SubjectConversation, props);
-  await screen.findByText(
-    "Previous send outcome is unknown. Its original input is retained.",
-  );
+  await screen.findByRole('button', { name: 'Retry message' });
+  await waitFor(() => expect(screen.getAllByText('You', { exact: true })).toHaveLength(1));
+  expect(screen.getByRole('button', { name: 'Retry message' }).closest('li')?.dataset.messageId).toBe(h.messages[0].id);
+  expect(screen.queryByText('delivered')).toBeNull();
+  expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe('edited next draft');
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {
-        name: "Retry same input",
+        name: "Retry message",
       }) as HTMLButtonElement).disabled,
     ).toBe(false)
   );
   h.mode("accepted");
   await fireEvent.click(
-    screen.getByRole("button", { name: "Retry same input" }),
+    screen.getByRole("button", { name: "Retry message" }),
   );
   await screen.findByText(
-    "Runtime accepted this input. Processing and replies are not confirmed.",
+    "delivered",
   );
   expect(h.posts).toHaveLength(2);
   expect(h.posts[0]).toEqual(h.posts[1]);
   expect(h.messages).toHaveLength(1);
   await waitFor(() => expect(screen.getAllByText("You", { exact: true })).toHaveLength(1));
   expect(readConversationAttempt(sessionStorage, props)).toBeNull();
+  expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe('edited next draft');
 });
 
 for (
   const mode of [
     "no_current_body",
     "unknown",
+    "unavailable",
     "rejected",
     "conflict",
     "failed",
@@ -227,7 +248,7 @@ for (
     await waitFor(() =>
       expect(
         (screen.getByRole("button", {
-          name: "Retry same input",
+          name: "Retry message",
         }) as HTMLButtonElement).disabled,
       ).toBe(false)
     );
@@ -236,13 +257,19 @@ for (
     );
     expect(
       screen.queryByText(
-        "Runtime accepted this input. Processing and replies are not confirmed.",
+        "delivered",
       ),
     ).toBeNull();
+    const retry = screen.getByRole('button', { name: 'Retry message' });
+    expect(retry.closest('li')?.textContent).toContain('retained');
+    expect(retry.querySelector('svg')).not.toBeNull();
+    expect(retry.textContent?.trim()).toBe('');
+    expect(screen.getAllByText('retained', { exact: true })).toHaveLength(1);
+    expect(screen.queryByText(/Runtime accepted|same ID|original request|Retained send input/)).toBeNull();
     typeDraft("do not replace");
     expect((send() as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(
-      screen.getByRole("button", { name: "Retry same input" }),
+      screen.getByRole("button", { name: "Retry message" }),
     );
     await waitFor(() => expect(h.posts).toHaveLength(2));
     expect(h.posts[0]).toEqual(h.posts[1]);
@@ -263,18 +290,18 @@ test("storage write refusal dispatches nothing, preserves the draft and can be r
   });
   await compose("unsent draft");
   await screen.findByText(
-    "Send input could not be retained safely. Nothing new was dispatched.",
+    "Message could not be saved in this tab. Nothing was sent.",
   );
   expect(h.posts).toHaveLength(0);
   expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe("unsent draft");
   vi.stubGlobal("sessionStorage", originalStorage);
   await fireEvent.click(
-    screen.getByRole("button", { name: "Recheck retry storage" }),
+    screen.getByRole("button", { name: "Recheck local storage" }),
   );
   expect(h.posts).toHaveLength(0);
   await fireEvent.click(send());
   await screen.findByText(
-    "Runtime accepted this input. Processing and replies are not confirmed.",
+    "delivered",
   );
 });
 
@@ -291,12 +318,14 @@ test("accepted clear failure blocks new input; local recheck clears only the mat
     },
   });
   await compose("accepted once");
-  await screen.findByText(/local retry record could not be cleared/);
+  await screen.findByText('Local storage could not be updated. Sending is paused.');
+  expect(screen.getByText('delivered').closest('li')?.dataset.messageId).toBe(h.messages[0].id);
+  expect(screen.queryByRole('button', { name: 'Retry message' })).toBeNull();
   expect(readConversationAttempt(sessionStorage, props)).not.toBeNull();
   expect(h.posts).toHaveLength(1);
   vi.stubGlobal("sessionStorage", originalStorage);
   await fireEvent.click(
-    screen.getByRole("button", { name: "Recheck retry storage" }),
+    screen.getByRole("button", { name: "Recheck local storage" }),
   );
   expect(readConversationAttempt(sessionStorage, props)).toBeNull();
   expect(h.posts).toHaveLength(1);
@@ -334,3 +363,87 @@ test("corrupt or mismatched stored input fails closed rather than silently issui
   expect((send() as HTMLButtonElement).disabled).toBe(true);
   expect(sessionStorage.getItem(conversationAttemptKey(props))).toBe("corrupt");
 });
+
+for (const order of ['page-first', 'response-first'] as const) {
+  test(`${order} reconciles the sending bubble by operation without losing the next draft or duplicating saved messages`, async () => {
+    const h = harness();
+    h.deferPublication();
+    const release = h.holdPost();
+    const ui = render(SubjectConversation, props);
+    await ready();
+    await compose('pending input');
+    const sending = await screen.findByText('sending');
+    expect(sending.closest('li')?.dataset.local).toBe('true');
+    expect(sending.closest('li')?.textContent).toContain('pending input');
+    expect(screen.queryByRole('button', { name: 'Retry message' })).toBeNull();
+    typeDraft('next draft stays');
+    if (order === 'page-first') {
+      h.publish();
+      await waitFor(() => expect(screen.getByText('sending').closest('li')?.dataset.messageId).toBe(h.messages[0].id));
+      expect(screen.queryByText('delivered')).toBeNull();
+      expect(ui.container.querySelector('[data-local]')).toBeNull();
+    }
+    release();
+    const delivered = await screen.findByText('delivered');
+    expect(readConversationAttempt(sessionStorage, props)).toBeNull();
+    if (order === 'response-first') {
+      expect(delivered.closest('li')?.dataset.local).toBe('true');
+      h.publish();
+    }
+    await waitFor(() => expect(screen.getByText('delivered').closest('li')?.dataset.messageId).toBe(h.messages[0].id));
+    expect(screen.getAllByText('pending input', { exact: true })).toHaveLength(1);
+    expect(ui.container.querySelector('[data-local]')).toBeNull();
+    expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe('next draft stays');
+    expect((send() as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText(/read|processed|Processing and replies/i, { selector: '.chat-delivery' })).toBeNull();
+  });
+}
+
+test('a second send does not replace an accepted bubble awaiting its saved page', async () => {
+  const h = harness();
+  h.deferPublication();
+  const ui = render(SubjectConversation, props);
+  await ready();
+  await compose('first unpublished');
+  await screen.findByText('delivered');
+  await compose('second unpublished');
+  await waitFor(() => expect(screen.getAllByText('delivered')).toHaveLength(2));
+  expect(ui.container.querySelectorAll('[data-local]')).toHaveLength(2);
+  h.publish();
+  await waitFor(() => expect(ui.container.querySelectorAll('[data-local]')).toHaveLength(0));
+  expect(screen.getAllByText('delivered')).toHaveLength(2);
+  expect([...ui.container.querySelectorAll('[data-message-id]')].map(row => row.getAttribute('data-message-id'))).toEqual(h.messages.map(message => message.id));
+});
+
+for (const boundary of ['accountId', 'workspaceId', 'subjectId'] as const) {
+  test(`${boundary} change fences local bubbles and a late accepted response without clearing the original retry`, async () => {
+    const h = harness();
+    h.deferPublication();
+    const release = h.holdPost();
+    const ui = render(SubjectConversation, props);
+    await ready();
+    await compose('old pending input');
+    await screen.findByText('sending');
+    typeDraft('old next draft');
+    const original = readConversationAttempt(sessionStorage, props);
+    const next = { ...props, [boundary]: 'another' };
+    if (boundary === 'accountId') authenticate(next.accountId);
+    const other = harness(next);
+    await ui.rerender(next);
+    await ready();
+    release();
+    // 応答のPromise継続とSvelte描画を処理し、旧contextの遅延結果が混入しないことを確認する。
+    await tick();
+    expect(screen.queryByText('old pending input')).toBeNull();
+    expect(screen.queryByText('delivered')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry message' })).toBeNull();
+    expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe('');
+    expect(readConversationAttempt(sessionStorage, props)).toEqual(original);
+    expect(readConversationAttempt(sessionStorage, next)).toBeNull();
+    await compose('new conversation input');
+    await screen.findByText('delivered');
+    expect(other.posts).toHaveLength(1);
+    expect(other.posts[0].operation_id).not.toBe(original?.operationId);
+    expect(readConversationAttempt(sessionStorage, props)).toEqual(original);
+  });
+}
