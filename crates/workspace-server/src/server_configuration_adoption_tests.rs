@@ -119,6 +119,21 @@ mod configuration_adoption_http_integration {
     }
 
     impl Fixture {
+        async fn reopen(self) -> Self {
+            let config = self.api.config.clone();
+            let Fixture { api, app, owner, foreign, owner_account, cookie, origin, subject, legacy, legacy_update, subject_policy, runtime_identity, _dir } = self;
+            drop(app);
+            drop(legacy);
+            drop(api);
+            let mut api = WorkspaceApi::new_api_fixture(config, Arc::new(DeterministicExecutionBackend::default())).await.unwrap();
+            configure_runtime_request_auth(&mut api, &runtime_identity, "adoption-http-runtime");
+            let legacy = open_subjektiv_store(&api).unwrap();
+            let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+            catalog.apis.lock().await.insert(TEST_WORKSPACE_ID.into(), api.clone());
+            catalog.routers.lock().await.insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+            Fixture { api, app: workspace_server_router(catalog), owner, foreign, owner_account, cookie, origin, subject, legacy, legacy_update, subject_policy, runtime_identity, _dir }
+        }
+
         async fn new() -> Self {
             Self::with_publication_host(HostExecutors::default()).await
         }
@@ -1696,7 +1711,34 @@ mod configuration_adoption_http_integration {
     }
 
     #[tokio::test]
-    async fn owner_http_refreshes_retained_decodal_040_without_rewriting_source() {
+    async fn failed_startup_reevaluation_keeps_owner_http_repair_available() {
+        let f = Fixture::new().await;
+        let mut state = f.api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
+        let path = config_source::VirtualPath::parse("main.dcdl").unwrap();
+        state.snapshot.entries.insert(path.clone(), config_source::ConfigEntry::new(path, config_source::ConfigContentType::Decodal, "{ prompts = ").unwrap());
+        state.snapshot = config_source::ConfigTreeSnapshot::from_entries(state.snapshot.entries.into_values()).unwrap();
+        f.api.config_store.with_immediate_transaction(|tx| {
+            tx.execute("DELETE FROM workspace_config_entries WHERE workspace_id=?1", [TEST_WORKSPACE_ID])?;
+            crate::config_source::insert_materialized_state(tx, TEST_WORKSPACE_ID, &state, "old-system")?;
+            tx.execute("UPDATE workspace_config_trees SET decodal_version='0.4.0' WHERE workspace_id=?1", [TEST_WORKSPACE_ID])?;
+            Ok(())
+        }).unwrap();
+        let before = f.durable();
+        let f = f.reopen().await;
+        assert_eq!(f.durable(), before, "failed reevaluation cannot alter saved authority");
+        let source = f.source().await;
+        assert_eq!(source.state.contract.decodal_version, "0.4.0");
+        let repair = request(&source, "repair-after-system-update", vec![update(&source, "main.dcdl", "{} as WorkspaceConfigSchema\n")]);
+        let (denied, _) = f.call(f.bearer(&f.foreign, "POST", "/commit", Some(serde_json::to_value(&repair).unwrap()))).await;
+        assert_eq!(denied, StatusCode::FORBIDDEN);
+        f.owner_call("/preview", &repair, StatusCode::OK).await;
+        let receipt = f.commit(&repair).await;
+        assert_eq!(receipt.state.contract.decodal_version, config_source::DECODAL_VERSION);
+        f.assert_subject_policy_unchanged();
+    }
+
+    #[tokio::test]
+    async fn startup_reevaluates_retained_decodal_evidence_without_rewriting_source() {
         let f = Fixture::new().await;
         let source = f.source().await;
         let text =
@@ -1786,69 +1828,17 @@ mod configuration_adoption_http_integration {
             tx.execute("UPDATE workspace_config_trees SET decodal_version=?2,schema_bundle_json=?3,toolchain_fingerprint=?4,projection_digest=?5 WHERE workspace_id=?1", rusqlite::params![TEST_WORKSPACE_ID, state.contract.decodal_version, serde_json::to_string(&state.contract.schema_bundle).unwrap(), state.contract.fingerprint, state.projection_digest])?;
             Ok(())
         }).unwrap();
+        let head_before = f.source().await.history_head;
         let before = f.durable();
         // Drop the API/router and their projection caches, then reopen the saved
         // database through the production startup branch before any owner request.
-        let Fixture {
-            api,
-            app,
-            owner,
-            foreign,
-            owner_account,
-            cookie,
-            origin,
-            subject,
-            legacy,
-            legacy_update,
-            subject_policy,
-            runtime_identity,
-            _dir,
-        } = f;
-        let config = api.config.clone();
-        drop(app);
-        drop(legacy);
-        drop(api);
-        let mut api = WorkspaceApi::new_api_fixture(
-            config,
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap();
-        configure_runtime_request_auth(&mut api, &runtime_identity, "adoption-http-runtime");
-        let legacy = open_subjektiv_store(&api).unwrap();
-        let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
-        catalog
-            .apis
-            .lock()
-            .await
-            .insert(TEST_WORKSPACE_ID.into(), api.clone());
-        catalog
-            .routers
-            .lock()
-            .await
-            .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
-        let f = Fixture {
-            api,
-            app: workspace_server_router(catalog),
-            owner,
-            foreign,
-            owner_account,
-            cookie,
-            origin,
-            subject,
-            legacy,
-            legacy_update,
-            subject_policy,
-            runtime_identity,
-            _dir,
-        };
-        assert_eq!(
-            f.durable(),
-            before,
-            "startup must not refresh saved evidence"
-        );
+        let f = f.reopen().await;
+        assert_ne!(f.durable(), before, "startup refreshes evaluation evidence");
+        let before = f.durable();
         let old = f.source().await;
-        assert_eq!(old.state.contract.decodal_version, "0.4.0");
+        assert_eq!(old.state.contract.decodal_version, "0.4.1");
+        assert_eq!(old.history_head, head_before);
+        assert_ne!(old.state.projection_digest, state.projection_digest);
         assert_eq!(
             old.state.snapshot,
             workspace_config_state_to_api(state.clone()).snapshot
@@ -1872,7 +1862,7 @@ mod configuration_adoption_http_integration {
         assert_eq!(receipt.state, preview.state);
         assert_eq!(receipt.state.contract.decodal_version, "0.4.1");
         assert_eq!(receipt.state.snapshot, old.state.snapshot);
-        assert_ne!(receipt.state.projection_digest, old.state.projection_digest);
+        assert_eq!(receipt.state.projection_digest, old.state.projection_digest);
         assert_ne!(Some(receipt.history_head.clone()), old.history_head);
         assert_eq!(f.source().await.state, receipt.state);
         let current = f

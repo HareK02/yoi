@@ -32,6 +32,21 @@ fn toolchain_upgrade_diagnostics(mut diagnostics: Vec<ConfigDiagnostic>) -> Erro
     ))
 }
 
+fn reevaluation_error(error: Error) -> Error {
+    match error {
+        Error::InvalidInput(_)
+        | Error::Configuration(_)
+        | Error::Config(_)
+        | Error::PluginCatalog(_) => Error::ConfigurationUpdateRequired(std::sync::Arc::new(error)),
+        Error::RepositoryAccess(ref failure)
+            if matches!(failure.source_error(), Error::InvalidInput(_)) =>
+        {
+            Error::ConfigurationUpdateRequired(std::sync::Arc::new(error))
+        }
+        other => other,
+    }
+}
+
 fn main_config_path() -> VirtualPath {
     VirtualPath::parse(MAIN_CONFIG_ENTRYPOINT).expect("main config entrypoint is a valid path")
 }
@@ -69,28 +84,30 @@ pub fn evaluate_workspace_config_state(
     state: &WorkspaceConfigState,
     schema_bundle: WorkspaceConfigSchemaBundle,
 ) -> Result<EvaluationResult> {
-    if state.contract.decodal_version != DECODAL_VERSION {
-        return Err(Error::RegistryInconsistency(
-            "Workspace config toolchain requires owner-authorized configuration refresh".into(),
-        ));
+    if state.contract.decodal_version != DECODAL_VERSION || state.contract.validate().is_err() {
+        return Err(Error::ConfigurationUpdateRequired(std::sync::Arc::new(
+            Error::RegistryInconsistency(
+                "saved evaluation is not valid for the current configuration toolchain".into(),
+            ),
+        )));
     }
     let expected_fingerprint = state.contract.fingerprint.clone();
     let contract = main_config_contract_with_schema(schema_bundle);
     if !state.contract.schema_bundle.contributions.is_empty()
         && contract.fingerprint != expected_fingerprint
     {
-        return Err(Error::RegistryInconsistency(
-            "active Workspace config schema fingerprint does not match the current provider bundle"
-                .to_string(),
-        ));
+        return Err(Error::ConfigurationUpdateRequired(std::sync::Arc::new(
+            Error::RegistryInconsistency(
+                "active Workspace config schema fingerprint does not match the current provider bundle".into(),
+            ),
+        )));
     }
     SnapshotEnvironment::new(state.snapshot.clone())
         .evaluate_contract(&contract)
         .map_err(|diagnostics| {
-            Error::InvalidInput(
-                serde_json::to_string(&diagnostics)
-                    .unwrap_or_else(|_| "virtual config evaluation failed".to_string()),
-            )
+            Error::ConfigurationUpdateRequired(std::sync::Arc::new(toolchain_upgrade_diagnostics(
+                diagnostics,
+            )))
         })
 }
 
@@ -144,7 +161,9 @@ pub(crate) fn validate_workspace_config_candidate_projections(
             .iter()
             .any(|provider| provider.provider_id == id)
     };
-    crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
+    if has_provider("builtin:prompts") {
+        crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
+    }
     if has_provider("builtin:profile") {
         crate::profile_settings::project_profiles_from_evaluation(
             workspace_id,
@@ -233,15 +252,18 @@ impl SqliteWorkspaceStore {
                 tx.commit()?;
                 Ok((state, requires_toolchain_refresh, base_identity, frozen))
             })?;
-        // Published configuration and retained 0.4.0 provenance change only through
-        // owner-authorized adoption. Loading must not silently adopt fixed Unicode semantics.
-        if frozen || state.contract.decodal_version != DECODAL_VERSION {
-            return Ok(state);
-        }
+        // Published source and owner receipts stay unchanged during system
+        // reevaluation, including patch releases. Retained evaluations keep their provenance.
         let desired_schema = crate::plugin_settings::materialization_schema(
             desired_schema,
             &state.contract.schema_bundle,
         )?;
+        if state.contract.decodal_version != DECODAL_VERSION || state.contract.validate().is_err() {
+            return self.reevaluate_workspace_config(workspace_id, materialized_at, desired_schema);
+        }
+        if frozen {
+            return Ok(state);
+        }
         let main_needs_normalization = state
             .snapshot
             .get(&main_config_path())
@@ -264,6 +286,67 @@ impl SqliteWorkspaceStore {
             return self.commit_evaluated_workspace_config(workspace_id, &candidate);
         }
         Ok(state)
+    }
+
+    fn reevaluate_workspace_config(
+        &self,
+        workspace_id: &str,
+        evaluated_at: &str,
+        schema: WorkspaceConfigSchemaBundle,
+    ) -> Result<WorkspaceConfigState> {
+        self.with_immediate_transaction(|tx| {
+            let current = load_state(tx, workspace_id)?.ok_or_else(config_not_materialized)?;
+            let snapshot = current.snapshot.clone();
+            let (contract, evaluation) = if has_plugin_provider(&schema) {
+                let (contract, evaluation, _) = crate::plugin_settings::evaluate_catalog_config(
+                    tx,
+                    workspace_id,
+                    &snapshot,
+                    schema,
+                )
+                .map_err(reevaluation_error)?;
+                (contract, evaluation)
+            } else {
+                let contract = main_config_contract_with_schema(schema);
+                let evaluation = SnapshotEnvironment::new(snapshot.clone())
+                    .evaluate_contract(&contract)
+                    .map_err(|diagnostics| {
+                        Error::ConfigurationUpdateRequired(std::sync::Arc::new(
+                            toolchain_upgrade_diagnostics(diagnostics),
+                        ))
+                    })?;
+                (contract, evaluation)
+            };
+            let base_identity = load_evaluation_identity(tx, workspace_id)?;
+            let candidate = EvaluatedConfigCandidate {
+                base_digest: snapshot.digest.clone(),
+                base_toolchain_fingerprint: base_identity.0,
+                base_projection_digest: base_identity.1,
+                snapshot,
+                contract,
+                evaluation,
+            };
+            validate_workspace_config_candidate_projections(workspace_id, &candidate)
+                .map_err(reevaluation_error)?;
+            crate::repository_access::validate_repository_access_in_transaction(
+                tx,
+                workspace_id,
+                &candidate,
+            )
+            .map_err(reevaluation_error)?;
+            let state = WorkspaceConfigState {
+                snapshot: candidate.snapshot,
+                contract: candidate.contract,
+                projection_digest: candidate.evaluation.projection_digest,
+            };
+            sync_adopted_config_references(tx, workspace_id, &state)?;
+            tx.execute(
+                "DELETE FROM workspace_config_entries WHERE workspace_id = ?1",
+                [workspace_id],
+            )?;
+            insert_materialized_state(tx, workspace_id, &state, evaluated_at)?;
+            Ok(state)
+        })
     }
 
     pub fn load_workspace_config(
@@ -511,7 +594,6 @@ fn format_candidate_sources(
     ConfigTreeSnapshot::from_entries(entries).map_err(config_error)
 }
 
-// Read persisted provenance, not load_state's upgraded in-memory contract.
 pub(crate) fn load_evaluation_identity(
     conn: &rusqlite::Connection,
     workspace_id: &str,
@@ -686,58 +768,19 @@ pub(crate) fn load_state(
     let stored_schema_bundle: WorkspaceConfigSchemaBundle =
         serde_json::from_str(&schema_bundle_json)
             .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
-    let requires_toolchain_refresh = decodal_version != DECODAL_VERSION;
-    if requires_toolchain_refresh && decodal_version == "0.4.0" {
-        // A saved evaluation is evidence, not a request to evaluate with the current
-        // lexer. Keep it readable (even if refresh will fail) so the owner can
-        // preview, repair and adopt through the existing head-CAS/receipt transaction.
-        return Ok(Some(WorkspaceConfigState {
-            snapshot,
-            contract: ToolchainContract {
-                contract_version: config_source::CONFIG_SOURCE_CONTRACT_VERSION,
-                decodal_version,
-                schema_version,
-                entrypoints,
-                import_policy_version,
-                schema_bundle: stored_schema_bundle,
-                fingerprint,
-            },
-            projection_digest,
-        }));
-    }
-    if requires_toolchain_refresh && !matches!(decodal_version.as_str(), "0.2.0" | "0.3.0") {
-        return Err(Error::RegistryInconsistency(format!(
-            "unsupported virtual config Decodal version {decodal_version} for Workspace {workspace_id}"
-        )));
-    }
-    let schema_bundle = if requires_toolchain_refresh {
-        WorkspaceConfigSchemaBundle::compose(stored_schema_bundle.contributions)
-            .map_err(config_error)?
-    } else {
-        stored_schema_bundle
-    };
-    let contract = ToolchainContract::with_schema_bundle(
-        schema_version,
-        entrypoints,
-        import_policy_version,
-        schema_bundle,
-    );
-    if !requires_toolchain_refresh && contract.fingerprint != fingerprint {
-        return Err(Error::RegistryInconsistency(format!(
-            "virtual config toolchain metadata mismatch for Workspace {workspace_id}"
-        )));
-    }
-    let projection_digest = if requires_toolchain_refresh {
-        SnapshotEnvironment::new(snapshot.clone())
-            .evaluate_contract(&contract)
-            .map_err(toolchain_upgrade_diagnostics)?
-            .projection_digest
-    } else {
-        projection_digest
-    };
+    // Loading preserves the saved evaluation even after an evaluator update or
+    // failed reevaluation. The owner must still be able to retrieve and repair source.
     Ok(Some(WorkspaceConfigState {
         snapshot,
-        contract,
+        contract: ToolchainContract {
+            contract_version: config_source::CONFIG_SOURCE_CONTRACT_VERSION,
+            decodal_version,
+            schema_version,
+            entrypoints,
+            import_policy_version,
+            schema_bundle: stored_schema_bundle,
+            fingerprint,
+        },
         projection_digest,
     }))
 }
@@ -1157,7 +1200,7 @@ mod tests {
         .unwrap()])
         .unwrap();
         let error = evaluate_workspace_config_state(&state, changed_bundle).unwrap_err();
-        assert!(error.to_string().contains("schema fingerprint"));
+        assert!(error.configuration_update_required().is_some());
     }
 
     #[tokio::test]
@@ -1420,7 +1463,10 @@ mod tests {
                 schema_bundle,
             )
             .unwrap_err();
-        let message = error.to_string();
+        let Error::ConfigurationUpdateRequired(cause) = error else {
+            panic!("{error:?}")
+        };
+        let message = cause.to_string();
         assert!(message.contains(&format!("Decodal {DECODAL_VERSION}")));
         assert!(message.contains("main.dcdl"));
         assert!(message.contains("constraintviolation"));

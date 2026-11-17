@@ -126,6 +126,10 @@ pub enum Error {
     Configuration(#[from] configuration_failure::ConfigurationFailure),
     #[error("workspace backend config error: {0}")]
     Config(String),
+    #[error(
+        "Automatic Workspace configuration reevaluation failed after a system update; the Workspace owner must update the configuration"
+    )]
+    ConfigurationUpdateRequired(#[source] std::sync::Arc<Error>),
     #[error("Workspace prompt projection is unavailable")]
     PromptProjection(#[source] std::sync::Arc<Error>),
     #[error("record `{0}` is missing frontmatter")]
@@ -291,4 +295,14 @@ pub enum Error {
     BackendJobCauseProjection(#[source] error_contract::ContractError),
     #[error("store error: {0}")]
     Store(String),
+}
+
+impl Error {
+    pub(crate) fn configuration_update_required(&self) -> Option<&Self> {
+        match self {
+            Self::ConfigurationUpdateRequired(_) => Some(self),
+            Self::PromptProjection(source) => source.configuration_update_required(),
+            _ => None,
+        }
+    }
 }

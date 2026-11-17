@@ -5005,11 +5005,19 @@ impl WorkspaceApi {
         store
             .db_executor()
             .run(move || {
-                materialization_store.ensure_workspace_config_materialized_with_schema(
+                match materialization_store.ensure_workspace_config_materialized_with_schema(
                     &workspace_id,
                     &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
                     schema,
-                )
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(error) if error.configuration_update_required().is_some() => {
+                        tracing::warn!(%workspace_id, message = %error,
+                            "Workspace owner must repair configuration after automatic reevaluation failed");
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             })
             .await?;
         let worker_projection = crate::worker_projection::WorkerProjectionService::new(
@@ -41625,6 +41633,9 @@ impl ApiError {
 }
 
 fn api_error_status(error: &Error) -> StatusCode {
+    if error.configuration_update_required().is_some() {
+        return StatusCode::CONFLICT;
+    }
     match error {
         Error::ExternalWorkdirCleanupFailed { primary, .. } => api_error_status(primary),
         Error::ExternalWorkdirObservationFailed { source, .. } => api_error_status(source),
@@ -41843,6 +41854,9 @@ fn api_error_status(error: &Error) -> StatusCode {
 }
 
 fn api_error_response_message(error: &Error) -> String {
+    if let Some(required) = error.configuration_update_required() {
+        return required.to_string();
+    }
     match error {
         Error::ExternalWorkdirCleanupFailed { primary, .. } => api_error_response_message(primary),
         Error::ExternalWorkdirObservationFailed { source, .. } => {
@@ -41928,6 +41942,27 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod failure_boundary_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_configuration_reevaluation_requests_owner_update_through_projection_wrapper() {
+        let error = Error::PromptProjection(Arc::new(Error::ConfigurationUpdateRequired(
+            Arc::new(Error::InvalidInput("private-source-canary".into())),
+        )));
+        let response = ApiError::from(error).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("owner must update")
+        );
+        assert!(!body.to_string().contains("private-source-canary"));
+    }
+
     #[tokio::test]
     async fn control_http_projection_preserves_owner_cause_without_private_diagnostics() {
         for cause in protocol::control_failure::RuntimeControlCause::ALL {

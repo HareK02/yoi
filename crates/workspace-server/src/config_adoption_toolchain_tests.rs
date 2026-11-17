@@ -1,4 +1,4 @@
-//! Persisted 0.4.0 evidence must survive an explicit, owner-authorized 0.4.1 refresh.
+//! System reevaluation and owner repair preserve persisted evaluation evidence.
 //! The fixture models the old storage format and byte-wise lexer result; it does not
 //! run the old evaluator (the independent version probe is a separate test surface).
 use super::*;
@@ -196,7 +196,7 @@ fn assert_retained(db: &SqliteWorkspaceStore, state: &WorkspaceConfigState) {
 }
 
 #[test]
-fn decodal_040_read_and_ensure_preserve_provenance_until_owner_refresh() {
+fn system_reevaluation_preserves_source_owner_receipts_and_subject_policy() {
     // Include pre-adoption installations: no editing head is not owner consent.
     for published in [false, true] {
         let f = legacy_fixture(published);
@@ -205,41 +205,88 @@ fn decodal_040_read_and_ensure_preserve_provenance_until_owner_refresh() {
             f.db.load_workspace_config(WORKSPACE).unwrap(),
             Some(f.state.clone())
         );
-        assert_eq!(
+        let head = f.db.configuration_head(WORKSPACE, OWNER).unwrap();
+        let refreshed =
             f.db.ensure_workspace_config_materialized_with_schema(WORKSPACE, "later", schema())
+                .unwrap();
+        assert_eq!(refreshed.snapshot, f.state.snapshot);
+        refreshed.contract.validate().unwrap();
+        assert_ne!(refreshed.projection_digest, f.state.projection_digest);
+        assert_eq!(f.db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
+        let after = evidence(&f.db);
+        for index in [1, 3, 4, 5, 6, 7, 8] {
+            assert_eq!(
+                after[index], before[index],
+                "source and authority evidence table {index}"
+            );
+        }
+        assert_retained(&f.db, &f.state);
+        assert_eq!(
+            f.db.ensure_workspace_config_materialized_with_schema(WORKSPACE, "again", schema())
                 .unwrap(),
-            f.state
+            refreshed
         );
-        assert!(crate::config_source::evaluate_workspace_config_state(&f.state, schema()).is_err());
-        let refresh = request(&f.db, &host(false), "refresh", None);
-        let candidate = f
-            .db
-            .evaluate_workspace_config_candidate_with_schema(WORKSPACE, &refresh.source, schema())
-            .unwrap();
-        assert!(
-            f.db.commit_evaluated_workspace_config(WORKSPACE, &candidate)
-                .is_err()
-        );
-        let error =
-            f.db.adopt_configuration(WORKSPACE, "not-owner", &refresh, schema(), &host(false))
-                .unwrap_err();
-        assert!(
-            matches!(error, Error::Configuration(cause) if cause.details().reason == FailureReason::OwnerRequired)
-        );
-        assert_eq!(evidence(&f.db), before);
+        assert_eq!(evidence(&f.db), after);
         drop(f.db);
         let db = open(&f.dir.path().join("server.sqlite"));
         assert_eq!(
             db.load_workspace_config(WORKSPACE).unwrap(),
-            Some(f.state.clone())
+            Some(refreshed)
         );
-        assert_eq!(evidence(&db), before);
+        assert_eq!(evidence(&db), after);
         assert_retained(&db, &f.state);
-        // Even without prior adoption, an explicit owner request can refresh.
-        if !published {
-            adopt(&db, &host(false), &refresh).unwrap();
-        }
     }
+}
+
+#[test]
+fn patch_version_change_reevaluates_even_when_saved_fingerprint_is_unchanged() {
+    let (_dir, db) = fixture();
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE workspace_config_trees SET decodal_version='0.4.0' WHERE workspace_id=?1",
+            [WORKSPACE],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let before = evidence(&db);
+    let saved = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+    assert!(saved.contract.validate().is_err());
+    assert!(
+        crate::config_source::evaluate_workspace_config_state(&saved, schema())
+            .unwrap_err()
+            .configuration_update_required()
+            .is_some()
+    );
+    let refreshed = db
+        .ensure_workspace_config_materialized_with_schema(WORKSPACE, "patch", schema())
+        .unwrap();
+    assert_eq!(refreshed.contract.decodal_version, DECODAL_VERSION);
+    assert_eq!(refreshed.snapshot, saved.snapshot);
+    assert_eq!(refreshed.contract.fingerprint, saved.contract.fingerprint);
+    assert_ne!(evidence(&db), before);
+    let after = evidence(&db);
+    assert_eq!(
+        db.ensure_workspace_config_materialized_with_schema(WORKSPACE, "same-version", schema())
+            .unwrap(),
+        refreshed
+    );
+    assert_eq!(evidence(&db), after);
+}
+
+#[test]
+fn system_reevaluation_storage_failure_rolls_back_without_requesting_owner_repair() {
+    let f = legacy_fixture(true);
+    let before = evidence(&f.db);
+    f.db.with_conn(|conn| {
+        conn.execute_batch("CREATE TRIGGER fail_reevaluation BEFORE UPDATE ON workspace_config_trees BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;")?;
+        Ok(())
+    }).unwrap();
+    let error =
+        f.db.ensure_workspace_config_materialized_with_schema(WORKSPACE, "later", schema())
+            .unwrap_err();
+    assert!(error.configuration_update_required().is_none(), "{error:?}");
+    assert_eq!(evidence(&f.db), before);
 }
 
 #[test]
@@ -332,6 +379,19 @@ fn decodal_040_refresh_rejects_failed_evaluation_stale_head_and_same_source_aba(
         .contribution()
         .unwrap()])
     .unwrap();
+    let error =
+        f.db.ensure_workspace_config_materialized_with_schema(
+            WORKSPACE,
+            "failed-update",
+            incompatible.clone(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::ConfigurationUpdateRequired(_)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("owner must update"));
+    assert_eq!(evidence(&f.db), before);
     assert!(
         f.db.preview_configuration_adoption(WORKSPACE, OWNER, &stale, incompatible.clone(), &host)
             .is_err()
@@ -438,5 +498,5 @@ fn decodal_040_empty_provider_bundle_cannot_silently_evaluate_with_new_lexer() {
         WorkspaceConfigSchemaBundle::empty(),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("owner-authorized"));
+    assert!(error.configuration_update_required().is_some());
 }

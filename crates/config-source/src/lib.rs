@@ -2326,6 +2326,17 @@ mod tests {
     use ts_rs::TS;
 
     #[test]
+    fn toolchain_contract_rejects_any_decodal_version_change() {
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        contract.validate().unwrap();
+        for version in ["0.4.0", "0.4.99", "0.3.9", "1.4.1", "invalid"] {
+            let mut changed = contract.clone();
+            changed.decodal_version = version.into();
+            assert!(changed.validate().is_err(), "{version}");
+        }
+    }
+
+    #[test]
     fn exports_typescript_contract() {
         let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../web/workspace/src/lib/workspace/config-source/generated/types");
