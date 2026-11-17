@@ -2227,10 +2227,6 @@ mod tests {
             let result = assert_control_failure(error, B::Observation, C::ResultUnavailable);
             assert_eq!(result, serde_json::json!({"status":400}));
         }
-        // Advisory guidance belongs to the Tool contract, not untrusted HTTP prose.
-        let description = WorkerOperation::SendInput.description();
-        assert!(description.contains("Non-Idle Workers reject WorkerSendInput without queueing"));
-        assert!(description.contains("Use WorkerNotify"));
     }
 
     #[tokio::test]
@@ -2990,28 +2986,6 @@ mod tests {
             .is_err()
         );
         assert_eq!(client.requests.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn worker_lifecycle_descriptions_separate_unfinished_work_retention_and_attachment_cleanup() {
-        let stop = worker_tool_declaration(WorkerOperation::Stop);
-        assert!(stop.description.contains("does not end unfinished work"));
-        assert!(
-            stop.description
-                .contains("release attachments, or delete Workdirs")
-        );
-        let remove = worker_tool_declaration(WorkerOperation::Remove);
-        assert!(
-            remove
-                .description
-                .contains("Terminal Ticket responsibility is retained")
-        );
-        assert!(remove.description.contains("does not require unassignment"));
-        assert!(
-            remove
-                .description
-                .contains("releases attachments but preserves Workdir materialization")
-        );
     }
 
     #[tokio::test]

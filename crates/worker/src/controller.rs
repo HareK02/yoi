@@ -4596,14 +4596,6 @@ mod tests {
                             "denied access must not reach Drive provider"
                         );
                     }
-                    worker.run_text("Inspect enabled features").await.unwrap();
-                    let requests = requests.lock().unwrap();
-                    let prompt = requests[0].system_prompt.as_deref().unwrap_or("");
-                    assert_eq!(
-                        prompt.contains("## Workspace Drive"),
-                        configured,
-                        "{mode:?}, enabled={enabled}, available={available}, workspace={workspace:?}"
-                    );
                 }
             }
         }

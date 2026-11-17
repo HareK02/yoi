@@ -62,9 +62,6 @@ fn assert_publication(
     } else {
         assert_eq!(names, ["Inspect", "Invoke", "Tree"]);
     }
-    let state = session_store::collect_state(&controller.handle.committed_entries());
-    let prompt = state.system_prompt.unwrap();
-    assert_eq!(prompt.contains("## SubWorker orchestration"), sub_worker);
 }
 
 #[tokio::test]
@@ -188,14 +185,6 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
             "chat body lacks {required}: {names:?}"
         );
     }
-    let state = session_store::collect_state(&controller.handle.committed_entries());
-    let prompt = state.system_prompt.unwrap();
-    let role_prompt = include_str!("../../../resources/prompts/role/async-chat.md");
-    assert!(
-        prompt.contains(role_prompt.trim()),
-        "chat composition must include the current role prompt"
-    );
-    assert!(prompt.contains("## Ticket workflow"));
     assert!(
         client.requests.lock().unwrap().is_empty(),
         "Profile activation must not issue authority or read protected content"

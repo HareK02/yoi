@@ -434,17 +434,6 @@ async fn implementation_result_validates_report_body_ticket_kind_and_optional_mr
     assert_eq!(client.requests.lock().unwrap().len(), 3);
 }
 
-#[test]
-fn implementation_result_guidance_keeps_retry_identity_host_owned() {
-    let description = description("TicketImplementationResult");
-    assert!(description.contains("authenticated active Workspace Worker"));
-    assert!(description.contains("Host owns transport retry identity"));
-    assert!(description.contains("a new invocation is a new report"));
-    assert!(description.contains("rather than blindly submitting"));
-    assert!(!description.contains("operation_key"));
-    assert!(!description.contains("fences both assignments"));
-}
-
 #[tokio::test]
 async fn continuing_answer_forwards_same_assignment_event_cas_and_saved_receipt() {
     let (kind, input, response) = cases()

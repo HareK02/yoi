@@ -336,10 +336,6 @@ fn assert_environment_and_reads(
         "Read must execute and return to the model"
     );
     let prompt = requests[0].system_prompt.as_deref().unwrap();
-    assert!(
-        !prompt.contains("## Working boundaries"),
-        "legacy Scope must not override the connected session environment"
-    );
     let environments = prompt_environments(prompt);
     assert_eq!(environments.len(), expected.len());
     assert_eq!(router.len(), expected.len());

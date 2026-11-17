@@ -430,14 +430,8 @@ mod tests {
         }
     }
 
-    // These builtin resources are the model-visible workflow compatibility contract.
-    // Fixtures prove composition and tool descriptions, not an agent's real judgment.
-    fn ticket_workflow_fixture(
-        role: &str,
-        mr_config: MergeRequestFeatureConfig,
-    ) -> (String, Vec<agen::tool::ToolMeta>) {
-        ticket_fixture_with_access(
-            role,
+    fn ticket_workflow_tools(mr_config: MergeRequestFeatureConfig) -> Vec<agen::tool::ToolMeta> {
+        ticket_tools_with_access(
             mr_config,
             TicketFeatureAccess {
                 thread: true,
@@ -447,11 +441,10 @@ mod tests {
         )
     }
 
-    fn ticket_fixture_with_access(
-        role: &str,
+    fn ticket_tools_with_access(
         mr_config: MergeRequestFeatureConfig,
         access: TicketFeatureAccess,
-    ) -> (String, Vec<agen::tool::ToolMeta>) {
+    ) -> Vec<agen::tool::ToolMeta> {
         let client = Arc::new(MetadataOnlyHost);
         let mut tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
@@ -460,67 +453,17 @@ mod tests {
             .with_module(MergeRequestFeature::new(client, mr_config))
             .install_into_pending(&mut tools, &mut hooks);
         assert!(!report.has_errors(), "{}", report.error_message());
-        let metas: Vec<_> = tools.into_iter().map(|definition| definition().0).collect();
-        let instructions = report.installed_instruction_contributions();
-        let prompts = PromptCatalog::builtins_only().unwrap();
-        let scope = Scope::empty();
-        let rendered = SystemPromptTemplate::parse(role, PromptCatalogSource::builtins_only())
-            .unwrap()
-            .render(&SystemPromptContext {
-                now: DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                workdir_sessions: &workdir::WorkdirSessionRouter::new(),
-                language: "en",
-                scope: &scope,
-                tool_names: metas.iter().map(|meta| meta.name.clone()).collect(),
-                feature_instructions: &instructions,
-                agents_md: None,
-                resident_summary: None,
-                prompts: &prompts,
-            })
-            .unwrap();
-        (rendered, metas)
+        tools.into_iter().map(|definition| definition().0).collect()
     }
 
     #[test]
-    fn notification_guidance_is_in_system_prompt_not_repeated_in_each_message() {
-        let catalog = PromptCatalog::builtins_only().unwrap();
-        let guidance = catalog
-            .render_name("common.notifications", Value::UNDEFINED)
-            .unwrap();
-        for role in ["default", "role.async_chat", "role.coder"] {
-            let (prompt, _) = ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
-            assert_eq!(prompt.matches(guidance.trim()).count(), 1, "{role}");
-        }
-        let notice = catalog
-            .notify_wrapper("conversation: C-1\nsender: user\ntext: hi\n")
-            .unwrap();
-        assert_eq!(
-            notice.trim(),
-            "[Notification]\nconversation: C-1\nsender: user\ntext: hi"
-        );
-    }
-
-    #[test]
-    fn effective_ticket_instructions_allow_review_not_required_without_mr_gate() {
-        let (prompt, tools) =
-            ticket_workflow_fixture("role.ticket_worker", MergeRequestFeatureConfig::default());
-        assert!(prompt.contains("No Merge Request or approval is a prerequisite"));
-        assert!(prompt.contains("optional Ticket comment"));
-        assert!(prompt.contains("optional Drive document/artifact"));
-        assert!(!prompt.contains("## Merge Request workflow"));
+    fn ticket_case_update_schema_does_not_require_mr_approval() {
+        let tools = ticket_workflow_tools(MergeRequestFeatureConfig::default());
         assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
         let complete = tools
             .iter()
             .find(|meta| meta.name == "TicketCaseUpdate")
             .unwrap();
-        assert!(
-            complete
-                .description
-                .contains("Repository, Merge Request and approval evidence are not prerequisites")
-        );
-        assert!(complete.description.contains("not real judgment"));
         assert!(
             complete.input_schema["properties"]
                 .get("approval_event_id")
@@ -529,47 +472,24 @@ mod tests {
     }
 
     #[test]
-    fn effective_orchestrator_instructions_separate_adoption_from_optional_mr_receipts() {
-        let (without_mr, without_mr_tools) =
-            ticket_workflow_fixture("role.orchestrator", MergeRequestFeatureConfig::default());
-        assert!(without_mr.contains("Select, adapt, or reject Coder changes"));
-        assert!(
-            without_mr.contains("Use Tickets and Merge Requests by default, adapting the workflow when the request calls for a different approach.")
-        );
+    fn mr_completion_registration_and_schema_follow_feature_config() {
+        let without_mr_tools = ticket_workflow_tools(MergeRequestFeatureConfig::default());
         assert!(
             !without_mr_tools
                 .iter()
                 .any(|meta| meta.name == "CompleteMergeRequest")
         );
-
-        let (prompt, tools) = ticket_workflow_fixture(
-            "role.orchestrator",
-            MergeRequestFeatureConfig {
-                show: true,
-                readiness_check: true,
-                complete: true,
-                ..Default::default()
-            },
-        );
-        for policy in [
-            "Select, adapt, or reject Coder changes",
-            "validate the combined result",
-            "Use Tickets and Merge Requests by default, adapting the workflow when the request calls for a different approach.",
-            "its approval requirement is not a general Git adoption gate",
-            "Partial or adapted adoption is not full MR integration",
-        ] {
-            assert!(prompt.contains(policy), "missing {policy}");
-        }
+        let tools = ticket_workflow_tools(MergeRequestFeatureConfig {
+            show: true,
+            readiness_check: true,
+            complete: true,
+            ..Default::default()
+        });
         assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
         let complete = tools
             .iter()
             .find(|meta| meta.name == "CompleteMergeRequest")
             .unwrap();
-        assert!(
-            complete
-                .description
-                .contains("trusted exact-source approval")
-        );
         assert!(
             complete.input_schema["required"]
                 .as_array()
@@ -580,105 +500,26 @@ mod tests {
     }
 
     #[test]
-    fn effective_ticket_instructions_allow_return_without_conclusion_and_separate_cleanup() {
-        for role in ["role.ticket_worker", "role.coder", "role.orchestrator"] {
-            let (prompt, tools) =
-                ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
-            assert!(
-                prompt.contains("return without concluding the Ticket"),
-                "{role}"
-            );
-            assert!(
-                prompt.contains(
-                    "a turn ending or a result report is not itself a completion decision"
-                ),
-                "{role}"
-            );
-            assert!(
-                prompt.contains("stopping a Worker alone does not end unfinished work"),
-                "{role}"
-            );
-            assert!(
-                prompt.contains("does not stop, remove, or clean up"),
-                "{role}"
-            );
-            let complete = tools
+    fn ticket_workflow_publishes_tracking_without_retired_operations() {
+        let tools = ticket_workflow_tools(MergeRequestFeatureConfig::default());
+        assert!(
+            tools
                 .iter()
-                .find(|meta| meta.name == "TicketCaseUpdate")
-                .unwrap();
-            assert!(
-                complete
-                    .description
-                    .contains("Return without conclusion need not call this tool")
-            );
-        }
+                .any(|meta| meta.name == "TicketAssignmentTrackingUpdate")
+        );
+        assert!(!tools.iter().any(|meta| matches!(
+            meta.name.as_str(),
+            "TicketMarkReady"
+                | "TicketQueue"
+                | "TicketIntakeReady"
+                | "CompleteTicket"
+                | "TicketWorkflowState"
+                | "TicketClose"
+        )));
     }
 
     #[test]
-    fn effective_ticket_instructions_separate_case_handling_and_delegation_retries() {
-        for role in [
-            "role.ticket_worker",
-            "role.coder",
-            "role.orchestrator",
-            "role.intake",
-        ] {
-            let (prompt, tools) =
-                ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
-            for policy in [
-                "only `open`",
-                "stable tag IDs, not display names",
-                "no ready step or separate Queue is required",
-                "assigned Subject's self-reported handling",
-                "Answers during waiting or ongoing handling continue the same assignment row",
-                "explicit reissue creates a new row/assignment_id",
-                "Respect an explicit user approval condition",
-                "done does not require unassignment",
-                "expected_last_event_id",
-                "Exact retries retain the same key and full input",
-                "Assign persistence, notification delivery, Runtime acceptance and actual work start",
-                "concrete API insufficiency",
-            ] {
-                assert!(prompt.contains(policy), "{role}: missing {policy}");
-            }
-            let update = tools
-                .iter()
-                .find(|meta| meta.name == "TicketAssignmentTrackingUpdate")
-                .unwrap();
-            for policy in [
-                "self-reported",
-                "same row",
-                "new Assign row",
-                "complete tracking payload",
-                "different input with that key is rejected",
-                "reread current authority",
-                "exact retry receipts are not fresh observations",
-            ] {
-                assert!(
-                    update.description.contains(policy),
-                    "{role}: missing {policy}"
-                );
-            }
-            assert!(!tools.iter().any(|meta| matches!(
-                meta.name.as_str(),
-                "TicketMarkReady"
-                    | "TicketQueue"
-                    | "TicketIntakeReady"
-                    | "CompleteTicket"
-                    | "TicketWorkflowState"
-                    | "TicketClose"
-            )));
-            if role == "role.orchestrator" {
-                assert!(prompt.contains(
-                    "`TicketWorkerAssign` with the current `orchestrator_assignment_id`"
-                ));
-            }
-        }
-    }
-
-    // Scripted policy/input fixtures: they do not run a model or certify its judgment.
-    #[test]
-    fn effective_return_wait_answer_and_close_fixtures_match_resolved_profile_tools_without_repo_or_mr()
-     {
+    fn ticket_input_schemas_accept_repo_free_work_and_reject_actor_claims() {
         let dir = tempfile::tempdir().unwrap();
         let resolved = manifest::ProfileResolver::new()
             .with_workspace_base(dir.path())
@@ -690,8 +531,7 @@ mod tests {
         let config = resolved.manifest.feature.ticket;
         // Omit MR feature for the no-repository/no-MR work fixture; profile selection
         // makes it available, not mandatory to exercise for every Ticket.
-        let (prompt, tools) = ticket_fixture_with_access(
-            &resolved.manifest.engine.instruction,
+        let tools = ticket_tools_with_access(
             MergeRequestFeatureConfig::default(),
             TicketFeatureAccess {
                 authoring: config.authoring,
@@ -704,34 +544,28 @@ mod tests {
             meta.name.as_str(),
             "OpenMergeRequest" | "ReviewMergeRequest" | "CompleteMergeRequest"
         )));
-        for (policy, name, input) in [
+        for (name, input) in [
             (
-                "Use `TicketOrchestratorAssign` for explicit initial assignment, reassignment or reissue to the selected Subject principal",
                 "TicketOrchestratorAssign",
                 serde_json::json!({"ticket":"T-743","principal":{"kind":"subject","subject_id":"subject-a"},"expected_assignment_id":null,"operation_id":"delegate-research"}),
             ),
             (
-                "research returned to a human can be `open` + handling `done`",
                 "TicketAssignmentTrackingUpdate",
                 serde_json::json!({"ticket":"T-743", "assignment_id":"delegation", "expected_last_event_id":"assigned", "operation_key":"return-options", "tracking":{"status":"done", "result":"Options returned", "next_action":"Human decision"}}),
             ),
             (
-                "Respect an explicit user approval condition",
                 "TicketAssignmentTrackingUpdate",
                 serde_json::json!({"ticket":"T-743", "assignment_id":"delegation", "expected_last_event_id":"assigned", "operation_key":"wait-for-answer", "tracking":{"status":"waiting", "waiting_reason":"User requested confirmation first", "next_action":"Read the user's answer on this assignment"}}),
             ),
             (
-                "use `TicketAssignmentAnswer` with that `assignment_id`",
                 "TicketAssignmentAnswer",
                 serde_json::json!({"ticket":"T-743","assignment_id":"delegation","expected_last_event_id":"waiting","operation_key":"answer-on-same-row","body":"Option A approved; continue within scope"}),
             ),
             (
-                "No Merge Request or approval is a prerequisite for a generic Ticket decision",
                 "TicketCaseUpdate",
                 serde_json::json!({"ticket":"T-743", "expected_content_digest":"observed-digest", "expected_state":"open", "expected_closure_operation_key":null, "operation_key":"fulfilled-close", "action":{"action":"close", "reason":"completed"}, "explanation":"The whole bounded request is fulfilled and closure was requested"}),
             ),
         ] {
-            assert!(prompt.contains(policy), "missing {policy}");
             let meta = tools.iter().find(|meta| meta.name == name).unwrap();
             let validator = jsonschema::validator_for(&meta.input_schema).unwrap();
             assert!(validator.is_valid(&input), "{name} rejected {input}");

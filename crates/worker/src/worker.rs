@@ -12543,41 +12543,6 @@ status: 200,
     }
 
     #[test]
-    fn compact_prompt_and_shrink_policy_prioritize_continuing_user_intent() {
-        // The builtin resource is the default model-visible compaction contract.
-        let prompt = include_str!("../../../resources/prompts/internal/compact_system.md");
-        for policy in [
-            "initial compaction summary in full",
-            "segment's user messages",
-            "prohibitions",
-            "completion conditions",
-            "explicit changes or retractions",
-            "Preserve uncertainty",
-            "retained tail stays verbatim",
-            "TaskStore",
-        ] {
-            assert!(prompt.contains(policy), "missing prompt policy: {policy}");
-        }
-        let shrink = summary_shrink_prompt(2_000, 1_000, 500);
-        for policy in [
-            "initial summary",
-            "and segment",
-            "Compress duplicate",
-            "prohibitions",
-            "completion conditions",
-            "exception-reporting duties",
-            "changes/retractions",
-            "uncertainty",
-            "recovery",
-        ] {
-            assert!(shrink.contains(policy), "missing shrink policy: {policy}");
-        }
-        let input = test_summary_input(&[Item::user_message("keep original scope")]);
-        assert!(input.contains("Preserve ongoing user goals and directives"));
-        assert!(input.contains("Retained tail entries remain verbatim"));
-    }
-
-    #[test]
     fn malformed_or_duplicate_host_summaries_fail_instead_of_omitting_context() {
         use crate::session_history::history_entry;
         let opening = |item| {

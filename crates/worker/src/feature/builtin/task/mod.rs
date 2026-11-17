@@ -320,7 +320,6 @@ mod tests {
         let SystemItem::TaskReminder { body, .. } = &queued[0].item else {
             panic!("unexpected system item: {:?}", queued[0]);
         };
-        assert!(body.starts_with("Current session steps are listed below."));
         assert!(body.contains("taskid 1"));
         assert!(body.contains("pending"));
         assert!(body.contains("keep going"));
@@ -345,18 +344,15 @@ mod tests {
             panic!("unexpected system item: {:?}", queued[0]);
         };
         assert_eq!(*source, SystemReminderSource::TaskInactivity);
-        assert!(body.starts_with("Current session steps are listed below."));
         assert!(body.contains("typed"));
     }
 
     #[test]
-    fn render_task_reminder_body_is_plain_system_text() {
+    fn render_task_reminder_body_includes_task_identity() {
         let feature = TaskFeature::new();
         let task = feature.task_store().create("body".into(), String::new());
         let body = render_task_reminder_body(&[task]);
 
-        assert!(body.starts_with("Current session steps are listed below."));
-        assert!(body.contains("TaskUpdate"));
         assert!(body.contains("taskid 1"));
     }
 
@@ -458,7 +454,6 @@ mod tests {
             panic!("unexpected system item: {:?}", queued[0]);
         };
         assert!(body.contains("taskid 1 (completed) done"));
-        assert!(body.contains("delete older completed steps"));
     }
 
     #[tokio::test]

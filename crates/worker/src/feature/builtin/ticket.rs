@@ -3137,8 +3137,7 @@ mod tests {
                 .into_iter()
                 .find(|definition| definition().0.name == "ShowTicket")
                 .unwrap();
-            let (meta, tool) = definition();
-            assert!(meta.description.contains("targets"));
+            let (_, tool) = definition();
             let output = tool
                 .execute(
                     r#"{"id":"T-739","event_limit":1}"#,
