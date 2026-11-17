@@ -1962,10 +1962,6 @@ where
             ),
         );
     }
-    if feature_config.orchestration.enabled {
-        feature_registry
-            .add_module(crate::feature::builtin::orchestration::orchestration_feature());
-    }
     if let Some(workspace_root) = local_workspace_root.as_ref() {
         let module = if let Some(cleanup) = worker.startup_feature_cleanup_handle() {
             crate::feature::mcp::discover_stdio_tool_feature_with_cleanup(

@@ -516,7 +516,6 @@ async fn chat_cross_subject_background_and_released_body_cannot_read_or_publish(
             display_name: "Ordinary chat permission holder".into(),
             singleton_key: None,
             profile: Some("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),

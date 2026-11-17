@@ -416,7 +416,6 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
             .is_some()
     );
     let context = WorkerSpawnCompensationContext {
-        assignment: None,
         spawned_workdir_ids: &[],
     };
     for _ in 0..2 {

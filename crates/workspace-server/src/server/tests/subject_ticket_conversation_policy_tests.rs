@@ -61,7 +61,7 @@ async fn conversation_only_policy_exposes_but_refuses_coder_delegation() {
             ticket::NewTicketEvent::new(ticket::TicketEventKind::Comment, "normal discussion"),
         )
         .unwrap();
-    let assigned = ok(&h,"PUT",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
+    let _assigned = ok(&h,"PUT",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
         json!({"operation_id":"conversation-only-assign","expected_assignment_id":null,"principal":{"kind":"subject","subject_id":subject}})).await;
     let conversation = ok(
         &h,
@@ -71,8 +71,8 @@ async fn conversation_only_policy_exposes_but_refuses_coder_delegation() {
     )
     .await;
     let input = json!({"subject":subject,"ticket":ticket,"deny":true,"content":"must not edit",
-        "spawn":{"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder","flow":null,
-            "orchestrator_assignment_id":assigned["assignment"]["assignment_id"],"initial_request":"must not execute",
+        "spawn":{"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
+            "operation_id":"conversation-only-denied-spawn","initial_submit":[],"workdir_attachments":[],
             "authorization":{"kind":"assignment","assignment":standalone_assignment("{}")}}});
     send(
         &h,

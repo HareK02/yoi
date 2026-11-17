@@ -51,6 +51,7 @@ async fn start_body_source(api: &mut WorkspaceApi, runtime_id: &str) -> StartSou
         &subject_id,
         &[
             "worker.create",
+            "worker.send_input",
             "worker.launch.assignment-read-only-start",
             "worker.launch.assignment-resource-free-start",
         ],
@@ -155,17 +156,13 @@ fn observed_start_delegation(
     })
 }
 
-fn start_worker_body(
-    ticket_id: Option<&str>,
-    attachments: Value,
-    delegation: Option<&str>,
-) -> Value {
+fn start_worker_body(attachments: Value) -> Value {
     let authorization = if attachments.as_array().unwrap().is_empty() {
         test_worker_operation_authorization(&[])
     } else {
         test_worker_operation_authorization(&[("filesystem", &["filesystem.read"])])
     };
-    let mut body = serde_json::json!({
+    serde_json::json!({
         "runtime_id": WorkdirlessFixtureRuntime::RUNTIME_ID,
         "display_name": "Partial investigation",
         "profile": "builtin:intake",
@@ -174,18 +171,90 @@ fn start_worker_body(
         "feature_connections": {},
         "control_operation_id": "partial-control-start",
         "authorization": authorization
-    });
-    if let Some(ticket_id) = ticket_id {
-        body["ticket_assignment"] = serde_json::json!({
-            "ticket_id": ticket_id,
-            "operation_id": "partial-start"
-        });
-        if let Some(delegation) = delegation {
-            body["ticket_assignment"]["orchestrator_assignment_id"] =
-                Value::String(delegation.into());
-        }
-    }
-    body
+    })
+}
+
+fn start_assignment_body(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    operation_id: &str,
+    delegation: Option<&str>,
+) -> Value {
+    // Claims name current connections from the authority, never spawn inputs or
+    // a cached fixture connection. Exact retries below retain the original body.
+    let workdir_bindings = api
+        .store
+        .list_worker_workdir_links(TEST_WORKSPACE_ID, worker)
+        .unwrap()
+        .into_iter()
+        .filter(|link| link.unlinked_at.is_none())
+        .map(|link| server_api::TicketWorkerAttachmentBinding {
+            alias: link.alias,
+            working_directory_id: link.workdir_id,
+            connection_id: link.connection_id,
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_value(server_api::SetTicketRoleAssignmentRequest {
+        operation_id: operation_id.into(),
+        principal: server_api::TicketAssignmentPrincipal::Worker {
+            runtime_id: worker.runtime_id.clone(),
+            worker_id: worker.worker_id.clone(),
+        },
+        orchestrator_assignment_id: delegation.map(str::to_owned),
+        expected_assignment_id: None,
+        workdir_bindings,
+    })
+    .unwrap()
+}
+
+async fn spawn_start_worker(
+    api: &WorkspaceApi,
+    source: Option<&StartSource>,
+    token: &str,
+    body: Value,
+) -> RuntimeWorkerRef {
+    assert_eq!(body["initial_submit"], serde_json::json!([]));
+    assert!(body.get("ticket_assignment").is_none());
+    assert!(body.get("ticket_role").is_none());
+    let path = if source.is_some() {
+        format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers")
+    } else {
+        format!("/api/w/{TEST_WORKSPACE_ID}/workers")
+    };
+    let created = start_http_response(
+        api,
+        start_http_request(source, token, "POST", &path, body),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(created["worker"]["profile"], "builtin:intake");
+    RuntimeWorkerRef::new(
+        WorkdirlessFixtureRuntime::RUNTIME_ID,
+        created["worker_id"].as_str().unwrap(),
+    )
+}
+
+// Existing owner-created fixture candidates need explicit Worker control too;
+// Ticket delegation alone is not authority over an arbitrary existing Worker.
+fn grant_start_candidate_control(
+    api: &WorkspaceApi,
+    source: &StartSource,
+    worker: &RuntimeWorkerRef,
+) {
+    api.store
+        .create_worker_control_grant(&WorkerControlGrantRecord {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            grant_id: format!("claim-control-{}", worker.worker_id),
+            controller: source.worker.clone(),
+            subject: worker.clone(),
+            relation: "spawned".into(),
+            origin: "test".into(),
+            permissions: vec!["send_input".into()],
+            operation_id: format!("claim-control-{}", worker.worker_id),
+            created_at: now_registry_timestamp(),
+            revoked_at: None,
+        })
+        .unwrap();
 }
 
 fn assert_start_dependency_diagnostic_only(api: &WorkspaceApi, ticket: &str, dependency: &str) {
@@ -201,184 +270,306 @@ fn assert_start_dependency_diagnostic_only(api: &WorkspaceApi, ticket: &str, dep
 }
 
 #[tokio::test]
-async fn ticket_start_rechecks_changed_target_after_allocation_before_runtime_dispatch() {
-    for change in ["access='read_only'", "ref_selector='different-branch'"] {
+async fn ticket_assignment_rechecks_changed_target_at_admission_and_finalization() {
+    for (phase, change) in [
+        ("admission", "remove_repository"),
+        ("finalization", "access='read_only'"),
+        ("finalization", "ref_selector='different-branch'"),
+    ] {
         let fixture = guarded_spawn_fixture().await;
-        let conn = rusqlite::Connection::open(&fixture.api.config.database_path).unwrap();
-        // Deterministic interleaving at a real persistence boundary: the initial
-        // target check has finished, but no Runtime spawn has been dispatched.
-        conn.execute_batch(&format!(
-            "CREATE TRIGGER narrow_target_after_allocation AFTER INSERT ON worker_create_reservations
-             WHEN NEW.runtime_id='workdirless-runtime'
-             BEGIN UPDATE typed_ticket_targets SET {change}
-               WHERE ticket_id='{}' AND repository_key='test-repository'; END;",
-            fixture.ticket_id,
-        )).unwrap();
-        let body = guarded_spawn_payload(&fixture, "target-changed-before-dispatch");
-        let response = post_guarded_spawn(&fixture, body).await;
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let api = &fixture.api;
+        // Selector values are provenance, not attachment eligibility. Target
+        // edits during a claim still participate in its current-content fence.
+        browser_ticket_backend(api)
+            .unwrap()
+            .edit_item(
+                fixture.ticket_id.clone().into(),
+                ticket::TicketItemEdit {
+                    targets: Some(ticket::TicketTargetsEdit::Set {
+                        targets: vec![
+                            test_ticket_target(
+                                "test-repository",
+                                "HEAD",
+                                TicketTargetAccess::ReadWrite,
+                            ),
+                            test_ticket_target("docs", "HEAD", TicketTargetAccess::ReadOnly),
+                        ],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let token = seed_test_workspace_owner_token(api.store.as_ref(), "target-guard-owner").await;
+        let worker = spawn_start_worker(
+            api,
+            None,
+            &token,
+            start_worker_body(serde_json::json!([
+                {"alias": "checkout", "working_directory_id": fixture.workdir_id},
+                {"alias": "docs", "working_directory_id": fixture.read_only_workdir_id}
+            ])),
+        )
+        .await;
+        // Ordinary spawn does not inspect or claim Ticket work. The claim names
+        // its live connections, with no initial work submitted.
         assert!(
-            matches!(status, StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST),
-            "{change}: {status}: {}",
-            String::from_utf8_lossy(&bytes)
-        );
-        assert!(
-            fixture.runtime.spawn_requests().is_empty(),
-            "{change}: no Runtime effect"
-        );
-        assert!(
-            fixture
-                .api
-                .store
-                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id,)
+            api.store
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
                 .unwrap()
                 .is_none()
+        );
+        // Prepare an already-narrowed candidate so claim finalization needs no
+        // stop/rebind/restore. Ordinary spawn no longer narrows by Ticket targets.
+        let mut links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+            .unwrap();
+        assert_eq!(links.len(), 2);
+        for link in &mut links {
+            link.capabilities = workdir::WorkdirSessionCapabilities::READ_ONLY;
+        }
+        api.store
+            .replace_worker_workdir_link_capabilities(TEST_WORKSPACE_ID, &worker, &links)
+            .unwrap();
+        sync_runtime_worker_workdir_attachments(api, &worker).unwrap();
+        let body = start_assignment_body(api, &worker, "target-changed-claim", None);
+        let attachments = fixture.runtime.logical_attachments(&worker.worker_id);
+        let spawns = fixture.runtime.spawn_requests().len();
+        let restores = *fixture.runtime.restore_attempts.lock().unwrap();
+        let mut runtime = fixture.runtime.clone();
+        runtime.stop_callback = Some(Arc::new(|| {
+            panic!("target guard must reject before stopping the Worker")
+        }));
+        api.runtime.register_or_replace(runtime);
+        let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+        if phase == "admission" {
+            conn.execute_batch(&format!(
+                "DELETE FROM typed_ticket_targets
+                 WHERE ticket_id='{}' AND repository_key='test-repository';",
+                fixture.ticket_id,
+            ))
+            .unwrap();
+        } else {
+            // Interleave after resource validation and claim admission, before
+            // unchanged-binding finalization; no Runtime mutation is needed.
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER change_target_after_claim AFTER INSERT ON ticket_assignment_operations
+                 WHEN NEW.operation_id='target-changed-claim'
+                 BEGIN UPDATE typed_ticket_targets SET {change}
+                   WHERE ticket_id='{}' AND repository_key='test-repository'; END;",
+                fixture.ticket_id,
+            )).unwrap();
+        }
+        let path = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
+            fixture.ticket_id
+        );
+        let denied = start_http_response(
+            api,
+            start_http_request(None, &token, "PUT", &path, body),
+            if phase == "admission" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::CONFLICT
+            },
+        )
+        .await;
+        let message = denied["message"].as_str().unwrap();
+        assert!(
+            if phase == "admission" {
+                message.contains("undeclared Repository")
+            } else {
+                message.contains("changed")
+            },
+            "{phase}: {change}: {denied}"
+        );
+        assert!(
+            api.store
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_none()
+        );
+        let operation = api
+            .store
+            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "target-changed-claim")
+            .unwrap();
+        if phase == "admission" {
+            assert!(operation.is_none());
+        } else {
+            let operation = operation.unwrap();
+            assert_eq!(operation.claim_state, "failed");
+            assert!(operation.assignment_id.is_none());
+        }
+        assert_eq!(fixture.runtime.spawn_requests().len(), spawns);
+        assert_eq!(*fixture.runtime.restore_attempts.lock().unwrap(), restores);
+        assert!(fixture.runtime.input_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+                .unwrap(),
+            links
+        );
+        assert_eq!(api.runtime.worker(&worker).unwrap().state, "idle");
+        assert_eq!(
+            fixture.runtime.logical_attachments(&worker.worker_id),
+            attachments
         );
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM worker_workdir_attachment_reservations",
                 [],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-            0,
-            "failed admission must release newly reserved attachments"
+            0
         );
     }
 }
 
 #[tokio::test]
-async fn unfinished_dependencies_allow_manual_and_orchestrator_resource_free_start_and_assign() {
+async fn unfinished_dependencies_allow_manual_and_orchestrator_resource_free_spawn_then_assign() {
     for orchestrator in [false, true] {
-        for existing in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut api = test_api(directory.path()).await;
-            register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
-            let runtime = WorkdirlessFixtureRuntime::default();
-            api.runtime.register_or_replace(runtime.clone());
-            let source = if orchestrator {
-                Some(start_source(&mut api, &runtime).await)
-            } else {
-                None
-            };
-            let token =
-                seed_test_workspace_owner_token(api.store.as_ref(), "partial-start-owner").await;
-            let ticket = browser_ticket_backend(&api)
-                .unwrap()
-                .create(ticket::NewTicket::new(
-                    "Partial resource-free investigation",
-                ))
-                .unwrap();
-            let dependency = add_unfinished_start_dependency(&api, &ticket.id);
-            if orchestrator {
-                assign_test_orchestrator(&api, &ticket.id);
-            }
-            let delegation = observed_start_delegation(&api, &ticket.id, source.as_ref());
-            assert!(
-                browser_ticket_detail(&api, &ticket.id)
-                    .unwrap()
-                    .0
-                    .action_eligibility
-                    .can_start_manual_worker
-            );
-            let create_path = if orchestrator {
-                format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers")
-            } else {
-                format!("/api/w/{TEST_WORKSPACE_ID}/workers")
-            };
-            let created = start_http_response(
-                &api,
-                start_http_request(
-                    source.as_ref(),
-                    &token,
-                    "POST",
-                    &create_path,
-                    start_worker_body(
-                        (!existing).then_some(ticket.id.as_str()),
-                        serde_json::json!([]),
-                        delegation.as_deref(),
-                    ),
-                ),
-                StatusCode::OK,
-            )
-            .await;
-            let worker_id = created["worker_id"].as_str().unwrap();
-            assert_eq!(created["worker"]["profile"], "builtin:intake");
-            if existing {
-                let path = format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
-                    ticket.id
-                );
-                let mut body = serde_json::json!({
-                    "operation_id": "partial-existing-assign",
-                    "principal": {
-                        "kind": "worker",
-                        "runtime_id": WorkdirlessFixtureRuntime::RUNTIME_ID,
-                        "worker_id": worker_id
-                    },
-                    "workdir_bindings": []
-                });
-                if let Some(delegation) = &delegation {
-                    body["orchestrator_assignment_id"] = Value::String(delegation.clone());
-                }
-                let assigned = start_http_response(
-                    &api,
-                    start_http_request(source.as_ref(), &token, "PUT", &path, body.clone()),
-                    StatusCode::OK,
-                )
-                .await;
-                let replay = start_http_response(
-                    &api,
-                    start_http_request(source.as_ref(), &token, "PUT", &path, body),
-                    StatusCode::OK,
-                )
-                .await;
-                assert_eq!(assigned, replay);
-            }
-            let worker = RuntimeWorkerRef::new(WorkdirlessFixtureRuntime::RUNTIME_ID, worker_id);
-            assert!(
-                api.store
-                    .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_start_dependency_diagnostic_only(&api, &ticket.id, &dependency);
-            // Partial work never permits a second unfinished Worker.
-            let mut competing = start_worker_body(
-                Some(&ticket.id),
-                serde_json::json!([]),
-                delegation.as_deref(),
-            );
-            competing["ticket_assignment"]["operation_id"] =
-                Value::String("competing-start".into());
-            competing["control_operation_id"] = Value::String("competing-control-start".into());
-            let spawn_count = runtime.spawn_requests().len();
-            start_http_response(
-                &api,
-                start_http_request(source.as_ref(), &token, "POST", &create_path, competing),
-                StatusCode::CONFLICT,
-            )
-            .await;
-            assert_eq!(runtime.spawn_requests().len(), spawn_count);
-            if !orchestrator {
-                assert!(
-                    api.store
-                        .get_current_ticket_role_assignment(
-                            TEST_WORKSPACE_ID,
-                            &ticket.id,
-                            TicketAssignmentRole::Orchestrator
-                        )
-                        .unwrap()
-                        .is_none()
-                );
-            }
+        let directory = tempfile::tempdir().unwrap();
+        let mut api = test_api(directory.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime.register_or_replace(runtime.clone());
+        let source = if orchestrator {
+            Some(start_source(&mut api, &runtime).await)
+        } else {
+            None
+        };
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "partial-start-owner").await;
+        let ticket = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new(
+                "Partial resource-free investigation",
+            ))
+            .unwrap();
+        let dependency = add_unfinished_start_dependency(&api, &ticket.id);
+        if orchestrator {
+            assign_test_orchestrator(&api, &ticket.id);
         }
+        let subject_assignment = api
+            .store
+            .get_current_ticket_role_assignment(
+                TEST_WORKSPACE_ID,
+                &ticket.id,
+                TicketAssignmentRole::Orchestrator,
+            )
+            .unwrap();
+        if let Some(assignment) = &subject_assignment {
+            assert_eq!(
+                assignment.principal,
+                TicketAssignmentPrincipal::Subject {
+                    subject_id: ensure_test_assignment_subject(&api)
+                }
+            );
+        }
+        let delegation = observed_start_delegation(&api, &ticket.id, source.as_ref());
+        assert!(
+            browser_ticket_detail(&api, &ticket.id)
+                .unwrap()
+                .0
+                .action_eligibility
+                .can_start_manual_worker
+        );
+        let worker = spawn_start_worker(
+            &api,
+            source.as_ref(),
+            &token,
+            start_worker_body(serde_json::json!([])),
+        )
+        .await;
+        assert!(
+            api.store
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+                .unwrap()
+                .is_none()
+        );
+        let path = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
+            ticket.id
+        );
+        let body = start_assignment_body(
+            &api,
+            &worker,
+            "partial-existing-assign",
+            delegation.as_deref(),
+        );
+        let assigned = start_http_response(
+            &api,
+            start_http_request(source.as_ref(), &token, "PUT", &path, body.clone()),
+            StatusCode::OK,
+        )
+        .await;
+        let replay = start_http_response(
+            &api,
+            start_http_request(source.as_ref(), &token, "PUT", &path, body),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(assigned, replay);
+        let assignment = api
+            .store
+            .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.worker, worker);
+        assert_eq!(
+            api.store
+                .get_current_ticket_role_assignment(
+                    TEST_WORKSPACE_ID,
+                    &ticket.id,
+                    TicketAssignmentRole::Orchestrator
+                )
+                .unwrap(),
+            subject_assignment
+        );
+        assert!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_empty()
+        );
+        assert_start_dependency_diagnostic_only(&api, &ticket.id, &dependency);
+        // A competing ordinary spawn is valid; only its Ticket claim conflicts.
+        // Keep the created Worker addressable without dispatching any work.
+        let mut competing_body = start_worker_body(serde_json::json!([]));
+        competing_body["control_operation_id"] = Value::String("competing-control-start".into());
+        let competing = spawn_start_worker(&api, source.as_ref(), &token, competing_body).await;
+        let spawns = runtime.spawn_requests().len();
+        let claim =
+            start_assignment_body(&api, &competing, "competing-claim", delegation.as_deref());
+        start_http_response(
+            &api,
+            start_http_request(source.as_ref(), &token, "PUT", &path, claim),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(runtime.spawn_requests().len(), spawns);
+        assert_eq!(api.runtime.worker(&competing).unwrap().state, "idle");
+        assert!(
+            api.store
+                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "competing-claim")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            api.store
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+                .unwrap()
+                .unwrap()
+                .assignment_id,
+            assignment.assignment_id
+        );
+        assert!(runtime.input_requests.lock().unwrap().is_empty());
     }
 }
 
 #[tokio::test]
-async fn unfinished_dependencies_allow_read_only_start_and_assign_without_write_or_command_grants()
+async fn unfinished_dependencies_allow_read_only_spawn_then_assign_without_write_or_command_grants()
 {
     for orchestrator in [false, true] {
         for existing in [false, true] {
@@ -404,7 +595,7 @@ async fn unfinished_dependencies_allow_read_only_start_and_assign_without_write_
                         targets: Some(ticket::TicketTargetsEdit::Set {
                             targets: vec![test_ticket_target(
                                 "docs",
-                                "develop",
+                                if existing { "develop" } else { "HEAD" },
                                 TicketTargetAccess::ReadOnly,
                             )],
                         }),
@@ -438,28 +629,6 @@ async fn unfinished_dependencies_allow_read_only_start_and_assign_without_write_
                     )
                     .unwrap();
                 sync_runtime_worker_workdir_attachments(api, &fixture.worker).unwrap();
-                let mut body = serde_json::to_value(manual_worker_assignment_request(
-                    &fixture,
-                    "read-only-existing",
-                ))
-                .unwrap();
-                if let Some(delegation) = &delegation {
-                    body["orchestrator_assignment_id"] = Value::String(delegation.clone());
-                }
-                body["workdir_bindings"] = serde_json::json!([{
-                    "alias": "docs", "working_directory_id": fixture.docs_workdir_id,
-                    "connection_id": api.store.list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker).unwrap().into_iter().find(|link| link.workdir_id == fixture.docs_workdir_id && link.unlinked_at.is_none()).unwrap().connection_id
-                }]);
-                let path = format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
-                    fixture.ticket_id
-                );
-                start_http_response(
-                    api,
-                    start_http_request(source.as_ref(), &token, "PUT", &path, body),
-                    StatusCode::OK,
-                )
-                .await;
                 fixture.worker.clone()
             } else {
                 // This matrix tests read-only start, not sharing an occupied
@@ -483,30 +652,39 @@ async fn unfinished_dependencies_allow_read_only_start_and_assign_without_write_
                     )
                     .unwrap();
                 sync_runtime_worker_workdir_attachments(api, &fixture.worker).unwrap();
-                let path = if orchestrator {
-                    format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers")
-                } else {
-                    format!("/api/w/{TEST_WORKSPACE_ID}/workers")
-                };
-                let body = start_worker_body(
-                    Some(&fixture.ticket_id),
-                    serde_json::json!([{
-                        "alias": "docs", "working_directory_id": fixture.docs_workdir_id
-                    }]),
-                    delegation.as_deref(),
-                );
-                let created = start_http_response(
+                spawn_start_worker(
                     api,
-                    start_http_request(source.as_ref(), &token, "POST", &path, body),
-                    StatusCode::OK,
+                    source.as_ref(),
+                    &token,
+                    start_worker_body(serde_json::json!([{
+                        "alias": "docs", "working_directory_id": fixture.docs_workdir_id
+                    }])),
                 )
-                .await;
-                assert_eq!(created["worker"]["profile"], "builtin:intake");
-                RuntimeWorkerRef::new(
-                    WorkdirlessFixtureRuntime::RUNTIME_ID,
-                    created["worker_id"].as_str().unwrap(),
-                )
+                .await
             };
+            // Both an existing fixture Worker and an ordinary newly spawned
+            // Worker are claimed through the same existing-Worker PUT contract.
+            assert!(
+                api.store
+                    .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let path = format!(
+                "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
+                fixture.ticket_id
+            );
+            if existing && let Some(source) = &source {
+                grant_start_candidate_control(api, source, &worker);
+            }
+            let body =
+                start_assignment_body(api, &worker, "read-only-existing", delegation.as_deref());
+            start_http_response(
+                api,
+                start_http_request(source.as_ref(), &token, "PUT", &path, body),
+                StatusCode::OK,
+            )
+            .await;
             let links = api
                 .store
                 .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
@@ -520,26 +698,24 @@ async fn unfinished_dependencies_allow_read_only_start_and_assign_without_write_
                 links[0].capabilities,
                 workdir::WorkdirSessionCapabilities::READ_ONLY
             );
-            if existing {
-                let attachments = fixture.runtime.logical_attachments(&worker.worker_id);
-                assert_eq!(attachments.len(), 1);
-                assert_eq!(
-                    attachments[0].capabilities,
-                    workdir::WorkdirSessionCapabilities::READ_ONLY
-                );
-            } else {
-                // This adapter records spawn inputs separately from the
-                // replacement-attachment calls used by existing-Worker assign.
+            // Assignment, not spawn, enforces the Ticket reference ceiling on
+            // both the persisted links and the live Runtime attachment set.
+            let attachments = fixture.runtime.logical_attachments(&worker.worker_id);
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].working_directory_id, fixture.docs_workdir_id);
+            assert_eq!(
+                attachments[0].capabilities,
+                workdir::WorkdirSessionCapabilities::READ_ONLY
+            );
+            assert!(fixture.runtime.input_requests.lock().unwrap().is_empty());
+            if !existing {
                 let request = fixture.runtime.spawn_requests().last().unwrap().clone();
                 assert_eq!(request.resolved_workdir_attachments.len(), 1);
                 assert_eq!(
                     request.resolved_workdir_attachments[0].working_directory_id,
                     fixture.docs_workdir_id
                 );
-                assert_eq!(
-                    request.resolved_workdir_attachments[0].capabilities,
-                    workdir::WorkdirSessionCapabilities::READ_ONLY
-                );
+                assert!(request.initial_submit.is_empty());
             }
             assert_start_dependency_diagnostic_only(api, &fixture.ticket_id, &dependency);
         }
@@ -556,8 +732,7 @@ async fn unfinished_dependencies_do_not_bypass_http_auth_closed_or_resource_bind
         "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
         fixture.ticket_id
     );
-    let valid =
-        serde_json::to_value(manual_worker_assignment_request(&fixture, "guarded-assign")).unwrap();
+    let valid = start_assignment_body(api, &fixture.worker, "guarded-assign", None);
     let denied = start_http_response(
         api,
         start_http_request(None, "invalid-token", "PUT", &path, valid.clone()),
@@ -604,8 +779,8 @@ async fn unfinished_dependencies_do_not_bypass_http_auth_closed_or_resource_bind
 }
 
 #[tokio::test]
-async fn orchestrator_start_and_assign_reject_missing_stale_cleared_or_reissued_delegation() {
-    for existing in [false, true] {
+async fn orchestrator_assignment_rejects_missing_stale_cleared_or_reissued_delegation() {
+    for owner_spawned in [false, true] {
         for invalidation in ["missing", "stale", "clear", "reissue"] {
             let directory = tempfile::tempdir().unwrap();
             let mut api = test_api(directory.path()).await;
@@ -617,28 +792,20 @@ async fn orchestrator_start_and_assign_reject_missing_stale_cleared_or_reissued_
                 seed_test_workspace_owner_token(api.store.as_ref(), "delegation-owner").await;
             let ticket = browser_ticket_backend(&api)
                 .unwrap()
-                .create(ticket::NewTicket::new("Observed delegation start"))
+                .create(ticket::NewTicket::new("Observed delegation claim"))
                 .unwrap();
             assign_test_orchestrator(&api, &ticket.id);
             let observed = observed_start_delegation(&api, &ticket.id, Some(&source)).unwrap();
-            let worker = if existing {
-                Some(
-                    start_http_response(
-                        &api,
-                        start_http_request(
-                            None,
-                            &token,
-                            "POST",
-                            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
-                            start_worker_body(None, serde_json::json!([]), None),
-                        ),
-                        StatusCode::OK,
-                    )
-                    .await,
-                )
-            } else {
-                None
-            };
+            let worker = spawn_start_worker(
+                &api,
+                if owner_spawned { None } else { Some(&source) },
+                &token,
+                start_worker_body(serde_json::json!([])),
+            )
+            .await;
+            if owner_spawned {
+                grant_start_candidate_control(&api, &source, &worker);
+            }
             if matches!(invalidation, "clear" | "reissue") {
                 let clear = format!(
                     "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/orchestrator?assignment_id={observed}&operation_id=clear-observed",
@@ -663,39 +830,29 @@ async fn orchestrator_start_and_assign_reject_missing_stale_cleared_or_reissued_
                     );
                 }
             }
+            let subject_assignment = api
+                .store
+                .get_current_ticket_role_assignment(
+                    TEST_WORKSPACE_ID,
+                    &ticket.id,
+                    TicketAssignmentRole::Orchestrator,
+                )
+                .unwrap();
             let submitted = match invalidation {
                 "missing" => None,
                 "stale" => Some("unrelated-assignment"),
                 _ => Some(observed.as_str()),
             };
-            let (method, path, body) = if let Some(worker) = worker {
-                let mut body = serde_json::json!({
-                    "operation_id":"invalid-existing-start",
-                    "principal":{"kind":"worker", "runtime_id":WorkdirlessFixtureRuntime::RUNTIME_ID, "worker_id":worker["worker_id"]},
-                    "workdir_bindings":[]
-                });
-                if let Some(submitted) = submitted {
-                    body["orchestrator_assignment_id"] = Value::String(submitted.into());
-                }
-                (
-                    "PUT",
-                    format!(
-                        "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
-                        ticket.id
-                    ),
-                    body,
-                )
-            } else {
-                (
-                    "POST",
-                    format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
-                    start_worker_body(Some(&ticket.id), serde_json::json!([]), submitted),
-                )
-            };
+            let body = start_assignment_body(&api, &worker, "invalid-existing-claim", submitted);
+            let path = format!(
+                "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
+                ticket.id
+            );
             let spawns = runtime.spawn_requests().len();
+            let inputs = runtime.input_requests.lock().unwrap().len();
             let denied = start_http_response(
                 &api,
-                start_http_request(Some(&source), &token, method, &path, body),
+                start_http_request(Some(&source), &token, "PUT", &path, body),
                 StatusCode::CONFLICT,
             )
             .await;
@@ -705,30 +862,37 @@ async fn orchestrator_start_and_assign_reject_missing_stale_cleared_or_reissued_
                 "{invalidation}: {denied}"
             );
             assert_eq!(runtime.spawn_requests().len(), spawns);
+            assert_eq!(api.runtime.worker(&worker).unwrap().state, "idle");
+            assert_eq!(runtime.input_requests.lock().unwrap().len(), inputs);
             assert!(
                 api.store
                     .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
                     .unwrap()
                     .is_none()
             );
-            let operation = if existing {
-                "invalid-existing-start"
-            } else {
-                "partial-start"
-            };
             assert!(
                 api.store
-                    .get_ticket_assignment_operation(TEST_WORKSPACE_ID, operation)
+                    .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "invalid-existing-claim")
                     .unwrap()
                     .is_none()
+            );
+            assert_eq!(
+                api.store
+                    .get_current_ticket_role_assignment(
+                        TEST_WORKSPACE_ID,
+                        &ticket.id,
+                        TicketAssignmentRole::Orchestrator
+                    )
+                    .unwrap(),
+                subject_assignment
             );
         }
     }
 }
 
 #[tokio::test]
-async fn replaced_orchestrator_cannot_start_or_assign_under_retained_current_delegation() {
-    for existing in [false, true] {
+async fn replaced_subject_body_cannot_assign_under_retained_current_delegation() {
+    for owner_spawned in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let (mut api, _) = assignment_test_api_with_recording_backend(directory.path()).await;
         register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
@@ -746,24 +910,24 @@ async fn replaced_orchestrator_cannot_start_or_assign_under_retained_current_del
             .unwrap();
         assign_test_orchestrator(&api, &ticket.id);
         let delegation = observed_start_delegation(&api, &ticket.id, Some(&source)).unwrap();
-        let worker = if existing {
-            Some(
-                start_http_response(
-                    &api,
-                    start_http_request(
-                        None,
-                        &token,
-                        "POST",
-                        &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
-                        start_worker_body(None, serde_json::json!([]), None),
-                    ),
-                    StatusCode::OK,
-                )
-                .await,
+        let subject_assignment = api
+            .store
+            .get_current_ticket_role_assignment(
+                TEST_WORKSPACE_ID,
+                &ticket.id,
+                TicketAssignmentRole::Orchestrator,
             )
-        } else {
-            None
-        };
+            .unwrap();
+        let worker = spawn_start_worker(
+            &api,
+            if owner_spawned { None } else { Some(&source) },
+            &token,
+            start_worker_body(serde_json::json!([])),
+        )
+        .await;
+        if owner_spawned {
+            grant_start_candidate_control(&api, &source, &worker);
+        }
         // Body replacement preserves Subject assignment, but rotates the real
         // create reservation/singleton generation through normal Subject launch.
         remove_test_assignment_body(&api, &source.worker).await;
@@ -778,42 +942,46 @@ async fn replaced_orchestrator_cannot_start_or_assign_under_retained_current_del
             observed_start_delegation(&api, &ticket.id, Some(&source)).unwrap(),
             delegation
         );
-        let (method, path, body) = if let Some(worker) = worker {
-            (
-                "PUT",
-                format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
-                    ticket.id
-                ),
-                serde_json::json!({
-                    "operation_id":"obsolete-existing-start", "orchestrator_assignment_id":delegation,
-                    "principal":{"kind":"worker", "runtime_id":WorkdirlessFixtureRuntime::RUNTIME_ID, "worker_id":worker["worker_id"]},
-                    "workdir_bindings":[]
-                }),
-            )
-        } else {
-            (
-                "POST",
-                format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
-                start_worker_body(Some(&ticket.id), serde_json::json!([]), Some(&delegation)),
-            )
-        };
+        let path = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
+            ticket.id
+        );
+        let body =
+            start_assignment_body(&api, &worker, "obsolete-existing-claim", Some(&delegation));
         let spawns = runtime.spawn_requests().len();
         let denied = start_http_response(
             &api,
-            start_http_request(Some(&source), &token, method, &path, body),
-            // The authenticated Worker-source middleware fences the replaced
-            // singleton before the start/assign handler is admitted.
+            start_http_request(Some(&source), &token, "PUT", &path, body),
+            // Authenticated Worker-source middleware fences the replaced body
+            // before the assignment handler is admitted.
             StatusCode::UNAUTHORIZED,
         )
         .await;
         assert!(denied["message"].is_string());
         assert_eq!(runtime.spawn_requests().len(), spawns);
+        assert_eq!(api.runtime.worker(&worker).unwrap().state, "idle");
+        assert!(runtime.input_requests.lock().unwrap().is_empty());
         assert!(
             api.store
                 .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            api.store
+                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "obsolete-existing-claim")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            api.store
+                .get_current_ticket_role_assignment(
+                    TEST_WORKSPACE_ID,
+                    &ticket.id,
+                    TicketAssignmentRole::Orchestrator
+                )
+                .unwrap(),
+            subject_assignment
         );
     }
 }

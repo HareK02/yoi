@@ -24286,7 +24286,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             profile: worker_runtime::catalog::ProfileSelector::Builtin(
                 "builtin:companion".to_string(),
             ),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),

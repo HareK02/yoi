@@ -12,7 +12,6 @@ async fn operation_controller(api: &WorkspaceApi) -> RuntimeWorkerRef {
             display_name: "Control admission fixture".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),

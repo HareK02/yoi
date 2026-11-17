@@ -159,7 +159,6 @@ fn request_from_selection(selection: Selection) -> BackendCreateWorkerRequest {
         profile: Some(selection.profile),
         initial_submit: Vec::new(),
         workdir_attachments: Vec::new(),
-        ticket_assignment: None,
         feature_connections: Default::default(),
         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
         authorization: client::BackendWorkerCreationAuthorization::Assignment { assignment: None },
@@ -474,6 +473,5 @@ mod tests {
         assert_eq!(request.profile.as_deref(), Some("builtin:coder"));
         assert!(request.initial_submit.is_empty());
         assert!(request.workdir_attachments.is_empty());
-        assert!(request.ticket_assignment.is_none());
     }
 }

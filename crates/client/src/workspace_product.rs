@@ -590,7 +590,6 @@ impl BackendWorkspaceProductClient {
             display_name: format!("intake-{ticket_id}"),
             singleton_key: None,
             profile: Some("builtin:intake".to_string()),
-            ticket_assignment: None,
             initial_submit: vec![protocol::Segment::Text {
                 content: format!("Please handle intake for Ticket {ticket_id}."),
             }],

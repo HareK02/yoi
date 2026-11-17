@@ -6,7 +6,9 @@ use assignment_tracking::authorization_tests::{AuthorizedClient, ticket};
 async fn public_operations_require_exact_ticket_grants_on_tool_and_wip() {
     for (kind, input, response) in cases() {
         let operation = match kind {
-            PublicAssignmentKind::Assign => "ticket.assignment.assign",
+            PublicAssignmentKind::WorkerAssign | PublicAssignmentKind::Assign => {
+                "ticket.assignment.assign"
+            }
             PublicAssignmentKind::Clear => "ticket.assignment.clear",
             PublicAssignmentKind::Assignments => "ticket.assignment.query",
             PublicAssignmentKind::Diagnostics => "ticket.assignment.diagnostics",

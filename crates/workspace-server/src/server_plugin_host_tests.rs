@@ -304,7 +304,6 @@ impl Fixture {
                 display_name: "Plugin Subject body".into(),
                 singleton_key: None,
                 profile: Some(PROFILE.into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

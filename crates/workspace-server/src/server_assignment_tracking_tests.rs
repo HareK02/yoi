@@ -54,7 +54,6 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
                 display_name: "Coder candidate".into(),
                 singleton_key: None,
                 profile: Some("builtin:coder".into()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),

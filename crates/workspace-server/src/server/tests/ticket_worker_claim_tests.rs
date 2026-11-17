@@ -68,7 +68,7 @@ async fn explicit_existing_worker_claim_accepts_no_resources_and_preserves_assig
         ticket::ticket_content_digest(&after),
         ticket::ticket_content_digest(&before)
     );
-    assert_eq!(*fixture.runtime.restore_attempts.lock().unwrap(), 1);
+    assert_eq!(*fixture.runtime.restore_attempts.lock().unwrap(), 0);
     assert!(
         fixture
             .runtime
@@ -424,7 +424,21 @@ async fn pending_manual_worker_claim_without_pinned_intent_rejects_replay_withou
 }
 
 #[tokio::test]
-async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits_without_input() {
+async fn pending_manual_worker_claim_reconciles_read_only_rebind_and_commits_without_input() {
+    claim_restore_recovery_scenario(false, false).await;
+}
+
+#[tokio::test]
+async fn legacy_equal_binding_pending_claim_reconciles_pinned_restore_before_assignment() {
+    claim_restore_recovery_scenario(true, false).await;
+}
+
+#[tokio::test]
+async fn legacy_equal_binding_pending_claim_without_pinned_restore_stays_unresolved() {
+    claim_restore_recovery_scenario(true, true).await;
+}
+
+async fn claim_restore_recovery_scenario(legacy_equal_binding: bool, missing_intent: bool) {
     let workspace = tempfile::tempdir().unwrap();
     let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
     execution.accept_restores();
@@ -435,18 +449,58 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
             .unwrap()
             .is_empty()
     );
-    let backend = browser_ticket_backend(&api).unwrap();
-    let input = ticket::NewTicket::new("Manual investigation without resources");
-    let ticket_id = backend.create(input).unwrap().id;
-    backend
-        .edit_item(
-            ticket_id.clone().into(),
-            TicketItemEdit {
-                targets: Some(TicketTargetsEdit::Clear),
-                ..Default::default()
+    let workdir_id = "claim-reconciliation-workdir".to_string();
+    let now = now_registry_timestamp();
+    api.store
+        .upsert_workdir_registry(&WorkdirRegistryRecord {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            workdir_id: workdir_id.clone(),
+            display_name: None,
+            source: WorkdirRegistrySource::Repository {
+                runtime_id: worker.runtime_id.clone(),
+                repository_id: test_repository_id(&api),
             },
-        )
+            creation_selector: Some("develop".into()),
+            creation_ref: None,
+            creation_tree: None,
+            current_selector: Some("develop".into()),
+            current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
+            materialization_status: "present".into(),
+            cleanliness: "clean".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
         .unwrap();
+    api.store
+        .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            worker: worker.clone(),
+            workdir_id: workdir_id.clone(),
+            alias: "checkout".into(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+            linked_at: now,
+            unlinked_at: None,
+        })
+        .unwrap();
+    sync_runtime_worker_workdir_attachments(&api, &worker).unwrap();
+    let original_link = api
+        .store
+        .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+        .unwrap()
+        .into_iter()
+        .find(|link| link.unlinked_at.is_none())
+        .unwrap();
+    let backend = browser_ticket_backend(&api).unwrap();
+    let mut input = ticket::NewTicket::new("Manual read-only investigation");
+    input.targets = vec![test_ticket_target(
+        "test-repository",
+        "develop",
+        TicketTargetAccess::ReadOnly,
+    )];
+    let ticket_id = backend.create(input).unwrap().id;
     let admitted_content_digest = api.authority.ticket(&ticket_id).unwrap().content_digest;
     let request = server_api::SetTicketRoleAssignmentRequest {
         orchestrator_assignment_id: None,
@@ -456,7 +510,11 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
             worker_id: worker.worker_id.clone(),
         },
         expected_assignment_id: None,
-        workdir_bindings: Vec::new(),
+        workdir_bindings: vec![server_api::TicketWorkerAttachmentBinding {
+            alias: original_link.alias.clone(),
+            working_directory_id: original_link.workdir_id.clone(),
+            connection_id: original_link.connection_id.clone(),
+        }],
     };
     let submit_claim = || {
         scoped_set_ticket_assignment(
@@ -508,10 +566,43 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
         .get_ticket_claim_recovery(TEST_WORKSPACE_ID, &request.operation_id)
         .unwrap()
         .unwrap();
+    if legacy_equal_binding {
+        // Recreate the old persisted receipt shape after an unknown restore:
+        // equal binding snapshots carry no proof that Runtime effects never ran.
+        // Only this isolated fixture DB is rewritten; keep the fingerprint,
+        // pending operation and exact issued restore intent from production.
+        let legacy = serde_json::json!({
+            "content_digest": recovery.content_digest,
+            "selected": recovery.selected,
+            "original_links": recovery.effective_links,
+            "effective_links": recovery.effective_links,
+        });
+        api.config_store.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE ticket_assignment_operations SET binding_recovery_json=?3 WHERE workspace_id=?1 AND operation_id=?2",
+                rusqlite::params![TEST_WORKSPACE_ID, request.operation_id, legacy.to_string()],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        }).unwrap();
+    }
+    let recovery = api
+        .config_store
+        .get_ticket_claim_recovery(TEST_WORKSPACE_ID, &request.operation_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(recovery.content_digest, admitted_content_digest);
-    assert!(recovery.selected.is_empty());
-    assert!(recovery.original_links.is_empty());
-    assert!(recovery.effective_links.is_empty());
+    assert_eq!(recovery.selected, request.workdir_bindings);
+    let mut expected_original = original_link;
+    if legacy_equal_binding {
+        expected_original.capabilities = workdir::WorkdirSessionCapabilities::READ_ONLY;
+    }
+    assert_eq!(recovery.original_links, vec![expected_original]);
+    assert_eq!(recovery.effective_links.len(), 1);
+    assert_eq!(
+        recovery.effective_links[0].capabilities,
+        workdir::WorkdirSessionCapabilities::READ_ONLY
+    );
     let request_id = format!("manual-worker-restore:{}", request.operation_id);
     let pinned = api
         .config_store
@@ -519,6 +610,39 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
         .unwrap()
         .unwrap();
     assert_eq!(pinned.request_id, request_id);
+    if missing_intent {
+        api.config_store.with_conn(|conn| {
+            let deleted = conn.execute(
+                "DELETE FROM worker_restore_intents WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND request_id=?4",
+                rusqlite::params![TEST_WORKSPACE_ID, worker.runtime_id, worker.worker_id, request_id],
+            )?;
+            assert_eq!(deleted, 1);
+            Ok(())
+        }).unwrap();
+        let response = submit_claim().await.unwrap_err().into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("no pinned restore intent"));
+        let retained = api
+            .store
+            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, &request.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.claim_state, "pending");
+        assert!(retained.assignment_id.is_none());
+        assert_eq!(retained.request_fingerprint, pending.request_fingerprint);
+        assert_eq!(execution.restore_operations.lock().unwrap().len(), 1);
+        assert!(execution.reconcile_operations.lock().unwrap().is_empty());
+        assert_eq!(
+            api.config_store
+                .get_ticket_claim_recovery(TEST_WORKSPACE_ID, &request.operation_id)
+                .unwrap()
+                .unwrap(),
+            recovery
+        );
+        return;
+    }
+
     let original = execution.restore_operations.lock().unwrap()[0];
     assert_eq!(
         execution.restore_operations.lock().unwrap().as_slice(),
@@ -613,11 +737,18 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
             .unwrap(),
         recovery
     );
-    assert!(
-        api.store
-            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
-            .unwrap()
-            .is_empty()
+    let active_links = api
+        .store
+        .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+        .unwrap()
+        .into_iter()
+        .filter(|link| link.unlinked_at.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(active_links.len(), 1);
+    assert_eq!(active_links[0].workdir_id, workdir_id);
+    assert_eq!(
+        active_links[0].capabilities,
+        workdir::WorkdirSessionCapabilities::READ_ONLY
     );
     // The executor logs reconcile_restore in restore_operations as well. There is
     // exactly one fresh dispatch; both subsequent entries reconcile its same id.

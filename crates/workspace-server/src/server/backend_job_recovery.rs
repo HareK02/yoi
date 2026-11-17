@@ -1402,7 +1402,6 @@ impl WorkspaceApi {
                 expected_segments: 0,
             },
             profile,
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),

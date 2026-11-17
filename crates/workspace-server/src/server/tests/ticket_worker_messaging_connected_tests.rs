@@ -209,7 +209,7 @@ impl agen::llm_client::LlmClient for LegacyScopeModel {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn public_ticket_spawn_refuses_legacy_scoped_authority_without_broadening_or_allocating() {
+async fn public_worker_spawn_refuses_legacy_scoped_authority_without_broadening_or_allocating() {
     // New key-only delegation cannot preserve old Ticket/path restrictions.
     // Current positive two-Subject execution and MR flows live in the child modules;
     // this retained-policy case must refuse rather than reintroduce scoped issuance.
@@ -222,15 +222,7 @@ async fn public_ticket_spawn_refuses_legacy_scoped_authority_without_broadening_
         .create_subject(crate::subjektiv::SubjectRole::new("retained-scoped-origin").unwrap())
         .unwrap()
         .id;
-    let ticket = browser_ticket_backend(api)
-        .unwrap()
-        .create(NewTicket::new("Legacy scoped creation refusal"))
-        .unwrap()
-        .id;
-    let mut execution = vec![
-        collection("worker.create"),
-        ticket_permission(&ticket, "ticket.assignment.assign"),
-    ];
+    let mut execution = vec![collection("worker.create")];
     execution.extend(
         [
             "session.record",
@@ -242,8 +234,7 @@ async fn public_ticket_spawn_refuses_legacy_scoped_authority_without_broadening_
         .into_iter()
         .map(|name| subject_permission(&subject, name)),
     );
-    let mut delegation = file_permissions("retained-workdir");
-    delegation.push(ticket_permission(&ticket, "ticket.read"));
+    let delegation = file_permissions("retained-workdir");
     let policy = seed_test_subject_legacy_constraints(api, &subject, execution, delegation);
     set_test_subject_policy_as_owner(api, &subject, policy.execution, policy.delegation);
     let before_policy = subjects.current_subject_policy(&subject).unwrap().unwrap();
@@ -256,14 +247,10 @@ async fn public_ticket_spawn_refuses_legacy_scoped_authority_without_broadening_
         source["runtime_id"].as_str().unwrap(),
         source["worker_id"].as_str().unwrap(),
     );
-    let (status, assigned) = h.human(reqwest::Method::PUT, &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
-        json!({"operation_id":"legacy-probe-assign","expected_assignment_id":null,"principal":{"kind":"subject","subject_id":subject}})).await;
-    assert_eq!(status, StatusCode::OK, "{assigned}");
-    let assignment = assigned["assignment"]["assignment_id"].clone();
-    let authorization = test_worker_operation_authorization(&[("ticket", &["ticket.read"])]);
+    let authorization =
+        test_worker_operation_authorization(&[("filesystem", &["filesystem.read"])]);
     let spawn = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:public-ticket-editor",
         "operation_id":"legacy-public-spawn","display_name":"Must not allocate",
-        "ticket_id":ticket,"orchestrator_assignment_id":assignment,
         "initial_submit":[],"authorization":authorization});
     let counts = || {
         api.config_store
@@ -305,7 +292,6 @@ async fn public_ticket_spawn_refuses_legacy_scoped_authority_without_broadening_
     let (status, body) = connected_authorization_post(&h.backend_url, &h.identity, &origin,
         &format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
         &json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:public-ticket-editor","display_name":"Must not allocate",
-            "ticket_assignment":{"ticket_id":ticket,"operation_id":"legacy-backend-spawn","orchestrator_assignment_id":assignment},
             "control_operation_id":"legacy-backend-spawn","authorization":authorization,
             "initial_submit":[],"workdir_attachments":[],"feature_connections":{}})).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -322,10 +308,4 @@ async fn public_ticket_spawn_refuses_legacy_scoped_authority_without_broadening_
         before_policy
     );
     assert_eq!(h.runtime.list_workers().unwrap().len(), 1);
-    assert!(
-        api.store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
-            .unwrap()
-            .is_none()
-    );
 }

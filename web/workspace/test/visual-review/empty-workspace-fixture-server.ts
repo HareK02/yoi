@@ -13,6 +13,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/api/auth/whoami") {
     return Response.json({
+      authentication_reference: "fixture-authentication",
       session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
       actor: {
         user_id: "fixture-user",
@@ -41,6 +42,12 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       return Response.json(
         dashboardFixture(path, url.searchParams, "home-empty"),
       );
+    }
+    if (path === "/workspace") {
+      const response = await fetch(new URL(url.pathname, upstream));
+      const body = await response.json();
+      body.permissions.delete_subjects = body.permissions.delete_workspace;
+      return Response.json(body);
     }
     if (path === "/workers") {
       return Response.json({

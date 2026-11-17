@@ -2555,29 +2555,6 @@
     ]
   },
   {
-    "path": "crates/worker/src/feature/builtin/orchestration.rs",
-    "kind": "rejection_test",
-    "reason": "旧数値認可identityと旧fieldの受理を拒否し、現行string keyのschema/Tool/Web送信に旧fieldが出ないことを検証する負例のみ。通常wire互換経路は設けない。",
-    "lines": [
-      {
-        "sha256": "295cd61c2b4bf95fcd42fefbf596f0d12b30da6c0390fe55b5b50829e4bb5e1e",
-        "count": 1
-      },
-      {
-        "sha256": "18b6ef49c3be036d86e119776367951681ca09df38ddf6d82b4e06ebadb8b149",
-        "count": 1
-      },
-      {
-        "sha256": "a8623173783b7da39c9915670075c4a2ba1c506e05cbc2b71919bdb6fdf9ef27",
-        "count": 1
-      },
-      {
-        "sha256": "f0c066d915b0aa2ae0c7af7ef71f2cba2c61b8a1bc166879f6006a0223888e7c",
-        "count": 1
-      }
-    ]
-  },
-  {
     "path": "web/workspace/src/lib/workspace/api/workers.test.ts",
     "kind": "rejection_test",
     "reason": "旧数値認可identityと旧fieldの受理を拒否し、現行string keyのschema/Tool/Web送信に旧fieldが出ないことを検証する負例のみ。通常wire互換経路は設けない。",

@@ -317,7 +317,6 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
     runtime_id: "runtime-a",
     display_name: "Worker A",
     profile: "builtin:coder",
-    ticket_assignment: null,
     initial_submit: [
       { kind: "text", content: "Implement T-565." },
       { kind: "flow", selector: "builtin:coder-review" },
@@ -439,7 +438,7 @@ Deno.test("Worker launch request preserves typed Feature invocations and rejects
     { name: "count", value: { kind: "integer", value: 1 } },
     { name: "enabled", value: { kind: "boolean", value: true } },
   ] };
-  const request = { runtime_id: "runtime-a", display_name: "Worker A", profile: "builtin:coder", ticket_assignment: null,
+  const request = { runtime_id: "runtime-a", display_name: "Worker A", profile: "builtin:coder",
     initial_submit: [{ kind: "feature_invoke", invocation }], workdir_attachments: [], feature_connections: {}, authorization: { kind: "assignment", assignment: null }, control_operation_id: "create-op" };
   assertEquals(parseCreateWorkspaceWorkerRequest(request).initial_submit, request.initial_submit);
   assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, initial_submit: [{ kind: "feature_invoke", invocation: {

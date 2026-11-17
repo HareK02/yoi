@@ -31,7 +31,6 @@
         workspace_config = { enabled = false; };
         ticket = { enabled = true; authoring = true; thread = true; intake = false; workflow = true; };
         merge_request = { show = true; open = false; review = false; readiness_check = true; complete = true; };
-        orchestration = { enabled = true; };
     };
     web = { enabled = false; };
 

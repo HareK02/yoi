@@ -232,7 +232,6 @@ async fn spawn_pair_member(api: &WorkspaceApi, name: &str) -> RuntimeWorkerRef {
             display_name: name.into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),

@@ -234,7 +234,6 @@ async fn unconfirmed_worker_shutdown_is_not_completion_and_exact_retry_converges
             display_name: "Subject deletion boundary".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -1159,7 +1158,6 @@ async fn body_archive_subject_deletion(completed_metadata_purge: bool) {
             display_name: "Existing body removal".into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

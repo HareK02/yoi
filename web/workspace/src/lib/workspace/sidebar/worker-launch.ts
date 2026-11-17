@@ -1,7 +1,6 @@
 import type {
   BrowserWorkerWorkingDirectorySelection,
   CreateWorkspaceWorkerRequest,
-  CreateWorkspaceWorkerTicketAssignmentRequest,
   WorkerLaunchProfileCandidate,
 } from "#lib/generated/worker-launch-api.ts";
 import { parseCreateWorkspaceWorkerRequest } from "#lib/workspace/api/workers.ts";
@@ -17,7 +16,6 @@ export type WorkerLaunchAttachmentFormState = {
 export type WorkerLaunchFormState = {
   runtime_id: string;
   flow?: string;
-  ticket_assignment?: CreateWorkspaceWorkerTicketAssignmentRequest | null;
   display_name: string;
   profile: string;
   subjektiv_subject_id: string;
@@ -138,7 +136,6 @@ export function buildCreateWorkspaceWorkerRequest(
     runtime_id: form.runtime_id.trim(),
     display_name: form.display_name.trim(),
     profile: form.profile.trim() || null,
-    ticket_assignment: form.ticket_assignment ?? null,
     initial_submit: [
       ...(initialMessage ? [{ kind: "text", content: form.initial_text }] : []),
       ...(form.flow?.trim()

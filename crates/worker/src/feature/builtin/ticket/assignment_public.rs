@@ -19,6 +19,7 @@ use super::*;
 use crate::worker::WorkspaceServerOperation;
 
 pub(super) const TOOL_NAMES: &[&str] = &[
+    "TicketWorkerAssign",
     "TicketOrchestratorAssign",
     "TicketOrchestratorClear",
     "TicketAssignmentsQuery",
@@ -35,6 +36,7 @@ pub(super) const READ_TOOL_NAMES: &[&str] = &[
 
 #[derive(Clone, Copy)]
 pub(super) enum PublicAssignmentKind {
+    WorkerAssign,
     Assign,
     Clear,
     Assignments,
@@ -44,6 +46,16 @@ pub(super) enum PublicAssignmentKind {
     ImplementationResultQuery,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkerAssignInput {
+    ticket: String,
+    runtime_id: String,
+    worker_id: String,
+    orchestrator_assignment_id: String,
+    operation_id: String,
+    workdir_bindings: Vec<server_api::TicketWorkerAttachmentBinding>,
+}
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AssignInput {
@@ -107,17 +119,19 @@ struct ImplementationResultQuery {
 impl PublicAssignmentKind {
     pub(super) fn name(self) -> &'static str {
         match self {
-            Self::Assign => TOOL_NAMES[0],
-            Self::Clear => TOOL_NAMES[1],
-            Self::Assignments => TOOL_NAMES[2],
-            Self::Diagnostics => TOOL_NAMES[3],
-            Self::Answer => TOOL_NAMES[4],
-            Self::ImplementationResult => TOOL_NAMES[5],
-            Self::ImplementationResultQuery => TOOL_NAMES[6],
+            Self::WorkerAssign => "TicketWorkerAssign",
+            Self::Assign => "TicketOrchestratorAssign",
+            Self::Clear => "TicketOrchestratorClear",
+            Self::Assignments => "TicketAssignmentsQuery",
+            Self::Diagnostics => "TicketAssignmentDiagnostics",
+            Self::Answer => "TicketAssignmentAnswer",
+            Self::ImplementationResult => "TicketImplementationResult",
+            Self::ImplementationResultQuery => "TicketImplementationResultQuery",
         }
     }
     fn schema(self) -> Value {
         match self {
+            Self::WorkerAssign => json!(schemars::schema_for!(WorkerAssignInput)),
             Self::Assign => {
                 let mut schema = json!(schemars::schema_for!(AssignInput));
                 let required = schema["required"]
@@ -144,6 +158,9 @@ impl PublicAssignmentKind {
 }
 pub(super) fn description(name: &str) -> &'static str {
     match name {
+        "TicketWorkerAssign" => {
+            "Assign an existing idle Workspace Worker to this Ticket; no Worker generation or Submit. Supply the observed current Subject assignment ID, a stable operation_id, and every exact live Workdir connection. Backend checks current caller/Subject/Worker/targets and narrows resources without granting authority. Unchanged bindings do not restart the Worker; narrowing may stop/rebind/restore with durable recovery. Reuse the same operation and full input after an unknown outcome, reconcile this Worker/claim rather than spawning another. Assignment does not change Subject handling, case, Profile, grant, or MR. Send Ticket work via WorkerSendInput only after confirmed assignment."
+        }
         "TicketOrchestratorAssign" => {
             "Explicitly delegate or reissue this Ticket to a target Subject principal using the existing role-assignment API. Query current assignment first; provide observed expected_assignment_id (explicit null only when unassigned), target principal and stable operation_id. Assign persists initial waiting without ready/Queue. Explicit reissue after done creates a new row even for the same principal and preserves the old result. Exact retry keeps the same operation_id and full input; never automatically generate a new key after conflict or unknown outcome. Reread and reconcile stale responsibility. Saved Assign and notification failure are separate outcomes, not a reason to reassign. Backend authenticates the actor and validates role/principal; target principal is not an authority claim. This does not start/stop Workers, close the case, or authorize review/merge."
         }
@@ -199,6 +216,7 @@ struct PublicAssignmentTool {
 }
 // Internal command DTOs belong to the shared execution boundary, not a native schema.
 enum Command {
+    WorkerAssign(WorkerAssignInput),
     Assign(AssignInput),
     Clear(ClearInput),
     Assignments(AssignmentsInput),
@@ -211,6 +229,7 @@ enum Command {
 impl Command {
     fn kind(&self) -> PublicAssignmentKind {
         match self {
+            Self::WorkerAssign(..) => PublicAssignmentKind::WorkerAssign,
             Self::Assign(..) => PublicAssignmentKind::Assign,
             Self::Clear(..) => PublicAssignmentKind::Clear,
             Self::Assignments(..) => PublicAssignmentKind::Assignments,
@@ -230,6 +249,10 @@ impl Tool for PublicAssignmentTool {
         ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let command = match self.kind {
+            PublicAssignmentKind::WorkerAssign => Command::WorkerAssign(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
             PublicAssignmentKind::Assign => Command::Assign(
                 serde_json::from_str(input)
                     .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
@@ -285,6 +308,7 @@ pub(super) async fn execute_native_value(
 ) -> Option<Result<Value, ToolError>> {
     let parse = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
     let command = match tool_name {
+        "TicketWorkerAssign" => serde_json::from_value(command).map(Command::WorkerAssign),
         "TicketOrchestratorAssign" => serde_json::from_value(command).map(Command::Assign),
         "TicketOrchestratorClear" => serde_json::from_value(command).map(Command::Clear),
         "TicketAssignmentsQuery" => serde_json::from_value(command).map(Command::Assignments),
@@ -338,6 +362,34 @@ async fn execute_value(
             )
         })?;
     let operation = match command {
+        Command::WorkerAssign(input) => {
+            for (name, value) in [
+                ("ticket", &input.ticket),
+                ("runtime_id", &input.runtime_id),
+                ("worker_id", &input.worker_id),
+                (
+                    "orchestrator_assignment_id",
+                    &input.orchestrator_assignment_id,
+                ),
+                ("operation_id", &input.operation_id),
+            ] {
+                identity(name, value)?;
+            }
+            WorkspaceServerOperation::TicketAssignmentSet {
+                ticket_id: input.ticket,
+                role: server_api::TicketAssignmentRole::Worker,
+                request: server_api::SetTicketRoleAssignmentRequest {
+                    orchestrator_assignment_id: Some(input.orchestrator_assignment_id),
+                    operation_id: input.operation_id,
+                    principal: server_api::TicketAssignmentPrincipal::Worker {
+                        runtime_id: input.runtime_id,
+                        worker_id: input.worker_id,
+                    },
+                    expected_assignment_id: None,
+                    workdir_bindings: input.workdir_bindings,
+                },
+            }
+        }
         Command::Assign(input) => {
             identity("ticket", &input.ticket)?;
             identity("operation_id", &input.operation_id)?;
@@ -469,7 +521,9 @@ async fn execute_value(
     assignment_tracking::authorize_ticket_target(
         client.as_ref(),
         match kind {
-            PublicAssignmentKind::Assign => "ticket.assignment.assign",
+            PublicAssignmentKind::WorkerAssign | PublicAssignmentKind::Assign => {
+                "ticket.assignment.assign"
+            }
             PublicAssignmentKind::Clear => "ticket.assignment.clear",
             PublicAssignmentKind::Assignments => "ticket.assignment.query",
             PublicAssignmentKind::Diagnostics => "ticket.assignment.diagnostics",
@@ -502,7 +556,9 @@ async fn execute_value(
         ))
     };
     let content = match kind {
-        PublicAssignmentKind::Assign | PublicAssignmentKind::Clear => serde_json::to_value(
+        PublicAssignmentKind::WorkerAssign
+        | PublicAssignmentKind::Assign
+        | PublicAssignmentKind::Clear => serde_json::to_value(
             serde_json::from_str::<server_api::TicketRoleAssignmentMutationResponse>(
                 &response.body,
             )
@@ -571,7 +627,9 @@ mod native_command_tests {
                 response["backend_private_field"] = json!("must be redacted");
             }
             let operation = match kind {
-                PublicAssignmentKind::Assign => "ticket.assignment.assign",
+                PublicAssignmentKind::WorkerAssign | PublicAssignmentKind::Assign => {
+                    "ticket.assignment.assign"
+                }
                 PublicAssignmentKind::Clear => "ticket.assignment.clear",
                 PublicAssignmentKind::Assignments => "ticket.assignment.query",
                 PublicAssignmentKind::Diagnostics => "ticket.assignment.diagnostics",
@@ -662,7 +720,11 @@ mod native_command_tests {
     #[tokio::test]
     async fn internal_assign_requires_observed_null_and_result_rejects_missing_host_identity() {
         let client = AuthorizedClient::new(json!({}));
-        let mut assign = super::tests::cases().remove(0).1;
+        let mut assign = super::tests::cases()
+            .into_iter()
+            .find(|(k, _, _)| matches!(k, PublicAssignmentKind::Assign))
+            .unwrap()
+            .1;
         assign
             .as_object_mut()
             .unwrap()

@@ -76,6 +76,7 @@ pub trait WorkerControlService: Send + Sync {
         subject: WorkerControlSubject,
         content: String,
         kind: WorkerControlInputKind,
+        segments: Option<Vec<protocol::Segment>>,
     ) -> Result<WorkspaceResponse, WorkspaceClientError>;
     async fn stop_worker(
         &self,
@@ -119,7 +120,7 @@ pub trait WorkerLifecycleService: Send + Sync {
     ) -> Result<WorkspaceResponse, WorkspaceClientError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLifecycleWorkdirAttachment {
     /// Stable Worker-local routing alias preserved into the canonical create request.
@@ -133,16 +134,12 @@ pub struct WorkerLifecycleWorkdirAttachment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLifecycleSpawnRequest {
-    /// Observed delegation required for Orchestrator Ticket starts.
-    pub orchestrator_assignment_id: Option<String>,
-
     pub runtime_id: String,
     /// Ordered alias-keyed selections forwarded as canonical Workdir attachments.
     pub workdir_attachments: Vec<WorkerLifecycleWorkdirAttachment>,
     pub profile: String,
     pub singleton_key: Option<String>,
-    pub ticket_id: Option<String>,
-    /// Required for ordinary and Ticket spawn; exact retries reuse this ID and full input.
+    /// Required for ordinary spawn; exact retries reuse this ID and full input.
     pub operation_id: Option<String>,
     /// Omission selects the shared Worker default; explicit selections are forwarded unchanged.
     #[serde(default)]

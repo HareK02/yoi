@@ -79,7 +79,6 @@ async fn spawn_journal_source(api: &WorkspaceApi, subject: &str, name: &str) -> 
             display_name: name.into(),
             singleton_key: None,
             profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -3348,7 +3347,6 @@ impl SubjectRemovalFixture {
                 display_name: "removal-source".into(),
                 singleton_key: None,
                 profile: Some("builtin:companion".into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

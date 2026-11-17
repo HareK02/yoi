@@ -973,7 +973,6 @@ async fn replaced_policy_and_body_never_revive_delegated_worker_control() {
             display_name: "Replacement control origin".into(),
             singleton_key: None,
             profile: Some("project:authority-source".into()),
-            ticket_assignment: None,
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

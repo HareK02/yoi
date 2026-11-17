@@ -669,7 +669,7 @@ mod tests {
             )));
             if role == "role.orchestrator" {
                 assert!(prompt.contains(
-                    "`SpawnTicketWorker` using the current `orchestrator_assignment_id`"
+                    "`TicketWorkerAssign` with the current `orchestrator_assignment_id`"
                 ));
             }
         }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import { readBoundedJson, workspaceApiPath } from '#lib/workspace/api/http.ts';
   import {
     parseWorkingDirectoryCreateResponse,
@@ -71,6 +71,8 @@
   let runtimeId = $state('');
   let profile = $state('');
   let flow = $state('');
+  let createdNotice: HTMLElement | undefined = $state();
+  let createdWorker = $state<{worker_id:string;console_href:string} | null>(null);
   let subjektivSubjectId = $state('');
   let subjects = $state<SubjektivSubjectResponse[]>([]);
   let subjectsLoading = $state(false);
@@ -339,20 +341,26 @@
         display_name: displayName,
         profile,
         flow,
-        ticket_assignment: ticketContext
-          ? { ticket_id: ticketContext.ticketId, operation_id: crypto.randomUUID() }
-          : null,
         subjektiv_subject_id: subjektivSubjectId,
         initial_text: initialText,
         workdir_attachments: workdirAttachments,
         working_directory_repository_key: workingDirectoryRepositoryKey,
         working_directory_selector: workingDirectorySelector,
       });
+      // Ticket work is supplied only after a separate confirmed assignment.
+      if (ticketContext) request.initial_submit = [];
       needsReconciliation = true;
       const result = await submitWorkerLaunch(fetch, workerApiPath('/workers'), request);
       if (result.kind === 'failed') {
         startupError = workerStartupNotice(result.receipt);
         needsReconciliation = workerLaunchNeedsReconciliation(result.receipt);
+        return;
+      }
+      if (ticketContext) {
+        createdWorker = result.response;
+        await tick();
+        createdNotice?.focus();
+        createdNotice?.scrollIntoView({ block: 'start' });
         return;
       }
       // 成功を観測しているので、navigationが失敗しても新しいWorkerを作らせない。
@@ -408,13 +416,21 @@
     </div>
   </header>
 
+  {#if createdWorker && ticketContext}
+    <section bind:this={createdNotice} class="worker-created" role="status" tabindex="-1" aria-label="Worker creation result">
+      <p>Worker created: <code>{createdWorker.worker_id}</code>. Not assigned; no work request sent.</p>
+      <a href={`/w/${workspaceId}/tickets/${encodeURIComponent(ticketContext.ticketId)}`}>Assign this existing Worker on the Ticket</a>
+      <a href={createdWorker.console_href}>Open Worker console</a>
+    </section>
+  {/if}
   {#if ticketContext}
     <aside class="worker-ticket-context">
       <div>
-        <span>Ticket assignment</span>
+        <span>Create a Worker for later assignment</span>
         <strong>{ticketContext.ticketTitle}</strong>
         <code>{ticketContext.ticketId}</code>
       </div>
+      <p>Creation does not assign this Ticket or send its work request. Assign the existing Worker from the Ticket, then send input from its console.</p>
       <a href={`/w/${workspaceId}/tickets/${encodeURIComponent(ticketContext.ticketId)}`}>View ticket</a>
     </aside>
   {/if}
@@ -608,11 +624,11 @@
         {/if}
         <label>
           <span>Flow (optional)</span>
-          <input bind:value={flow} autocomplete="off" placeholder="Optional Flow selector" />
+          <input disabled={!!ticketContext} bind:value={flow} autocomplete="off" placeholder="Optional Flow selector" />
         </label>
         <label>
           <span>Initial request</span>
-          <textarea bind:value={initialText} rows="7" placeholder="Optional first instruction"></textarea>
+          <textarea disabled={!!ticketContext} bind:value={initialText} rows="7" placeholder="Optional first instruction"></textarea>
         </label>
       </section>
 
@@ -644,7 +660,7 @@
       {/if}
       <div class="worker-new-actions">
         <button type="submit" disabled={submitting || !canStartWorker}>
-          {submitting ? 'Starting…' : 'Start Worker'}
+          {submitting ? (ticketContext ? 'Creating…' : 'Starting…') : (ticketContext ? 'Create Worker' : 'Start Worker')}
         </button>
         <a class="secondary-link" href={`/w/${workspaceId}`}>Cancel</a>
       </div>
@@ -653,6 +669,13 @@
 </section>
 
 <style>
+  .worker-created {
+    display: grid;
+    gap: 0.5rem;
+    padding-block: 1rem;
+    border-block: 1px solid var(--line);
+    overflow-wrap: anywhere;
+  }
   .worker-reconciliation { overflow-wrap: anywhere; margin-block: var(--space-3); }
   .worker-reconciliation p { margin-block: var(--space-2); }
   .worker-reconciliation a + a { margin-inline-start: var(--space-4); }

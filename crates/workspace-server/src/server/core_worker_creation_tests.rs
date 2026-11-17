@@ -26,7 +26,6 @@ mod core_worker_creation_tests {
                 display_name: operation.into(),
                 singleton_key: None,
                 profile: Some("builtin:companion".into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: Default::default(),

@@ -345,7 +345,7 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(), display_name: name.into(),
-            singleton_key: None, profile: Some("builtin:companion".into()), ticket_assignment: None,
+            singleton_key: None, profile: Some("builtin:companion".into()),
             initial_submit: vec![protocol::Segment::Text { content: "User chose B rather than A. Continue the partial work without assuming success.".into() }],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -1953,7 +1953,6 @@ async fn connected_restore_fixture_with_pending_head(
                 display_name: "restore-auth-body".into(),
                 singleton_key: None,
                 profile: Some("builtin:companion".into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {

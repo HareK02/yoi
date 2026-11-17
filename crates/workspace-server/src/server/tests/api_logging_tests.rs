@@ -111,7 +111,6 @@ async fn cleanup_retention_failures_preserve_cause_on_execution_and_recovery() {
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -280,16 +279,12 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
             test_create_binding(),
             WorkerSpawnRequest {
                 requested_worker_name: Some("logging-coder".to_string()),
-                intent: WorkerSpawnIntent::TicketRole {
-                    ticket_id: "cancellation-logging".to_string(),
-                    role: TicketWorkerRole::Worker,
-                },
+                intent: WorkerSpawnIntent::WorkspaceCoding,
                 singleton_key: None,
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 0,
                 },
                 profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),

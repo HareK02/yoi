@@ -905,7 +905,6 @@ mod tests {
             display_name: "Coder one".to_string(),
             singleton_key: None,
             profile: Some("builtin:coder".to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),

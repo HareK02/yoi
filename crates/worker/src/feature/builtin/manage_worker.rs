@@ -15,10 +15,7 @@ use serde::Deserialize;
 
 use protocol::Segment;
 use server_api::authorization::PermissionResource;
-use server_api::{
-    BrowserWorkerWorkingDirectorySelection, CreateWorkspaceWorkerRequest,
-    CreateWorkspaceWorkerTicketAssignmentRequest,
-};
+use server_api::{BrowserWorkerWorkingDirectorySelection, CreateWorkspaceWorkerRequest};
 
 use crate::feature::contracts::{
     WORKER_CONTROL_SERVICE_ID, WORKER_CONTROL_SERVICE_VERSION, WORKER_LIFECYCLE_SERVICE_ID,
@@ -37,6 +34,7 @@ const FEATURE_ID: &str = "worker";
 const FEATURE_NAME: &str = "Worker";
 const FEATURE_DESCRIPTION: &str =
     "Workspace-authority tools for managing Workdir-bound Backend/Runtime Worker sessions.";
+#[cfg(test)]
 const INITIAL_WORKDIR_ALIAS: &str = "workdir";
 
 struct WorkspaceWorkerControlService {
@@ -186,7 +184,16 @@ impl WorkerControlService for WorkspaceWorkerControlService {
         subject: WorkerControlSubject,
         content: String,
         kind: WorkerControlInputKind,
+        segments: Option<Vec<protocol::Segment>>,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if segments.is_some()
+            && (kind != WorkerControlInputKind::User
+                || matches!(&subject, WorkerControlSubject::SubWorker { .. }))
+        {
+            return Err(WorkspaceClientError::Request(
+                "typed segments require Runtime Worker user input".into(),
+            ));
+        }
         match subject {
             WorkerControlSubject::RuntimeWorker {
                 runtime_id,
@@ -208,7 +215,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                             submission_request_id: None,
                             kind: Some(kind.to_string()),
                             content,
-                            segments: None,
+                            segments,
                         },
                     },
                 )
@@ -450,27 +457,13 @@ fn workspace_worker_create_request(
     }).ok_or_else(|| WorkspaceClientError::Request(
         "operation_id is required for every Worker spawn (reuse the same ID and full input after an unknown outcome)".into()
     ))?;
-    if request.ticket_id.is_none() && request.orchestrator_assignment_id.is_some() {
-        return Err(WorkspaceClientError::Request(
-            "orchestrator_assignment_id requires ticket_id".into(),
-        ));
-    }
     validate_launch_selection(&request.authorization, &request.profile)
         .map_err(WorkspaceClientError::Request)?;
-    let ticket_assignment =
-        request
-            .ticket_id
-            .map(|ticket_id| CreateWorkspaceWorkerTicketAssignmentRequest {
-                orchestrator_assignment_id: request.orchestrator_assignment_id,
-                ticket_id,
-                operation_id: control_operation_id.clone(),
-            });
     Ok(CreateWorkspaceWorkerRequest {
         runtime_id: request.runtime_id,
         display_name: request.display_name,
         singleton_key: request.singleton_key,
         profile: Some(request.profile),
-        ticket_assignment,
         initial_submit: request.initial_submit,
         workdir_attachments: request
             .workdir_attachments
@@ -691,10 +684,9 @@ struct WorkerListInput {}
 #[serde(deny_unknown_fields)]
 struct WorkerSpawnInput {
     runtime_id: String,
-    /// Singular Workdir selection wrapped into the shared attachment collection
-    /// under the stable `workdir` alias.
+    /// Ordered existing Workdir selections; empty is valid. Access remains provider-owned.
     #[serde(default)]
-    working_directory_id: Option<String>,
+    workdir_attachments: Vec<WorkerLifecycleWorkdirAttachment>,
     /// Stable caller-chosen intent ID. Exact retries retain this ID and full input.
     operation_id: String,
     /// Omit for the shared Worker default, or select an explicit assignment or launch policy.
@@ -705,21 +697,12 @@ struct WorkerSpawnInput {
     /// Optional opaque Workspace singleton key. Prefixes are caller-owned and uninterpreted.
     #[serde(default)]
     singleton_key: Option<String>,
-    /// Optional Ticket assignment. Backend validates claims and resource requirements;
-    /// neither the profile nor an initial Flow segment grants review authority.
-    #[serde(default)]
-    ticket_id: Option<String>,
-    /// Observed current Orchestrator delegation, required for a Ticket start by the Orchestrator.
-    #[serde(default)]
-    orchestrator_assignment_id: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
     /// Normal typed initial user submission delivered after spawn. An empty
     /// vector starts the Worker without initial input.
     #[serde(default)]
     initial_submit: Vec<Segment>,
-    #[serde(default)]
-    relative_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -778,6 +761,16 @@ struct DirectSubWorkerStopInput {
 struct WorkerMessageInput {
     subject: WorkerSubjectInput,
     content: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkerSubmitInput {
+    subject: WorkerSubjectInput,
+    content: String,
+    /// Typed user input, including an explicit Flow. Validated by the Runtime input boundary.
+    #[serde(default)]
+    segments: Option<Vec<protocol::Segment>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -844,10 +837,10 @@ impl WorkerOperation {
                 "List only known Runtime Workers and direct SubWorkers granted to the current Worker."
             }
             Self::Spawn => {
-                "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission, with an optional Flow segment. Set `ticket_id` to atomically assign the Worker; Backend validates claims and resource requirements. Selecting a profile or Flow does not grant review authority. Omit authorization to use the shared worker_default; an explicit assignment (including empty) or Policy selection is forwarded without fallback. profile must be a source-qualified builtin: or project: selector; Profile selection does not grant permissions. Reuse operation_id and the full input after an unknown outcome."
+                "Spawn an ordinary Backend/Runtime Worker with zero or more existing Workdir attachments. Worker creation, TicketWorkerAssign, and subsequent WorkerSendInput are independent operations. For Ticket work, create with empty initial_submit, assign the existing Worker, then send the work request only after confirmed assignment. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission, with an optional Flow segment. Selecting a profile or Flow does not grant review authority. Omit authorization to use the shared worker_default; an explicit assignment (including empty) or Policy selection is forwarded without fallback. profile must be a source-qualified builtin: or project: selector; Profile selection does not grant permissions. Reuse operation_id and the full input after an unknown outcome."
             }
             Self::SendInput => {
-                "Start a fresh turn for an Idle Worker. Non-Idle Workers reject WorkerSendInput without queueing. Use WorkerNotify for advisory information during work already in progress. Direct SubWorkers also require Idle."
+                "Start a fresh turn for an Idle Worker. Runtime input may include typed segments with an explicit Flow; Notify and SubWorkers remain text-only. Non-Idle Workers reject WorkerSendInput without queueing. Use WorkerNotify for advisory information during work already in progress. Direct SubWorkers also require Idle."
             }
             Self::Notify => {
                 "Send an advisory notification to a known Runtime Worker so information can be incorporated into work already in progress without creating a queued Submit."
@@ -883,39 +876,26 @@ impl Tool for WorkspaceWorkerTool {
             }
             WorkerOperation::Spawn => {
                 let input = parse::<WorkerSpawnInput>(input_json, "WorkerSpawn")?;
-                let ticket_id = input
-                    .ticket_id
-                    .map(|ticket_id| authority_id(&ticket_id, "ticket_id"))
-                    .transpose()?;
                 let operation_id = Some(authority_id(&input.operation_id, "operation_id")?);
-                let workdir_attachments = match input.working_directory_id {
-                    Some(id) => vec![WorkerLifecycleWorkdirAttachment {
-                        alias: INITIAL_WORKDIR_ALIAS.to_string(),
-                        working_directory_id: authority_id(&id, "working_directory_id")?,
-                        relative_cwd: input
-                            .relative_cwd
-                            .map(|value| validate_relative_cwd(&value))
-                            .transpose()?,
-                    }],
-                    None if input.relative_cwd.is_none() => Vec::new(),
-                    None => {
-                        return Err(ToolError::ExecutionFailed(
-                            "relative_cwd requires working_directory_id".into(),
-                        ));
-                    }
-                };
+                let mut workdir_attachments = input.workdir_attachments;
+                for attachment in &mut workdir_attachments {
+                    workdir::WorkdirAttachmentAlias::new(attachment.alias.clone())
+                        .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+                    attachment.working_directory_id =
+                        authority_id(&attachment.working_directory_id, "working_directory_id")?;
+                    attachment.relative_cwd = attachment
+                        .relative_cwd
+                        .as_deref()
+                        .map(validate_relative_cwd)
+                        .transpose()?;
+                }
                 self.control
                     .spawn_worker(WorkerLifecycleSpawnRequest {
-                        orchestrator_assignment_id: input
-                            .orchestrator_assignment_id
-                            .map(|id| authority_id(&id, "orchestrator_assignment_id"))
-                            .transpose()?,
                         runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
                         workdir_attachments,
                         authorization: input.authorization,
                         profile: canonical_launch_profile(input.profile)?,
                         singleton_key: input.singleton_key,
-                        ticket_id,
                         operation_id,
                         display_name: input
                             .display_name
@@ -927,16 +907,27 @@ impl Tool for WorkspaceWorkerTool {
                     .map_err(control_tool_error)?
             }
             WorkerOperation::SendInput | WorkerOperation::Notify => {
-                let input = if self.runtime_worker_control {
-                    parse::<WorkerMessageInput>(input_json, self.operation.tool_name())?
+                let input = if self.runtime_worker_control
+                    && self.operation == WorkerOperation::SendInput
+                {
+                    parse::<WorkerSubmitInput>(input_json, self.operation.tool_name())?
+                } else if self.runtime_worker_control {
+                    let input =
+                        parse::<WorkerMessageInput>(input_json, self.operation.tool_name())?;
+                    WorkerSubmitInput {
+                        subject: input.subject,
+                        content: input.content,
+                        segments: None,
+                    }
                 } else {
                     let input = parse::<DirectSubWorkerMessageInput>(
                         input_json,
                         self.operation.tool_name(),
                     )?;
-                    WorkerMessageInput {
+                    WorkerSubmitInput {
                         subject: input.subject.into(),
                         content: input.content,
+                        segments: None,
                     }
                 };
                 let content = non_empty(input.content, "content")?;
@@ -954,7 +945,7 @@ impl Tool for WorkspaceWorkerTool {
                 let direct_subworker = matches!(&subject, WorkerControlSubject::SubWorker { .. });
                 let response = self
                     .control
-                    .send_input(subject, content, kind)
+                    .send_input(subject, content, kind, input.segments)
                     .await
                     .map_err(control_tool_error)?;
                 if direct_subworker && response.is_success() {
@@ -1419,7 +1410,9 @@ fn worker_tool_contribution(
             definition::<WorkerSpawnInput>(operation, control, runtime_worker_control)
         }
         WorkerOperation::SendInput | WorkerOperation::Notify => {
-            if runtime_worker_control {
+            if runtime_worker_control && operation == WorkerOperation::SendInput {
+                definition::<WorkerSubmitInput>(operation, control, true)
+            } else if runtime_worker_control {
                 definition::<WorkerMessageInput>(operation, control, true)
             } else {
                 definition::<DirectSubWorkerMessageInput>(operation, control, false)
@@ -1676,12 +1669,14 @@ mod tests {
             subject: WorkerControlSubject,
             content: String,
             kind: WorkerControlInputKind,
+            segments: Option<Vec<protocol::Segment>>,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             let WorkerControlSubject::SubWorker { name } = subject else {
                 return Err(WorkspaceClientError::Request(
                     "expected subworker subject".to_string(),
                 ));
             };
+            assert!(segments.is_none());
             if kind != WorkerControlInputKind::User {
                 return Err(WorkspaceClientError::Request(
                     "expected user input".to_string(),
@@ -2068,10 +2063,8 @@ mod tests {
         tool.execute(
             &serde_json::json!({
                 "runtime_id": "runtime-1",
-                "working_directory_id": "workdir-1",
-                "relative_cwd": "crates/worker",
+                "workdir_attachments": [{"alias":"workdir","working_directory_id":"workdir-1","relative_cwd":"crates/worker"}],
                 "profile": "builtin:coder",
-                "ticket_id": "00001KZ9E0DBS",
                 "operation_id": "stable-ticket-intent",
                 "initial_submit": [
                     { "kind": "flow", "selector": "builtin:coder-review" },
@@ -2098,13 +2091,7 @@ mod tests {
             "builtin:coder-review"
         );
         assert_eq!(body["initial_submit"][1]["kind"], "text");
-        assert_eq!(
-            body["ticket_assignment"],
-            serde_json::json!({
-                "ticket_id": "00001KZ9E0DBS",
-                "operation_id": "stable-ticket-intent"
-            })
-        );
+        assert!(body.get("ticket_assignment").is_none());
         assert_eq!(body["workdir_attachments"].as_array().unwrap().len(), 1);
         assert_eq!(
             body["workdir_attachments"][0]["alias"],
@@ -2264,6 +2251,7 @@ mod tests {
                 },
                 "continue".to_string(),
                 WorkerControlInputKind::User,
+                None,
             )
             .await
             .unwrap();
@@ -2277,6 +2265,7 @@ mod tests {
                 },
                 "continue".to_string(),
                 WorkerControlInputKind::User,
+                None,
             )
             .await
             .unwrap_err();
@@ -2608,12 +2597,10 @@ mod tests {
             Some("bad\nidentity".into()),
         ] {
             let result = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
-                orchestrator_assignment_id: None,
                 runtime_id: "runtime-1".into(),
                 workdir_attachments: Vec::new(),
                 profile: "builtin:coder".into(),
                 singleton_key: None,
-                ticket_id: None,
                 operation_id,
                 authorization: Default::default(),
                 display_name: "Worker".into(),
@@ -2740,7 +2727,7 @@ mod tests {
             assert!(!jsonschema::is_valid(&schema, &input));
         }
         assert!(text.contains("initial_submit"));
-        assert!(text.contains("ticket_id"));
+        assert!(!text.contains("ticket_id"));
         assert!(text.contains("selector"));
         assert!(text.contains("flow"));
         assert!(!text.contains("initial_text"));
@@ -2749,7 +2736,6 @@ mod tests {
     #[test]
     fn worker_lifecycle_spawn_request_preserves_canonical_attachment_collection() {
         let request = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
-            orchestrator_assignment_id: None,
             runtime_id: "runtime-1".to_string(),
             workdir_attachments: vec![
                 WorkerLifecycleWorkdirAttachment {
@@ -2765,7 +2751,6 @@ mod tests {
             ],
             profile: "builtin:coder".to_string(),
             singleton_key: Some("subjektiv:subject-1".to_string()),
-            ticket_id: None,
             operation_id: Some("ordinary-spawn-intent-1".into()),
             authorization: Default::default(),
             display_name: "Coder".to_string(),
@@ -2808,14 +2793,12 @@ mod tests {
     }
 
     #[test]
-    fn worker_lifecycle_spawn_serializes_ticket_assignment_without_workdirs_or_flow() {
+    fn worker_lifecycle_spawn_without_resources_has_no_ticket_contract() {
         let request = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
-            orchestrator_assignment_id: Some("delegation-742".into()),
             runtime_id: "runtime-1".to_string(),
             workdir_attachments: Vec::new(),
             profile: "project:ticket-worker".to_string(),
             singleton_key: None,
-            ticket_id: Some("T-719".to_string()),
             operation_id: Some("spawn-ticket-worker:T-719:call-1".to_string()),
             authorization: Default::default(),
             display_name: "Worker · T-719".to_string(),
@@ -2825,14 +2808,7 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["workdir_attachments"], serde_json::json!([]));
         assert_eq!(value["profile"], "project:ticket-worker");
-        assert_eq!(
-            value["ticket_assignment"],
-            serde_json::json!({
-                "ticket_id": "T-719",
-                "orchestrator_assignment_id": "delegation-742",
-                "operation_id": "spawn-ticket-worker:T-719:call-1",
-            })
-        );
+        assert!(value.get("ticket_assignment").is_none());
         assert_eq!(
             value["control_operation_id"],
             "spawn-ticket-worker:T-719:call-1"
@@ -2954,6 +2930,66 @@ mod tests {
                 assert_eq!(body["kind"], expected_kind);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn post_assignment_submission_preserves_explicit_flow_and_never_converts_notify_or_subworker()
+     {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let segments = serde_json::json!([
+            {"kind":"flow","selector":"builtin:coder-review"},
+            {"kind":"text","content":"Implement the assigned Ticket"}
+        ]);
+        let args = serde_json::json!({
+            "subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"worker-7"},
+            "content":"Implement the assigned Ticket", "segments":segments
+        });
+        WorkspaceWorkerTool {
+            operation: WorkerOperation::SendInput,
+            control: test_control(client.clone()),
+            runtime_worker_control: true,
+        }
+        .execute(&args.to_string(), ToolExecutionContext::direct())
+        .await
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(client.requests.lock().unwrap()[0].body.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(body["segments"], segments);
+        assert_eq!(body["kind"], "user");
+        assert_eq!(
+            client
+                .authorizations
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .operation,
+            "worker.send_input"
+        );
+        assert!(
+            WorkspaceWorkerTool {
+                operation: WorkerOperation::Notify,
+                control: test_control(client.clone()),
+                runtime_worker_control: true
+            }
+            .execute(&args.to_string(), ToolExecutionContext::direct())
+            .await
+            .is_err()
+        );
+        let mut sub = args;
+        sub["subject"] = serde_json::json!({"kind":"sub_worker","name":"reviewer"});
+        assert!(
+            WorkspaceWorkerTool {
+                operation: WorkerOperation::SendInput,
+                control: test_control(client.clone()),
+                runtime_worker_control: true
+            }
+            .execute(&sub.to_string(), ToolExecutionContext::direct())
+            .await
+            .is_err()
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -3144,6 +3180,7 @@ mod tests {
                             } else {
                                 WorkerControlInputKind::User
                             },
+                            None,
                         )
                         .await
                 }
@@ -3196,12 +3233,10 @@ mod tests {
                 "worker.create" => {
                     control
                         .spawn_worker(WorkerLifecycleSpawnRequest {
-                            orchestrator_assignment_id: None,
                             runtime_id: "target-runtime".into(),
                             workdir_attachments: vec![],
                             profile: "builtin:coder".into(),
                             singleton_key: None,
-                            ticket_id: None,
                             operation_id: Some("spawn-intent".into()),
                             authorization: Default::default(),
                             display_name: "child".into(),

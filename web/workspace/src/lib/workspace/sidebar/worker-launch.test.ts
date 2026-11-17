@@ -205,7 +205,6 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits multiple aliased attachments"
     runtime_id: "remote",
     display_name: "Worker",
     profile: "builtin:coder",
-    ticket_assignment: null,
     initial_submit: [{ kind: "text", content: "go" }],
     workdir_attachments: [
       {
@@ -307,7 +306,6 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits an empty attachment list for 
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:companion",
-    ticket_assignment: null,
     initial_submit: [{ kind: "text", content: "chat" }],
     workdir_attachments: [],
     feature_connections: {},

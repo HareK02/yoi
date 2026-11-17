@@ -495,7 +495,6 @@ async fn assert_publication_fault_retains_committed_worker(query_failure: bool) 
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:companion".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),

@@ -4,7 +4,6 @@ import type {
   BrowserWorkspaceOrchestratorResponse,
   CreateWorkspaceWorkerRequest,
   WorkerCreationAuthorization,
-  CreateWorkspaceWorkerTicketAssignmentRequest,
   Diagnostic,
   DiagnosticSeverity,
   RepositoryApiError,
@@ -776,18 +775,6 @@ function workingDirectorySelection(
   };
 }
 
-function ticketAssignment(
-  value: unknown,
-  label: string,
-): CreateWorkspaceWorkerTicketAssignmentRequest {
-  const item = record(value, label);
-  exact(item, ["ticket_id", "operation_id"], label);
-  return {
-    ticket_id: string(item.ticket_id, `${label}.ticket_id`),
-    operation_id: string(item.operation_id, `${label}.operation_id`),
-  };
-}
-
 function featureConnectionsRequest(
   value: unknown,
   label: string,
@@ -1058,7 +1045,6 @@ export function parseCreateWorkspaceWorkerRequest(
       "runtime_id",
       "display_name",
       "profile",
-      "ticket_assignment",
       "initial_submit",
       "workdir_attachments",
       "feature_connections",
@@ -1071,9 +1057,6 @@ export function parseCreateWorkspaceWorkerRequest(
     runtime_id: string(item.runtime_id, "runtime_id"),
     display_name: string(item.display_name, "display_name"),
     profile: nullableString(item.profile, "profile"),
-    ticket_assignment: item.ticket_assignment === null
-      ? null
-      : ticketAssignment(item.ticket_assignment, "ticket_assignment"),
     initial_submit: array(item.initial_submit, "initial_submit", segment),
     workdir_attachments: array(
       item.workdir_attachments,

@@ -91,6 +91,8 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
     // This case isolates registration restrictions from independently tested
     // Subject startup Memory/Journal authorization and chat Host requirements.
     manifest.feature.subjektiv.profile.enabled = false;
+    // A frozen legacy composition bit cannot republish the retired spawn Tool.
+    manifest.feature.orchestration.enabled = true;
     let (_, store) = feature_restore_fixture(&temp);
     let client = Arc::new(FeatureAdmissionClient::default());
     let controller = bootstrap(&temp, manifest, store, Some(client.clone()))
@@ -118,6 +120,7 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
         "TicketQueue",
         "TicketMarkReady",
         "TicketIntakeReady",
+        "SpawnTicketWorker",
     ] {
         assert!(
             !names.iter().any(|name| name == forbidden),
@@ -164,7 +167,7 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
         "WorkspaceTagCreate",
         "WorkspaceTagRename",
         "WorkspaceTagDelete",
-        "SpawnTicketWorker",
+        "TicketWorkerAssign",
         "TicketAssignmentTrackingQuery",
         "TicketAssignmentTrackingHistory",
         "TicketAssignmentTrackingUpdate",
@@ -200,8 +203,8 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
         "bounded, explicitly scoped `execution_grant`",
         "Reviewer redelegation authority within that actual grant",
         "Runtime/domain checks independent",
-        "For bounded Ticket implementation use `SpawnTicketWorker`",
-        "General `WorkerSpawn` remains available for non-Ticket work",
+        "Create an ordinary Worker with empty initial_submit",
+        "After confirmed assignment, send the work with WorkerSendInput",
         "Assignment tools do not authorize self-assignment or automatic Worker starts",
         "Preserve explicit user approval and closing conditions",
         "not automatic cleanup",

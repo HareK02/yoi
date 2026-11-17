@@ -814,6 +814,7 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketTagsSet",
     "TicketAssignmentTrackingQuery",
     "TicketAssignmentTrackingHistory",
+    "TicketWorkerAssign",
     "TicketOrchestratorAssign",
     "TicketOrchestratorClear",
     "TicketAssignmentsQuery",
@@ -843,6 +844,7 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentTrackingQuery",
     "TicketAssignmentTrackingHistory",
     "TicketAssignmentTrackingUpdate",
+    "TicketWorkerAssign",
     "TicketOrchestratorAssign",
     "TicketOrchestratorClear",
     "TicketAssignmentsQuery",
@@ -1885,6 +1887,12 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
             identity_field: Some("ticket"),
             mutating: true,
         },
+        "TicketWorkerAssign" => NativeTicketOperation {
+            operation: "worker_assign",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
         "TicketOrchestratorAssign" => NativeTicketOperation {
             operation: "orchestrator_assign",
             surface: NativeTicketSurface::Item,
@@ -2036,6 +2044,7 @@ pub(crate) fn enabled_ticket_definitions(
         }
     }
     for kind in [
+        assignment_public::PublicAssignmentKind::WorkerAssign,
         assignment_public::PublicAssignmentKind::Assign,
         assignment_public::PublicAssignmentKind::Clear,
         assignment_public::PublicAssignmentKind::Assignments,

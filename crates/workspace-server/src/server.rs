@@ -114,26 +114,25 @@ use server_api::{
     CleanupWorkdirFileStatus, CleanupWorkerCandidate, ConfirmRepositorySshHostTrustRequest,
     CreateRemoteRuntimeRequest, CreateRepositorySshCredentialRequest,
     CreateWorkspaceRepositoryRequest, CreateWorkspaceRepositoryResponse,
-    CreateWorkspaceWorkerRequest, CreateWorkspaceWorkerTicketAssignmentRequest,
-    DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
-    DeviceAccessTokenType, DeviceLoginApprovalStatus, DeviceLoginApproveRequest,
-    DeviceLoginApproveResponse, DeviceLoginPollRequest, DeviceLoginPollResponse,
-    DeviceLoginPollStatus, DeviceLoginStartRequest, DeviceLoginStartResponse,
-    ExecuteRuntimeCleanupRequest, ExternalWorkdirGrantCreateRequest, ExternalWorkdirGrantResponse,
-    GenerateRepositorySshCredentialRequest, LogoutResponse, LogoutStatus, MemoryDocumentResponse,
-    MemoryStagingListResponse, ObjectiveCreateRequest, ObjectiveEditRequest,
-    ObjectiveLinkTicketRequest, ObjectiveStateRequest, PasskeyLoginCompleteRequest,
-    PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse, PasskeyRegistrationCompleteRequest,
-    PasskeyRegistrationOptionsRequest, PasskeyRegistrationOptionsResponse, ProfileSettingsResponse,
-    PutRepositorySshHostTrustRequest, RemoveRuntimeRequest, RepositoryAccessProjection,
-    RepositoryDetailResponse, RepositoryListResponse, RepositoryLogResponse,
-    RepositorySshConnectionProbeRequest, RepositorySshConnectionProbeResponse,
-    RepositorySshConnectionTrustState, RepositorySshCredential, RepositorySshHostKeyCandidate,
-    RepositorySshHostTrust, RepositorySshPublicKey, RequestActor,
-    RotateRepositorySshCredentialRequest, RuntimeCleanupExecutionResponse,
-    RuntimeCleanupExecutionResult, RuntimeCleanupPlanResponse, RuntimeConnectionTestFailureKind,
-    RuntimeConnectionTestResponse, RuntimeConnectionTestStatus, RuntimeManagementSummary,
-    RuntimeRemovalOperationResponse,
+    CreateWorkspaceWorkerRequest, DeleteRepositorySshCredentialRequest,
+    DeleteRepositorySshHostTrustRequest, DeviceAccessTokenType, DeviceLoginApprovalStatus,
+    DeviceLoginApproveRequest, DeviceLoginApproveResponse, DeviceLoginPollRequest,
+    DeviceLoginPollResponse, DeviceLoginPollStatus, DeviceLoginStartRequest,
+    DeviceLoginStartResponse, ExecuteRuntimeCleanupRequest, ExternalWorkdirGrantCreateRequest,
+    ExternalWorkdirGrantResponse, GenerateRepositorySshCredentialRequest, LogoutResponse,
+    LogoutStatus, MemoryDocumentResponse, MemoryStagingListResponse, ObjectiveCreateRequest,
+    ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest,
+    PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse,
+    PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsRequest,
+    PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
+    RemoveRuntimeRequest, RepositoryAccessProjection, RepositoryDetailResponse,
+    RepositoryListResponse, RepositoryLogResponse, RepositorySshConnectionProbeRequest,
+    RepositorySshConnectionProbeResponse, RepositorySshConnectionTrustState,
+    RepositorySshCredential, RepositorySshHostKeyCandidate, RepositorySshHostTrust,
+    RepositorySshPublicKey, RequestActor, RotateRepositorySshCredentialRequest,
+    RuntimeCleanupExecutionResponse, RuntimeCleanupExecutionResult, RuntimeCleanupPlanResponse,
+    RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
+    RuntimeManagementSummary, RuntimeRemovalOperationResponse,
     RuntimeRemovalOperationState as ApiRuntimeRemovalOperationState, RuntimeTrustAuditAction,
     RuntimeTrustAuditEntry, RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState,
     RuntimeTrustKeyStatus, UpdateRemoteRuntimeRequest, UpdateWorkspaceMetadataRequest,
@@ -231,14 +230,14 @@ use crate::hosts::{
     InternalWorkerImplementationSummary, InternalWorkerOperationState, InternalWorkerRestoreResult,
     InternalWorkerSummary, InternalWorkerWorkspaceSummary, RemoteRuntimeConfig,
     RemoteWorkerRuntime, RuntimeDiagnostic, RuntimePingFailureKind, RuntimeRegistry,
-    RuntimeRegistryError, RuntimeRegistryUnregisterResult, TicketWorkerRole,
-    WorkerCompletionsRequest, WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding,
-    WorkerInputDisposition, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
-    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerSpawnAcceptanceEvidence,
-    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSpawnWorkingDirectoryRequest, WorkerTicketAssignmentRequest,
-    WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
-    is_loopback_runtime_origin, worker_spawn_create_fingerprint, workspace_worker_summary,
+    RuntimeRegistryError, RuntimeRegistryUnregisterResult, WorkerCompletionsRequest,
+    WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding, WorkerInputDisposition,
+    WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
+    WorkerLifecycleResult, WorkerSpawnAcceptanceEvidence, WorkerSpawnAcceptanceRequirement,
+    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
+    WorkerTicketAssignmentRequest, WorkspaceRuntimeAuthorization,
+    is_disallowed_remote_runtime_address, is_loopback_runtime_origin,
+    worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
@@ -267,19 +266,19 @@ use crate::runtime_settings::RuntimeConfigSchemaProvider;
 use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::skills;
 #[cfg(test)]
-use crate::store::AccountRecord;
+use crate::store::{AccountRecord, TicketWorkerAssignmentRecord};
 use crate::store::{
     ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, ExternalWorkdirGrantRecord, FlowSourceRecord,
     PasskeyAuthenticationBinding, PasskeyCredentialRecord, PasskeyRegistrationTarget,
     RepositoryInsertOutcome, RepositoryRecord, RuntimeRemovalOperation,
     RuntimeRemovalOperationState, TicketAssignmentPrincipal, TicketAssignmentRole,
-    TicketRoleAssignmentRecord, TicketWorkerAssignmentRecord, UserRecord,
-    WorkdirCreateCredentialCandidate, WorkdirCreateCredentialCandidateRole,
-    WorkdirCreateOperationRecord, WorkdirRegistryRecord, WorkdirRegistrySource,
-    WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
-    WorkspaceResourceKind, WorkspaceRuntimeAuthenticationMode as StoredRuntimeAuthenticationMode,
-    WorkspaceRuntimeBinding, WorkspaceRuntimeBindingAuditRecord, WorkspaceRuntimeBindingMutation,
+    TicketRoleAssignmentRecord, UserRecord, WorkdirCreateCredentialCandidate,
+    WorkdirCreateCredentialCandidateRole, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
+    WorkdirRegistrySource, WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord,
+    WorkspaceRecord, WorkspaceResourceKind,
+    WorkspaceRuntimeAuthenticationMode as StoredRuntimeAuthenticationMode, WorkspaceRuntimeBinding,
+    WorkspaceRuntimeBindingAuditRecord, WorkspaceRuntimeBindingMutation,
 };
 use crate::ticket_item_checker::{self, TicketItemCheckBodyReplacement, TicketItemCheckEdit};
 use crate::workdir_removal::{
@@ -6286,16 +6285,6 @@ impl WorkspaceApi {
         runtime_id: &str,
         request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
-        self.spawn_workspace_worker_with_claim_admission(runtime_id, request, false)
-    }
-
-    fn spawn_workspace_worker_with_claim_admission(
-        &self,
-        runtime_id: &str,
-        request: WorkerSpawnRequest,
-        fresh_ticket_claim: bool,
-    ) -> ApiResult<WorkerSpawnResult> {
-        let assignment = request.ticket_assignment.clone();
         let mut dispatched = false;
         let mut reserved_worker = None;
         let mut result = self.spawn_workspace_worker_inner(
@@ -6337,25 +6326,6 @@ impl WorkspaceApi {
                     error
                 });
         }
-        // Only a newly inserted durable receipt proves there was no earlier
-        // dispatch. A local rejection on replay says nothing about a prior
-        // unknown outcome; keep its fence until absence is confirmed.
-        if fresh_ticket_claim && !dispatched && result.is_err() {
-            if let Some(assignment) = assignment.as_ref() {
-                if let Err(error) = self.store.fail_ticket_assignment_operation(
-                    &self.config.workspace_id,
-                    &assignment.operation_id,
-                    "Worker creation rejected before Runtime dispatch",
-                ) {
-                    if let Err(source) = &mut result {
-                        source.diagnostics.push(spawn_compensation_diagnostic(
-                            "ticket_claim_failure_record_failed",
-                            error.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
         result
     }
 
@@ -6378,7 +6348,7 @@ impl WorkspaceApi {
             )
             .into());
         }
-        self.validate_worker_spawn_repository_scope(runtime_id, &mut request)?;
+        self.validate_worker_spawn_repository_scope(&mut request)?;
         if let Some(grant) = request.resolved_execution_grant.as_ref() {
             for claim in &mut request.resolved_workdir_attachments {
                 claim.capabilities = workdir_authorization::intersect_capabilities(
@@ -6440,12 +6410,6 @@ impl WorkspaceApi {
             .resolved_control_operation
             .as_ref()
             .map(|operation| operation.operation_id.clone())
-            .or_else(|| {
-                request
-                    .ticket_assignment
-                    .as_ref()
-                    .map(|assignment| assignment.operation_id.clone())
-            })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
         let body_subject = singleton_key
             .as_deref()
@@ -6565,13 +6529,6 @@ impl WorkspaceApi {
                 diagnostics: Vec::new(),
             });
         }
-        if let Some(assignment) = request.ticket_assignment.as_ref() {
-            self.store.bind_ticket_assignment_operation_worker(
-                &self.config.workspace_id,
-                &assignment.operation_id,
-                &worker_id.to_string(),
-            )?;
-        }
         let create_binding = match self.plugin_launch_binding(runtime_id, &request, &reservation) {
             Ok(binding) => binding,
             Err(error) => {
@@ -6593,9 +6550,7 @@ impl WorkspaceApi {
         request.resolved_memory_settings = Some(reservation.memory_settings);
         let reservation_fingerprint = create_binding.create_fingerprint.clone();
         *reserved_identity = Some(reserved_worker.clone());
-        let lifecycle_assignment = request.ticket_assignment.clone();
         let compensation_context = WorkerSpawnCompensationContext {
-            assignment: lifecycle_assignment.as_ref(),
             spawned_workdir_ids: &spawned_workdir_ids,
         };
         let mut reserved_attachments: Vec<(
@@ -6642,49 +6597,6 @@ impl WorkspaceApi {
                 reservation_id.clone(),
                 *capabilities,
             ));
-        }
-        if let Some(assignment) = request.ticket_assignment.as_ref() {
-            let dispatch_authority = (|| -> ApiResult<()> {
-                let mut current = request.clone();
-                self.validate_worker_spawn_repository_scope(runtime_id, &mut current)?;
-                for (pinned, live) in request
-                    .resolved_workdir_attachments
-                    .iter()
-                    .zip(&current.resolved_workdir_attachments)
-                {
-                    if pinned.capabilities.intersection(live.capabilities) != pinned.capabilities {
-                        return Err(Error::WorkspacePermissionDenied(
-                            "Ticket target or Workdir authority narrowed before Runtime dispatch"
-                                .into(),
-                        )
-                        .into());
-                    }
-                }
-                validate_ticket_start_dispatch(self, assignment)?;
-                if request.resolved_execution_grant.is_some()
-                    && subject_authorization::has_subject_authority(self, &reserved_worker)?
-                        == false
-                {
-                    return Err(Error::WorkspacePermissionDenied(
-                        "Ticket execution grant disappeared before Runtime dispatch".into(),
-                    )
-                    .into());
-                }
-                Ok(())
-            })();
-            if let Err(error) = dispatch_authority {
-                let diagnostics = compensate_failed_workspace_worker_create(
-                    self,
-                    runtime_id,
-                    worker_id,
-                    &reservation_fingerprint,
-                    "ticket_start_authority",
-                    None,
-                    &compensation_context,
-                    &reserved_attachments,
-                );
-                return Err(ApiError::with_diagnostics(error.error, diagnostics));
-            }
         }
         if let Some(grant) = request.resolved_execution_grant.as_ref() {
             if let Err(error) = subject_authorization::revalidate_execution_grant(self, grant) {
@@ -7212,109 +7124,18 @@ impl WorkspaceApi {
 
     fn validate_worker_spawn_repository_scope(
         &self,
-        runtime_id: &str,
         request: &mut WorkerSpawnRequest,
     ) -> ApiResult<()> {
         for attachment in &request.resolved_workdir_attachment_requests {
             self.require_workspace_repository(&attachment.working_directory.repository.id)?;
         }
-        let WorkerSpawnIntent::TicketRole { ticket_id, .. } = &request.intent else {
-            for claim in &mut request.resolved_workdir_attachments {
-                let workdir = self
-                    .store
-                    .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
-                    .ok_or_else(|| {
-                        ApiError::from(Error::Config(format!(
-                            "unknown working directory `{}` in this Workspace",
-                            claim.working_directory_id
-                        )))
-                    })?;
-                claim.capabilities = workdir_source_capabilities(self, &workdir)?;
-            }
-            return Ok(());
-        };
-
-        if !request.resolved_workdir_attachment_requests.is_empty() {
-            return Err(Error::InvalidInput(
-                "Ticket-role spawn requires existing Workspace Workdir attachments so Backend authority can bind each persisted target capability before Runtime side effects"
-                    .to_string(),
-            )
-            .into());
-        }
-
-        let targets = validated_ticket_resource_targets(self, ticket_id)?;
-        let mut aliases = HashSet::new();
-        let mut workdir_ids = HashSet::new();
-        let mut covered_repositories = HashSet::new();
         for claim in &mut request.resolved_workdir_attachments {
-            if !aliases.insert(claim.alias.as_str().to_string()) {
-                return Err(Error::InvalidInput(format!(
-                    "Ticket `{ticket_id}` Worker attachment alias `{}` appears more than once",
-                    claim.alias
-                ))
-                .into());
-            }
-            if !workdir_ids.insert(claim.working_directory_id.clone()) {
-                return Err(Error::InvalidInput(format!(
-                    "Ticket `{ticket_id}` Workdir `{}` appears more than once",
-                    claim.working_directory_id
-                ))
-                .into());
-            }
             let workdir = self
                 .store
                 .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
-                .ok_or_else(|| {
-                    ApiError::from(Error::Config(format!(
-                        "unknown working directory `{}` in this Workspace",
-                        claim.working_directory_id
-                    )))
-                })?;
-            let (workdir_runtime_id, repository_id) = match &workdir.source {
-                WorkdirRegistrySource::Repository {
-                    runtime_id,
-                    repository_id,
-                } => (runtime_id, repository_id),
-                WorkdirRegistrySource::ExternalGrant { .. } => {
-                    claim.capabilities = workdir_source_capabilities(self, &workdir)?;
-                    continue;
-                }
-                WorkdirRegistrySource::WorkspaceConfig { .. } => {
-                    return Err(Error::InvalidInput(format!(
-                        "Ticket `{ticket_id}` attachment `{}` is an ExternalGrant and cannot satisfy a persisted Repository target",
-                        claim.alias
-                    ))
-                    .into());
-                }
-            };
-            if workdir_runtime_id != runtime_id {
-                return Err(Error::InvalidInput(format!(
-                    "Ticket `{ticket_id}` attachment `{}` belongs to Runtime `{workdir_runtime_id}`, not requested Runtime `{runtime_id}`",
-                    claim.alias
-                ))
-                .into());
-            }
-            let target = targets
-                .iter()
-                .find(|target| target.repository_id == *repository_id)
-                .ok_or_else(|| {
-                    ApiError::from(Error::InvalidInput(format!(
-                        "Ticket `{ticket_id}` attachment `{}` resolves undeclared Repository `{repository_id}`",
-                        claim.alias
-                    )))
-                })?;
-            if !covered_repositories.insert(repository_id.clone()) {
-                return Err(Error::InvalidInput(format!(
-                    "Ticket `{ticket_id}` target Repository `{}` has more than one Worker attachment",
-                    target.repository_key
-                ))
-                .into());
-            }
-            claim.capabilities = target
-                .capabilities
-                .intersection(workdir_source_capabilities(self, &workdir)?);
+                .ok_or_else(|| Error::InvalidInput("unknown Workdir in this Workspace".into()))?;
+            claim.capabilities = workdir_source_capabilities(self, &workdir)?;
         }
-
         Ok(())
     }
 }
@@ -8769,19 +8590,6 @@ fn worker_spawn_request_from_api(
             WorkerSpawnIntent::WorkspaceOrchestrator
         }
         server_api::RuntimeWorkerSpawnIntent::WorkspaceCoding => WorkerSpawnIntent::WorkspaceCoding,
-        server_api::RuntimeWorkerSpawnIntent::TicketRole { ticket_id, role } => {
-            WorkerSpawnIntent::TicketRole {
-                ticket_id,
-                role: match role {
-                    server_api::RuntimeTicketWorkerRole::Intake => TicketWorkerRole::Intake,
-                    server_api::RuntimeTicketWorkerRole::Orchestrator => {
-                        TicketWorkerRole::Orchestrator
-                    }
-                    server_api::RuntimeTicketWorkerRole::Worker => TicketWorkerRole::Worker,
-                    server_api::RuntimeTicketWorkerRole::Reviewer => TicketWorkerRole::Reviewer,
-                },
-            }
-        }
     };
     let acceptance = match request.acceptance {
         server_api::RuntimeWorkerSpawnAcceptanceRequirement::SocketReady => {
@@ -8824,9 +8632,6 @@ fn worker_spawn_request_from_api(
         singleton_key: request.singleton_key,
         acceptance,
         profile,
-        ticket_assignment: request
-            .ticket_assignment
-            .map(worker_ticket_assignment_from_api),
         initial_submit,
         workdir_attachment_requests,
         resolved_workdir_attachment_requests: Vec::new(),
@@ -17498,6 +17303,9 @@ async fn start_manual_ticket_worker_assignment_on_host(
     };
     let binding_fingerprint = serde_json::to_string(&(&selected, &content_digest))
         .map_err(|error| Error::Store(error.to_string()))?;
+    // Old combined-spawn claims retain their original fingerprint/Worker identity.
+    // They are not reinterpreted as new manual assignments or redispatched; a
+    // mismatched receipt requires reconciliation against the saved references.
     let fingerprint =
         crate::store::manual_ticket_assignment_fingerprint(record, Some(&binding_fingerprint))?;
     if let Some(operation) = api
@@ -17536,6 +17344,9 @@ async fn start_manual_ticket_worker_assignment_on_host(
         }
         if operation.assignment_id.is_none() {
             let saved = recovery.as_ref().ok_or_else(|| Error::TicketAssignmentConflict("pending manual claim has no admitted recovery context; reconciliation required".into()))?;
+            // Legacy claims stopped/restored even unchanged bindings. Equality is
+            // not a durable no-effects phase: reconcile the exact pinned intent,
+            // or keep an intent-less pending receipt unresolved without dispatch.
             let request_id = format!("manual-worker-restore:{operation_id}");
             let request=api.config_store.get_internal_worker_restore_intent(&api.config.workspace_id,&worker,&request_id)?.ok_or_else(|| Error::TicketAssignmentConflict("pending manual claim has no pinned restore intent; reconciliation required before any Runtime effects".into()))?;
             let binding = ManualTicketWorkerWorkdirBinding {
@@ -17647,6 +17458,17 @@ async fn start_manual_ticket_worker_assignment_on_host(
     }
     api.store
         .validate_ticket_assignment_operation_fence(&api.config.workspace_id, operation_id)?;
+    if binding.original_links == binding.effective_links {
+        return finalize_unchanged_ticket_worker_claim(
+            api,
+            record,
+            operation_id,
+            &binding_fingerprint,
+            &content_digest,
+            &worker,
+            &selected,
+        );
+    }
     let stopped = api
         .runtime
         .stop_worker(
@@ -17831,6 +17653,63 @@ async fn start_manual_ticket_worker_assignment_on_host(
         &binding,
     )
     .await
+}
+
+// No Runtime mutation has been admitted on this path. A replay rechecks the live
+// session and exact connections rather than requiring or manufacturing a restore.
+fn finalize_unchanged_ticket_worker_claim(
+    api: &WorkspaceApi,
+    record: &TicketRoleAssignmentRecord,
+    operation_id: &str,
+    binding_fingerprint: &str,
+    content_digest: &str,
+    worker: &RuntimeWorkerRef,
+    selected: &[server_api::TicketWorkerAttachmentBinding],
+) -> ApiResult<TicketRoleAssignmentRecord> {
+    let result = (|| -> ApiResult<_> {
+        if api.authority.ticket(&record.ticket_id)?.content_digest != content_digest {
+            return Err(
+                Error::TicketAssignmentConflict("Ticket changed before assignment".into()).into(),
+            );
+        }
+        let current = validate_manual_ticket_worker_workdir_binding(
+            api,
+            worker,
+            &record.ticket_id,
+            selected,
+        )?;
+        if current.original_links != current.effective_links {
+            return Err(Error::TicketAssignmentConflict(
+                "Worker binding changed; reconcile the exact claim".into(),
+            )
+            .into());
+        }
+        if api
+            .runtime
+            .worker(worker)
+            .map_err(|e| e.into_error())?
+            .state
+            != "idle"
+        {
+            return Err(Error::TicketAssignmentConflict("Worker is no longer idle".into()).into());
+        }
+        api.store
+            .validate_ticket_assignment_operation_fence(api.workspace_id(), operation_id)?;
+        Ok(api.store.start_ticket_with_worker_assignment(
+            record,
+            &new_id("tasev"),
+            operation_id,
+            Some(binding_fingerprint),
+        )?)
+    })();
+    if let Err(error) = &result {
+        api.store.fail_ticket_assignment_operation(
+            api.workspace_id(),
+            operation_id,
+            &error.to_string(),
+        )?;
+    }
+    result
 }
 
 async fn finalize_manual_ticket_worker_claim(
@@ -18165,6 +18044,26 @@ async fn apply_set_ticket_assignment(
                 )
                 .into());
             }
+            if let (
+                Some(crate::store::TicketOrchestratorAssignmentSourceContext::Runtime {
+                    runtime_id,
+                    worker_id,
+                    ..
+                }),
+                TicketAssignmentPrincipal::Worker {
+                    runtime_id: target_runtime,
+                    worker_id: target_worker,
+                },
+            ) = (source.as_ref(), &record.principal)
+            {
+                authorize_known_worker_permission(
+                    &api,
+                    api.workspace_id(),
+                    &RuntimeWorkerRef::new(runtime_id, worker_id),
+                    &RuntimeWorkerRef::new(target_runtime, target_worker),
+                    "send_input",
+                )?;
+            }
             let delegation = ticket_start_delegation(
                 &api,
                 source.as_ref(),
@@ -18480,44 +18379,6 @@ fn ticket_start_delegation(
     }
 }
 
-fn ticket_spawn_delegation(
-    api: &WorkspaceApi,
-    headers: &HeaderMap,
-    context: Option<&server_api::ServerRequestContext>,
-    observed_assignment_id: Option<&str>,
-) -> Result<Option<TicketStartDelegation>> {
-    if let Some(context) = context {
-        // Subject-connected children cannot impersonate their body or fall through
-        // to manual initiation by omitting the observed responsibility. Generic
-        // non-Subject Workers retain the existing manual start contract.
-        let worker = authenticated_ticket_worker_source(headers, context)?;
-        if let Some(worker) = worker.as_ref() {
-            api.store
-                .require_current_worker_singleton_owner(&api.config.workspace_id, worker)?;
-            if subject_authorization::has_subject_authority(api, worker)
-                .map_err(|error| error.error)?
-            {
-                let (_, source) = authenticated_assignment_source(api, headers, context)?;
-                return ticket_start_delegation(api, Some(&source), observed_assignment_id);
-            }
-        }
-        ticket_start_delegation(api, None, observed_assignment_id)
-    } else {
-        // Only direct test adapters omit middleware context. Production routes
-        // must preserve the binding that actually authenticated the request.
-        #[cfg(test)]
-        {
-            ticket_start_delegation(api, None, observed_assignment_id)
-        }
-        #[cfg(not(test))]
-        {
-            Err(Error::WorkspacePermissionDenied(
-                "Ticket start requires Backend-authenticated context".into(),
-            ))
-        }
-    }
-}
-
 fn authorize_ticket_start_source(
     api: &WorkspaceApi,
     ticket_id: &str,
@@ -18535,25 +18396,6 @@ fn authorize_ticket_start_source(
         },
     )
     .map_err(|error| error.error)
-}
-
-fn validate_ticket_start_dispatch(
-    api: &WorkspaceApi,
-    assignment: &WorkerTicketAssignmentRequest,
-) -> Result<()> {
-    // A saved startup reservation is not a live operation grant. Recheck at the
-    // actual Runtime boundary, after materialization and attachment reservation.
-    if let Some(observed) = assignment.orchestrator_assignment_id.as_deref() {
-        let body =
-            assigned_subject_body(api, &assignment.ticket_id, observed)?.ok_or_else(|| {
-                Error::WorkspacePermissionDenied(
-                    "Ticket responsibility has no current Subject body".into(),
-                )
-            })?;
-        authorize_ticket_start_source(api, &assignment.ticket_id, &body)?;
-    }
-    api.store
-        .validate_ticket_assignment_operation_fence(api.workspace_id(), &assignment.operation_id)
 }
 
 fn reserve_ticket_start(
@@ -18597,89 +18439,6 @@ fn reserve_ticket_start(
     }
 }
 
-fn validate_ticket_assignment_state(
-    api: &WorkspaceApi,
-    assignment: &WorkerTicketAssignmentRequest,
-) -> Result<()> {
-    let ticket = api.authority.ticket(&assignment.ticket_id)?;
-    if ticket.state == server_api::BrowserTicketState::Closed {
-        return Err(Error::TicketAssignmentConflict(format!(
-            "Ticket {} is {}; reopen through an explicit lifecycle decision before starting work",
-            ticket.id,
-            ticket.state.as_str()
-        )));
-    }
-    // Dependencies remain diagnostics for the caller's partial-work decision;
-    // they are not authority, resource occupancy, or execution reservations.
-    Ok(())
-}
-
-fn validate_ticket_assignment_spawn(
-    api: &WorkspaceApi,
-    runtime_id: &str,
-    request: &WorkerSpawnRequest,
-) -> Result<()> {
-    let Some(assignment) = request.ticket_assignment.as_ref() else {
-        return Ok(());
-    };
-
-    match &request.intent {
-        WorkerSpawnIntent::TicketRole {
-            ticket_id,
-            role: TicketWorkerRole::Worker,
-        } if ticket_id == &assignment.ticket_id => {}
-        WorkerSpawnIntent::TicketRole {
-            ticket_id,
-            role: TicketWorkerRole::Worker,
-        } => {
-            return Err(Error::TicketAssignmentConflict(format!(
-                "spawn intent Ticket {ticket_id} does not match assignment Ticket {}",
-                assignment.ticket_id
-            )));
-        }
-        _ => {
-            return Err(Error::TicketAssignmentConflict(
-                "ticket_assignment is accepted only for a Ticket-role Ticket Worker spawn"
-                    .to_string(),
-            ));
-        }
-    }
-    if !request.workdir_attachment_requests.is_empty()
-        || !request.resolved_workdir_attachment_requests.is_empty()
-    {
-        return Err(Error::TicketAssignmentConflict(
-            "Ticket-assigned Ticket Worker spawn requires existing Workspace Workdir attachments; new materialization requests cannot carry persisted Ticket target capabilities"
-                .to_string(),
-        ));
-    }
-    validated_ticket_resource_targets(api, &assignment.ticket_id)
-        .map_err(|error| Error::TicketAssignmentConflict(error.error.to_string()))?;
-    validate_ticket_assignment_state(api, assignment)?;
-
-    if let Some(current) = api
-        .store
-        .get_active_ticket_worker_assignment(&api.config.workspace_id, &assignment.ticket_id)?
-    {
-        let replay_matches = api
-            .store
-            .get_ticket_assignment_operation(&api.config.workspace_id, &assignment.operation_id)?
-            .is_some_and(|operation| {
-                operation.action == "assign"
-                    && operation.ticket_id == assignment.ticket_id
-                    && operation.runtime_id.as_deref() == Some(runtime_id)
-                    && operation.assignment_id.as_deref() == Some(current.assignment_id.as_str())
-                    && operation.worker.as_ref() == Some(&current.worker)
-            });
-        if !replay_matches {
-            return Err(Error::TicketAssignmentConflict(format!(
-                "Ticket {} is already assigned; use the explicit reassign operation",
-                assignment.ticket_id
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn optional_worker_mutation_source(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -18691,142 +18450,6 @@ fn optional_worker_mutation_source(
         return Ok(None);
     }
     authenticate_worker_mutation_source(api, workspace_id, headers).map(Some)
-}
-
-fn reject_orchestrator_generic_flow_spawn(
-    api: &WorkspaceApi,
-    source: Option<&WorkerMutationSource>,
-    initial_submit: &[Segment],
-    has_ticket_assignment: bool,
-) -> Result<()> {
-    let is_current_orchestrator = source.is_some_and(|source| {
-        find_workspace_orchestrator(api).is_some_and(|orchestrator| orchestrator.worker == *source)
-    });
-    reject_orchestrator_generic_flow_spawn_for_source(
-        is_current_orchestrator,
-        initial_submit,
-        has_ticket_assignment,
-    )
-}
-
-fn reject_orchestrator_generic_flow_spawn_for_source(
-    is_current_orchestrator: bool,
-    initial_submit: &[Segment],
-    has_ticket_assignment: bool,
-) -> Result<()> {
-    let has_flow = initial_submit
-        .iter()
-        .any(|segment| matches!(segment, Segment::Flow { .. }));
-    if is_current_orchestrator && has_flow && !has_ticket_assignment {
-        return Err(Error::TicketAssignmentConflict(
-            "Workspace Orchestrator Flow spawn requires typed Ticket assignment; Ticket identity in initial text is not assignment authority"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn assign_ticket_worker_from_lifecycle(
-    api: &WorkspaceApi,
-    assignment: &crate::hosts::WorkerTicketAssignmentRequest,
-    runtime_id: &str,
-    worker_id: &str,
-) -> Result<TicketWorkerAssignmentRecord> {
-    let ticket = api.authority.ticket(&assignment.ticket_id)?;
-    let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
-    if let Some(operation) = api
-        .store
-        .get_ticket_assignment_operation(&api.config.workspace_id, &assignment.operation_id)?
-        && let Some(assignment_id) = operation.assignment_id.as_ref()
-    {
-        if operation.action == "assign"
-            && operation.ticket_id == assignment.ticket_id
-            && operation.worker.as_ref() == Some(&worker)
-            && let Some(current) = api.store.get_active_ticket_worker_assignment(
-                &api.config.workspace_id,
-                &assignment.ticket_id,
-            )?
-            && current.assignment_id == *assignment_id
-            && current.worker == worker
-        {
-            return Ok(current);
-        }
-        return Err(Error::TicketAssignmentConflict(format!(
-            "assignment operation {} is already bound to another assignment",
-            assignment.operation_id
-        )));
-    }
-    let assigned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let record = TicketWorkerAssignmentRecord {
-        workspace_id: api.config.workspace_id.clone(),
-        ticket_id: ticket.id,
-        assignment_id: new_id("tasg"),
-        worker,
-        assigned_by: "worker-lifecycle".to_string(),
-        assigned_at,
-    };
-    Ok(api
-        .store
-        .set_current_ticket_worker_assignment(
-            &record,
-            None,
-            &new_id("tasev"),
-            &assignment.operation_id,
-            false,
-        )?
-        .current)
-}
-
-fn accept_queued_ticket_after_worker_spawn(
-    api: &WorkspaceApi,
-    assignment: &crate::hosts::WorkerTicketAssignmentRequest,
-) -> Result<()> {
-    let ticket = api.authority.ticket(&assignment.ticket_id)?;
-    if ticket.state != server_api::BrowserTicketState::Open {
-        return Err(Error::TicketAssignmentConflict(format!(
-            "Ticket {} was closed before explicit Worker spawn acceptance",
-            ticket.id
-        )));
-    }
-    // Claim/assignment receipts own execution acceptance. Never manufacture a
-    // Ticket phase or revive a released identity from its retained assignee.
-    Ok(())
-}
-
-fn existing_lifecycle_assignment_worker(
-    api: &WorkspaceApi,
-    assignment: &crate::hosts::WorkerTicketAssignmentRequest,
-    runtime_id: &str,
-) -> Result<Option<InternalWorkerSummary>> {
-    let Some(operation) = api
-        .store
-        .get_ticket_assignment_operation(&api.config.workspace_id, &assignment.operation_id)?
-    else {
-        return Ok(None);
-    };
-    if operation.action != "assign"
-        || operation.ticket_id != assignment.ticket_id
-        || operation.runtime_id.as_deref() != Some(runtime_id)
-    {
-        return Err(Error::TicketAssignmentConflict(format!(
-            "assignment operation {} was already used with different lifecycle input",
-            assignment.operation_id
-        )));
-    }
-    if operation.assignment_id.is_none() {
-        return Ok(None);
-    }
-    let Some(worker_ref) = operation.worker else {
-        return Ok(None);
-    };
-    let worker = api
-        .runtime
-        .worker(&worker_ref)
-        .map_err(|error| error.into_error())?;
-    if operation.assignment_id.is_none() && worker.state == "stopped" {
-        return Ok(None);
-    }
-    Ok(Some(worker))
 }
 
 fn require_ticket_assignment_value(field: &str, value: String) -> Result<String> {
@@ -20290,18 +19913,6 @@ fn resolve_workspace_ticket_identity(
         .into());
     }
     Ok(ticket_id)
-}
-
-fn resolve_workspace_worker_ticket_assignment(
-    api: &WorkspaceApi,
-    workspace_id: &str,
-    assignment: &mut Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
-) -> ApiResult<()> {
-    if let Some(assignment) = assignment {
-        assignment.ticket_id =
-            resolve_workspace_ticket_identity(api, workspace_id, &assignment.ticket_id)?;
-    }
-    Ok(())
 }
 
 fn merge_request_ticket_id(mr: &merge_request::MergeRequest) -> ApiResult<String> {
@@ -27922,7 +27533,6 @@ fn start_memory_staging_consolidation(
                 expected_segments: 1,
             },
             profile: profile_selector,
-            ticket_assignment: None,
             initial_submit,
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -29185,7 +28795,27 @@ async fn list_known_workers(
                     .runtime
                     .worker(&grant.subject)
                     .map_err(|error| error.into_error())?;
+                let workdir_connections = if grant
+                    .permissions
+                    .iter()
+                    .any(|p| p == "send_input" || p == "observe")
+                {
+                    api.store
+                        .list_worker_workdir_links(&path.workspace_id, &grant.subject)?
+                        .into_iter()
+                        .filter(|link| link.unlinked_at.is_none())
+                        .map(|link| server_api::CurrentWorkerWorkdirAttachmentItem {
+                            alias: link.alias,
+                            working_directory_id: link.workdir_id,
+                            capabilities: link.capabilities,
+                            connection_id: link.connection_id,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 items.push(server_api::WorkerControlRecord {
+                    workdir_connections,
                     subject: server_api::WorkerControlSubject {
                         runtime_id: grant.subject.runtime_id,
                         worker_id: grant.subject.worker_id,
@@ -29252,16 +28882,7 @@ async fn spawn_known_worker_authenticated_on_host(
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
-    resolve_workspace_worker_ticket_assignment(
-        &api,
-        &path.workspace_id,
-        &mut request.ticket_assignment,
-    )?;
-    let relation = if request.ticket_assignment.is_some() {
-        "assigned"
-    } else {
-        "spawned"
-    };
+    let relation = "spawned";
     let operation_id = request
         .control_operation_id
         .as_deref()
@@ -29749,7 +29370,6 @@ async fn scoped_start_workspace_orchestrator(
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:orchestrator".to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -35939,58 +35559,14 @@ fn validate_worker_initial_submit(segments: &[Segment]) -> Result<()> {
 }
 
 fn browser_worker_spawn_policy(
-    ticket_assignment: Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
     initial_submit: &[Segment],
-) -> Result<(
-    WorkerSpawnIntent,
-    WorkerSpawnAcceptanceRequirement,
-    Option<WorkerTicketAssignmentRequest>,
-)> {
-    let expected_segments = initial_submit.len();
-    match ticket_assignment {
-        Some(assignment) => {
-            let ticket_id = assignment.ticket_id.trim().to_string();
-            if ticket_id.is_empty() {
-                return Err(Error::InvalidInput(
-                    "ticket_id must not be empty".to_string(),
-                ));
-            }
-            let operation_id = assignment.operation_id.trim().to_string();
-            if operation_id.is_empty() {
-                return Err(Error::InvalidInput(
-                    "assignment operation_id must not be empty".to_string(),
-                ));
-            }
-            Ok((
-                WorkerSpawnIntent::TicketRole {
-                    ticket_id: ticket_id.clone(),
-                    role: TicketWorkerRole::Worker,
-                },
-                WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
-                Some(WorkerTicketAssignmentRequest {
-                    orchestrator_assignment_id: assignment.orchestrator_assignment_id,
-                    ticket_id,
-                    operation_id,
-                }),
-            ))
-        }
-        None => {
-            if initial_submit
-                .iter()
-                .any(|segment| matches!(segment, Segment::Flow { .. }))
-            {
-                return Err(Error::InvalidInput(
-                    "Workspace Worker Flow spawn requires ticket_assignment; use a typed Ticket-assigned Ticket Worker spawn"
-                        .to_string(),
-                ));
-            }
-            Ok((
-                WorkerSpawnIntent::WorkspaceCoding,
-                WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
-                None,
-            ))
-        }
-    }
+) -> Result<(WorkerSpawnIntent, WorkerSpawnAcceptanceRequirement)> {
+    Ok((
+        WorkerSpawnIntent::WorkspaceCoding,
+        WorkerSpawnAcceptanceRequirement::RunAccepted {
+            expected_segments: initial_submit.len(),
+        },
+    ))
 }
 
 fn browser_worker_console_href(workspace_id: &str, resource_key: &str) -> String {
@@ -36044,39 +35620,18 @@ async fn create_workspace_worker_authenticated_on_host(
     resolved_control_operation: Option<WorkerControlOperation>,
     context: Option<&server_api::ServerRequestContext>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    let claim_lock = request
-        .ticket_assignment
-        .as_ref()
-        .map(|a| worker_control_lock(&api, &format!("ticket-claim:{}", a.operation_id)));
-    let _claim_guard = match claim_lock {
-        Some(lock) => Some(lock.lock_owned().await),
-        None => None,
-    };
     let caller_request = request.clone();
     let CreateWorkspaceWorkerRequest {
         runtime_id,
         display_name,
         mut singleton_key,
         profile,
-        ticket_assignment,
         initial_submit,
         workdir_attachments,
         feature_connections,
         authorization,
         control_operation_id,
     } = request;
-    let delegation = ticket_assignment
-        .as_ref()
-        .map(|assignment| {
-            ticket_spawn_delegation(
-                &api,
-                &headers,
-                context,
-                assignment.orchestrator_assignment_id.as_deref(),
-            )
-        })
-        .transpose()?
-        .flatten();
     let source = if let Some(context) = context {
         authenticated_ticket_worker_source(&headers, context)?
     } else {
@@ -36215,12 +35770,6 @@ async fn create_workspace_worker_authenticated_on_host(
         return Err(Error::ReservedWorkerName(display_name).into());
     }
     validate_worker_initial_submit(&initial_submit)?;
-    reject_orchestrator_generic_flow_spawn(
-        &api,
-        source.as_ref(),
-        &initial_submit,
-        ticket_assignment.is_some(),
-    )?;
     let resolved_workdir_attachments = workdir_attachments
         .into_iter()
         .map(|selection| {
@@ -36239,15 +35788,13 @@ async fn create_workspace_worker_authenticated_on_host(
         })
         .collect::<ApiResult<Vec<_>>>()?;
     validate_working_directory_claims_for_browser(&resolved_workdir_attachments)?;
-    let (intent, acceptance, ticket_assignment) =
-        browser_worker_spawn_policy(ticket_assignment, &initial_submit)?;
+    let (intent, acceptance) = browser_worker_spawn_policy(&initial_submit)?;
     let request = WorkerSpawnRequest {
         requested_worker_name: Some(display_name.clone()),
         singleton_key,
         intent,
         acceptance,
         profile: profile_selector,
-        ticket_assignment,
         initial_submit,
         workdir_attachment_requests: Vec::new(),
         resolved_workdir_attachment_requests: Vec::new(),
@@ -36263,72 +35810,13 @@ async fn create_workspace_worker_authenticated_on_host(
         resolved_memory_settings: None,
         resolved_subjektiv_attached,
     };
-    validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
-    let assignment = request.ticket_assignment.clone();
-    let assignment_fingerprint = crate::hosts::worker_spawn_idempotency(&request)
-        .map_err(Error::Config)?
-        .map(|(_, fingerprint)| fingerprint);
-    let mut fresh_ticket_claim = false;
-    if let (Some(assignment), Some(fingerprint)) =
-        (assignment.as_ref(), assignment_fingerprint.as_deref())
-    {
-        fresh_ticket_claim = reserve_ticket_start(
-            &api,
-            &assignment.operation_id,
-            &assignment.ticket_id,
-            &runtime_id,
-            None,
-            fingerprint,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            delegation.as_ref(),
-        )?;
-        let operation = api
-            .store
-            .get_ticket_assignment_operation(&api.config.workspace_id, &assignment.operation_id)?
-            .ok_or_else(|| {
-                Error::TicketAssignmentConflict(format!(
-                    "assignment operation {} disappeared after reservation",
-                    assignment.operation_id
-                ))
-            })?;
-        if let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)? {
-            accept_queued_ticket_after_worker_spawn(&api, assignment)?;
-            return Ok(Json(browser_worker_response_for_committed_summary(
-                &api,
-                worker,
-                display_name,
-                Vec::new(),
-            )?));
-        }
-        if operation.assignment_id.is_some() {
-            return Err(Error::TicketAssignmentConflict(format!(
-                "completed operation {} has no recoverable Worker",
-                assignment.operation_id
-            ))
-            .into());
-        }
-    }
-    if let Some(assignment) = assignment.as_ref() {
-        api.store.validate_ticket_assignment_operation_fence(
-            &api.config.workspace_id,
-            &assignment.operation_id,
-        )?;
-    }
-    let result = match api.spawn_workspace_worker_with_claim_admission(
-        &runtime_id,
-        request,
-        fresh_ticket_claim,
-    ) {
-        Ok(result) => result,
-        Err(error) => return Err(error.into()),
-    };
+    let result = api.spawn_workspace_worker(&runtime_id, request)?;
     let result = if resolved_subjektiv_attached {
         restore_reused_subject_worker(&api, result)?
     } else {
         result
     };
-    let response =
-        record_browser_worker_spawn(&api, runtime_id, display_name, result, assignment.as_ref())?;
+    let response = record_browser_worker_spawn(&api, runtime_id, display_name, result)?;
     if resolved_subjektiv_attached {
         dispatch_orchestrator_assignment_attention(
             &api,
@@ -36389,7 +35877,6 @@ fn record_browser_worker_spawn(
     requested_runtime_id: String,
     display_name: String,
     result: WorkerSpawnResult,
-    assignment: Option<&WorkerTicketAssignmentRequest>,
 ) -> ApiResult<BrowserCreateWorkerResponse> {
     if result.state != InternalWorkerOperationState::Accepted {
         return Err(worker_create_not_accepted_error(
@@ -36403,7 +35890,7 @@ fn record_browser_worker_spawn(
         code: "workspace_worker_create_missing_summary".to_string(),
         message: "Runtime completed worker creation without returning a Worker summary".to_string(),
     })?;
-    browser_worker_response_from_summary(api, worker, display_name, result.diagnostics, assignment)
+    browser_worker_response_from_summary(api, worker, display_name, result.diagnostics)
 }
 
 fn browser_worker_response_from_summary(
@@ -36411,10 +35898,8 @@ fn browser_worker_response_from_summary(
     worker: InternalWorkerSummary,
     display_name: String,
     diagnostics: Vec<RuntimeDiagnostic>,
-    assignment: Option<&WorkerTicketAssignmentRequest>,
 ) -> ApiResult<BrowserCreateWorkerResponse> {
     let compensation = WorkerSpawnCompensationContext {
-        assignment,
         spawned_workdir_ids: &[],
     };
     let worker_record = finalize_worker_spawn_stage(
@@ -36431,45 +35916,7 @@ fn browser_worker_response_from_summary(
         )
         .map_err(ApiError::from),
     )?;
-    if let Some(assignment) = assignment {
-        if let Err(error) = api.store.bind_ticket_assignment_operation_worker(
-            &api.config.workspace_id,
-            &assignment.operation_id,
-            &worker.worker.worker_id,
-        ) {
-            return finalize_worker_spawn_stage(
-                api,
-                &worker,
-                &compensation,
-                WorkerSpawnFinalizeStage::TicketAssignmentBind,
-                Err(error.into()),
-            );
-        }
-        if let Err(error) = assign_ticket_worker_from_lifecycle(
-            api,
-            assignment,
-            &worker.worker.runtime_id,
-            &worker.worker.worker_id,
-        ) {
-            return finalize_worker_spawn_stage(
-                api,
-                &worker,
-                &compensation,
-                WorkerSpawnFinalizeStage::TicketAssignmentBind,
-                Err(error.into()),
-            );
-        }
-    }
     finalize_spawned_worker_workdir_attachments(api, &worker, &worker_record, &compensation)?;
-    if let Some(assignment) = assignment {
-        finalize_worker_spawn_stage(
-            api,
-            &worker,
-            &compensation,
-            WorkerSpawnFinalizeStage::TicketStateAccept,
-            accept_queued_ticket_after_worker_spawn(api, assignment).map_err(ApiError::from),
-        )?;
-    }
     browser_worker_response_for_committed_summary(api, worker, display_name, diagnostics)
 }
 
@@ -37116,15 +36563,11 @@ enum WorkerSpawnFinalizeStage {
     WorkspaceApiBinding,
     CreateReservation,
     WorkerRegistry,
-    TicketAssignmentBind,
-    TicketAssignmentCurrent,
-    TicketStateAccept,
     WorkdirRegistry,
     WorkdirAttachment,
 }
 
 struct WorkerSpawnCompensationContext<'a> {
-    assignment: Option<&'a crate::hosts::WorkerTicketAssignmentRequest>,
     spawned_workdir_ids: &'a [String],
 }
 
@@ -37398,23 +36841,6 @@ fn finalize_spawn_compensation_after_worker_delete(
     context: &WorkerSpawnCompensationContext<'_>,
 ) -> Vec<RuntimeDiagnostic> {
     let mut diagnostics = Vec::new();
-    if let Some(assignment) = context.assignment {
-        if let Err(error) = api.store.rollback_ticket_assignment_operation(
-            &api.config.workspace_id,
-            &assignment.operation_id,
-        ) {
-            diagnostics.push(spawn_compensation_diagnostic(
-                "worker_spawn_compensation_assignment_rollback_failed",
-                format!(
-                    "Failed to roll back Ticket assignment operation `{}` for Worker {}:{}: {}",
-                    assignment.operation_id,
-                    worker_ref.runtime_id,
-                    worker_ref.worker_id,
-                    sanitize_backend_error(&error.to_string())
-                ),
-            ));
-        }
-    }
     if let Err(error) = WorkerRemovalService::new(api).commit_catalog_removal(worker_ref) {
         diagnostics.push(spawn_compensation_diagnostic(
             "worker_spawn_compensation_registry_delete_failed",
@@ -37426,7 +36852,6 @@ fn finalize_spawn_compensation_after_worker_delete(
             ),
         ));
     }
-
     for workdir_id in context.spawned_workdir_ids {
         match execute_workdir_removal(
             api,
@@ -37642,31 +37067,8 @@ async fn create_runtime_worker_authenticated_on_host(
     request.resolved_core_execution_grant = grant;
     request.authorization = Some(authorization);
     request.resolved_control_operation = Some(operation.clone());
-    let delegation = request
-        .ticket_assignment
-        .as_ref()
-        .map(|assignment| {
-            ticket_spawn_delegation(
-                &api,
-                &headers,
-                context,
-                assignment.orchestrator_assignment_id.as_deref(),
-            )
-        })
-        .transpose()?
-        .flatten();
-    let claim_lock = request
-        .ticket_assignment
-        .as_ref()
-        .map(|a| worker_control_lock(&api, &format!("ticket-claim:{}", a.operation_id)));
-    let _claim_guard = match claim_lock {
-        Some(lock) => Some(lock.lock_owned().await),
-        None => None,
-    };
     validate_caller_worker_singleton_key(request.singleton_key.as_deref())?;
     validate_worker_initial_submit(&request.initial_submit)?;
-    let lifecycle_assignment = request.ticket_assignment.clone();
-    validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
     reject_workdir_for_embedded_runtime(
         &runtime_id,
         !request.workdir_attachment_requests.is_empty()
@@ -37688,13 +37090,7 @@ async fn create_runtime_worker_authenticated_on_host(
     let repository_operation_id = request
         .resolved_control_operation
         .as_ref()
-        .map(|operation| operation.operation_id.clone())
-        .or_else(|| {
-            request
-                .ticket_assignment
-                .as_ref()
-                .map(|assignment| assignment.operation_id.clone())
-        });
+        .map(|operation| operation.operation_id.clone());
     let mut created_workdir_ids = Vec::new();
     for attachment in &mut request.resolved_workdir_attachment_requests {
         let workdir_id =
@@ -37715,52 +37111,9 @@ async fn create_runtime_worker_authenticated_on_host(
         }
     }
     let requested_worker_name = request.requested_worker_name.clone();
-    let spawn_idempotency =
-        crate::hosts::worker_spawn_idempotency(&request).map_err(Error::Config)?;
-    let mut fresh_ticket_claim = false;
-    if let (Some(assignment), Some((_, fingerprint))) =
-        (lifecycle_assignment.as_ref(), spawn_idempotency.as_ref())
-    {
-        fresh_ticket_claim = match reserve_ticket_start(
-            &api,
-            &assignment.operation_id,
-            &assignment.ticket_id,
-            &runtime_id,
-            None,
-            fingerprint,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            delegation.as_ref(),
-        ) {
-            Ok(fresh) => fresh,
-            Err(error) => {
-                let diagnostics = cleanup_spawn_created_workdirs(&api, &created_workdir_ids);
-                return Err(ApiError::with_diagnostics(error, diagnostics));
-            }
-        };
-    }
-    if let Some(assignment) = lifecycle_assignment.as_ref()
-        && let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)?
-    {
-        accept_queued_ticket_after_worker_spawn(&api, assignment)?;
-        return Ok(Json(worker_spawn_result_to_api(WorkerSpawnResult {
-            failure: None,
-            state: InternalWorkerOperationState::Accepted,
-            worker: Some(worker),
-            acceptance_evidence: Vec::new(),
-            diagnostics: Vec::new(),
-        })?));
-    }
-    if let Some(assignment) = lifecycle_assignment.as_ref() {
-        api.store.validate_ticket_assignment_operation_fence(
-            &api.config.workspace_id,
-            &assignment.operation_id,
-        )?;
-    }
-    let result =
-        api.spawn_workspace_worker_with_claim_admission(&runtime_id, request, fresh_ticket_claim)?;
+    let result = api.spawn_workspace_worker(&runtime_id, request)?;
     if let Some(worker) = result.worker.as_ref() {
         let compensation = WorkerSpawnCompensationContext {
-            assignment: lifecycle_assignment.as_ref(),
             spawned_workdir_ids: &created_workdir_ids,
         };
         let display_name = requested_worker_name
@@ -37781,41 +37134,6 @@ async fn create_runtime_worker_authenticated_on_host(
                 WorkerRegistryDisplayNamePolicy::UseProvided,
             ),
         )?;
-        if let Some(assignment) = lifecycle_assignment.as_ref() {
-            finalize_worker_spawn_stage(
-                &api,
-                worker,
-                &compensation,
-                WorkerSpawnFinalizeStage::TicketAssignmentBind,
-                api.store
-                    .bind_ticket_assignment_operation_worker(
-                        &api.config.workspace_id,
-                        &assignment.operation_id,
-                        &worker.worker.worker_id,
-                    )
-                    .map_err(ApiError::from),
-            )?;
-            finalize_worker_spawn_stage(
-                &api,
-                worker,
-                &compensation,
-                WorkerSpawnFinalizeStage::TicketAssignmentCurrent,
-                assign_ticket_worker_from_lifecycle(
-                    &api,
-                    assignment,
-                    &runtime_id,
-                    &worker.worker.worker_id,
-                )
-                .map_err(ApiError::from),
-            )?;
-            finalize_worker_spawn_stage(
-                &api,
-                worker,
-                &compensation,
-                WorkerSpawnFinalizeStage::TicketStateAccept,
-                accept_queued_ticket_after_worker_spawn(&api, assignment).map_err(ApiError::from),
-            )?;
-        }
         finalize_spawned_worker_workdir_attachments(&api, worker, &record, &compensation)?;
     } else {
         for workdir_id in &created_workdir_ids {
@@ -37836,7 +37154,7 @@ async fn create_runtime_worker_authenticated_on_host(
             &worker.worker,
             &operation_key,
             &operation.operation_id,
-            lifecycle_assignment.is_some(),
+            false,
         )?;
     }
     Ok(Json(worker_spawn_result_to_api(result)?))
@@ -42262,7 +41580,6 @@ mod tests {
                         display_name: "Notification source reader".into(),
                         singleton_key: None,
                         profile: Some("builtin:companion".into()),
-                        ticket_assignment: None,
                         initial_submit: vec![],
                         workdir_attachments: vec![],
                         feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -42535,8 +41852,8 @@ mod tests {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
     use crate::hosts::{
-        InternalWorkerOperationState, TicketWorkerRole, WorkerInputKind,
-        WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
+        InternalWorkerOperationState, WorkerInputKind, WorkerSpawnAcceptanceRequirement,
+        WorkerSpawnIntent,
     };
     use crate::store::{
         AccountRecord, ApiTokenRecord, BrowserSessionRecord, MemoryDocumentRecord,
@@ -43604,7 +42921,6 @@ mod tests {
                 display_name: "External expiry Worker".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -44217,7 +43533,6 @@ mod tests {
                 display_name: "External multi-attachment Worker".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: vec![
                     server_api::BrowserWorkerWorkingDirectorySelection {
@@ -44479,7 +43794,6 @@ mod tests {
                 display_name: "External analysis Worker".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -48015,7 +47329,6 @@ mod tests {
                 expected_segments: 1,
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            ticket_assignment: None,
             initial_submit: vec![Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }],
@@ -48040,7 +47353,7 @@ mod tests {
             resolved_core_execution_grant: None,
         };
         assert!(
-            api.validate_worker_spawn_repository_scope("runtime-1", &mut workdir_flow_launch)
+            api.validate_worker_spawn_repository_scope(&mut workdir_flow_launch)
                 .is_err()
         );
 
@@ -48174,154 +47487,34 @@ mod tests {
     }
 
     #[test]
-    fn worker_ticket_assignment_projects_optional_flow_and_run_acceptance() {
-        let initial_submit = vec![
-            Segment::Flow {
-                selector: "builtin:coder-review".to_string(),
-            },
-            Segment::text("Implement Ticket 00001KZ9E0DBS"),
-        ];
-        let assignment_request = || CreateWorkspaceWorkerTicketAssignmentRequest {
-            orchestrator_assignment_id: None,
-            ticket_id: "00001KZ9E0DBS".to_string(),
-            operation_id: "worker-spawn:00001KZ9E0DBS:call-1".to_string(),
-        };
-        let (intent, acceptance, assignment) =
-            browser_worker_spawn_policy(Some(assignment_request()), &initial_submit).unwrap();
-
-        assert_eq!(
-            intent,
-            WorkerSpawnIntent::TicketRole {
-                ticket_id: "00001KZ9E0DBS".to_string(),
-                role: TicketWorkerRole::Worker,
-            }
-        );
+    fn ordinary_flow_spawn_needs_no_ticket_assignment() {
+        let (intent, acceptance) = browser_worker_spawn_policy(&[Segment::Flow {
+            selector: "builtin:coder-review".into(),
+        }])
+        .unwrap();
+        assert_eq!(intent, WorkerSpawnIntent::WorkspaceCoding);
         assert_eq!(
             acceptance,
             WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 2,
+                expected_segments: 1
             }
         );
-        assert_eq!(
-            assignment,
-            Some(WorkerTicketAssignmentRequest {
-                orchestrator_assignment_id: None,
-                ticket_id: "00001KZ9E0DBS".to_string(),
-                operation_id: "worker-spawn:00001KZ9E0DBS:call-1".to_string(),
-            })
-        );
+    }
+
+    #[test]
+    fn old_spawn_claim_fields_are_rejected_not_ignored() {
+        let input = json!({"runtime_id":"runtime", "display_name":"worker", "profile":"builtin:coder", "ticket_assignment":{"ticket_id":"T-1","operation_id":"old"}, "feature_connections":{}});
+        assert!(serde_json::from_value::<CreateWorkspaceWorkerRequest>(input).is_err());
         assert!(
-            browser_worker_spawn_policy(
-                Some(CreateWorkspaceWorkerTicketAssignmentRequest {
-                    orchestrator_assignment_id: None,
-                    ticket_id: " ".to_string(),
-                    operation_id: "operation".to_string(),
-                }),
-                &initial_submit,
+            serde_json::from_value::<server_api::RuntimeWorkerSpawnIntent>(
+                json!({"kind":"ticket_role","ticket_id":"T-1","role":"worker"})
             )
             .is_err()
-        );
-        assert!(
-            browser_worker_spawn_policy(
-                Some(assignment_request()),
-                &[Segment::text("Research without Flow")],
-            )
-            .is_ok()
-        );
-        assert!(
-            browser_worker_spawn_policy(
-                None,
-                &[Segment::Flow {
-                    selector: "builtin:coder-review".to_string(),
-                }],
-            )
-            .is_err()
-        );
-        assert!(
-            reject_orchestrator_generic_flow_spawn_for_source(
-                true,
-                &[Segment::Flow {
-                    selector: "builtin:coder-review".to_string(),
-                }],
-                false,
-            )
-            .is_err()
-        );
-        assert!(
-            reject_orchestrator_generic_flow_spawn_for_source(
-                false,
-                &[Segment::Flow {
-                    selector: "builtin:coder-review".to_string(),
-                }],
-                false,
-            )
-            .is_ok()
         );
     }
 
     #[tokio::test]
-    async fn ticket_assignment_spawn_accepts_planning_without_runtime_side_effects() {
-        let workspace = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
-        let backend = browser_ticket_backend(&api).unwrap();
-        let ticket = backend
-            .create(ticket::NewTicket::new("Planning Ticket"))
-            .unwrap();
-        let request = WorkerSpawnRequest {
-            requested_worker_name: Some("Rejected Coder".to_string()),
-            intent: WorkerSpawnIntent::TicketRole {
-                ticket_id: ticket.id.clone(),
-                role: TicketWorkerRole::Worker,
-            },
-            singleton_key: None,
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 1,
-            },
-            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            ticket_assignment: Some(WorkerTicketAssignmentRequest {
-                orchestrator_assignment_id: None,
-                ticket_id: ticket.id,
-                operation_id: "planning-spawn".to_string(),
-            }),
-            initial_submit: vec![Segment::Flow {
-                selector: "builtin:coder-review".to_string(),
-            }],
-            workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle: None,
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: Vec::new(),
-            resolved_workspace_api: None,
-            resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
-            resolved_control_operation: None,
-            resolved_execution_grant: None,
-            authorization: None,
-            resolved_core_execution_grant: None,
-        };
-
-        assert!(
-            validate_ticket_assignment_spawn(&api, EMBEDDED_WORKER_RUNTIME_ID, &request).is_ok()
-        );
-        assert!(
-            api.store
-                .get_ticket_assignment_operation(&api.config.workspace_id, "planning-spawn")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            api.runtime
-                .list_workers_for_runtime(EMBEDDED_WORKER_RUNTIME_ID, 20)
-                .unwrap()
-                .items
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_worker_endpoint_finalizes_ticket_assignment() {
+    async fn workspace_worker_endpoint_does_not_create_ticket_assignment() {
         let fixture = guarded_spawn_fixture().await;
         let operation_id = "workspace-endpoint-assignment";
         let response =
@@ -48346,22 +47539,23 @@ mod tests {
                 .as_str(),
             TicketState::Open.as_str()
         );
-        let current = fixture
-            .api
-            .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
-            .unwrap()
-            .unwrap();
-        let response_ref = RuntimeWorkerRef::new(&response.runtime_id, &response.worker_id);
-        assert_eq!(current.worker, response_ref);
-        let operation = fixture
-            .api
-            .store
-            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, operation_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(operation.assignment_id, Some(current.assignment_id));
-        assert_eq!(operation.worker, Some(response_ref));
+        assert!(
+            fixture
+                .api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .api
+                .store
+                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, operation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!response.worker_id.is_empty());
     }
 
     #[tokio::test]
@@ -48383,11 +47577,6 @@ mod tests {
                 display_name: "Rejected Coder".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
-                    orchestrator_assignment_id: None,
-                    ticket_id: ticket.id.clone(),
-                    operation_id: "failed-queued-assignment".to_string(),
-                }),
                 initial_submit: vec![Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
                 }],
@@ -48427,7 +47616,6 @@ mod tests {
                 display_name: "Scoped Worker".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -48466,7 +47654,6 @@ mod tests {
                 display_name: "Cross-runtime Worker".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -48829,7 +48016,6 @@ mod tests {
                 display_name: "Guarded spawn controller".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -48875,10 +48061,6 @@ mod tests {
             "runtime_id": WorkdirlessFixtureRuntime::RUNTIME_ID,
             "display_name": "Coder · guarded attachment",
             "profile": "builtin:coder",
-            "ticket_assignment": {
-                "ticket_id": fixture.ticket_id,
-                "operation_id": operation_id,
-            },
             "initial_submit": [
                 { "kind": "flow", "selector": "builtin:coder-review" },
                 { "kind": "text", "content": "Implement guarded attachment Ticket." },
@@ -49014,7 +48196,7 @@ mod tests {
         assert_eq!(read_only.relative_cwd, None);
         assert_eq!(
             read_only.capabilities,
-            workdir::WorkdirSessionCapabilities::READ_ONLY
+            workdir::WorkdirSessionCapabilities::ALL
         );
         for attachment in &request.workdir_attachments {
             assert!(state.workdir_statuses.iter().any(|status| {
@@ -49212,15 +48394,17 @@ mod tests {
             assert_eq!(read_only.working_directory_id, fixture.read_only_workdir_id);
             assert_eq!(
                 read_only.capabilities,
-                workdir::WorkdirSessionCapabilities::READ_ONLY
+                workdir::WorkdirSessionCapabilities::ALL
             );
-            let worker = fixture
-                .api
-                .store
-                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
-                .unwrap()
-                .unwrap()
-                .worker;
+            assert!(
+                fixture
+                    .api
+                    .store
+                    .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let worker = RuntimeWorkerRef::new(&body.runtime_id, &body.worker_id);
             let links = fixture
                 .api
                 .store
@@ -49233,7 +48417,7 @@ mod tests {
             }));
             assert!(links.iter().any(|link| {
                 link.workdir_id == fixture.read_only_workdir_id
-                    && link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
+                    && link.capabilities == workdir::WorkdirSessionCapabilities::ALL
             }));
         }
     }
@@ -49337,7 +48521,6 @@ mod tests {
                 display_name: "Strict remote spawn controller".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -49364,10 +48547,6 @@ mod tests {
             "runtime_id": STRICT_REMOTE_RUNTIME_ID,
             "display_name": "Coder · strict remote attachment",
             "profile": "builtin:coder",
-            "ticket_assignment": {
-                "ticket_id": ticket_id,
-                "operation_id": "guarded-strict-remote-success",
-            },
             "initial_submit": [
                 { "kind": "flow", "selector": "builtin:coder-review" },
                 { "kind": "text", "content": "Implement strict remote attachment Ticket." },
@@ -49438,12 +48617,7 @@ mod tests {
             2
         );
         drop(requests);
-        let worker = api
-            .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket_id)
-            .unwrap()
-            .unwrap()
-            .worker;
+        let worker = RuntimeWorkerRef::new(&body.runtime_id, &body.worker_id);
         let links = api
             .store
             .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
@@ -49455,7 +48629,7 @@ mod tests {
         }));
         assert!(links.iter().any(|link| {
             link.workdir_id == read_only_workdir_id
-                && link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
+                && link.capabilities == workdir::WorkdirSessionCapabilities::ALL
         }));
         runtime_server.abort();
     }
@@ -49487,44 +48661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_attachment_spawn_rolls_back_post_create_assignment_failure() {
-        let fixture = guarded_spawn_fixture().await;
-        rusqlite::Connection::open(&fixture.api.config.database_path)
-            .unwrap()
-            .execute_batch(
-                r#"
-                CREATE TRIGGER fail_guarded_coder_assignment
-                BEFORE INSERT ON ticket_current_worker_assignments
-                WHEN NEW.role = 'worker'
-                BEGIN
-                    SELECT RAISE(ABORT, 'injected guarded Coder assignment failure');
-                END;
-                "#,
-            )
-            .unwrap();
-
-        let response = post_guarded_spawn(
-            &fixture,
-            guarded_spawn_payload(&fixture, "guarded-post-create-failure"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
-        let bytes = to_bytes(
-            response.into_body(),
-            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
-        )
-        .await
-        .unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["yoi_startup"]["operation"]["acceptance"], "accepted");
-        assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
-        assert_eq!(fixture.runtime.spawn_requests().len(), 1);
-        assert_guarded_spawn_rolled_back(&fixture);
-    }
-
-    #[tokio::test]
-    async fn guarded_attachment_spawn_assignment_conflict_has_no_side_effects() {
+    async fn ordinary_spawn_does_not_consume_existing_ticket_assignment() {
         let fixture = guarded_spawn_fixture().await;
         fixture
             .api
@@ -49554,20 +48691,8 @@ mod tests {
             guarded_spawn_payload(&fixture, "guarded-assignment-conflict"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(fixture.runtime.spawn_requests().is_empty());
-        assert_eq!(
-            guarded_spawn_artifact_counts(&fixture.api, &fixture.workdir_id),
-            (0, 0, 0)
-        );
-        assert!(
-            fixture
-                .api
-                .store
-                .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.workdir_id)
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.runtime.spawn_requests().len(), 1);
         let current = fixture
             .api
             .store
@@ -49668,7 +48793,6 @@ mod tests {
                 display_name: "Control caller".to_string(),
                 singleton_key: None,
                 profile: None,
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -49702,7 +48826,6 @@ mod tests {
             display_name: "Idempotent controlled child".to_string(),
             singleton_key: None,
             profile: Some("builtin:default".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
@@ -49779,7 +48902,6 @@ mod tests {
             display_name: "Subject Worker".to_string(),
             singleton_key: Some("custom:subject-42".to_string()),
             profile: Some("builtin:companion".to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
@@ -49950,7 +49072,6 @@ mod tests {
                 display_name: "Session boundary Worker".to_string(),
                 singleton_key: None,
                 profile: None,
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -50053,7 +49174,6 @@ mod tests {
             display_name: display_name.to_string(),
             singleton_key: None,
             profile: None,
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
@@ -50266,7 +49386,6 @@ mod tests {
                 profile: worker_runtime::catalog::ProfileSelector::Builtin(
                     "builtin:companion".to_string(),
                 ),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -51306,7 +50425,6 @@ mod tests {
                 display_name: "Ordinary launch".to_string(),
                 singleton_key: singleton_key.map(ToOwned::to_owned),
                 profile: Some(profile.to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -51442,7 +50560,6 @@ mod tests {
                 display_name: "Bound authorization source".into(),
                 singleton_key: None,
                 profile: Some("builtin:companion".into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -51613,7 +50730,6 @@ mod tests {
             display_name: "Subject Worker".to_string(),
             singleton_key: None,
             profile: Some("builtin:companion".to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
@@ -52802,7 +51918,6 @@ mod tests {
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -53087,7 +52202,6 @@ mod tests {
                 display_name: "Generic Orchestrator Profile Worker".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -53111,7 +52225,6 @@ mod tests {
                 display_name: "Generic singleton key claimant".to_string(),
                 singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
                 profile: Some("builtin:companion".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -53147,7 +52260,6 @@ mod tests {
                     expected_segments: 0,
                 },
                 profile: ProfileSelector::Builtin("builtin:companion".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -53206,7 +52318,6 @@ mod tests {
                 display_name: crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
                 singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -55268,7 +54379,6 @@ mod tests {
                     expected_segments: 0,
                 },
                 profile: ProfileSelector::Builtin("builtin:companion".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -60266,7 +59376,6 @@ mod tests {
                     expected_segments: 0,
                 },
                 profile: ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -60687,7 +59796,6 @@ mod tests {
                 display_name: "Notification Source".into(),
                 singleton_key: None,
                 profile: Some("builtin:coder".into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: Default::default(),
@@ -60758,15 +59866,6 @@ mod tests {
                 false,
             )
             .unwrap();
-        accept_queued_ticket_after_worker_spawn(
-            &api,
-            &crate::hosts::WorkerTicketAssignmentRequest {
-                orchestrator_assignment_id: None,
-                ticket_id: ticket.id.clone(),
-                operation_id: "notification-source-assignment-operation".to_string(),
-            },
-        )
-        .unwrap();
 
         let operations = [
             TicketBackendOperation::AddEvent {
@@ -60883,7 +59982,6 @@ mod tests {
                 display_name: "Assignment lifecycle Coder".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -61341,7 +60439,6 @@ mod tests {
                 display_name: "Manual Coder candidate".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -62044,16 +61141,12 @@ mod tests {
                 test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some("cancelled-coder".to_string()),
-                    intent: WorkerSpawnIntent::TicketRole {
-                        ticket_id: "implementation-cancellation".to_string(),
-                        role: TicketWorkerRole::Worker,
-                    },
+                    intent: WorkerSpawnIntent::WorkspaceCoding,
                     singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
                     initial_submit: Vec::new(),
                     workdir_attachment_requests: Vec::new(),
                     resolved_workdir_attachment_requests: Vec::new(),
@@ -62152,16 +61245,12 @@ mod tests {
         let api = test_api(dir.path()).await;
         let spawn = |name: &str| WorkerSpawnRequest {
             requested_worker_name: Some(name.to_string()),
-            intent: WorkerSpawnIntent::TicketRole {
-                ticket_id: name.to_string(),
-                role: TicketWorkerRole::Worker,
-            },
+            intent: WorkerSpawnIntent::WorkspaceCoding,
             singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -62708,16 +61797,12 @@ mod tests {
                 test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some("orchestrator-source".to_string()),
-                    intent: WorkerSpawnIntent::TicketRole {
-                        ticket_id: "source-ticket".to_string(),
-                        role: TicketWorkerRole::Worker,
-                    },
+                    intent: WorkerSpawnIntent::WorkspaceCoding,
                     singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
                     initial_submit: Vec::new(),
                     workdir_attachment_requests: Vec::new(),
                     resolved_workdir_attachment_requests: Vec::new(),
@@ -62779,16 +61864,12 @@ mod tests {
                 test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some("orchestrator-source".to_string()),
-                    intent: WorkerSpawnIntent::TicketRole {
-                        ticket_id: "source-ticket".to_string(),
-                        role: TicketWorkerRole::Worker,
-                    },
+                    intent: WorkerSpawnIntent::WorkspaceCoding,
                     singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
                     initial_submit: Vec::new(),
                     workdir_attachment_requests: Vec::new(),
                     resolved_workdir_attachment_requests: Vec::new(),
@@ -63016,7 +62097,6 @@ mod tests {
                     expected_segments: 0,
                 },
                 profile: server_api::RuntimeProfileSelector::Builtin(profile.to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
             };
@@ -63070,7 +62150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_worker_ticket_assignment_can_omit_targets_and_flow_and_replay_exact_start() {
+    async fn runtime_worker_creation_never_claims_ticket_and_replays_exact_start() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
@@ -63086,20 +62166,12 @@ mod tests {
             },
             control_operation_id: "runtime-test-create".into(),
             requested_worker_name: Some("assigned-spawn".to_string()),
-            intent: server_api::RuntimeWorkerSpawnIntent::TicketRole {
-                ticket_id: ticket.id.clone(),
-                role: server_api::RuntimeTicketWorkerRole::Worker,
-            },
+            intent: server_api::RuntimeWorkerSpawnIntent::WorkspaceCoding,
             singleton_key: None,
             acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
             },
             profile: server_api::RuntimeProfileSelector::Builtin("builtin:intake".to_string()),
-            ticket_assignment: Some(server_api::RuntimeWorkerTicketAssignmentRequest {
-                orchestrator_assignment_id: None,
-                ticket_id: ticket.id.clone(),
-                operation_id: "runtime-explicit-work".to_string(),
-            }),
             initial_submit: vec![
                 serde_json::to_value(Segment::text("Investigate this Ticket")).unwrap(),
             ],
@@ -63126,7 +62198,7 @@ mod tests {
             api.store
                 .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
                 .unwrap()
-                .is_some()
+                .is_none()
         );
         assert_eq!(
             backend
@@ -63437,14 +62509,6 @@ mod tests {
             resolve_workspace_ticket_identity(&api, TEST_WORKSPACE_ID, &ticket_id).unwrap(),
             ticket_id
         );
-        let mut assignment = Some(CreateWorkspaceWorkerTicketAssignmentRequest {
-            orchestrator_assignment_id: None,
-            ticket_id: ticket_resource_key.clone(),
-            operation_id: "ticket-key-assignment".to_string(),
-        });
-        resolve_workspace_worker_ticket_assignment(&api, TEST_WORKSPACE_ID, &mut assignment)
-            .unwrap();
-        assert_eq!(assignment.unwrap().ticket_id, ticket_id);
         let missing =
             resolve_workspace_ticket_identity(&api, TEST_WORKSPACE_ID, "T-999999").unwrap_err();
         assert_eq!(missing.into_response().status(), StatusCode::NOT_FOUND);
@@ -64430,7 +63494,6 @@ mod tests {
                     expected_segments: 0,
                 },
                 profile: ProfileSelector::Builtin("builtin:orchestrator".into()),
-                ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachment_requests: vec![],
                 resolved_workdir_attachment_requests: vec![],
@@ -65040,7 +64103,6 @@ mod tests {
                 profile: worker_runtime::catalog::ProfileSelector::Builtin(
                     "builtin:companion".to_string(),
                 ),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -65117,7 +64179,6 @@ mod tests {
                 profile: worker_runtime::catalog::ProfileSelector::Builtin(
                     "builtin:companion".to_string(),
                 ),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -65261,7 +64322,6 @@ mod tests {
                 profile: worker_runtime::catalog::ProfileSelector::Builtin(
                     "builtin:companion".to_string(),
                 ),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -65288,7 +64348,6 @@ mod tests {
             &api,
             &summary,
             &WorkerSpawnCompensationContext {
-                assignment: None,
                 spawned_workdir_ids: &[],
             },
         );
@@ -69079,7 +68138,6 @@ mod tests {
                 profile: worker_runtime::catalog::ProfileSelector::Builtin(
                     "builtin:companion".to_string(),
                 ),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
@@ -72202,7 +71260,6 @@ mod tests {
                 profile: server_api::RuntimeProfileSelector::Builtin(
                     "builtin:companion".to_string(),
                 ),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
             }),
@@ -72226,7 +71283,6 @@ mod tests {
                 display_name: "Remote Worker".to_string(),
                 singleton_key: None,
                 profile: Some("builtin:companion".to_string()),
-                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
@@ -72252,11 +71308,7 @@ mod tests {
             "POST",
             "/api/runtimes/embedded-worker-runtime/workers",
             Some(serde_json::json!({
-                "intent": {
-                    "kind": "ticket_role",
-                    "ticket_id": "00001KVZSGT0Q",
-                    "role": "worker"
-                },
+                "intent": {"kind":"workspace_coding"},
                 "acceptance": {
                     "kind": "run_accepted",
                     "expected_segments": 0
@@ -72294,11 +71346,7 @@ mod tests {
             Some(serde_json::json!({
                 "control_operation_id": "embedded-workdir-rejected",
                 "authorization": {"kind": "assignment"},
-                "intent": {
-                    "kind": "ticket_role",
-                    "ticket_id": "00001KVZSGT0Q",
-                    "role": "worker"
-                },
+                "intent": {"kind":"workspace_coding"},
                 "acceptance": {
                     "kind": "run_accepted",
                     "expected_segments": 0
@@ -72997,17 +72045,13 @@ mod tests {
                 "embedded-worker-runtime",
                 test_create_binding(),
                 WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::TicketRole {
-                        ticket_id: "00001KVZSGT0Q".to_string(),
-                        role: TicketWorkerRole::Worker,
-                    },
+                    intent: WorkerSpawnIntent::WorkspaceCoding,
                     requested_worker_name: None,
                     singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
                     initial_submit: Vec::new(),
                     workdir_attachment_requests: Vec::new(),
                     resolved_workdir_attachment_requests: Vec::new(),
@@ -74442,7 +73486,6 @@ mod tests {
             profile: worker_runtime::catalog::ProfileSelector::Builtin(
                 "builtin:companion".to_string(),
             ),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -75338,7 +74381,6 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin(profile.to_string()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),

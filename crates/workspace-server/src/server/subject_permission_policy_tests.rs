@@ -122,7 +122,6 @@ mod subject_permission_policy_tests {
                     } else {
                         "builtin:companion".into()
                     }),
-                    ticket_assignment: None,
                     initial_submit: vec![],
                     workdir_attachments: vec![],
                     feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
