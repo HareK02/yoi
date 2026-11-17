@@ -7303,19 +7303,6 @@ impl WorkspaceApi {
                         claim.alias
                     )))
                 })?;
-            if target
-                .ref_selector
-                .as_deref()
-                .is_some_and(|selector| workdir.creation_selector.as_deref() != Some(selector))
-            {
-                return Err(Error::InvalidInput(format!(
-                    "Ticket `{ticket_id}` target selector `{}` does not match attachment `{}` selector `{}`",
-                    target.ref_selector.as_deref().unwrap_or("unspecified"),
-                    claim.alias,
-                    workdir.creation_selector.as_deref().unwrap_or("none")
-                ))
-                .into());
-            }
             if !covered_repositories.insert(repository_id.clone()) {
                 return Err(Error::InvalidInput(format!(
                     "Ticket `{ticket_id}` target Repository `{}` has more than one Worker attachment",
@@ -7489,7 +7476,6 @@ fn require_ticket_read_write_target(
 
 enum TicketWorkdirTargetMismatch {
     RepositoryUndeclared,
-    SelectorMismatch,
 }
 
 impl TicketWorkdirTargetMismatch {
@@ -7497,9 +7483,6 @@ impl TicketWorkdirTargetMismatch {
         Error::InvalidInput(match self {
             Self::RepositoryUndeclared => format!(
                 "Workdir `{workdir_id}` Repository is not declared by assigned Ticket `{ticket_id}`"
-            ),
-            Self::SelectorMismatch => format!(
-                "Workdir `{workdir_id}` selector does not match assigned Ticket `{ticket_id}` target selector"
             ),
         })
     }
@@ -7562,16 +7545,7 @@ fn ticket_workdir_access(
             mismatch: TicketWorkdirTargetMismatch::RepositoryUndeclared,
         });
     };
-    if target
-        .ref_selector
-        .as_deref()
-        .is_some_and(|selector| workdir.creation_selector.as_deref() != Some(selector))
-    {
-        return Ok(TicketWorkdirAccess::Denied {
-            ticket_id: assignment.ticket_id,
-            mismatch: TicketWorkdirTargetMismatch::SelectorMismatch,
-        });
-    }
+    // Creation selectors are provenance, not current Workdir access authority.
     Ok(TicketWorkdirAccess::Granted(
         target.capabilities.intersection(source_capabilities),
     ))
@@ -7722,19 +7696,6 @@ fn validate_manual_ticket_worker_workdir_binding(
                     link.alias
                 )))
             })?;
-        if target
-            .ref_selector
-            .as_deref()
-            .is_some_and(|selector| workdir.creation_selector.as_deref() != Some(selector))
-        {
-            return Err(Error::InvalidInput(format!(
-                "Ticket `{ticket_id}` target selector `{}` does not match attachment `{}` selector `{}`",
-                target.ref_selector.as_deref().unwrap_or("unspecified"),
-                link.alias,
-                workdir.creation_selector.as_deref().unwrap_or("none")
-            ))
-            .into());
-        }
         if !covered_repositories.insert(repository_id.clone()) {
             return Err(Error::InvalidInput(format!(
                 "Ticket `{ticket_id}` target Repository `{}` has more than one Worker attachment",
@@ -49183,94 +49144,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_spawn_http_boundary_preserves_multi_target_capabilities() {
-        let fixture = guarded_spawn_fixture().await;
-        let payload = guarded_spawn_payload(&fixture, "guarded-success");
-        assert!(payload.get("working_directory").is_none());
+    async fn guarded_spawn_preserves_capabilities_independent_of_creation_selector() {
+        for selector in [
+            Some("HEAD"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            None,
+        ] {
+            let fixture = guarded_spawn_fixture().await;
+            let mut record = fixture
+                .api
+                .store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.workdir_id)
+                .unwrap()
+                .unwrap();
+            record.creation_selector = selector.map(str::to_string);
+            fixture.api.store.upsert_workdir_registry(&record).unwrap();
+            let mut record = fixture
+                .api
+                .store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.read_only_workdir_id)
+                .unwrap()
+                .unwrap();
+            record.creation_selector = selector.map(str::to_string);
+            fixture.api.store.upsert_workdir_registry(&record).unwrap();
+            let payload = guarded_spawn_payload(&fixture, "guarded-success");
+            assert!(payload.get("working_directory").is_none());
 
-        let response = post_guarded_spawn(&fixture, payload).await;
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "unexpected guarded spawn response: {}",
-            String::from_utf8_lossy(&bytes)
-        );
-        let body: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body.worker.workdir_attachments.len(), 2);
-        assert!(body.worker.workdir_attachments.iter().any(|attachment| {
-            attachment.alias == "workdir"
-                && attachment.working_directory.working_directory_id == fixture.workdir_id
-        }));
-        assert!(body.worker.workdir_attachments.iter().any(|attachment| {
-            attachment.alias == "docs"
-                && attachment.working_directory.working_directory_id == fixture.read_only_workdir_id
-        }));
-        let requests = fixture.runtime.spawn_requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].resolved_workdir_attachments.len(), 2);
-        let writable = requests[0]
-            .resolved_workdir_attachments
-            .iter()
-            .find(|attachment| attachment.alias.as_str() == "workdir")
-            .unwrap();
-        assert_eq!(writable.working_directory_id, fixture.workdir_id);
-        assert_eq!(writable.relative_cwd.as_deref(), Some("crates/yoi"));
-        assert_eq!(
-            writable.capabilities,
-            workdir::WorkdirSessionCapabilities::ALL
-        );
-        let read_only = requests[0]
-            .resolved_workdir_attachments
-            .iter()
-            .find(|attachment| attachment.alias.as_str() == "docs")
-            .unwrap();
-        assert_eq!(read_only.working_directory_id, fixture.read_only_workdir_id);
-        assert_eq!(
-            read_only.capabilities,
-            workdir::WorkdirSessionCapabilities::READ_ONLY
-        );
-        let worker = fixture
-            .api
-            .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
-            .unwrap()
-            .unwrap()
-            .worker;
-        let links = fixture
-            .api
-            .store
-            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
-            .unwrap();
-        assert_eq!(links.len(), 2);
-        assert!(links.iter().any(|link| {
-            link.workdir_id == fixture.workdir_id
-                && link.capabilities == workdir::WorkdirSessionCapabilities::ALL
-        }));
-        assert!(links.iter().any(|link| {
-            link.workdir_id == fixture.read_only_workdir_id
-                && link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
-        }));
-    }
-
-    #[tokio::test]
-    async fn guarded_spawn_rejects_mismatched_selector_before_runtime_side_effects() {
-        let fixture = guarded_spawn_fixture().await;
-        let payload = guarded_spawn_payload(&fixture, "guarded-selector-mismatch");
-        let mut docs = fixture
-            .api
-            .store
-            .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.read_only_workdir_id)
-            .unwrap()
-            .unwrap();
-        docs.creation_selector = Some("other".into());
-        fixture.api.store.upsert_workdir_registry(&docs).unwrap();
-
-        let response = post_guarded_spawn(&fixture, payload).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(fixture.runtime.spawn_requests().is_empty());
-        assert_guarded_spawn_rolled_back(&fixture);
+            let response = post_guarded_spawn(&fixture, payload).await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "unexpected guarded spawn response: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let body: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.worker.workdir_attachments.len(), 2);
+            assert!(body.worker.workdir_attachments.iter().any(|attachment| {
+                attachment.alias == "workdir"
+                    && attachment.working_directory.working_directory_id == fixture.workdir_id
+            }));
+            assert!(body.worker.workdir_attachments.iter().any(|attachment| {
+                attachment.alias == "docs"
+                    && attachment.working_directory.working_directory_id
+                        == fixture.read_only_workdir_id
+            }));
+            let requests = fixture.runtime.spawn_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].resolved_workdir_attachments.len(), 2);
+            let writable = requests[0]
+                .resolved_workdir_attachments
+                .iter()
+                .find(|attachment| attachment.alias.as_str() == "workdir")
+                .unwrap();
+            assert_eq!(writable.working_directory_id, fixture.workdir_id);
+            assert_eq!(writable.relative_cwd.as_deref(), Some("crates/yoi"));
+            assert_eq!(
+                writable.capabilities,
+                workdir::WorkdirSessionCapabilities::ALL
+            );
+            let read_only = requests[0]
+                .resolved_workdir_attachments
+                .iter()
+                .find(|attachment| attachment.alias.as_str() == "docs")
+                .unwrap();
+            assert_eq!(read_only.working_directory_id, fixture.read_only_workdir_id);
+            assert_eq!(
+                read_only.capabilities,
+                workdir::WorkdirSessionCapabilities::READ_ONLY
+            );
+            let worker = fixture
+                .api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .unwrap()
+                .worker;
+            let links = fixture
+                .api
+                .store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+                .unwrap();
+            assert_eq!(links.len(), 2);
+            assert!(links.iter().any(|link| {
+                link.workdir_id == fixture.workdir_id
+                    && link.capabilities == workdir::WorkdirSessionCapabilities::ALL
+            }));
+            assert!(links.iter().any(|link| {
+                link.workdir_id == fixture.read_only_workdir_id
+                    && link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
+            }));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -61491,80 +61456,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_worker_assignment_validates_and_rebinds_all_ticket_targets() {
-        let fixture = manual_worker_assignment_fixture().await;
-        let Json(response) = scoped_set_ticket_assignment(
-            State(fixture.api.clone()),
-            AxumPath((
-                TEST_WORKSPACE_ID.to_string(),
-                fixture.ticket_id.clone(),
-                "worker".to_string(),
-            )),
-            Json(manual_worker_assignment_request(
-                &fixture,
-                "manual-multi-target-success",
-            )),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            response.assignment.unwrap().principal,
-            server_api::TicketAssignmentPrincipal::Worker {
-                runtime_id: fixture.worker.runtime_id.clone(),
-                worker_id: fixture.worker.worker_id.clone(),
-            }
-        );
-        assert_eq!(
-            fixture
+    async fn manual_worker_assignment_preserves_capabilities_independent_of_creation_selector() {
+        for selector in [
+            Some("HEAD"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            None,
+        ] {
+            let fixture = manual_worker_assignment_fixture().await;
+            let mut record = fixture
                 .api
-                .authority
-                .ticket(&fixture.ticket_id)
+                .store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.main_workdir_id)
                 .unwrap()
-                .state
-                .as_str(),
-            TicketState::Open.as_str()
-        );
-        let links = fixture
-            .api
-            .store
-            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+                .unwrap();
+            record.creation_selector = selector.map(str::to_string);
+            fixture.api.store.upsert_workdir_registry(&record).unwrap();
+            let mut record = fixture
+                .api
+                .store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+                .unwrap()
+                .unwrap();
+            record.creation_selector = selector.map(str::to_string);
+            fixture.api.store.upsert_workdir_registry(&record).unwrap();
+            let Json(response) = scoped_set_ticket_assignment(
+                State(fixture.api.clone()),
+                AxumPath((
+                    TEST_WORKSPACE_ID.to_string(),
+                    fixture.ticket_id.clone(),
+                    "worker".to_string(),
+                )),
+                Json(manual_worker_assignment_request(
+                    &fixture,
+                    "manual-multi-target-success",
+                )),
+            )
+            .await
             .unwrap();
-        assert_eq!(links.len(), 2);
-        assert_eq!(
-            links
-                .iter()
-                .find(|link| link.workdir_id == fixture.main_workdir_id)
-                .unwrap()
-                .capabilities,
-            workdir::WorkdirSessionCapabilities::ALL
-        );
-        assert_eq!(
-            links
-                .iter()
-                .find(|link| link.workdir_id == fixture.docs_workdir_id)
-                .unwrap()
-                .capabilities,
-            workdir::WorkdirSessionCapabilities::READ_ONLY
-        );
-        assert_eq!(
-            fixture.api.runtime.worker(&fixture.worker).unwrap().state,
-            "idle",
-            "manual assignment must restore the live Worker after capability binding"
-        );
-        let runtime_attachments = fixture
-            .runtime
-            .logical_attachments(&fixture.worker.worker_id);
-        assert_eq!(runtime_attachments.len(), 2);
-        assert_eq!(
-            runtime_attachments
-                .iter()
-                .find(|attachment| attachment.alias.as_str() == "docs")
-                .unwrap()
-                .capabilities,
-            workdir::WorkdirSessionCapabilities::READ_ONLY,
-            "the restored live Worker must not retain its pre-assignment ALL capability"
-        );
+
+            assert_eq!(
+                response.assignment.unwrap().principal,
+                server_api::TicketAssignmentPrincipal::Worker {
+                    runtime_id: fixture.worker.runtime_id.clone(),
+                    worker_id: fixture.worker.worker_id.clone(),
+                }
+            );
+            assert_eq!(
+                fixture
+                    .api
+                    .authority
+                    .ticket(&fixture.ticket_id)
+                    .unwrap()
+                    .state
+                    .as_str(),
+                TicketState::Open.as_str()
+            );
+            let links = fixture
+                .api
+                .store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+                .unwrap();
+            assert_eq!(links.len(), 2);
+            assert_eq!(
+                links
+                    .iter()
+                    .find(|link| link.workdir_id == fixture.main_workdir_id)
+                    .unwrap()
+                    .capabilities,
+                workdir::WorkdirSessionCapabilities::ALL
+            );
+            assert_eq!(
+                links
+                    .iter()
+                    .find(|link| link.workdir_id == fixture.docs_workdir_id)
+                    .unwrap()
+                    .capabilities,
+                workdir::WorkdirSessionCapabilities::READ_ONLY
+            );
+            assert_eq!(
+                fixture.api.runtime.worker(&fixture.worker).unwrap().state,
+                "idle",
+                "manual assignment must restore the live Worker after capability binding"
+            );
+            let runtime_attachments = fixture
+                .runtime
+                .logical_attachments(&fixture.worker.worker_id);
+            assert_eq!(runtime_attachments.len(), 2);
+            assert_eq!(
+                runtime_attachments
+                    .iter()
+                    .find(|attachment| attachment.alias.as_str() == "docs")
+                    .unwrap()
+                    .capabilities,
+                workdir::WorkdirSessionCapabilities::READ_ONLY,
+                "the restored live Worker must not retain its pre-assignment ALL capability"
+            );
+            for id in [&fixture.main_workdir_id, &fixture.docs_workdir_id] {
+                assert_eq!(
+                    fixture
+                        .api
+                        .store
+                        .get_workdir_registry(TEST_WORKSPACE_ID, id)
+                        .unwrap()
+                        .unwrap()
+                        .creation_selector
+                        .as_deref(),
+                    selector
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -61608,10 +61608,10 @@ mod tests {
                         targets: vec![
                             test_ticket_target(
                                 "test-repository",
-                                "develop",
+                                "release",
                                 TicketTargetAccess::ReadWrite,
                             ),
-                            test_ticket_target("docs", "develop", TicketTargetAccess::ReadWrite),
+                            test_ticket_target("docs", "release", TicketTargetAccess::ReadWrite),
                         ],
                     }),
                     ..Default::default()
@@ -61660,7 +61660,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_worker_assignment_rejects_stale_or_mismatched_workdirs_before_state_change() {
-        for case in ["stale", "undeclared", "selector"] {
+        for case in ["stale", "undeclared"] {
             let fixture = manual_worker_assignment_fixture().await;
             let request =
                 manual_worker_assignment_request(&fixture, &format!("manual-invalid-{case}"));
@@ -61714,16 +61714,6 @@ mod tests {
                         runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                         repository_id: "undeclared-repository".to_string(),
                     };
-                    fixture.api.store.upsert_workdir_registry(&docs).unwrap();
-                }
-                "selector" => {
-                    let mut docs = fixture
-                        .api
-                        .store
-                        .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
-                        .unwrap()
-                        .unwrap();
-                    docs.creation_selector = Some("other".to_string());
                     fixture.api.store.upsert_workdir_registry(&docs).unwrap();
                 }
                 _ => unreachable!(),

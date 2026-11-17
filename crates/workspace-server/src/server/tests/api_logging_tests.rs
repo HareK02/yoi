@@ -1,4 +1,5 @@
 mod workdir_open;
+mod workdir_selector;
 
 use super::*;
 use std::io::Write;
