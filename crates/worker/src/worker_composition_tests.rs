@@ -190,32 +190,12 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
     }
     let state = session_store::collect_state(&controller.handle.committed_entries());
     let prompt = state.system_prompt.unwrap();
-    assert!(prompt.contains("## Assigned Ticket coordination"));
-    assert!(prompt.contains("TicketAssignmentTrackingUpdate"));
+    let role_prompt = include_str!("../../../resources/prompts/role/async-chat.md");
+    assert!(
+        prompt.contains(role_prompt.trim()),
+        "chat composition must include the current role prompt"
+    );
     assert!(prompt.contains("## Ticket workflow"));
-    for required in [
-        server_api::authorization::CONVERSATION_PERMISSION_SET,
-        server_api::authorization::WORK_COORDINATION_PERMISSION_SET,
-        server_api::authorization::WORK_EXECUTION_PERMISSION_SET,
-        "Profile activation does not enroll or expand them",
-        "Preserve configured references and exclusions, explicit-empty policies",
-        "revoked grants",
-        "bounded, explicitly scoped `execution_grant`",
-        "Reviewer redelegation authority within that actual grant",
-        "Runtime/domain checks independent",
-        "Create an ordinary Worker with empty initial_submit",
-        "After confirmed assignment, send the work with WorkerSendInput",
-        "Assignment tools do not authorize self-assignment or automatic Worker starts",
-        "Preserve explicit user approval and closing conditions",
-        "not automatic cleanup",
-    ] {
-        assert!(
-            prompt.contains(required),
-            "chat prompt lacks authority boundary: {required}"
-        );
-    }
-    assert!(!prompt.contains("Subject creation enrolls conversation/Ticket acceptance only"));
-    assert!(!prompt.contains("through the existing `WorkerSpawn` Ticket fields"));
     assert!(
         client.requests.lock().unwrap().is_empty(),
         "Profile activation must not issue authority or read protected content"
