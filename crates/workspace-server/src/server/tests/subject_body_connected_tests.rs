@@ -687,8 +687,9 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
         "refused startup must not register a protected Session"
     );
 
-    // A separate Subject proves the same denial at restore, with normal defaults
-    // at creation and explicit owner revocation only after a successful start.
+    // Unlike fresh registration, restoring a confirmed Session does not require
+    // session.record again. It must preserve attribution without regranting the
+    // operation that the owner revoked after the successful start.
     let subject = f.subject("body-restore-revoked-subject").await;
     let started = f
         .mutate(&subject, "/start", absent_start("body-authorized-start"))
@@ -702,29 +703,49 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
         .current_subject_policy(&subject)
         .unwrap()
         .unwrap();
+    let store = open_subjektiv_store(&f.connected.api).unwrap();
+    let attribution = store.subject_session_attributions(&subject).unwrap();
+    assert_eq!(attribution.len(), 1);
     let observed = f.read(&subject).await;
-    let request = intent("body-denied-restore", &observed);
-    let denied = f.mutate(&subject, "/start", request.clone()).await;
-    assert_ne!(denied["disposition"], "accepted", "{denied}");
+    let request = intent("body-restore-without-record", &observed);
+    let restored = f.mutate(&subject, "/start", request.clone()).await;
+    assert_eq!(restored["disposition"], "accepted", "{restored}");
     let replay = f.mutate(&subject, "/start", request).await;
-    assert_ne!(replay["disposition"], "accepted", "{replay}");
+    assert_eq!(replay["disposition"], "accepted", "{replay}");
     assert_eq!(
-        open_subjektiv_store(&f.connected.api)
-            .unwrap()
-            .current_subject_policy(&subject)
-            .unwrap()
-            .unwrap(),
+        store.current_subject_policy(&subject).unwrap().unwrap(),
         revoked
     );
     assert_eq!(
         f.read(&subject).await["current"],
         observed["current"],
-        "denial must not replace singleton generation"
+        "restore must not replace singleton generation"
     );
     assert_eq!(
         f.read(&subject).await["observation"]["worker"]["state"],
-        "stopped"
+        "idle"
     );
+    let (status, denied) = connected_authorization_post(
+        &f.connected.backend_url,
+        &f.connected.identity,
+        &RuntimeWorkerRef::new(
+            CONNECTED_RUNTIME,
+            observed["current"]["worker_id"].as_str().unwrap(),
+        ),
+        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions"),
+        &json!({"session_id":attribution[0].session_id,"create_if_missing":true}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "restore must not regrant session.record: {denied}"
+    );
+    assert_eq!(
+        store.subject_session_attributions(&subject).unwrap(),
+        attribution
+    );
+    f.stop(&subject, "body-revoked-restore-cleanup").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

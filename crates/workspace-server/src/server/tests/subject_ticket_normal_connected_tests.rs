@@ -478,15 +478,6 @@ async fn next(rx: &mut tokio::sync::mpsc::Receiver<Value>) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn ordinary_two_subjects_builtin_coders_edit_validate_save_evaluate_and_track() {
-    ordinary_subject_scenario(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn tailored_background_handling_grant_does_not_bypass_current_subject_body() {
-    ordinary_subject_scenario(true).await;
-}
-
-async fn ordinary_subject_scenario(background_handling_control: bool) {
     crate::restore_test_environment::require_restore_test_environment();
     let (edited, mut edits) = tokio::sync::mpsc::channel(4);
     let (evaluated, mut evaluations) = tokio::sync::mpsc::channel(8);
@@ -555,26 +546,14 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
                 .unwrap()
                 .success()
         );
-        // The positive case carries the actual creation assignments through
-        // canonical enrollment without adding operation keys. Only the separate
-        // domain-negative case permits child handling, to test the body fence
-        // rather than merely failing its delegation ceiling.
-        if background_handling_control {
-            super::super::chat_tests::adopt_subject_policy(
-                &h.api,
-                &h.owner,
-                &subject,
-                r#"{ sets = ["conversation", "work-coordination"]; }"#,
-                r#"{ sets = ["work-execution"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,
-            )
-            .await;
-        } else {
-            super::super::chat_tests::adopt_chat_defaults(&h.api, &h.owner).await;
-            assert_eq!(
-                subjects.current_subject_policy(&subject).unwrap().unwrap(),
-                created_policy
-            );
-        }
+        // Carry the actual creation assignments through canonical enrollment.
+        // Tailored child handling authority is tested separately at the signed
+        // router boundary, without replaying this entire connected scenario.
+        super::super::chat_tests::adopt_chat_defaults(&h.api, &h.owner).await;
+        assert_eq!(
+            subjects.current_subject_policy(&subject).unwrap().unwrap(),
+            created_policy
+        );
         let body = start(&h, &subject, &format!("ordinary-start-{label}")).await;
         assert_eq!(
             body["observation"]["worker"]["profile"],
@@ -631,19 +610,13 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
         let content = format!("normal {label} verified\n");
         // Operation authority is separate from the selected Ticket and Workdir.
         // The Host freezes the assignment within the current Subject delegation.
-        let mut assignment = standalone_assignment(
+        let assignment = standalone_assignment(
             r#"{ namespaces = [
                 { namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; },
                 { namespace = "bash"; keys = ["bash.execute"]; },
                 { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; }
             ]; }"#,
         );
-        if background_handling_control {
-            let handling = standalone_assignment(
-                r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,
-            );
-            assignment.grants.extend(handling.grants);
-        }
         let spawn = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder",
             "operation_id":format!("ordinary-spawn-{label}"),"initial_submit":[],
             "workdir_attachments":[{"alias":"checkout","working_directory_id":wd}],
@@ -725,9 +698,10 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
                 .iter()
                 .any(|text| text.contains("implementation-result:"))
         );
-        // Even with the update operation in its frozen grant, a Coder is not
-        // the Subject's current body. Exercise the signed production endpoint,
-        // not absence of a Tool in the bounded Coder Profile.
+        // The ordinary Coder cannot self-report through the signed endpoint.
+        // The separate subject_handling_authority test grants the update key
+        // explicitly and proves rejection by current-body ownership, independent
+        // of capability denial or the bounded Coder Profile's Tool set.
         let child = h.api.config_store.with_conn(|conn| {
             conn.query_row("SELECT runtime_id,worker_id FROM ticket_implementation_results WHERE workspace_id=?1 AND result_id=?2",
                 rusqlite::params![TEST_WORKSPACE_ID,results[ticket]["result_id"].as_str().unwrap()],
@@ -753,22 +727,6 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
             } if subject_id == input["subject"].as_str().unwrap()
                 && runtime_id == &source.runtime_id && worker_id == &source.worker_id
         ));
-        if background_handling_control {
-            let (status, permission) = connected_authorization_post(
-                &h.backend_url,
-                &h.identity,
-                &child,
-                &authorization_path(),
-                &json!({"operation":"ticket.assignment.update","resource":{
-                    "kind":"ticket","workspace_id":TEST_WORKSPACE_ID,"ticket_id":ticket}}),
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "tailored child has the operation; the handling refusal must exercise body ownership: {permission}"
-            );
-        }
         let tracking = persisted_tracking(&h, ticket);
         let mut denied = handling(
             ticket,
@@ -788,7 +746,7 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "background current-body fence: {error}"
+            "ordinary background self-report denied: {error}"
         );
     }
 

@@ -188,7 +188,8 @@ impl agen::llm_client::LlmClient for MessagingModel {
                 let policy = self.policy.lock().unwrap().clone().unwrap();
                 let mut input = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:messaging-peer","operation_id":"public-roundtrip-spawn","display_name":"Notify-only delegated peer","initial_submit":if self.repair.is_some() {vec![protocol::Segment::Text {content:EARLY.into()}]} else {vec![]},"authorization":{"kind":"policy","policy_id":policy.policy_id,"policy_authorization_key":policy.authorization_key}});
                 if let Some(workdir) = self.workdir.lock().unwrap().as_ref() {
-                    input["working_directory_id"] = json!(workdir);
+                    input["workdir_attachments"] =
+                        json!([{"alias":"checkout","working_directory_id":workdir}]);
                 }
                 call(call_id, "WorkerSpawn", input)
             }

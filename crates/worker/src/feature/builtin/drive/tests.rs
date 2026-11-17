@@ -765,7 +765,7 @@ async fn drive_common_text_reads_use_bounded_complete_source_and_literal_window_
             .contains(&Contract::SearchText.reference())
     );
     assert!(
-        projection
+        !projection
             .object
             .interfaces
             .contains(&Contract::Write.reference())
@@ -1030,7 +1030,7 @@ async fn drive_common_mutation_publication_uses_provider_capability() {
         .unwrap()
         .projection;
     assert!(
-        !projection
+        projection
             .object
             .interfaces
             .contains(&Contract::Write.reference())

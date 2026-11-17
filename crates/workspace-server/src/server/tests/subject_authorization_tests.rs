@@ -30,6 +30,8 @@ mod subject_body_cleanup_connected;
 mod subject_body_connected;
 #[path = "subject_body_tests.rs"]
 mod subject_body_tests;
+#[path = "subject_handling_authority_tests.rs"]
+mod subject_handling_authority;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
 #[path = "subject_mr_completion_admission_tests.rs"]

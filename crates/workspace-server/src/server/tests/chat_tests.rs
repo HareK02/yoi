@@ -1705,21 +1705,59 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         .unwrap()
         .restore_observation_token
         .unwrap();
+    let attribution_before_restore = store.subject_session_attributions(&subject).unwrap();
+    assert_eq!(attribution_before_restore.len(), 1);
     let restored = f
         .post(
             &format!("{lifecycle_path}/restore"),
             json!({"request_id":"restore-revoked-defaults","expected_observation_token":token}),
         )
         .await;
-    assert_ne!(
+    assert_eq!(
         restored["result"]["state"], "accepted",
-        "required startup authorization must refuse revoked source: {restored}"
+        "confirmed Session restoration does not register it again: {restored}"
+    );
+    assert_eq!(restored["worker_id"], worker);
+    assert_eq!(
+        store.subject_session_attributions(&subject).unwrap(),
+        attribution_before_restore
     );
     assert_eq!(
         store.current_subject_policy(&subject).unwrap(),
         Some(revoked),
         "restore never reissues the initial policy"
     );
+    let (status, before_denied_send) =
+        account(&f.api, &f.owner, "GET", &messages_path(c), None).await;
+    assert_eq!(status, StatusCode::OK);
+    for operation in [read(c), send(c, "revoked-after-restore", None)] {
+        let (status, body) = worker_chat_connected(&f, worker, operation).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "restore must not reinstate revoked chat authority: {body}"
+        );
+    }
+    let (status, after_denied_send) =
+        account(&f.api, &f.owner, "GET", &messages_path(c), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after_denied_send, before_denied_send);
+    let stop_observation = f
+        .api
+        .runtime
+        .worker(&worker_ref)
+        .unwrap()
+        .restore_observation_token
+        .unwrap();
+    let stopped = f
+        .post(
+            &format!("{lifecycle_path}/stop"),
+            json!({"stop_intent": {
+                "request_id":"revoked-restore-cleanup","expected_observation_token":stop_observation
+            }}),
+        )
+        .await;
+    assert_eq!(stopped["state"], "accepted");
 }
 
 #[derive(Clone)]

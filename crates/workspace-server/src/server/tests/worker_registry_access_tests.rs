@@ -56,14 +56,14 @@ async fn target_edits_preserve_worker_reads_and_input_but_deny_mismatched_workdi
                         TicketTargetsEdit::Clear
                     } else {
                         TicketTargetsEdit::Set {
-                            targets: vec![
-                                test_ticket_target(
-                                    "test-repository",
-                                    "other-branch",
-                                    TicketTargetAccess::ReadWrite,
-                                ),
-                                test_ticket_target("docs", "develop", TicketTargetAccess::ReadOnly),
-                            ],
+                            // Remove the checkout Repository, not merely its
+                            // selector: creation selectors are provenance and
+                            // must not become access constraints.
+                            targets: vec![test_ticket_target(
+                                "docs",
+                                "develop",
+                                TicketTargetAccess::ReadOnly,
+                            )],
                         }
                     }),
                     ..Default::default()
