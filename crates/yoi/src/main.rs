@@ -858,7 +858,12 @@ fn parse_workdir_args(
         )));
     }
     let mut path = None;
-    let mut workspace_id = target_selection.workspace_id.clone();
+    if target_selection.workspace_id.is_some() {
+        return Err(ParseError(
+            "yoi workdir share uses --workspace-name, not --workspace-id".into(),
+        ));
+    }
+    let mut workspace_name = None;
     let mut backend_url = target_selection.backend_url.clone();
     let mut display_name = None;
     let mut ttl = None;
@@ -870,13 +875,18 @@ fn parse_workdir_args(
     while index < args.len() {
         match args[index].as_str() {
             "--workspace-id" => {
-                if workspace_id.is_some() {
+                return Err(ParseError(
+                    "yoi workdir share uses --workspace-name, not --workspace-id".into(),
+                ));
+            }
+            "--workspace-name" => {
+                if workspace_name.is_some() {
                     return Err(ParseError(
-                        "--workspace-id may only be provided once".to_string(),
+                        "--workspace-name may only be provided once".to_string(),
                     ));
                 }
-                workspace_id =
-                    Some(required_option_value(args, index, "--workspace-id")?.to_string());
+                workspace_name =
+                    Some(required_option_value(args, index, "--workspace-name")?.to_string());
                 index += 2;
             }
             "--backend" => {
@@ -988,16 +998,22 @@ fn parse_workdir_args(
         } else {
             server_api::ExternalWorkdirPermissions::READ
         });
-    if non_interactive && workspace_id.is_none() {
+    if non_interactive && workspace_name.is_none() {
         return Err(ParseError(
-            "--non-interactive requires --workspace-id".to_string(),
+            "--non-interactive requires --workspace-name".to_string(),
         ));
     }
-    let backend_url = resolve_backend_url(backend_url, workspace_id.as_deref())?;
+    if workspace_name
+        .as_ref()
+        .is_some_and(|name: &String| name.trim().is_empty())
+    {
+        return Err(ParseError("--workspace-name must not be blank".into()));
+    }
+    let backend_url = resolve_backend_url(backend_url, None)?;
     Ok(Mode::WorkdirShare(workdir_share::WorkdirShareOptions {
         path: path
             .ok_or_else(|| ParseError("yoi workdir share requires a directory path".to_string()))?,
-        workspace_id,
+        workspace_name,
         backend_url,
         display_name: display_name.unwrap_or_else(|| "External Workdir".to_string()),
         ttl: ttl.flatten(),
@@ -2181,7 +2197,7 @@ Usage:
   yoi [--backend <URL>] workspace create --display-name <NAME>
   yoi [--backend <URL>] init --display-name <NAME> --repository-key <KEY> [--repository <PATH>] [--default-ref <REF>]
   yoi [--backend <URL>] login [--no-wait]
-  yoi [--backend <URL>] workdir share <PATH> [--workspace-id <ID>] [--permission <read|write|command>] [--read-only|--read-write] [--ttl <TTL>] [--display-name <NAME>] [--non-interactive]
+  yoi [--backend <URL>] workdir share <PATH> [--workspace-name <NAME>] [--permission <read|write|command>] [--read-only|--read-write] [--ttl <TTL>] [--display-name <NAME>] [--non-interactive]
   yoi <HOST_COMMAND> [OPTIONS]
 
 Target selection:
@@ -2235,7 +2251,7 @@ Options:
 
 fn print_workdir_help() {
     println!(
-        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> [OPTIONS]\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nInteractive mode is the default: choose an accessible Workspace, one READ/WRITE/COMMAND permission level, and TTL, then explicitly confirm before any grant is created.\nREAD enables Read/Glob/Grep and related observation operations. WRITE includes READ and adds Write/Edit. COMMAND includes WRITE and READ, adds command start/status/output/cancel, and runs with the sharing CLI user's host authority; it is not sandboxed.\nUse --permission once to choose the level in automation. Legacy --read-only and --read-write retain the READ and WRITE meanings and conflict with --permission.\nOmitting --ttl means unlimited automatic lifetime, but stop, disconnect, Ctrl-C, and revoke still fail closed. TTL accepts none or unlimited for no automatic expiry, or s, m, or h suffixes from 60s through 24h.\nNo host path is sent to the Backend. Ctrl-C explicitly revokes the grant before exit.\n\nOptions:\n      --workspace-id <ID>  Preselect a Workspace; required with --non-interactive\n      --permission <LEVEL>  Grant read, write (includes read), or command (includes write + read)\n      --read-only          Legacy alias for --permission read\n      --read-write         Legacy alias for --permission write\n      --ttl <TTL>          Automatic expiry: 60s..24h, none, or unlimited (default: none)\n      --display-name <NAME>  Backend-visible label (default: External Workdir)\n      --non-interactive    Skip all prompts including confirmation; requires --workspace-id\n                          Uses --permission (default: read) and --ttl (default: none)\n  -h, --help               Print help\n\nNon-interactive example (no TTY required; stays in the foreground):\n  yoi --backend https://backend.example workdir share ./project --workspace-id <ID> --permission write --ttl none --display-name project --non-interactive\n"
+        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> [OPTIONS]\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nInteractive mode is the default: choose an accessible Workspace, one READ/WRITE/COMMAND permission level, and TTL, then explicitly confirm before any grant is created.\nREAD enables Read/Glob/Grep and related observation operations. WRITE includes READ and adds Write/Edit. COMMAND includes WRITE and READ, adds command start/status/output/cancel, and runs with the sharing CLI user's host authority; it is not sandboxed.\nUse --permission once to choose the level in automation. Legacy --read-only and --read-write retain the READ and WRITE meanings and conflict with --permission.\nOmitting --ttl means unlimited automatic lifetime, but stop, disconnect, Ctrl-C, and revoke still fail closed. TTL accepts none or unlimited for no automatic expiry, or s, m, or h suffixes from 60s through 24h.\nNo host path is sent to the Backend. Ctrl-C explicitly revokes the grant before exit.\n\nOptions:\n      --workspace-name <NAME>  Select an exact, unique accessible Workspace name; required with --non-interactive\n      --permission <LEVEL>  Grant read, write (includes read), or command (includes write + read)\n      --read-only          Legacy alias for --permission read\n      --read-write         Legacy alias for --permission write\n      --ttl <TTL>          Automatic expiry: 60s..24h, none, or unlimited (default: none)\n      --display-name <NAME>  Backend-visible label (default: External Workdir)\n      --non-interactive    Skip all prompts including confirmation; requires --workspace-name\n                          Uses --permission (default: read) and --ttl (default: none)\n  -h, --help               Print help\n\nNon-interactive example (no TTY required; stays in the foreground):\n  yoi --backend https://backend.example workdir share ./project --workspace-name \"My Workspace\" --permission write --ttl none --display-name project --non-interactive\n"
     );
 }
 
@@ -2300,18 +2316,19 @@ mod tests {
             "90m".to_string(),
             "--display-name".to_string(),
             "session-analysis".to_string(),
+            "--workspace-name".to_string(),
+            "workspace-a".to_string(),
             "--non-interactive".to_string(),
         ];
         let target = TargetSelection {
             backend_url: Some("https://backend.example".to_string()),
-            workspace_id: Some("workspace-a".to_string()),
             ..TargetSelection::default()
         };
         let Mode::WorkdirShare(options) = parse_workdir_args(&args, &target).unwrap() else {
             panic!("expected Workdir share mode");
         };
         assert_eq!(options.path, PathBuf::from("./session-log"));
-        assert_eq!(options.workspace_id.as_deref(), Some("workspace-a"));
+        assert_eq!(options.workspace_name.as_deref(), Some("workspace-a"));
         assert_eq!(options.backend_url, "https://backend.example");
         assert_eq!(options.display_name, "session-analysis");
         assert_eq!(options.ttl, Some(Duration::from_secs(5_400)));
@@ -2333,11 +2350,12 @@ mod tests {
             ".".to_string(),
             "--permission".to_string(),
             "command".to_string(),
+            "--workspace-name".to_string(),
+            "workspace-a".to_string(),
             "--non-interactive".to_string(),
         ];
         let target = TargetSelection {
             backend_url: Some("https://backend.example".to_string()),
-            workspace_id: Some("workspace-a".to_string()),
             ..TargetSelection::default()
         };
         let Mode::WorkdirShare(options) = parse_workdir_args(&args, &target).unwrap() else {
@@ -2368,7 +2386,7 @@ mod tests {
                     "./project",
                     "--backend",
                     "https://backend.example",
-                    "--workspace-id",
+                    "--workspace-name",
                     "workspace-a",
                     "--permission",
                     level,
@@ -2386,13 +2404,72 @@ mod tests {
                 };
                 assert_eq!(options.path, PathBuf::from("./project"));
                 assert_eq!(options.backend_url, "https://backend.example");
-                assert_eq!(options.workspace_id.as_deref(), Some("workspace-a"));
+                assert_eq!(options.workspace_name.as_deref(), Some("workspace-a"));
                 assert_eq!(options.display_name, "project");
                 assert_eq!(options.permissions, permissions);
                 assert_eq!(options.ttl, expected_ttl);
                 assert!(options.non_interactive);
             }
         }
+    }
+
+    #[test]
+    fn workdir_share_workspace_name_is_explicit_and_preserves_spaces_and_unicode() {
+        let target = TargetSelection {
+            backend_url: Some("https://backend.example".into()),
+            ..Default::default()
+        };
+        let args = [
+            "share",
+            ".",
+            "--workspace-name",
+            "開発 Workspace",
+            "--non-interactive",
+        ]
+        .map(str::to_owned);
+        let Mode::WorkdirShare(options) = parse_workdir_args(&args, &target).unwrap() else {
+            panic!("expected share");
+        };
+        assert_eq!(options.workspace_name.as_deref(), Some("開発 Workspace"));
+        for args in [
+            vec!["share", ".", "--workspace-name"],
+            vec!["share", ".", "--workspace-name", "   "],
+            vec![
+                "share",
+                ".",
+                "--workspace-name",
+                "Alpha",
+                "--workspace-name",
+                "Beta",
+            ],
+            vec!["share", ".", "--workspace-id", "1"],
+            vec![
+                "share",
+                ".",
+                "--workspace-name",
+                "Alpha",
+                "--workspace-id",
+                "1",
+            ],
+        ] {
+            assert!(
+                parse_workdir_args(
+                    &args.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                    &target
+                )
+                .is_err()
+            );
+        }
+        let global_id = TargetSelection {
+            workspace_id: Some("1".into()),
+            ..target
+        };
+        assert!(
+            parse_workdir_args(&args, &global_id)
+                .unwrap_err()
+                .0
+                .contains("uses --workspace-name")
+        );
     }
 
     #[test]
@@ -2418,7 +2495,7 @@ mod tests {
         let Mode::WorkdirShare(options) = parse_workdir_args(&args, &target).unwrap() else {
             panic!("expected Workdir share mode");
         };
-        assert_eq!(options.workspace_id, None);
+        assert_eq!(options.workspace_name, None);
         assert_eq!(options.display_name, "External Workdir");
         assert_eq!(options.ttl, None);
         assert_eq!(
@@ -2432,7 +2509,6 @@ mod tests {
     fn workdir_share_rejects_invalid_or_conflicting_automation_options() {
         let target = TargetSelection {
             backend_url: Some("https://backend.example".to_string()),
-            workspace_id: Some("workspace-a".to_string()),
             ..TargetSelection::default()
         };
         let invalid_ttl = vec![
@@ -2503,7 +2579,7 @@ mod tests {
             parse_workdir_args(&automation, &missing_workspace)
                 .unwrap_err()
                 .0
-                .contains("--workspace-id")
+                .contains("--workspace-name")
         );
     }
 

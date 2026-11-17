@@ -35,7 +35,7 @@ use workdir::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkdirShareOptions {
     pub path: PathBuf,
-    pub workspace_id: Option<String>,
+    pub workspace_name: Option<String>,
     pub backend_url: String,
     pub display_name: String,
     pub ttl: Option<Duration>,
@@ -626,18 +626,9 @@ fn configure_interactively(
         .map_err(|error| format!("failed to write prompt: {error}"))?;
     }
     let initial_index = options
-        .workspace_id
+        .workspace_name
         .as_deref()
-        .map(|workspace_id| {
-            workspaces
-                .iter()
-                .position(|workspace| workspace.workspace_id == workspace_id)
-                .ok_or_else(|| {
-                    format!(
-                        "Workspace `{workspace_id}` is not present in the accessible Backend catalog"
-                    )
-                })
-        })
+        .map(|name| workspace_index_by_name(workspaces, name))
         .transpose()?
         .unwrap_or(0);
     let Some(selection) = read_prompt_line(
@@ -661,7 +652,7 @@ fn configure_interactively(
             .filter(|index| *index < workspaces.len())
             .ok_or_else(|| "Workspace selection is invalid".to_string())?
     };
-    options.workspace_id = Some(workspaces[selected_index].workspace_id.clone());
+    let selected_workspace = &workspaces[selected_index];
 
     writeln!(
         output,
@@ -715,12 +706,9 @@ fn configure_interactively(
         value => parse_ttl(value)?,
     };
 
-    let workspace_id = options
-        .workspace_id
-        .clone()
-        .expect("interactive selection always assigns a Workspace");
+    let workspace_id = selected_workspace.workspace_id.clone();
     writeln!(output, "Share configuration:")
-        .and_then(|()| writeln!(output, "  Workspace: {workspace_id}"))
+        .and_then(|()| writeln!(output, "  Workspace: {}", selected_workspace.display_name))
         .and_then(|()| {
             writeln!(
                 output,
@@ -752,43 +740,96 @@ fn ensure_interactive_tty(stdin_is_tty: bool, stderr_is_tty: bool) -> Result<(),
         Ok(())
     } else {
         Err(
-            "interactive sharing requires a TTY; use --non-interactive with --workspace-id for automation"
+            "interactive sharing requires a TTY; use --non-interactive with --workspace-name for automation"
                 .to_string(),
         )
     }
+}
+
+const SHARE_WORKSPACE_LIMIT: u32 = 200;
+
+fn workspace_index_by_name(
+    workspaces: &[server_api::WorkspaceSummary],
+    name: &str,
+) -> Result<usize, String> {
+    if name.trim().is_empty() {
+        return Err("--workspace-name must not be blank".into());
+    }
+    // A full bounded catalog cannot establish uniqueness beyond the returned rows.
+    if workspaces.len() >= SHARE_WORKSPACE_LIMIT as usize {
+        return Err("Workspace catalog limit reached; name uniqueness could not be confirmed. Use interactive selection or narrow the accessible catalog.".into());
+    }
+    let mut matches = workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, workspace)| workspace.display_name == name);
+    let Some((index, _)) = matches.next() else {
+        return Err(format!(
+            "No accessible Workspace has the exact name {name:?} on this Backend"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "Workspace name {name:?} is ambiguous on this Backend; use interactive selection or give the Workspaces distinct names"
+        ));
+    }
+    Ok(index)
+}
+
+fn configure_non_interactively(
+    options: WorkdirShareOptions,
+    workspaces: &[server_api::WorkspaceSummary],
+) -> Result<ResolvedWorkdirShareOptions, String> {
+    let name = options.workspace_name.as_deref().ok_or_else(||
+        "non-interactive sharing requires --workspace-name; no Workspace is inferred from cwd or path".to_string())?;
+    let workspace_id = workspaces[workspace_index_by_name(workspaces, name)?]
+        .workspace_id
+        .clone();
+    Ok(ResolvedWorkdirShareOptions {
+        path: options.path,
+        workspace_id,
+        backend_url: options.backend_url,
+        display_name: options.display_name,
+        ttl: options.ttl,
+        permissions: options.permissions,
+    })
+}
+
+async fn load_share_workspaces(
+    client: &ServerApiClient,
+) -> Result<Vec<server_api::WorkspaceSummary>, String> {
+    client
+        .workspace_catalog_list(server_api::WorkspaceListQuery {
+            limit: Some(SHARE_WORKSPACE_LIMIT),
+        })
+        .await
+        .map(|response| response.0)
+        .map_err(|error| format!("failed to query Backend Workspace catalog: {error}"))
 }
 
 async fn resolve_share_options(
     options: WorkdirShareOptions,
 ) -> Result<Option<ResolvedWorkdirShareOptions>, String> {
     validate_permissions(options.permissions)?;
-    if options.non_interactive {
-        let workspace_id = options.workspace_id.clone().ok_or_else(|| {
-            "non-interactive sharing requires --workspace-id; no Workspace is inferred from cwd or path"
-                .to_string()
-        })?;
-        return Ok(Some(ResolvedWorkdirShareOptions {
-            path: options.path,
-            workspace_id,
-            backend_url: options.backend_url,
-            display_name: options.display_name,
-            ttl: options.ttl,
-            permissions: options.permissions,
-        }));
+    if options.non_interactive && options.workspace_name.is_none() {
+        return Err("non-interactive sharing requires --workspace-name; no Workspace is inferred from cwd or path".into());
     }
-    ensure_interactive_tty(
-        std::io::stdin().is_terminal(),
-        std::io::stderr().is_terminal(),
-    )?;
-    let target = client::BackendWorkspaceCatalogTarget::new(options.backend_url.clone());
-    let workspaces = client::list_backend_workspaces(&target)
-        .await
-        .map_err(|error| format!("failed to query Backend Workspace catalog: {error}"))?;
+    if !options.non_interactive {
+        ensure_interactive_tty(
+            std::io::stdin().is_terminal(),
+            std::io::stderr().is_terminal(),
+        )?;
+    }
+    let backend_client = BackendApiClient::from_stored_token(&options.backend_url)
+        .map_err(|error| error.to_string())?;
+    let api = authenticated_server_api_client(&backend_client, &options.backend_url)?;
+    let workspaces = load_share_workspaces(&api).await?;
+    if options.non_interactive {
+        return configure_non_interactively(options, &workspaces).map(Some);
+    }
     let stdin = std::io::stdin();
     let stderr = std::io::stderr();
-    let mut input = stdin.lock();
-    let mut output = stderr.lock();
-    configure_interactively(options, &workspaces, &mut input, &mut output)
+    configure_interactively(options, &workspaces, &mut stdin.lock(), &mut stderr.lock())
 }
 
 pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
@@ -1547,7 +1588,7 @@ mod tests {
     fn share_options() -> WorkdirShareOptions {
         WorkdirShareOptions {
             path: PathBuf::from("."),
-            workspace_id: None,
+            workspace_name: None,
             backend_url: "https://backend.example".to_string(),
             display_name: "External Workdir".to_string(),
             ttl: None,
@@ -1583,6 +1624,131 @@ mod tests {
         assert!(error.contains("rejected"), "{error}");
         assert!(!error.contains("provider-secret"), "{error}");
         assert!(!error.contains("/private/provider"), "{error}");
+    }
+
+    #[test]
+    fn workspace_name_selection_requires_a_unique_exact_accessible_name() {
+        let workspaces = [
+            workspace("id-a", "Alpha"),
+            workspace("id-b", "開発 Workspace"),
+        ];
+        for (name, expected) in [("Alpha", "id-a"), ("開発 Workspace", "id-b")] {
+            let mut options = share_options();
+            options.workspace_name = Some(name.into());
+            options.non_interactive = true;
+            let resolved = configure_non_interactively(options, &workspaces).unwrap();
+            assert_eq!(resolved.workspace_id, expected);
+        }
+        for name in ["alpha", "Al", "id-a", " Alpha", "missing"] {
+            assert!(
+                workspace_index_by_name(&workspaces, name)
+                    .unwrap_err()
+                    .contains("No accessible Workspace")
+            );
+        }
+        assert!(workspace_index_by_name(&[], "Alpha").is_err());
+        assert!(
+            workspace_index_by_name(&workspaces, " ")
+                .unwrap_err()
+                .contains("blank")
+        );
+        let duplicates = [workspace("id-a", "Alpha"), workspace("id-b", "Alpha")];
+        assert!(
+            workspace_index_by_name(&duplicates, "Alpha")
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        let mut bounded = (0..SHARE_WORKSPACE_LIMIT)
+            .map(|i| workspace(&format!("id-{i}"), &format!("Name {i}")))
+            .collect::<Vec<_>>();
+        assert!(
+            workspace_index_by_name(&bounded, "Name 0")
+                .unwrap_err()
+                .contains("uniqueness could not be confirmed")
+        );
+        bounded.pop();
+        assert_eq!(workspace_index_by_name(&bounded, "Name 0").unwrap(), 0);
+    }
+
+    #[test]
+    fn interactive_workspace_name_preselects_without_skipping_confirmation() {
+        let workspaces = [
+            workspace("id-a", "Alpha"),
+            workspace("id-b", "開発 Workspace"),
+        ];
+        let mut options = share_options();
+        options.workspace_name = Some("開発 Workspace".into());
+        let mut output = Vec::new();
+        let selected = configure_interactively(
+            options.clone(),
+            &workspaces,
+            &mut std::io::Cursor::new(b"\n\n\nyes\n"),
+            &mut output,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.workspace_id, "id-b");
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Workspace [2;"));
+        assert!(output.contains("Workspace: 開発 Workspace"));
+        assert!(output.contains("Connect and create grant?"));
+        assert!(
+            configure_interactively(
+                options,
+                &workspaces,
+                &mut std::io::Cursor::new(b"\n\n\nno\n"),
+                &mut Vec::new()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_name_catalog_uses_authenticated_http_and_returns_resolved_id() {
+        let body = serde_json::to_string(&vec![
+            workspace("workspace-a", "Alpha"),
+            workspace("workspace-b", "開発 Workspace"),
+        ])
+        .unwrap();
+        let (base, requests, server) = spawn_json_server(body, 1);
+        let client = test_server_api_client(&base);
+        let catalog = load_share_workspaces(&client).await.unwrap();
+        let mut options = share_options();
+        options.backend_url = base;
+        options.workspace_name = Some("開発 Workspace".into());
+        options.non_interactive = true;
+        let resolved = configure_non_interactively(options, &catalog).unwrap();
+        assert_eq!(resolved.workspace_id, "workspace-b");
+        let request = requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            request.starts_with("get /api/workspaces?limit=200 "),
+            "{request}"
+        );
+        assert!(request.contains("authorization: bearer test-token\r\n"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_name_catalog_rejection_or_malformed_response_is_not_an_empty_catalog() {
+        for (status, body) in [("403 Forbidden", "{}"), ("200 OK", "not-json")] {
+            let (base, requests, server) =
+                spawn_http_server(body.into(), 1, Some(status), "application/json");
+            let error = load_share_workspaces(&test_server_api_client(&base))
+                .await
+                .unwrap_err();
+            assert!(error.contains("failed to query Backend Workspace catalog"));
+            assert!(
+                requests
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .starts_with("GET /api/workspaces?")
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]
@@ -1689,8 +1855,7 @@ mod tests {
         );
     }
 
-    // Exercise the real resolver without a TTY or Backend: the invalid URL makes
-    // any accidental catalog lookup fail rather than contacting a live service.
+    // Both modes consume the same authenticated catalog; neither infers a Workspace from the path.
     #[tokio::test]
     async fn non_interactive_share_resolves_the_same_choices_without_prompting() {
         let workspaces = [workspace("workspace-a", "Alpha")];
@@ -1711,7 +1876,7 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
-                options.workspace_id = Some("workspace-a".into());
+                options.workspace_name = Some("Alpha".into());
                 options.permissions = match level {
                     "read" => server_api::ExternalWorkdirPermissions::READ,
                     "write" => server_api::ExternalWorkdirPermissions::WRITE,
@@ -1720,7 +1885,7 @@ mod tests {
                 };
                 options.ttl = parse_ttl(ttl).unwrap();
                 options.non_interactive = true;
-                let automated = resolve_share_options(options).await.unwrap().unwrap();
+                let automated = configure_non_interactively(options, &workspaces).unwrap();
                 assert_eq!(automated.path, interactive.path);
                 assert_eq!(automated.workspace_id, interactive.workspace_id);
                 assert_eq!(automated.backend_url, interactive.backend_url);
@@ -1743,7 +1908,7 @@ mod tests {
             resolve_share_options(missing_workspace)
                 .await
                 .unwrap_err()
-                .contains("requires --workspace-id")
+                .contains("requires --workspace-name")
         );
     }
 
