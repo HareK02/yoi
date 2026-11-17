@@ -7479,11 +7479,51 @@ fn require_ticket_read_write_target(
     Ok(write_target)
 }
 
+enum TicketWorkdirTargetMismatch {
+    RepositoryUndeclared,
+    SelectorMismatch,
+}
+
+impl TicketWorkdirTargetMismatch {
+    fn error(self, ticket_id: &str, workdir_id: &str) -> Error {
+        Error::InvalidInput(match self {
+            Self::RepositoryUndeclared => format!(
+                "Workdir `{workdir_id}` Repository is not declared by assigned Ticket `{ticket_id}`"
+            ),
+            Self::SelectorMismatch => format!(
+                "Workdir `{workdir_id}` selector does not match assigned Ticket `{ticket_id}` target selector"
+            ),
+        })
+    }
+}
+
+enum TicketWorkdirAccess {
+    Granted(workdir::WorkdirSessionCapabilities),
+    Denied {
+        ticket_id: String,
+        mismatch: TicketWorkdirTargetMismatch,
+    },
+}
+
 fn ticket_target_capabilities_for_workdir(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
     workdir: &WorkdirRegistryRecord,
 ) -> Result<workdir::WorkdirSessionCapabilities> {
+    match ticket_workdir_access(api, worker, workdir)? {
+        TicketWorkdirAccess::Granted(capabilities) => Ok(capabilities),
+        TicketWorkdirAccess::Denied {
+            ticket_id,
+            mismatch,
+        } => Err(mismatch.error(&ticket_id, &workdir.workdir_id)),
+    }
+}
+
+fn ticket_workdir_access(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    workdir: &WorkdirRegistryRecord,
+) -> Result<TicketWorkdirAccess> {
     let source_capabilities = workdir_source_capabilities(api, workdir)?;
     if let WorkdirRegistrySource::WorkspaceConfig { grant_id } = &workdir.source {
         if !workspace_config::granted_to(api, worker, grant_id) {
@@ -7491,40 +7531,42 @@ fn ticket_target_capabilities_for_workdir(
                 "Workspace config grant unavailable".into(),
             ));
         }
-        return Ok(source_capabilities);
+        return Ok(TicketWorkdirAccess::Granted(source_capabilities));
     }
     let Some(assignment) = api
         .store
         .get_active_ticket_role_assignment_for_worker(&api.config.workspace_id, worker)?
         .filter(|assignment| assignment.role == TicketAssignmentRole::Worker)
     else {
-        return Ok(source_capabilities);
+        return Ok(TicketWorkdirAccess::Granted(source_capabilities));
     };
     let WorkdirRegistrySource::Repository { repository_id, .. } = &workdir.source else {
-        return Ok(source_capabilities);
+        return Ok(TicketWorkdirAccess::Granted(source_capabilities));
     };
     let targets = validated_ticket_resource_targets(api, &assignment.ticket_id)
         .map_err(|error| error.error)?;
-    let target = targets
+    let Some(target) = targets
         .into_iter()
         .find(|target| target.repository_id == *repository_id)
-        .ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "Workdir `{}` Repository is not declared by assigned Ticket `{}`",
-                workdir.workdir_id, assignment.ticket_id
-            ))
-        })?;
+    else {
+        return Ok(TicketWorkdirAccess::Denied {
+            ticket_id: assignment.ticket_id,
+            mismatch: TicketWorkdirTargetMismatch::RepositoryUndeclared,
+        });
+    };
     if target
         .ref_selector
         .as_deref()
         .is_some_and(|selector| workdir.creation_selector.as_deref() != Some(selector))
     {
-        return Err(Error::InvalidInput(format!(
-            "Workdir `{}` selector does not match assigned Ticket `{}` target selector",
-            workdir.workdir_id, assignment.ticket_id
-        )));
+        return Ok(TicketWorkdirAccess::Denied {
+            ticket_id: assignment.ticket_id,
+            mismatch: TicketWorkdirTargetMismatch::SelectorMismatch,
+        });
     }
-    Ok(target.capabilities.intersection(source_capabilities))
+    Ok(TicketWorkdirAccess::Granted(
+        target.capabilities.intersection(source_capabilities),
+    ))
 }
 
 fn effective_worker_workdir_capabilities(
@@ -28982,16 +29024,27 @@ async fn scoped_get_workspace_worker(
                 .ok_or_else(|| Error::UnknownWorker {
                     worker: RuntimeWorkerRef::new("unknown", &path.worker_ref),
                 })?;
-            let workers = workers_response(api.clone())?;
-            workers
-                .items
-                .into_iter()
-                .find(|worker| {
-                    worker.runtime_id == worker_ref.runtime_id
-                        && worker.worker_id == worker_ref.worker_id
-                })
-                .map(Json)
-                .ok_or_else(|| Error::UnknownWorker { worker: worker_ref }.into())
+            let projection = api
+                .store
+                .worker_registry_projection(&api.config.workspace_id, &worker_ref)?
+                .ok_or_else(|| Error::UnknownWorker {
+                    worker: worker_ref.clone(),
+                })?;
+            let links = api
+                .store
+                .list_worker_workdir_links(&api.config.workspace_id, &worker_ref)?;
+            let workdirs = api
+                .store
+                .list_workdir_registry(&api.config.workspace_id, 500)?;
+            let observed = worker_summary_from_projection(&projection);
+            project_worker_registry_projection(
+                &api,
+                observed.as_ref(),
+                &projection.registry,
+                links,
+                &workdirs,
+            )
+            .map(Json)
         })
         .await
 }
@@ -39615,7 +39668,7 @@ fn project_worker_registry_projection(
     links: Vec<WorkerWorkdirLinkRecord>,
     workdirs: &[WorkdirRegistryRecord],
 ) -> ApiResult<server_api::WorkerSummary> {
-    let summary = merge_worker_registry_summary(live, record);
+    let mut summary = merge_worker_registry_summary(live, record);
     let mut workdir_attachments = Vec::with_capacity(links.len());
     for link in links {
         let Some(workdir) = workdirs
@@ -39648,9 +39701,25 @@ fn project_worker_registry_projection(
             });
             continue;
         }
-        let effective_permissions = workdir_permission_summary(
-            effective_worker_workdir_capabilities(api, &record.worker, workdir, link.capabilities)?,
-        );
+        // Observing a retained attachment must not authorize its use or prevent
+        // access to the Worker itself when the Ticket's targets have changed.
+        let capabilities = match ticket_workdir_access(api, &record.worker, workdir)? {
+            TicketWorkdirAccess::Granted(capabilities) => {
+                link.capabilities.intersection(capabilities)
+            }
+            TicketWorkdirAccess::Denied {
+                ticket_id,
+                mismatch,
+            } => {
+                summary.diagnostics.push(RuntimeDiagnostic::new(
+                    "worker_workdir_ticket_target_mismatch",
+                    "warning",
+                    mismatch.error(&ticket_id, &workdir.workdir_id).to_string(),
+                ));
+                workdir::WorkdirSessionCapabilities::EMPTY
+            }
+        };
+        let effective_permissions = workdir_permission_summary(capabilities);
         workdir_attachments.push(server_api::WorkerWorkdirAttachmentSummary {
             alias: workdir::WorkdirAttachmentAlias::new(link.alias)
                 .expect("persisted attachment aliases are validated on write")
@@ -42444,6 +42513,7 @@ mod tests {
     mod worker_launch_policy_api_tests;
     mod worker_operations_tests;
     mod worker_protocol_tests;
+    mod worker_registry_access_tests;
     mod workspace_admission_tests;
     mod workspace_protocol_backpressure_tests;
     include!("server_workspace_config_tests.rs");
