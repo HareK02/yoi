@@ -15,6 +15,9 @@
 //! WorkerHandle is owned internally; external operations take WorkerRef. Socket/session paths,
 //! Manifests, credentials, and handles are not passed to browser/API projections.
 
+mod command_admission;
+use command_admission::{command_execution_result, controller_command_identity, observe_command};
+
 mod deferred_workdir;
 mod restore_recovery;
 
@@ -123,6 +126,7 @@ fn rollback_materialized_spawn_workdirs(
     })
 }
 
+#[cfg(test)]
 fn next_internal_command(
     state: &RwLock<protocol::WorkerStateSnapshot>,
 ) -> Result<WorkerCommandEnvelope, String> {
@@ -4743,6 +4747,24 @@ where
                     Err(result)
                 }
             }
+            method if controller_command_identity(&method).is_some() => {
+                let mut result = self.send_method(
+                    WorkerExecutionOperation::ProtocolMethod,
+                    execution.handle.clone(),
+                    method,
+                );
+                result.execution_id = Some(execution.tasks.execution_id);
+                match result.command.as_ref() {
+                    Some(protocol::WorkerCommandResult::Acknowledged { acknowledgement }) => {
+                        // The protocol response is the Controller disposition, including
+                        // rejection, not an empty transport-success acknowledgement.
+                        Ok(vec![Event::CommandAcknowledged {
+                            acknowledgement: acknowledgement.clone(),
+                        }])
+                    }
+                    _ => Err(result),
+                }
+            }
             method => {
                 // The connected protocol owns this bounded admission wait. The old
                 // generic adapter waiter could time out while leaving a detached send
@@ -4772,7 +4794,12 @@ where
         worker: WorkerHandle,
         method: Method,
     ) -> WorkerExecutionResult {
-        self.run_on_adapter_runtime(async move {
+        if let Some((command_id, kind)) = controller_command_identity(&method) {
+            return self.wait_for_command(operation, kind, Some(command_id), async move {
+                worker.send_command(method).await
+            });
+        }
+        self.run_cancellable_on_adapter_runtime(USER_INPUT_TASK_TIMEOUT, async move {
             worker
                 .send(method)
                 .await
@@ -4780,6 +4807,48 @@ where
         })
         .map(|_| WorkerExecutionResult::accepted(operation))
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
+    }
+
+    fn send_host_command(
+        &self,
+        operation: WorkerExecutionOperation,
+        worker: WorkerHandle,
+        kind: protocol::WorkerCommandKind,
+    ) -> WorkerExecutionResult {
+        self.wait_for_command(operation, kind, None, async move {
+            worker.send_host_command(kind).await
+        })
+    }
+
+    fn wait_for_command<Fut>(
+        &self,
+        operation: WorkerExecutionOperation,
+        kind: protocol::WorkerCommandKind,
+        command_id: Option<u64>,
+        send: Fut,
+    ) -> WorkerExecutionResult
+    where
+        Fut: Future<
+                Output = Result<
+                    protocol::WorkerCommandAcknowledgement,
+                    worker::WorkerCommandSendError,
+                >,
+            > + Send
+            + 'static,
+    {
+        // The future owns only this captured endpoint. A bounded wait cancels
+        // and joins the waiter, not the enqueued command, and never resends it.
+        let evidence = self
+            .run_joined_on_adapter_runtime(async move {
+                Ok(observe_command(send, kind, command_id, USER_INPUT_TASK_TIMEOUT).await)
+            })
+            .unwrap_or_else(|_| protocol::WorkerCommandResult::Unconfirmed {
+                command: kind,
+                command_id,
+                delivery: protocol::WorkerCommandDelivery::Unknown,
+                reason: protocol::WorkerCommandObservationFailure::SendFailed,
+            });
+        command_execution_result(operation, evidence)
     }
 
     fn send_submit_and_wait_for_acceptance(
@@ -8025,7 +8094,6 @@ where
             }
         };
         let worker = execution.handle.clone();
-        let worker_state = execution.worker_state.clone();
 
         if input.kind == WorkerInputKind::Notify {
             let notification_request_id = input
@@ -8049,17 +8117,13 @@ where
         }
 
         if input.kind == WorkerInputKind::Compact {
-            let command = match next_internal_command(&worker_state) {
-                Ok(command) => command,
-                Err(error) => {
-                    return WorkerExecutionResult::errored(WorkerExecutionOperation::Input, error);
-                }
-            };
-            return self.send_method(
+            let mut result = self.send_host_command(
                 WorkerExecutionOperation::Input,
                 worker,
-                Method::Compact { command },
+                protocol::WorkerCommandKind::Compact,
             );
+            result.execution_id = Some(execution.tasks.execution_id);
+            return result;
         }
 
         let mut submission_binding = None;
@@ -8357,24 +8421,30 @@ where
                 return WorkerExecutionResult::errored(WorkerExecutionOperation::Cancel, message);
             }
         };
-        let (worker, worker_state, _workspace_client) = match self.get_execution(worker_ref) {
-            Ok(execution) => execution,
-            Err(mut result) => {
-                result.operation = WorkerExecutionOperation::Cancel;
-                return result;
+        let execution = match self.workers.lock() {
+            Ok(workers) => match workers.get(worker_ref) {
+                Some(execution) => execution.clone(),
+                None => {
+                    return WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Cancel,
+                        "WorkerRef does not reference a live Worker execution",
+                    );
+                }
+            },
+            Err(_) => {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Cancel,
+                    "worker adapter registry lock is poisoned",
+                );
             }
         };
-        let command = match next_internal_command(&worker_state) {
-            Ok(command) => command,
-            Err(error) => {
-                return WorkerExecutionResult::errored(WorkerExecutionOperation::Cancel, error);
-            }
-        };
-        self.send_method(
+        let mut result = self.send_host_command(
             WorkerExecutionOperation::Cancel,
-            worker,
-            Method::Cancel { command },
-        )
+            execution.handle.clone(),
+            protocol::WorkerCommandKind::Cancel,
+        );
+        result.execution_id = Some(execution.tasks.execution_id);
+        result
     }
 
     #[cfg(feature = "ws-server")]
@@ -8568,6 +8638,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod command_admission_tests;
     #[cfg(all(feature = "fs-store", feature = "ws-server"))]
     mod removal_tests {
         include!("worker_backend/removal_tests.rs");
@@ -14986,7 +15057,7 @@ mod tests {
                     command: running_resume,
                 },
             )
-            .expect("running Resume is forwarded for controller admission");
+            .expect_err("running Resume returns the Controller InvalidState disposition");
         wait_for_adapter_command(&backend, &detail.worker_ref, running_resume.command_id);
 
         runtime
@@ -15017,7 +15088,7 @@ mod tests {
                     command: duplicate_resume,
                 },
             )
-            .expect("duplicate Resume is forwarded for controller admission");
+            .expect_err("duplicate Resume returns the Controller InvalidState disposition");
         wait_for_adapter_command(&backend, &detail.worker_ref, duplicate_resume.command_id);
 
         runtime
@@ -15048,7 +15119,7 @@ mod tests {
                     command: idle_resume,
                 },
             )
-            .expect("Idle Resume preserves controller NotPaused semantics");
+            .expect_err("Idle Resume preserves controller InvalidState semantics");
         wait_for_adapter_command(&backend, &detail.worker_ref, idle_resume.command_id);
         wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Idle);
         let events = runtime

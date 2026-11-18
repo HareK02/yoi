@@ -178,6 +178,11 @@ pub enum RuntimeError {
 }
 
 impl RuntimeError {
+    pub fn command_result(&self) -> Option<&protocol::WorkerCommandResult> {
+        self.execution_result()
+            .and_then(|result| result.command.as_ref())
+    }
+
     /// Only an owning create boundary or a Spawn result can identify a creation
     /// failure. Independent Input errors retain their ordinary API contract.
     pub fn create_failure(&self) -> Option<runtime_api::startup::WorkerCreateFailure> {
@@ -226,8 +231,12 @@ impl RuntimeError {
             E::WorkerExecutionUnavailable { .. } | E::ExecutionBackendUnavailable { .. } => {
                 C::ExecutionUnavailable
             }
-            E::WorkerExecutionRejected { .. }
-            | E::WorkdirAttachmentsRequestConflict { .. }
+            E::WorkerExecutionRejected { result, .. } => match result.command.as_ref() {
+                Some(protocol::WorkerCommandResult::Unconfirmed { .. }) => C::ResultUnavailable,
+                Some(protocol::WorkerCommandResult::NotDelivered { .. }) => C::ExecutionUnavailable,
+                _ => C::ExecutionRejected,
+            },
+            E::WorkdirAttachmentsRequestConflict { .. }
             | E::WorkdirAttachmentsGenerationStale { .. } => C::ExecutionRejected,
             E::WorkerDeletePersistenceFailed { .. } | E::StoreIo { .. } => C::PersistenceFailed,
             E::StoreCommitOutcomeUnknown { .. } => C::PersistenceOutcomeUnknown,

@@ -279,7 +279,7 @@ fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
         runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message);
     if error.startup.is_none() {
         if let Some(cause) = error.control {
-            response = response.with_control(cause);
+            response = response.with_control(cause).with_command(error.command);
         }
     }
     response.error.startup = error.startup;

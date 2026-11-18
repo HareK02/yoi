@@ -3668,6 +3668,9 @@ impl Runtime {
         };
 
         let mut dispatch_result = backend.dispatch_input(worker_ref, input.clone());
+        if input.kind == WorkerInputKind::Compact {
+            dispatch_result.require_command_acknowledgement(protocol::WorkerCommandKind::Compact);
+        }
         if let Some(expected) = expected_submission_id.as_ref()
             && matches!(
                 dispatch_result.outcome,
@@ -3739,12 +3742,15 @@ impl Runtime {
             });
         }
 
+        let command = dispatch_result.command.clone();
         let submission = dispatch_result.submission.clone();
         let notification = dispatch_result.notification.clone();
         let mut state = self.lock()?;
         state.ensure_running()?;
         let worker = state.worker_mut(worker_ref)?;
-        if let Some(snapshot) = dispatch_result.worker_state.as_ref() {
+        if dispatch_result.command.is_none()
+            && let Some(snapshot) = dispatch_result.worker_state.as_ref()
+        {
             let _ = worker.apply_worker_state(snapshot);
         }
         let status = worker.status;
@@ -3757,6 +3763,7 @@ impl Runtime {
         state.publish_worker_upsert(worker_ref.worker_id)?;
 
         Ok(WorkerInteractionAck {
+            command,
             worker_ref: worker_ref.clone(),
             status,
             submission,
@@ -4470,7 +4477,7 @@ impl Runtime {
         // Accepted dispatch without a state snapshot is transport evidence only;
         // the Controller protocol stream remains live authority. Test/detached
         // backends may return an exact full snapshot as their acknowledgement.
-        if !result.is_accepted() {
+        if !result.is_accepted() || result.command.is_some() {
             return Ok(());
         }
         let Some(snapshot) = result.worker_state else {
@@ -4489,13 +4496,13 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         operation: WorkerExecutionOperation,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Option<WorkerExecutionResult>, RuntimeError> {
         let backend = {
             let state = self.lock()?;
             state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
             if !worker.status.is_active() {
-                return Ok(());
+                return Ok(None);
             }
             state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
@@ -4505,7 +4512,7 @@ impl Runtime {
             })?
         };
 
-        let result = match operation {
+        let mut result = match operation {
             WorkerExecutionOperation::Stop => backend.stop_worker(worker_ref),
             WorkerExecutionOperation::Cancel => backend.cancel_worker(worker_ref),
             WorkerExecutionOperation::Spawn
@@ -4513,10 +4520,13 @@ impl Runtime {
             | WorkerExecutionOperation::Input
             | WorkerExecutionOperation::UploadFile
             | WorkerExecutionOperation::DeleteUploadedFile
-            | WorkerExecutionOperation::ProtocolMethod => return Ok(()),
+            | WorkerExecutionOperation::ProtocolMethod => return Ok(None),
         };
+        if operation == WorkerExecutionOperation::Cancel {
+            result.require_command_acknowledgement(protocol::WorkerCommandKind::Cancel);
+        }
         if result.is_accepted() {
-            return Ok(());
+            return Ok(Some(result));
         }
         Err(RuntimeError::WorkerExecutionRejected {
             worker_id: worker_ref.worker_id.clone(),
@@ -4818,6 +4828,7 @@ impl Runtime {
                 .restore_guard
                 .finish(RuntimeWorkerRestoreResult::superseded_by_stop(None));
             let ack = WorkerLifecycleAck {
+                command: None,
                 replayed: false,
                 worker_ref: worker_ref.clone(),
                 status: worker.status,
@@ -4924,6 +4935,7 @@ impl Runtime {
             }
             if worker.status == WorkerStatus::Stopped {
                 return Ok(WorkerLifecycleAck {
+                    command: None,
                     replayed: false,
                     worker_ref: worker_ref.clone(),
                     status: WorkerStatus::Stopped,
@@ -4931,11 +4943,13 @@ impl Runtime {
                 });
             }
         }
-        self.dispatch_lifecycle_to_backend(worker_ref, WorkerExecutionOperation::Cancel)?;
+        let result =
+            self.dispatch_lifecycle_to_backend(worker_ref, WorkerExecutionOperation::Cancel)?;
         let _ = reason;
         let state = self.lock()?;
         let worker = state.worker(worker_ref)?;
         Ok(WorkerLifecycleAck {
+            command: result.and_then(|result| result.command),
             replayed: false,
             worker_ref: worker_ref.clone(),
             status: worker.status,
@@ -8208,6 +8222,7 @@ impl WorkerRecord {
         candidate.restore_guard.finish(restore_receipt);
         candidate.internal_workers.clear();
         let ack = WorkerLifecycleAck {
+            command: None,
             replayed: false,
             worker_ref: candidate.worker_ref.clone(),
             status: candidate.status,
@@ -10457,6 +10472,7 @@ mod tests {
         submission_receipt_result: Mutex<Option<WorkerExecutionResult>>,
         submission_receipt_queries: Mutex<Vec<WorkerInput>>,
         stop_result: Mutex<Option<WorkerExecutionResult>>,
+        cancel_result: Mutex<Option<WorkerExecutionResult>>,
         stop_gate: Mutex<Option<Arc<RestoreGate>>>,
         stop_count: Mutex<u64>,
         stop_operation_ids: Mutex<Vec<WorkerLifecycleOperationId>>,
@@ -11069,7 +11085,23 @@ mod tests {
         }
 
         fn cancel_worker(&self, _worker_ref: &WorkerRef) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(WorkerExecutionOperation::Cancel)
+            self.cancel_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    let mut result =
+                        WorkerExecutionResult::accepted(WorkerExecutionOperation::Cancel);
+                    result.command = Some(protocol::WorkerCommandResult::Acknowledged {
+                        acknowledgement: protocol::WorkerCommandAcknowledgement {
+                            command_id: 1,
+                            command: protocol::WorkerCommandKind::Cancel,
+                            disposition: protocol::WorkerCommandDisposition::Accepted,
+                            state: protocol::WorkerStateSnapshot::initial(),
+                        },
+                    });
+                    result
+                })
         }
 
         #[cfg(feature = "ws-server")]
@@ -17354,6 +17386,97 @@ mod tests {
                     if item["kind"] == "embedded_worker_notification"
             )
         }));
+    }
+
+    #[test]
+    fn command_acknowledgements_are_returned_without_overwriting_live_state() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime
+            .create_worker(task_request("command observation"))
+            .unwrap();
+        let initial = runtime.worker_detail(&worker.worker_ref).unwrap();
+        let mut snapshot = protocol::WorkerStateSnapshot::initial();
+        snapshot.last_command_id = 91;
+        snapshot.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+            protocol::WorkerRunState::Cancelling,
+        ));
+        for (kind, operation) in [
+            (
+                protocol::WorkerCommandKind::Compact,
+                WorkerExecutionOperation::Input,
+            ),
+            (
+                protocol::WorkerCommandKind::Cancel,
+                WorkerExecutionOperation::Cancel,
+            ),
+        ] {
+            let command = protocol::WorkerCommandResult::Acknowledged {
+                acknowledgement: protocol::WorkerCommandAcknowledgement {
+                    command_id: 91,
+                    command: kind,
+                    disposition: protocol::WorkerCommandDisposition::Accepted,
+                    state: snapshot.clone(),
+                },
+            };
+            let mut result =
+                WorkerExecutionResult::accepted(operation).with_worker_state(snapshot.clone());
+            result.command = Some(command.clone());
+            let observed = if kind == protocol::WorkerCommandKind::Compact {
+                *backend.dispatch_result.lock().unwrap() = Some(result);
+                runtime
+                    .send_input(
+                        &worker.worker_ref,
+                        WorkerInput {
+                            kind: WorkerInputKind::Compact,
+                            ..WorkerInput::user("")
+                        },
+                    )
+                    .unwrap()
+                    .command
+            } else {
+                *backend.cancel_result.lock().unwrap() = Some(result);
+                runtime
+                    .cancel_worker(&worker.worker_ref, None)
+                    .unwrap()
+                    .command
+            };
+            assert_eq!(observed, Some(command));
+            let current = runtime.worker_detail(&worker.worker_ref).unwrap();
+            assert_eq!(current.status, initial.status);
+            assert_eq!(current.worker_state, initial.worker_state);
+        }
+    }
+
+    #[test]
+    fn command_transport_success_without_admission_evidence_is_not_accepted() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime
+            .create_worker(task_request("missing admission"))
+            .unwrap();
+        *backend.dispatch_result.lock().unwrap() = Some(WorkerExecutionResult::accepted(
+            WorkerExecutionOperation::Input,
+        ));
+        let error = runtime
+            .send_input(
+                &worker.worker_ref,
+                WorkerInput {
+                    kind: WorkerInputKind::Compact,
+                    ..WorkerInput::user("")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.execution_result().unwrap().outcome,
+            crate::execution::WorkerExecutionOutcome::Errored
+        );
+        *backend.cancel_result.lock().unwrap() = Some(WorkerExecutionResult::accepted(
+            WorkerExecutionOperation::Cancel,
+        ));
+        let error = runtime.cancel_worker(&worker.worker_ref, None).unwrap_err();
+        assert_eq!(
+            error.execution_result().unwrap().outcome,
+            crate::execution::WorkerExecutionOutcome::Errored
+        );
     }
 
     #[test]
