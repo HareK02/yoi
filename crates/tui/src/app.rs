@@ -2072,12 +2072,11 @@ impl App {
                 }
             }
             Event::CommandAcknowledged { acknowledgement } => {
-                self.apply_worker_state_snapshot(&acknowledgement.state);
-                if let Some(progress) = self.compaction_progress.take() {
-                    let _ = self.handle_worker_event(Event::CompactionProgress {
-                        compaction: Some(progress),
-                    });
-                }
+                // Admission/replay can advance the caller's issuance floor, but
+                // its historical snapshot is not a live-state writer.
+                self.next_command_id = self
+                    .next_command_id
+                    .max(acknowledgement.state.last_command_id.saturating_add(1));
             }
             // Command telemetry is an operational Web Console surface. The
             // TUI continues to render the final Bash ToolResult from history.
@@ -4511,46 +4510,103 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn worker_state_events_and_acknowledgements_replace_full_state() {
-        let mut app = App::new("test".into());
-        let running = WorkerStateSnapshot {
-            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                protocol::WorkerRunState::Running,
-            )),
-            last_command_id: 2,
-            last_finished_submission_request_id: Some("request-old".to_string()),
-        };
-        app.handle_worker_event(Event::WorkerState {
-            snapshot: running.clone(),
-        });
-        assert_eq!(app.worker_state, running);
-
-        let fresh_idle = WorkerStateSnapshot {
-            state: protocol::WorkerState::Idle,
-            last_command_id: 0,
-            last_finished_submission_request_id: None,
-        };
-        app.handle_worker_event(Event::WorkerState {
-            snapshot: fresh_idle.clone(),
-        });
-        assert_eq!(app.worker_state, fresh_idle);
-
-        let paused = WorkerStateSnapshot {
-            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                protocol::WorkerRunState::Paused,
-            )),
-            last_command_id: 3,
-            last_finished_submission_request_id: None,
-        };
-        app.handle_worker_event(Event::CommandAcknowledged {
-            acknowledgement: protocol::WorkerCommandAcknowledgement {
-                command_id: 3,
-                command: protocol::WorkerCommandKind::Pause,
+    fn accepted_command_replay_preserves_idle_and_newer_run() {
+        use protocol::{WorkerBusyState as B, WorkerCommandKind as K, WorkerState as S};
+        for (command, historical) in [
+            (
+                K::Cancel,
+                S::Busy(B::Run(protocol::WorkerRunState::Cancelling)),
+            ),
+            (
+                K::Compact,
+                S::Busy(B::Maintenance(protocol::WorkerMaintenanceState::Compacting)),
+            ),
+        ] {
+            let mut app = App::new("test".into());
+            let acknowledgement = protocol::WorkerCommandAcknowledgement {
+                command_id: 20,
+                command,
                 disposition: protocol::WorkerCommandDisposition::Accepted,
-                state: paused.clone(),
-            },
+                state: WorkerStateSnapshot {
+                    state: historical,
+                    last_command_id: 20,
+                    last_finished_submission_request_id: None,
+                },
+            };
+            for status in [WorkerStatus::Idle, WorkerStatus::Running] {
+                let mut current: WorkerStateSnapshot = status.into();
+                current.last_command_id = 30;
+                current.last_finished_submission_request_id = Some("finished-newer".into());
+                app.handle_worker_event(Event::WorkerState {
+                    snapshot: current.clone(),
+                });
+                app.handle_worker_event(Event::CommandAcknowledged {
+                    acknowledgement: acknowledgement.clone(),
+                });
+                assert_eq!(app.worker_state, current);
+                assert_eq!(app.worker_status, status);
+                assert!(!app.paused);
+                assert!(app.compaction_progress.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn pause_resume_acknowledgements_wait_for_state_events() {
+        use protocol::WorkerCommandKind as K;
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::WorkerState {
+            snapshot: WorkerStatus::Running.into(),
         });
-        assert_eq!(app.worker_state, paused);
+        for (command, status, id) in [
+            (K::Pause, WorkerStatus::Paused, 11),
+            (K::Resume, WorkerStatus::Running, 12),
+        ] {
+            let previous = app.worker_state.clone();
+            let previous_status = app.worker_status;
+            let mut state: WorkerStateSnapshot = status.into();
+            state.last_command_id = id;
+            app.handle_worker_event(Event::CommandAcknowledged {
+                acknowledgement: protocol::WorkerCommandAcknowledgement {
+                    command_id: id,
+                    command,
+                    disposition: protocol::WorkerCommandDisposition::Accepted,
+                    state: state.clone(),
+                },
+            });
+            assert_eq!(app.worker_state, previous);
+            assert_eq!(app.worker_status, previous_status);
+            assert_eq!(app.paused, previous_status == WorkerStatus::Paused);
+            app.handle_worker_event(Event::WorkerState {
+                snapshot: state.clone(),
+            });
+            assert_eq!(app.worker_state, state);
+            assert_eq!(app.worker_status, status);
+            assert_eq!(app.paused, status == WorkerStatus::Paused);
+        }
+    }
+
+    #[test]
+    fn acknowledgement_issuance_floor_never_rolls_back_or_writes_live_state() {
+        let mut app = App::new("test".into());
+        let current = WorkerStateSnapshot::initial();
+        let mut previous_id = 0;
+        for floor in [80, 20, 80, 10] {
+            let mut historical = WorkerStateSnapshot::initial();
+            historical.last_command_id = floor;
+            app.handle_worker_event(Event::CommandAcknowledged {
+                acknowledgement: protocol::WorkerCommandAcknowledgement {
+                    command_id: floor,
+                    command: protocol::WorkerCommandKind::Compact,
+                    disposition: protocol::WorkerCommandDisposition::Accepted,
+                    state: historical,
+                },
+            });
+            let id = app.next_command_envelope().command_id;
+            assert!(id > floor && id > previous_id);
+            previous_id = id;
+            assert_eq!(app.worker_state, current);
+        }
     }
 
     #[test]
