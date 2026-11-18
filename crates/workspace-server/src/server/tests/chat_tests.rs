@@ -998,6 +998,7 @@ struct ConnectedChat {
     runtime: worker_runtime::Runtime,
     owner: String,
     url: String,
+    client: reqwest::Client,
     lose_next_input_ack: Arc<std::sync::atomic::AtomicBool>,
     identity: RuntimeIdentityMaterial,
     _backend: AuthorizationCallbackServer,
@@ -1214,6 +1215,12 @@ impl ConnectedChat {
             runtime,
             owner,
             url,
+            // Reuse transport inside this fixture only; authorization remains
+            // request-local and still crosses the real HTTP boundary.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap(),
             lose_next_input_ack,
             identity,
             _backend: backend,
@@ -1222,10 +1229,8 @@ impl ConnectedChat {
         }
     }
     async fn post(&self, path: &str, body: Value) -> Value {
-        let response = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap()
+        let response = self
+            .client
             .post(format!("{}{path}", self.url))
             .bearer_auth(&self.owner)
             .json(&body)
