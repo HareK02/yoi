@@ -54,7 +54,6 @@ pub fn seed_fixed_worker(
     }
     if !matches!(request.intent, WorkerSpawnIntent::WorkspaceCoding)
         || request.singleton_key.is_some()
-        || request.ticket_assignment.is_some()
         || request.resolved_subjektiv_attached
         || !request.workdir_attachment_requests.is_empty()
         || !request.resolved_workdir_attachment_requests.is_empty()
@@ -286,7 +285,6 @@ mod tests {
             singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
             profile: ProfileSelector::Builtin("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),

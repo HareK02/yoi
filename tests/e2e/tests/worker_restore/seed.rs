@@ -122,6 +122,7 @@ pub fn start_in_with_source_setup(
             memory_settings: Some(bootstrap.memory_settings.clone()),
             subjektiv_attached: false,
             backend_job: None,
+            plugin_execution: None,
         };
         support(template.install(&options, request, &bootstrap.manifest))?;
         setup(
@@ -454,7 +455,8 @@ fn bootstrap(
         singleton_key: None,
         acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
         profile: ProfileSelector::Named(PROFILE.into()),
-        ticket_assignment: None,
+        authorization: None,
+        resolved_core_execution_grant: None,
         initial_submit: vec![],
         workdir_attachment_requests: vec![],
         resolved_workdir_attachment_requests: vec![],
