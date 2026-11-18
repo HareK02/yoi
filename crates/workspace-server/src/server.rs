@@ -4633,6 +4633,21 @@ impl WorkspaceApi {
         &self.feature_storage
     }
 
+    /// Load an evaluation for new work, never a retained evaluation after a failed
+    /// schema/toolchain refresh. Source/history and exact launch replay use their
+    /// separate saved-record paths and must remain available for repair/recovery.
+    fn current_workspace_config(&self) -> Result<crate::config_source::WorkspaceConfigState> {
+        let state = self
+            .config_store
+            .load_workspace_config(self.workspace_id())?
+            .ok_or_else(|| Error::InvalidRecordId("virtual config source tree".into()))?;
+        crate::config_source::validate_current_evaluation(
+            &state,
+            self.config_schema_registry.compose()?,
+        )?;
+        Ok(state)
+    }
+
     pub fn with_config_schema_provider(
         mut self,
         provider: Arc<dyn crate::config_source::WorkspaceConfigSchemaProvider>,
@@ -18867,10 +18882,7 @@ fn ticket_item_check_edit(
 }
 
 fn ticket_item_checker_instruction(api: &WorkspaceApi) -> Result<String> {
-    let config_state = api
-        .config_store
-        .load_workspace_config(&api.config.workspace_id)?
-        .ok_or_else(|| Error::Config("Workspace config is unavailable".to_string()))?;
+    let config_state = api.current_workspace_config()?;
     let projection = api
         .prompt_projection_cache
         .resolve(&api.config.workspace_id, &config_state)
@@ -24161,11 +24173,8 @@ fn check_orchestrator_assignment_attention(
                 continue;
             }
         };
-        let config_state = match api
-            .config_store
-            .load_workspace_config(&api.config.workspace_id)
-        {
-            Ok(Some(config)) => config,
+        let config_state = match api.current_workspace_config() {
+            Ok(config) => config,
             _ => {
                 record_notification_failure(
                     api,
@@ -27452,10 +27461,7 @@ fn start_memory_staging_consolidation(
             .unwrap_or(MEMORY_CONSOLIDATION_PROFILE)
     );
     let profile_selector = ProfileSelector::Builtin(profile.clone());
-    let config = api
-        .config_store
-        .load_workspace_config(api.workspace_id())?
-        .ok_or_else(|| Error::Config("Workspace configuration is unavailable".into()))?;
+    let config = api.current_workspace_config()?;
     let projection = crate::profile_settings::project_profiles_from_workspace_config(
         api.workspace_id(),
         &config,
@@ -27692,15 +27698,7 @@ async fn scoped_list_skills(
         .db_executor()
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            let state = api
-                .config_store
-                .load_workspace_config(&path.workspace_id)?
-                .ok_or_else(|| {
-                    Error::RegistryInconsistency(format!(
-                        "Workspace {} has no active config snapshot",
-                        path.workspace_id
-                    ))
-                })?;
+            let state = api.current_workspace_config()?;
             skills::catalog(&state).map(Json).map_err(skill_api_error)
         })
         .await
@@ -27714,15 +27712,7 @@ async fn scoped_lint_skills(
         .db_executor()
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            let state = api
-                .config_store
-                .load_workspace_config(&path.workspace_id)?
-                .ok_or_else(|| {
-                    Error::RegistryInconsistency(format!(
-                        "Workspace {} has no active config snapshot",
-                        path.workspace_id
-                    ))
-                })?;
+            let state = api.current_workspace_config()?;
             skills::lint(&state).map(Json).map_err(skill_api_error)
         })
         .await
@@ -27736,15 +27726,7 @@ async fn scoped_get_skill(
         .db_executor()
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            let state = api
-                .config_store
-                .load_workspace_config(&path.workspace_id)?
-                .ok_or_else(|| {
-                    Error::RegistryInconsistency(format!(
-                        "Workspace {} has no active config snapshot",
-                        path.workspace_id
-                    ))
-                })?;
+            let state = api.current_workspace_config()?;
             skills::detail(&state, &path.name)
                 .map(Json)
                 .map_err(skill_api_error)
@@ -27760,15 +27742,7 @@ async fn scoped_activate_skill(
         .db_executor()
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            let state = api
-                .config_store
-                .load_workspace_config(&path.workspace_id)?
-                .ok_or_else(|| {
-                    Error::RegistryInconsistency(format!(
-                        "Workspace {} has no active config snapshot",
-                        path.workspace_id
-                    ))
-                })?;
+            let state = api.current_workspace_config()?;
             skills::activation(&state, &path.name)
                 .map(Json)
                 .map_err(skill_api_error)
@@ -28232,17 +28206,8 @@ fn workspace_runtime_config_result(
     }
     validate_workspace_scope(api, workspace_id).map_err(ApiError::into_repository_api_error)?;
     let config_state = api
-        .config_store
-        .load_workspace_config(workspace_id)
-        .map_err(|error| ApiError::from(error).into_repository_api_error())?
-        .ok_or_else(|| {
-            server_api::RepositoryApiError::new(
-                StatusCode::NOT_FOUND.as_u16(),
-                "workspace_config_not_found",
-                "Workspace Config was not found",
-                Vec::new(),
-            )
-        })?;
+        .current_workspace_config()
+        .map_err(|error| ApiError::from(error).into_repository_api_error())?;
     let profile_projection = crate::profile_settings::project_profiles_from_workspace_config(
         workspace_id,
         &config_state,
@@ -31452,14 +31417,7 @@ fn prepare_workspace_workdir_create(
     let reserved = if let Some(existing) = existing {
         existing
     } else {
-        let config_state = api
-            .config_store
-            .load_workspace_config(workspace_id)?
-            .ok_or_else(|| {
-                Error::RegistryInconsistency(format!(
-                    "Workspace {workspace_id} has no active configuration"
-                ))
-            })?;
+        let config_state = api.current_workspace_config()?;
         let runtime_projection = crate::runtime_settings::project_runtime_from_workspace_config(
             workspace_id,
             &config_state,
@@ -38514,12 +38472,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
             }
         })
         .collect();
-    let config_state = api
-        .config_store
-        .load_workspace_config(&api.config.workspace_id)?
-        .ok_or_else(|| {
-            ApiError::from(Error::InvalidRecordId("virtual config source tree".into()))
-        })?;
+    let config_state = api.current_workspace_config()?;
     let profile_projection = crate::profile_settings::project_profiles_from_workspace_config(
         &api.config.workspace_id,
         &config_state,

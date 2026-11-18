@@ -14,12 +14,7 @@ impl WorkspaceApi {
         request: &BackendJobRequest,
     ) -> Result<(ProfileSelector, worker_runtime::config_bundle::ConfigBundle)> {
         request.validate()?;
-        let state = self
-            .config_store
-            .load_workspace_config(self.workspace_id())?
-            .ok_or_else(|| {
-                Error::Config("Backend Job requires Workspace Profile configuration".into())
-            })?;
+        let state = self.current_workspace_config()?;
         let projection = crate::profile_settings::project_profiles_from_workspace_config(
             self.workspace_id(),
             &state,

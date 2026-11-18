@@ -436,6 +436,88 @@ async fn config_persistence_failure_rolls_back_reference_changes_and_restart_kee
 }
 
 #[tokio::test]
+async fn builtin_schema_refresh_after_plugin_revoke_rolls_back_and_allows_disable_repair() {
+    let f = Fixture::new().await;
+    let committed = f.commit(f.source());
+    let refs = f.refs();
+    assert!(refs > 0);
+    let artifact = &f.installed.installation.artifacts[0];
+    f.store
+        .plugin_revoke(
+            "a",
+            "owner",
+            &f.installed.installation.installation_id,
+            &PluginRevokeRequest {
+                artifact_digest: artifact.artifact_digest.clone(),
+                expected_last_operation: f.installed.operation_id.clone(),
+                reason: "withdraw".into(),
+                operation_key: "withdraw".into(),
+            },
+        )
+        .unwrap();
+    let mut providers = bundle().contributions;
+    providers.push(
+        config_source::ConfigSchemaContribution::new(
+            "builtin:refresh-test",
+            "refresh_test",
+            "1",
+            "{ refresh_test = Bool default true; }",
+        )
+        .unwrap(),
+    );
+    let current_schema = WorkspaceConfigSchemaBundle::compose(providers).unwrap();
+    let reopened = crate::SqliteWorkspaceStore::open_for_test(f.dir.path().join("db")).unwrap();
+    let error = reopened
+        .ensure_workspace_config_materialized_with_schema("a", "2", current_schema.clone())
+        .unwrap_err();
+    assert!(error.configuration_update_required().is_some(), "{error}");
+    let retained = reopened.load_workspace_config("a").unwrap().unwrap();
+    assert_eq!(retained, committed);
+    assert_eq!(f.refs(), refs);
+    assert!(
+        crate::config_source::validate_current_evaluation(&retained, current_schema.clone())
+            .unwrap_err()
+            .configuration_update_required()
+            .is_some()
+    );
+
+    let path = VirtualPath::parse("main.dcdl").unwrap();
+    let repair = ConfigCommitRequest {
+        base_digest: retained.snapshot.digest.clone(),
+        entrypoints: vec![path.clone()],
+        changes: vec![ConfigTreeChange::Update {
+            path: path.clone(),
+            expected_digest: retained.snapshot.get(&path).unwrap().content_digest.clone(),
+            content: format!(
+                "{} as WorkspaceConfigSchema",
+                render_value(&json!({
+                    "plugins": {}, "profile": {"entries": []}
+                }))
+                .unwrap()
+            ),
+        }],
+    };
+    let candidate = reopened
+        .evaluate_workspace_config_candidate_with_schema("a", &repair, current_schema.clone())
+        .unwrap();
+    assert_eq!(
+        reopened.load_workspace_config("a").unwrap().unwrap(),
+        committed
+    );
+    let repaired = reopened
+        .commit_evaluated_workspace_config("a", &candidate)
+        .unwrap();
+    crate::config_source::validate_current_evaluation(&repaired, current_schema.clone()).unwrap();
+    assert_eq!(f.refs(), 0);
+    assert_eq!(
+        reopened
+            .ensure_workspace_config_materialized_with_schema("a", "3", current_schema)
+            .unwrap(),
+        repaired
+    );
+}
+
+#[tokio::test]
 async fn https_config_binding_is_validated_pinned_by_digest_and_never_copied_to_plan() {
     use crate::plugin_plan::WorkerPluginExecutionPlan;
     use manifest::plugin::*;
