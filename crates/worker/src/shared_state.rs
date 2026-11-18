@@ -5,8 +5,9 @@ use std::sync::{
 };
 
 use protocol::{
-    WorkerBusyState, WorkerCommandDisposition, WorkerCommandEnvelope, WorkerCommandKind,
-    WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot, WorkerStatus,
+    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    WorkerCommandKind, WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot,
+    WorkerStatus,
 };
 use serde_json::json;
 use session_store::SegmentId;
@@ -15,11 +16,11 @@ use crate::fs_view::WorkerFsView;
 
 const COMPLETED_COMMAND_RETENTION: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AcceptedWorkerCommand {
     envelope: WorkerCommandEnvelope,
     kind: WorkerCommandKind,
-    disposition: Option<WorkerCommandDisposition>,
+    acknowledgement: Option<WorkerCommandAcknowledgement>,
+    replies: Vec<crate::controller::commands::CommandReply>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,9 +184,81 @@ impl WorkerSharedState {
         accepted.push_back(AcceptedWorkerCommand {
             envelope,
             kind,
-            disposition: None,
+            acknowledgement: None,
+            replies: Vec::new(),
         });
         WorkerCommandAdmission::Accepted
+    }
+
+    pub(crate) fn admit_host_command(
+        &self,
+        kind: WorkerCommandKind,
+    ) -> Option<WorkerCommandEnvelope> {
+        let mut snapshot = self
+            .state
+            .write()
+            .expect("worker state lock poisoned; refusing command issuance");
+        let mut accepted = self
+            .accepted_commands
+            .write()
+            .expect("worker command ledger lock poisoned");
+        let command_id = snapshot.last_command_id.checked_add(1)?;
+        let envelope = WorkerCommandEnvelope::new(command_id);
+        snapshot.last_command_id = command_id;
+        accepted.push_back(AcceptedWorkerCommand {
+            envelope,
+            kind,
+            acknowledgement: None,
+            replies: Vec::new(),
+        });
+        Some(envelope)
+    }
+
+    pub(crate) fn register_command_reply(
+        &self,
+        command_id: u64,
+        kind: WorkerCommandKind,
+        reply: crate::controller::commands::CommandReply,
+    ) {
+        let mut accepted = self
+            .accepted_commands
+            .write()
+            .expect("worker command ledger lock poisoned");
+        if let Some(command) = accepted
+            .iter_mut()
+            .find(|command| command.envelope.command_id == command_id && command.kind == kind)
+        {
+            if let Some(acknowledgement) = &command.acknowledgement {
+                let _ = reply.send(Ok(acknowledgement.clone()));
+            } else {
+                command.replies.retain(|reply| !reply.is_closed());
+                command.replies.push(reply);
+            }
+        }
+    }
+
+    pub(crate) fn command_acknowledgement(
+        &self,
+        command_id: u64,
+        kind: WorkerCommandKind,
+    ) -> Option<WorkerCommandAcknowledgement> {
+        self.accepted_commands
+            .read()
+            .expect("worker command ledger lock poisoned")
+            .iter()
+            .find(|command| command.envelope.command_id == command_id && command.kind == kind)
+            .and_then(|command| command.acknowledgement.clone())
+    }
+
+    pub(crate) fn close_command_replies(&self) {
+        for command in self
+            .accepted_commands
+            .write()
+            .expect("worker command ledger lock poisoned")
+            .iter_mut()
+        {
+            command.replies.clear();
+        }
     }
 
     pub(crate) fn complete_command(
@@ -193,37 +266,54 @@ impl WorkerSharedState {
         command_id: u64,
         kind: WorkerCommandKind,
         disposition: WorkerCommandDisposition,
-    ) {
+    ) -> WorkerCommandAcknowledgement {
+        // Snapshot before locking the ledger, matching admission's lock order.
+        let acknowledgement = WorkerCommandAcknowledgement {
+            command_id,
+            command: kind,
+            disposition,
+            state: self.snapshot(),
+        };
         if !matches!(
             disposition,
             WorkerCommandDisposition::Accepted | WorkerCommandDisposition::InvalidState
         ) {
-            return;
+            return acknowledgement;
         }
         let mut accepted = self
             .accepted_commands
             .write()
-            .expect("worker command ledger lock poisoned; refusing command completion");
-        if let Some(command) = accepted
+            .expect("worker command ledger lock poisoned");
+        let acknowledgement = if let Some(command) = accepted
             .iter_mut()
             .find(|command| command.envelope.command_id == command_id && command.kind == kind)
         {
-            command.disposition.get_or_insert(disposition);
-        }
+            let acknowledgement = command
+                .acknowledgement
+                .get_or_insert(acknowledgement)
+                .clone();
+            for reply in command.replies.drain(..) {
+                let _ = reply.send(Ok(acknowledgement.clone()));
+            }
+            acknowledgement
+        } else {
+            acknowledgement
+        };
         while accepted
             .iter()
-            .filter(|command| command.disposition.is_some())
+            .filter(|command| command.acknowledgement.is_some())
             .count()
             > COMPLETED_COMMAND_RETENTION
         {
             let Some(index) = accepted
                 .iter()
-                .position(|command| command.disposition.is_some())
+                .position(|command| command.acknowledgement.is_some())
             else {
                 break;
             };
             accepted.remove(index);
         }
+        acknowledgement
     }
 
     #[cfg(test)]
@@ -236,7 +326,7 @@ impl WorkerSharedState {
             .expect("worker command ledger lock poisoned")
             .iter()
             .find(|command| command.envelope.command_id == command_id)
-            .map(|command| command.disposition)
+            .map(|command| command.acknowledgement.as_ref().map(|ack| ack.disposition))
     }
 
     pub fn snapshot(&self) -> WorkerStateSnapshot {
@@ -385,6 +475,34 @@ mod tests {
             WorkerCommandAdmission::Conflict
         );
         assert_eq!(state.snapshot().last_command_id, 9);
+    }
+
+    #[test]
+    fn evicted_completed_command_stays_stale_without_readmitting_effects() {
+        let state = test_state();
+        for command_id in 1..=(COMPLETED_COMMAND_RETENTION as u64 + 1) {
+            assert_eq!(
+                state.admit_command(
+                    WorkerCommandEnvelope::new(command_id),
+                    WorkerCommandKind::Pause
+                ),
+                WorkerCommandAdmission::Accepted
+            );
+            state.complete_command(
+                command_id,
+                WorkerCommandKind::Pause,
+                WorkerCommandDisposition::InvalidState,
+            );
+        }
+        assert_eq!(state.command_result(1), None);
+        assert_eq!(
+            state.admit_command(WorkerCommandEnvelope::new(1), WorkerCommandKind::Pause),
+            WorkerCommandAdmission::StaleCommandId
+        );
+        assert_eq!(
+            state.command_result(2),
+            Some(Some(WorkerCommandDisposition::InvalidState))
+        );
     }
 
     #[test]

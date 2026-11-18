@@ -1,3 +1,8 @@
+#[path = "controller_commands.rs"]
+pub(crate) mod commands;
+use commands::{ControllerMessage, ControllerReceiver};
+pub use commands::{WorkerCommandNotDeliveredReason, WorkerCommandSendError};
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,7 +57,7 @@ pub struct SubmissionReceipt {
 
 #[derive(Clone)]
 pub struct WorkerHandle {
-    method_tx: mpsc::Sender<Method>,
+    method_tx: mpsc::Sender<ControllerMessage>,
     working_event_tx: broadcast::Sender<Event>,
     pub shared_state: Arc<WorkerSharedState>,
     pub runtime_dir: Arc<RuntimeDir>,
@@ -149,7 +154,15 @@ impl WorkerHandle {
         {
             return Ok(());
         }
-        self.method_tx.send(method).await
+        self.method_tx
+            .send(ControllerMessage::Protocol(method))
+            .await
+            .map_err(|error| {
+                let ControllerMessage::Protocol(method) = error.0 else {
+                    unreachable!()
+                };
+                mpsc::error::SendError(method)
+            })
     }
 
     pub fn upload_file(
@@ -355,7 +368,7 @@ impl WorkerHandle {
 fn answer_idle_release<St: Store + Clone>(
     control: &Arc<crate::subject_release::ReleaseControl>,
     shared_state: &WorkerSharedState,
-    methods: &mpsc::Receiver<Method>,
+    methods: &ControllerReceiver,
     staged: bool,
     pending: &PendingSubmissionHandle<St>,
     notifications: &NotifyBuffer,
@@ -395,36 +408,6 @@ async fn release_requested(shared_state: &WorkerSharedState) {
     }
 }
 
-fn command_admission_disposition(
-    admission: WorkerCommandAdmission,
-) -> Result<(), WorkerCommandDisposition> {
-    match admission {
-        WorkerCommandAdmission::Accepted => Ok(()),
-        WorkerCommandAdmission::Retry | WorkerCommandAdmission::StaleCommandId => {
-            Err(WorkerCommandDisposition::StaleCommandId)
-        }
-        WorkerCommandAdmission::Conflict => Err(WorkerCommandDisposition::Conflict),
-    }
-}
-
-fn validate_command(
-    envelope: WorkerCommandEnvelope,
-    kind: WorkerCommandKind,
-    shared_state: &WorkerSharedState,
-) -> Result<(), WorkerCommandDisposition> {
-    command_admission_disposition(shared_state.admit_command(envelope, kind))
-}
-
-fn validate_shutdown_command(
-    envelope: WorkerCommandEnvelope,
-    shared_state: &WorkerSharedState,
-) -> Result<(), WorkerCommandDisposition> {
-    match shared_state.admit_command(envelope, WorkerCommandKind::Shutdown) {
-        WorkerCommandAdmission::Accepted | WorkerCommandAdmission::Retry => Ok(()),
-        admission => command_admission_disposition(admission),
-    }
-}
-
 fn acknowledge_command(
     working_event_tx: &broadcast::Sender<Event>,
     shared_state: &WorkerSharedState,
@@ -432,15 +415,8 @@ fn acknowledge_command(
     command: WorkerCommandKind,
     disposition: WorkerCommandDisposition,
 ) {
-    shared_state.complete_command(command_id, command, disposition);
-    let _ = working_event_tx.send(Event::CommandAcknowledged {
-        acknowledgement: WorkerCommandAcknowledgement {
-            command_id,
-            command,
-            disposition,
-            state: shared_state.snapshot(),
-        },
-    });
+    let acknowledgement = shared_state.complete_command(command_id, command, disposition);
+    let _ = working_event_tx.send(Event::CommandAcknowledged { acknowledgement });
 }
 
 fn reject_invalid_command_state(
@@ -698,7 +674,7 @@ pub struct WorkerController;
 pub(crate) struct InitializedWorkerController<C: LlmClient, St: Store> {
     pub(crate) worker: Worker<C, St>,
     pub(crate) handle: WorkerHandle,
-    method_rx: mpsc::Receiver<Method>,
+    method_rx: ControllerReceiver,
     shutdown_tx: oneshot::Sender<ControllerShutdownReport>,
     shutdown_rx: ShutdownReceiver,
     registry_reclaim: PreparedSpawnedWorkerRegistryLoad<St>,
@@ -894,7 +870,7 @@ impl WorkerController {
         // === 1. Initialization (channels / RuntimeDir / worker-immutable
         //         snapshots / SpawnedWorkerRegistry / alerter attach) ===
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<ControllerShutdownReport>();
-        let (method_tx, method_rx) = mpsc::channel::<Method>(32);
+        let (method_tx, method_rx) = mpsc::channel::<ControllerMessage>(32);
         let (working_event_tx, _) = broadcast::channel::<Event>(256);
         let alerter = Alerter::new(working_event_tx.clone());
         let in_flight = InFlightEvents::new(working_event_tx.clone());
@@ -1035,7 +1011,7 @@ impl WorkerController {
         Ok(InitializedWorkerController {
             worker,
             handle,
-            method_rx,
+            method_rx: ControllerReceiver::new(method_rx, shared_state, working_event_tx),
             shutdown_tx,
             shutdown_rx,
             registry_reclaim,
@@ -1472,7 +1448,7 @@ pub(crate) async fn register_worker_tools<C, St>(
 
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
-    parent_method_tx: Option<mpsc::WeakSender<Method>>,
+    parent_method_tx: Option<mpsc::WeakSender<ControllerMessage>>,
     inherited_workdir_tool_broker: Option<workdir::WorkdirToolBrokerRouter>,
 ) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
 where
@@ -2368,7 +2344,13 @@ fn reject_method_while_attention_locked(
     method: &Method,
     working_event_tx: &broadcast::Sender<Event>,
     message: &str,
+    shared_state: &WorkerSharedState,
 ) -> bool {
+    if let Some((envelope, kind)) = commands::command_identity(method)
+        && kind != WorkerCommandKind::Shutdown
+    {
+        reject_invalid_command_state(working_event_tx, shared_state, envelope, kind);
+    }
     match method {
         Method::Shutdown { .. } | Method::ListPendingSubmissions => false,
         Method::Submit {
@@ -2422,7 +2404,7 @@ fn reject_method_while_attention_locked(
 #[allow(clippy::too_many_arguments)]
 async fn controller_loop<C, St>(
     mut worker: Worker<C, St>,
-    mut method_rx: mpsc::Receiver<Method>,
+    mut method_rx: ControllerReceiver,
     working_event_tx: broadcast::Sender<Event>,
     shared_state: Arc<WorkerSharedState>,
     _runtime_dir: Arc<RuntimeDir>,
@@ -2722,6 +2704,7 @@ async fn controller_loop<C, St>(
                             &method,
                             &working_event_tx,
                             &message,
+                            &shared_state,
                         ) {
                             continue;
                         }
@@ -2735,6 +2718,7 @@ async fn controller_loop<C, St>(
                 &method,
                 &working_event_tx,
                 "Segment activation is incomplete; restore or shut down the Worker",
+                &shared_state,
             )
         {
             continue;
@@ -2914,18 +2898,6 @@ async fn controller_loop<C, St>(
                 }
             }
             Method::Resume { command } => {
-                if let Err(disposition) =
-                    validate_command(command, WorkerCommandKind::Resume, &shared_state)
-                {
-                    acknowledge_command(
-                        &working_event_tx,
-                        &shared_state,
-                        command.command_id,
-                        WorkerCommandKind::Resume,
-                        disposition,
-                    );
-                    continue;
-                }
                 if !matches!(
                     shared_state.snapshot().state,
                     WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused))
@@ -2955,18 +2927,6 @@ async fn controller_loop<C, St>(
             }
 
             Method::Cancel { command } => {
-                if let Err(disposition) =
-                    validate_command(command, WorkerCommandKind::Cancel, &shared_state)
-                {
-                    acknowledge_command(
-                        &working_event_tx,
-                        &shared_state,
-                        command.command_id,
-                        WorkerCommandKind::Cancel,
-                        disposition,
-                    );
-                    continue;
-                }
                 if !matches!(
                     shared_state.snapshot().state,
                     WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused))
@@ -3014,39 +2974,15 @@ async fn controller_loop<C, St>(
             }
 
             Method::Pause { command } => {
-                if let Err(disposition) =
-                    validate_command(command, WorkerCommandKind::Pause, &shared_state)
-                {
-                    acknowledge_command(
-                        &working_event_tx,
-                        &shared_state,
-                        command.command_id,
-                        WorkerCommandKind::Pause,
-                        disposition,
-                    );
-                } else {
-                    reject_invalid_command_state(
-                        &working_event_tx,
-                        &shared_state,
-                        command,
-                        WorkerCommandKind::Pause,
-                    );
-                }
+                reject_invalid_command_state(
+                    &working_event_tx,
+                    &shared_state,
+                    command,
+                    WorkerCommandKind::Pause,
+                );
             }
 
             Method::Compact { command } => {
-                if let Err(disposition) =
-                    validate_command(command, WorkerCommandKind::Compact, &shared_state)
-                {
-                    acknowledge_command(
-                        &working_event_tx,
-                        &shared_state,
-                        command.command_id,
-                        WorkerCommandKind::Compact,
-                        disposition,
-                    );
-                    continue;
-                }
                 if !matches!(shared_state.snapshot().state, WorkerState::Idle) {
                     reject_invalid_command_state(
                         &working_event_tx,
@@ -3082,20 +3018,6 @@ async fn controller_loop<C, St>(
                             method = method_rx.recv() => {
                                 match method {
                                     Some(Method::Cancel { command }) => {
-                                        if let Err(disposition) = validate_command(
-                                            command,
-                                            WorkerCommandKind::Cancel,
-                                            &shared_state,
-                                        ) {
-                                            acknowledge_command(
-                                                &working_event_tx,
-                                                &shared_state,
-                                                command.command_id,
-                                                WorkerCommandKind::Cancel,
-                                                disposition,
-                                            );
-                                            continue;
-                                        }
                                         acknowledge_command(
                                             &working_event_tx,
                                             &shared_state,
@@ -3106,18 +3028,6 @@ async fn controller_loop<C, St>(
                                         let _ = cancel_tx.send(true);
                                     }
                                     Some(Method::Shutdown { command }) => {
-                                        if let Err(disposition) =
-                                            validate_shutdown_command(command, &shared_state)
-                                        {
-                                            acknowledge_command(
-                                                &working_event_tx,
-                                                &shared_state,
-                                                command.command_id,
-                                                WorkerCommandKind::Shutdown,
-                                                disposition,
-                                            );
-                                            continue;
-                                        }
                                         shutdown_after_compaction = true;
                                         acknowledge_command(
                                             &working_event_tx,
@@ -3221,16 +3131,6 @@ async fn controller_loop<C, St>(
                 // Shutdown applies to this controller at admission time, not
                 // a caller-observed Run. Exact command-id/kind retries remain
                 // valid so every shutdown path can reach the cleanup barrier.
-                if let Err(disposition) = validate_shutdown_command(command, &shared_state) {
-                    acknowledge_command(
-                        &working_event_tx,
-                        &shared_state,
-                        command.command_id,
-                        WorkerCommandKind::Shutdown,
-                        disposition,
-                    );
-                    continue;
-                }
                 acknowledge_command(
                     &working_event_tx,
                     &shared_state,
@@ -3353,7 +3253,7 @@ fn handle_inbound_worker_event(event: protocol::WorkerEvent, notify_buffer: &Not
 #[allow(clippy::too_many_arguments)]
 async fn drive_turn<F, St>(
     worker_future: F,
-    method_rx: &mut mpsc::Receiver<Method>,
+    method_rx: &mut ControllerReceiver,
     working_event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     pause_tx: &mpsc::Sender<()>,
@@ -3481,18 +3381,6 @@ where
             method = method_rx.recv(), if input_commit.is_none() => {
                 match method {
                     Some(Method::Cancel { command }) => {
-                        if let Err(disposition) =
-                            validate_command(command, WorkerCommandKind::Cancel, shared_state)
-                        {
-                            acknowledge_command(
-                                working_event_tx,
-                                shared_state,
-                                command.command_id,
-                                WorkerCommandKind::Cancel,
-                                disposition,
-                            );
-                            continue;
-                        }
                         if !matches!(
                             shared_state.snapshot().state,
                             WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running))
@@ -3521,18 +3409,6 @@ where
                         let _ = cancel_tx.try_send(());
                     }
                     Some(Method::Pause { command }) => {
-                        if let Err(disposition) =
-                            validate_command(command, WorkerCommandKind::Pause, shared_state)
-                        {
-                            acknowledge_command(
-                                working_event_tx,
-                                shared_state,
-                                command.command_id,
-                                WorkerCommandKind::Pause,
-                                disposition,
-                            );
-                            continue;
-                        }
                         if !matches!(
                             shared_state.snapshot().state,
                             WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running))
@@ -3562,16 +3438,6 @@ where
                         let _ = pause_tx.try_send(());
                     }
                     Some(Method::Shutdown { command }) => {
-                        if let Err(disposition) = validate_shutdown_command(command, shared_state) {
-                            acknowledge_command(
-                                working_event_tx,
-                                shared_state,
-                                command.command_id,
-                                WorkerCommandKind::Shutdown,
-                                disposition,
-                            );
-                            continue;
-                        }
                         shutdown_requested = true;
                         set_controller_state(
                             shared_state,
@@ -3655,24 +3521,12 @@ where
                         }
                     }
                     Some(Method::Resume { command }) => {
-                        if let Err(disposition) =
-                            validate_command(command, WorkerCommandKind::Resume, shared_state)
-                        {
-                            acknowledge_command(
-                                working_event_tx,
-                                shared_state,
-                                command.command_id,
-                                WorkerCommandKind::Resume,
-                                disposition,
-                            );
-                        } else {
                             reject_invalid_command_state(
                                 working_event_tx,
                                 shared_state,
                                 command,
                                 WorkerCommandKind::Resume,
                             );
-                        }
                     }
                     Some(Method::ContinuePending { .. }) => {
                         let _ = working_event_tx.send(Event::Error {
@@ -3714,24 +3568,12 @@ where
                         }
                     }
                     Some(Method::Compact { command }) => {
-                        if let Err(disposition) =
-                            validate_command(command, WorkerCommandKind::Compact, shared_state)
-                        {
-                            acknowledge_command(
-                                working_event_tx,
-                                shared_state,
-                                command.command_id,
-                                WorkerCommandKind::Compact,
-                                disposition,
-                            );
-                        } else {
                             reject_invalid_command_state(
                                 working_event_tx,
                                 shared_state,
                                 command,
                                 WorkerCommandKind::Compact,
                             );
-                        }
                     }
                     Some(Method::RewindTo { .. }) => {
                         let _ = working_event_tx.send(Event::Error {
@@ -3962,6 +3804,10 @@ fn worker_error_code(e: &WorkerError) -> ErrorCode {
         _ => ErrorCode::Internal,
     }
 }
+
+#[cfg(test)]
+#[path = "controller_commands_tests.rs"]
+mod command_tests;
 
 #[cfg(test)]
 #[path = "controller_subject_release_tests.rs"]
@@ -4994,8 +4840,8 @@ mod tests {
     struct DriveTurnEnv {
         // Held to keep the channel alive; without this `method_rx.recv()`
         // would observe channel-closed and confuse the select! arm.
-        _method_tx: mpsc::Sender<Method>,
-        method_rx: mpsc::Receiver<Method>,
+        _method_tx: mpsc::Sender<ControllerMessage>,
+        method_rx: ControllerReceiver,
         working_event_tx: broadcast::Sender<Event>,
         cancel_tx: mpsc::Sender<()>,
         _cancel_rx: mpsc::Receiver<()>,
@@ -5009,7 +4855,7 @@ mod tests {
 
     async fn make_env() -> DriveTurnEnv {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (method_tx, method_rx) = mpsc::channel::<Method>(16);
+        let (method_tx, method_rx) = mpsc::channel::<ControllerMessage>(16);
         let (working_event_tx, _) = broadcast::channel::<Event>(16);
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
         let (pause_tx, pause_rx) = mpsc::channel::<()>(1);
@@ -5036,7 +4882,11 @@ mod tests {
 
         DriveTurnEnv {
             _method_tx: method_tx,
-            method_rx,
+            method_rx: ControllerReceiver::new(
+                method_rx,
+                shared_state.clone(),
+                working_event_tx.clone(),
+            ),
             working_event_tx,
             cancel_tx,
             _cancel_rx: cancel_rx,
@@ -5164,8 +5014,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attention_gate_rejects_submit_before_dispatch() {
+    #[tokio::test]
+    async fn attention_gate_rejects_submit_before_dispatch() {
+        let env = make_env().await;
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let method = Method::Submit {
             submission_request_id: "request-1".into(),
@@ -5176,6 +5027,7 @@ mod tests {
             &method,
             &event_tx,
             "repair required",
+            &env.shared_state,
         ));
         assert!(matches!(
             event_rx.try_recv().unwrap(),
@@ -5226,9 +5078,9 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             method_tx
-                .send(Method::Shutdown {
+                .send(ControllerMessage::Protocol(Method::Shutdown {
                     command: WorkerCommandEnvelope::new(1),
-                })
+                }))
                 .await
                 .expect("send shutdown");
         });
@@ -5271,7 +5123,7 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             method_tx
-                .send(Method::Pause { command })
+                .send(ControllerMessage::Protocol(Method::Pause { command }))
                 .await
                 .expect("send pause");
         });
@@ -5369,12 +5221,14 @@ mod tests {
     async fn running_legacy_scope_callback_has_no_registry_authority_or_notify() {
         let mut env = make_env().await;
         env._method_tx
-            .send(Method::WorkerEvent(WorkerEvent::ScopeSubDelegated {
-                parent_worker: "child".into(),
-                sub_worker: "grandchild".into(),
-                sub_socket: "/tmp/grandchild.sock".into(),
-                scope: vec![],
-            }))
+            .send(ControllerMessage::Protocol(Method::WorkerEvent(
+                WorkerEvent::ScopeSubDelegated {
+                    parent_worker: "child".into(),
+                    sub_worker: "grandchild".into(),
+                    sub_socket: "/tmp/grandchild.sock".into(),
+                    scope: vec![],
+                },
+            )))
             .await
             .expect("send worker event");
 
@@ -5407,9 +5261,11 @@ mod tests {
     async fn running_visible_worker_event_enters_notify_buffer() {
         let mut env = make_env().await;
         env._method_tx
-            .send(Method::WorkerEvent(WorkerEvent::TurnEnded {
-                worker_name: "child".into(),
-            }))
+            .send(ControllerMessage::Protocol(Method::WorkerEvent(
+                WorkerEvent::TurnEnded {
+                    worker_name: "child".into(),
+                },
+            )))
             .await
             .expect("send worker event");
 
@@ -5439,10 +5295,10 @@ mod tests {
     async fn running_notify_remains_staged_for_the_next_model_boundary() {
         let mut env = make_env().await;
         env._method_tx
-            .send(Method::Notify {
+            .send(ControllerMessage::Protocol(Method::Notify {
                 notification_request_id: protocol::new_submission_request_id(),
                 message: "continue".into(),
-            })
+            }))
             .await
             .expect("send notify");
 
@@ -5479,7 +5335,7 @@ mod tests {
             )));
         let command = WorkerCommandEnvelope::new(1);
         env._method_tx
-            .send(Method::Compact { command })
+            .send(ControllerMessage::Protocol(Method::Compact { command }))
             .await
             .expect("send compact");
 
@@ -5520,59 +5376,6 @@ mod tests {
             }
             other => panic!("expected compact rejection acknowledgement, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn command_admission_rejects_stale_ids_and_reuse_conflicts() {
-        let shared = WorkerSharedState::new(
-            "worker".into(),
-            session_store::new_segment_id(),
-            String::new(),
-            protocol::Greeting {
-                worker_name: "worker".into(),
-                cwd: "/tmp".into(),
-                provider: "test".into(),
-                model: "test".into(),
-                scope_summary: String::new(),
-                tools: Vec::new(),
-                context_window: 1,
-                context_tokens: 0,
-                reasoning: None,
-                context_usage: None,
-            },
-        );
-        assert!(
-            validate_command(
-                WorkerCommandEnvelope { command_id: 1 },
-                WorkerCommandKind::Pause,
-                &shared,
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            validate_command(
-                WorkerCommandEnvelope { command_id: 1 },
-                WorkerCommandKind::Pause,
-                &shared,
-            ),
-            Err(WorkerCommandDisposition::StaleCommandId)
-        );
-        assert_eq!(
-            validate_command(
-                WorkerCommandEnvelope { command_id: 1 },
-                WorkerCommandKind::Cancel,
-                &shared,
-            ),
-            Err(WorkerCommandDisposition::Conflict)
-        );
-        assert!(
-            validate_command(
-                WorkerCommandEnvelope { command_id: 2 },
-                WorkerCommandKind::Pause,
-                &shared,
-            )
-            .is_ok()
-        );
     }
 
     #[test]

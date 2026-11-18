@@ -47,7 +47,10 @@ pub use bootstrap::{
     WorkerBootstrapLayout, start_worker_controller,
 };
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
-pub use controller::{ShutdownReceiver, WorkerController, WorkerHandle};
+pub use controller::{
+    ShutdownReceiver, WorkerCommandNotDeliveredReason, WorkerCommandSendError, WorkerController,
+    WorkerHandle,
+};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use ipc::alerter::Alerter;
 pub use manifest::{

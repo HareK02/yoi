@@ -1581,6 +1581,7 @@ mod tests {
                     .to_string()
                 } else if is_worker_input {
                     serde_json::to_string(&server_api::RuntimeWorkerInputResult {
+                        command: None,
                         control_explanation: None,
                         control: None,
                         state: server_api::WorkerOperationState::Accepted,
@@ -1592,6 +1593,7 @@ mod tests {
                     .unwrap()
                 } else if is_worker_lifecycle {
                     serde_json::to_string(&server_api::RuntimeWorkerLifecycleResult {
+                        command: None,
                         cleanup_failures: vec![],
                         control_explanation: None,
                         control: None,
@@ -1877,6 +1879,7 @@ mod tests {
             ),
         ] {
             let input = server_api::RuntimeWorkerInputResult {
+                command: None,
                 control_explanation: None,
                 control: None,
                 state,
@@ -1936,6 +1939,7 @@ mod tests {
         );
 
         let input = server_api::RuntimeWorkerInputResult {
+            command: None,
             control_explanation: None,
             control: None,
             state: S::Accepted,
@@ -2178,6 +2182,7 @@ mod tests {
         use tools::failure::ToolFailureBoundary as B;
 
         let rejected = server_api::RuntimeWorkerInputResult {
+            command: None,
             control_explanation: None,
             control: None,
             state: server_api::WorkerOperationState::Rejected,
