@@ -118,6 +118,15 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
         }
         verify_history_records(conn, 123, &prefix)?;
     }
+    verify_failure_receipts(current, &rows, tail)
+}
+
+// Receipt equality is independent of SQLite shape/data validation. The caller
+// still verifies the prefix and every physical extension before accepting a DB.
+fn verify_failure_receipts(current: i64, rows: &[(i64, String)], tail: FailureTail) -> Result<()> {
+    let baseline = rows
+        .first()
+        .ok_or_else(|| invalid("missing migration receipts"))?;
     let expected: Vec<_> = tail
         .migrations()
         .into_iter()
@@ -148,11 +157,54 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
     if current == 123 {
         verify_execution_shape(conn)?;
         verify_execution_data(conn)?;
-        if rows == [(current, super::SCHEMA_BASELINE_NAME.to_owned())] {
+        let Some(prefix) = pre_failure_receipt_prefix(current, rows)? else {
             verify_configuration_shape(conn)?;
             require_shape(conn, Stage::Base)?;
             return verify_103_features(conn, current, rows);
+        };
+        return verify_history_records(conn, current - 1, prefix);
+    }
+    if current == 122 {
+        verify_configuration_shape(conn)?;
+        let Some(prefix) = pre_failure_receipt_prefix(current, rows)? else {
+            require_shape(conn, Stage::Base)?;
+            return verify_103_features(conn, current, rows);
+        };
+        return verify_history_records(conn, prefix.last().unwrap().0, prefix);
+    }
+    let stages = retained_receipt_stages(current, rows)?;
+    if current <= 113 {
+        reject_early_tail(conn, current)?;
+        verify_103_features(conn, current, rows)?;
+        if current == 113 {
+            require_shape(conn, Stage::Base)?;
         }
+        return Ok(());
+    }
+    verify_103_features(conn, current, rows)?;
+    let mut diagnostics = Vec::new();
+    for stage in stages {
+        match require_shape(conn, stage) {
+            Ok(()) => return Ok(()),
+            Err(error) => diagnostics.push(error.to_string()),
+        }
+    }
+    Err(invalid(format!(
+        "unknown/mixed receipts or receipt-shape mismatch at {current}: {}",
+        diagnostics.join("; ")
+    )))
+}
+
+// These two receipts bridge a retained history to the failure tail. None means
+// a fresh baseline; Some borrows the exact saved prefix, never a fabricated one.
+fn pre_failure_receipt_prefix(
+    current: i64,
+    rows: &[(i64, String)],
+) -> Result<Option<&[(i64, String)]>> {
+    if rows == [(current, super::SCHEMA_BASELINE_NAME.to_owned())] {
+        return Ok(None);
+    }
+    if current == 123 {
         if rows.last().map(|(version, name)| (*version, name.as_str()))
             != Some((current, tail_migration_name(current)?))
         {
@@ -162,29 +214,31 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
         if prefix.last().map(|row| row.0) != Some(current - 1) {
             return Err(invalid(format!("missing schema-{current} predecessor")));
         }
-        return verify_history_records(conn, current - 1, prefix);
+        return Ok(Some(prefix));
     }
-    if current == 122 {
-        verify_configuration_shape(conn)?;
-        if rows == [(122, super::SCHEMA_BASELINE_NAME.to_owned())] {
-            require_shape(conn, Stage::Base)?;
-            return verify_103_features(conn, current, rows);
-        }
-        if rows.last().map(|(version, name)| (*version, name.as_str()))
-            != Some((122, crate::config_adoption::MIGRATION_NAME))
-        {
-            return Err(invalid("unrecognized configuration adoption receipt"));
-        }
-        let prefix = &rows[..rows.len() - 1];
-        let prior = prefix
-            .last()
-            .map(|row| row.0)
-            .ok_or_else(|| invalid("missing configuration predecessor"))?;
-        if !(113..=121).contains(&prior) {
-            return Err(invalid("invalid configuration predecessor"));
-        }
-        return verify_history_records(conn, prior, prefix);
+    if current != 122 {
+        return Err(invalid("expected configuration or execution receipt"));
     }
+    if rows.last().map(|(version, name)| (*version, name.as_str()))
+        != Some((122, crate::config_adoption::MIGRATION_NAME))
+    {
+        return Err(invalid("unrecognized configuration adoption receipt"));
+    }
+    let prefix = &rows[..rows.len() - 1];
+    let prior = prefix
+        .last()
+        .map(|row| row.0)
+        .ok_or_else(|| invalid("missing configuration predecessor"))?;
+    if !(113..=121).contains(&prior) {
+        return Err(invalid("invalid configuration predecessor"));
+    }
+    Ok(Some(prefix))
+}
+
+// Pure recognition of saved receipts, not database acceptance. Branch-local
+// baseline receipts can describe several families: keep every candidate so the
+// caller must still disambiguate them against the actual SQLite programs.
+fn retained_receipt_stages(current: i64, rows: &[(i64, String)]) -> Result<Vec<Stage>> {
     let Some((baseline, name)) = rows.first() else {
         return Err(invalid("missing migration receipts"));
     };
@@ -219,15 +273,13 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
                 "unknown or missing retained receipt: {rows:?}"
             )));
         }
-        reject_early_tail(conn, current)?;
-        verify_103_features(conn, current, &rows)?;
-        if current == 113 {
-            require_shape(conn, Stage::Base)?;
-        }
-        return Ok(());
+        return Ok(if current == 113 {
+            vec![Stage::Base]
+        } else {
+            Vec::new()
+        });
     }
 
-    verify_103_features(conn, current, &rows)?;
     // A converged history may have jumped straight from 113, or retained any
     // exact published prefix. It must not acquire fabricated missing receipts.
     let prior = if current < 119 {
@@ -250,7 +302,7 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
             .map(|family| Stage::Published(family, (prior - 113) as usize))
             .collect()
     };
-    let mut diagnostics = Vec::new();
+    let mut matching = Vec::new();
     for stage in stages {
         let mut expected = prefix.clone();
         if let Stage::Published(family, count) = stage {
@@ -281,15 +333,9 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
         } else {
             stage
         };
-        match require_shape(conn, installed) {
-            Ok(()) => return Ok(()),
-            Err(error) => diagnostics.push(error.to_string()),
-        }
+        matching.push(installed);
     }
-    Err(invalid(format!(
-        "unknown/mixed receipts or receipt-shape mismatch at {current}: {}",
-        diagnostics.join("; ")
-    )))
+    Ok(matching)
 }
 
 /// Plan physical acceptance of a published tail without downgrading it to 113
@@ -303,23 +349,12 @@ pub(super) fn published_plan(
         return Ok(None);
     }
     verify_history(conn, current)?;
-    Ok(Some(super::WorkspaceSchemaMigrationPlan {
-        current_schema_version: current,
-        target_schema_version: super::LATEST_SCHEMA_VERSION,
-        migrations: failure_tail(
-            conn,
-            current,
-            &super::workspace_schema_migration_history(conn)?,
-        )?
-        .migrations()
-        .into_iter()
-        .filter(|(version, _)| *version > current)
-        .map(|(version, name)| super::WorkspaceSchemaMigrationStep {
-            version,
-            name: name.to_owned(),
-        })
-        .collect(),
-    }))
+    let tail = failure_tail(
+        conn,
+        current,
+        &super::workspace_schema_migration_history(conn)?,
+    )?;
+    Ok(Some(tail.plan(current)))
 }
 
 // Receipt names come from the ordered owner, including the Service-126 hook.
@@ -341,6 +376,22 @@ enum FailureTail {
     Journal,
 }
 impl FailureTail {
+    fn plan(self, current: i64) -> super::WorkspaceSchemaMigrationPlan {
+        super::WorkspaceSchemaMigrationPlan {
+            current_schema_version: current,
+            target_schema_version: super::LATEST_SCHEMA_VERSION,
+            migrations: self
+                .migrations()
+                .into_iter()
+                .filter(|(version, _)| *version > current)
+                .map(|(version, name)| super::WorkspaceSchemaMigrationStep {
+                    version,
+                    name: name.to_owned(),
+                })
+                .collect(),
+        }
+    }
+
     fn migrations(self) -> Vec<(i64, &'static str)> {
         let mut tail = vec![
             (122, crate::config_adoption::MIGRATION_NAME),
