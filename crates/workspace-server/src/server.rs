@@ -5812,10 +5812,15 @@ impl WorkspaceApi {
     }
 
     fn recover_backend_job_worker_cleanups(&self) -> Result<()> {
+        self.recover_backend_job_worker_cleanups_with_page_limit(usize::from(
+            ABSOLUTE_MAX_CONCURRENT_JOBS,
+        ))
+    }
+
+    fn recover_backend_job_worker_cleanups_with_page_limit(&self, page_limit: usize) -> Result<()> {
         // The same Store list also returns Completed Journal cleanup with
         // Available input. Its owner takes the retirement-only step before claim;
         // neither a live Worker nor a new removal operation is required.
-        let page_limit = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS);
         let mut after: Option<(String, String)> = None;
         loop {
             let attempts = self.store.list_backend_job_worker_cleanups(

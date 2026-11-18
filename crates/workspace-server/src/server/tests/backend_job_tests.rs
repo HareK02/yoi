@@ -1930,7 +1930,11 @@ async fn cleanup_recovery_owns_later_pages_while_first_page_is_held_before_claim
     // Seed accepted/terminal Jobs without automatic owner tasks. Keep the actual
     // original Host owners: this fixture pause is not a reconstructed restart fence.
     api.stop_backend_job_recovery().await;
-    let count = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS) + 2;
+    // Exercise the production pager with two full pages and a partial tail.
+    // The default entry point still uses ABSOLUTE_MAX_CONCURRENT_JOBS (64);
+    // that batch size is not the number of real Workers this contract needs.
+    let page_limit = 2;
+    let count = 2 * page_limit + 1;
     let mut attempts = Vec::new();
     for index in 0..count {
         let request = recovery_request(&format!("cleanup-page-{index:03}"));
@@ -1956,7 +1960,8 @@ async fn cleanup_recovery_owns_later_pages_while_first_page_is_held_before_claim
         .lock()
         .unwrap() = Some(gate.clone());
     api.backend_job_recovery.resume_after_test_pause();
-    api.recover_backend_job_worker_cleanups().unwrap();
+    api.recover_backend_job_worker_cleanups_with_page_limit(page_limit)
+        .unwrap();
     let owners = api.backend_job_recovery.cleanup_owner_ids();
     assert_eq!(
         owners.len(),
@@ -1980,7 +1985,8 @@ async fn cleanup_recovery_owns_later_pages_while_first_page_is_held_before_claim
     }
     // A concurrent sweep sees the same admitted owners and must advance past
     // them too, without creating another owner or needing a later user request.
-    api.recover_backend_job_worker_cleanups().unwrap();
+    api.recover_backend_job_worker_cleanups_with_page_limit(page_limit)
+        .unwrap();
     assert_eq!(api.backend_job_recovery.cleanup_owner_ids(), owners);
     gate.add_permits(count);
     // The two finite cleanup workers perform real canonical removal/retention
@@ -2001,6 +2007,8 @@ async fn cleanup_recovery_owns_later_pages_while_first_page_is_held_before_claim
                 assert_eq!(saved.worker, attempt.worker);
                 assert_eq!(saved.runtime_run_id, attempt.runtime_run_id);
                 assert_eq!(saved.failure_category, attempt.failure_category);
+                assert_eq!(saved.failure_detail, attempt.failure_detail);
+                assert_eq!(saved.input_digest, attempt.input_digest);
                 if saved.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
                     && !api.backend_job_recovery.cleanup_owner_ids().contains(&saved.attempt_id)
                 {
@@ -2029,6 +2037,27 @@ async fn cleanup_recovery_owns_later_pages_while_first_page_is_held_before_claim
         panic!("cleanup page did not finish: live_owners={}, pending={pending:?}",
             api.backend_job_recovery.cleanup_owner_ids().len());
     });
+    for attempt in &attempts {
+        let worker = attempt.worker.as_ref().unwrap();
+        let retained = api
+            .config_store
+            .recover_worker_removal_execution(api.workspace_id(), worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.plan.state,
+            crate::retention::WorkerRemovalPlanState::Succeeded
+        );
+        assert!(api.runtime.worker(worker).is_err());
+    }
+    assert_eq!(
+        execution.take_input_request_ids(),
+        attempts
+            .iter()
+            .map(|attempt| attempt.runtime_run_id.clone())
+            .collect::<Vec<_>>(),
+        "only the original tracked Submits may reach the execution callee"
+    );
     assert_eq!(
         execution.take_inputs().len(),
         count,
