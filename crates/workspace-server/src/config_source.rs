@@ -129,6 +129,33 @@ pub struct WorkspaceConfigState {
     pub projection_digest: String,
 }
 
+/// Check a saved evaluation before supplying it to a current-config consumer.
+/// Raw source/history reads intentionally do not require a current evaluation so
+/// an owner can still repair configuration after reevaluation fails.
+pub(crate) fn validate_current_evaluation(
+    state: &WorkspaceConfigState,
+    schema: WorkspaceConfigSchemaBundle,
+) -> Result<()> {
+    let desired = current_evaluation_contract(state, schema)?;
+    if state.contract.validate().is_err() || state.contract != desired {
+        return Err(Error::ConfigurationUpdateRequired(std::sync::Arc::new(
+            Error::RegistryInconsistency(
+                "saved Workspace evaluation does not match the current schema and toolchain".into(),
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn current_evaluation_contract(
+    state: &WorkspaceConfigState,
+    schema: WorkspaceConfigSchemaBundle,
+) -> Result<ToolchainContract> {
+    let schema =
+        crate::plugin_settings::materialization_schema(schema, &state.contract.schema_bundle)?;
+    Ok(main_config_contract_with_schema(schema))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluatedConfigCandidate {
     pub base_digest: String,
@@ -206,96 +233,39 @@ impl SqliteWorkspaceStore {
         materialized_at: &str,
         schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<WorkspaceConfigState> {
-        let desired_schema = schema_bundle.clone();
-        let (state, requires_toolchain_refresh, base_identity, frozen) =
-            self.with_conn_mut(|conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let workspace_exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
-                    [workspace_id],
-                    |row| row.get(0),
-                )?;
-                if !workspace_exists {
-                    return Err(Error::WorkspaceIdMismatch);
-                }
-                let stored_decodal_version = tx
-                .query_row(
-                    "SELECT decodal_version FROM workspace_config_trees WHERE workspace_id = ?1",
-                    [workspace_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-                let requires_toolchain_refresh = stored_decodal_version
-                    .as_deref()
-                    .is_some_and(|version| version != DECODAL_VERSION);
-                let state = match load_state(&tx, workspace_id)? {
-                    Some(state) => state,
-                    None => {
-                        let mut state = initial_state_with_schema(schema_bundle.clone())?;
-                        if has_plugin_provider(&schema_bundle) {
-                            let (contract, evaluation, _) =
-                                crate::plugin_settings::evaluate_catalog_config(
-                                    &tx,
-                                    workspace_id,
-                                    &state.snapshot,
-                                    schema_bundle.clone(),
-                                )?;
-                            state.contract = contract;
-                            state.projection_digest = evaluation.projection_digest;
-                        }
-                        insert_materialized_state(&tx, workspace_id, &state, materialized_at)?;
-                        state
-                    }
-                };
-                let base_identity = load_evaluation_identity(&tx, workspace_id)?;
-                let frozen = crate::config_adoption::has_history(&tx, workspace_id)?;
-                tx.commit()?;
-                Ok((state, requires_toolchain_refresh, base_identity, frozen))
-            })?;
-        // Published source and owner receipts stay unchanged during system
-        // reevaluation, including patch releases. Retained evaluations keep their provenance.
-        let desired_schema = crate::plugin_settings::materialization_schema(
-            desired_schema,
-            &state.contract.schema_bundle,
-        )?;
-        if state.contract.decodal_version != DECODAL_VERSION || state.contract.validate().is_err() {
-            return self.reevaluate_workspace_config(workspace_id, materialized_at, desired_schema);
-        }
-        if frozen {
-            return Ok(state);
-        }
-        let main_needs_normalization = state
-            .snapshot
-            .get(&main_config_path())
-            .is_some_and(|entry| !main_config_has_schema_assertion(&entry.content));
-        if requires_toolchain_refresh
-            || state.contract.schema_bundle.fingerprint != desired_schema.fingerprint
-            || main_needs_normalization
-        {
-            let candidate = self.with_conn(|conn| {
-                let tx = conn.unchecked_transaction()?;
-                evaluate_candidate_in_transaction(
-                    &tx,
-                    workspace_id,
-                    state,
-                    base_identity,
-                    &[],
-                    desired_schema,
-                )
-            })?;
-            return self.commit_evaluated_workspace_config(workspace_id, &candidate);
-        }
-        Ok(state)
-    }
-
-    fn reevaluate_workspace_config(
-        &self,
-        workspace_id: &str,
-        evaluated_at: &str,
-        schema: WorkspaceConfigSchemaBundle,
-    ) -> Result<WorkspaceConfigState> {
         self.with_immediate_transaction(|tx| {
-            let current = load_state(tx, workspace_id)?.ok_or_else(config_not_materialized)?;
+            let workspace_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
+                [workspace_id],
+                |row| row.get(0),
+            )?;
+            if !workspace_exists {
+                return Err(Error::WorkspaceIdMismatch);
+            }
+            let Some(current) = load_state(tx, workspace_id)? else {
+                let mut state = initial_state_with_schema(schema_bundle.clone())?;
+                if has_plugin_provider(&schema_bundle) {
+                    let (contract, evaluation, _) =
+                        crate::plugin_settings::evaluate_catalog_config(
+                            tx,
+                            workspace_id,
+                            &state.snapshot,
+                            schema_bundle,
+                        )?;
+                    state.contract = contract;
+                    state.projection_digest = evaluation.projection_digest;
+                }
+                insert_materialized_state(tx, workspace_id, &state, materialized_at)?;
+                return Ok(state);
+            };
+            // Only the current evaluation contract determines cache reuse. Editing
+            // history protects source publication, not builtin defaults or interpretation.
+            // Resolve pinned Plugin schema against the source read in this same transaction.
+            let desired = current_evaluation_contract(&current, schema_bundle)?;
+            if current.contract.validate().is_ok() && current.contract == desired {
+                return Ok(current);
+            }
+            let schema = desired.schema_bundle;
             let snapshot = current.snapshot.clone();
             let (contract, evaluation) = if has_plugin_provider(&schema) {
                 let (contract, evaluation, _) = crate::plugin_settings::evaluate_catalog_config(
@@ -344,7 +314,7 @@ impl SqliteWorkspaceStore {
                 "DELETE FROM workspace_config_entries WHERE workspace_id = ?1",
                 [workspace_id],
             )?;
-            insert_materialized_state(tx, workspace_id, &state, evaluated_at)?;
+            insert_materialized_state(tx, workspace_id, &state, materialized_at)?;
             Ok(state)
         })
     }
@@ -1559,7 +1529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_upgrades_legacy_main_and_preserves_prior_content_history() {
+    async fn materialization_preserves_unasserted_source_without_implicit_owner_edit() {
         let store = open_store().await;
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let legacy_snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
@@ -1591,14 +1561,14 @@ mod tests {
                 current.contract.schema_bundle.clone(),
             )
             .unwrap();
-        assert_ne!(upgraded.snapshot.digest, legacy.snapshot.digest);
+        assert_eq!(upgraded, legacy);
         assert_eq!(
             upgraded
                 .snapshot
                 .get(&path(MAIN_CONFIG_ENTRYPOINT))
                 .unwrap()
                 .content,
-            DEFAULT_MAIN_CONFIG_SOURCE
+            "{}"
         );
         assert_eq!(
             store

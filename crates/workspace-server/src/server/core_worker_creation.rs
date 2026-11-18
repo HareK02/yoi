@@ -149,10 +149,7 @@ pub(super) fn resolve_creation_profile(
             };
             (grant.profile.clone(), selector, Some(bundle), Some(grant))
         } else {
-            let config_state = api
-                .config_store
-                .load_workspace_config(&api.config.workspace_id)?
-                .ok_or_else(|| Error::InvalidRecordId("virtual config source tree".into()))?;
+            let config_state = api.current_workspace_config()?;
             let profile_projection =
                 crate::profile_settings::project_profiles_from_workspace_config(
                     &api.config.workspace_id,

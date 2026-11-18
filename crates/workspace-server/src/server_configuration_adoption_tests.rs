@@ -1710,6 +1710,159 @@ mod configuration_adoption_http_integration {
         );
     }
 
+    // Seed an older, valid evaluation, not a malformed fingerprint. The running
+    // Server uses its real builtin registry on reopen, as it does after an upgrade.
+    fn retain_test_evaluation(
+        f: &Fixture,
+        snapshot: config_source::ConfigTreeSnapshot,
+        schema: config_source::WorkspaceConfigSchemaBundle,
+    ) -> crate::config_source::WorkspaceConfigState {
+        let contract = config_source::ToolchainContract::with_schema_bundle(
+            config_source::DEFAULT_SCHEMA_VERSION,
+            vec![config_source::VirtualPath::parse("main.dcdl").unwrap()],
+            config_source::DEFAULT_IMPORT_POLICY_VERSION,
+            schema,
+        );
+        let evaluation = config_source::SnapshotEnvironment::new(snapshot.clone())
+            .evaluate_contract(&contract)
+            .unwrap();
+        let state = crate::config_source::WorkspaceConfigState {
+            snapshot,
+            contract,
+            projection_digest: evaluation.projection_digest,
+        };
+        f.api.config_store.with_immediate_transaction(|tx| {
+            tx.execute("DELETE FROM workspace_config_entries WHERE workspace_id=?1", [TEST_WORKSPACE_ID])?;
+            crate::config_source::insert_materialized_state(tx, TEST_WORKSPACE_ID, &state, "prior-evaluation")
+        }).unwrap();
+        state
+    }
+
+    async fn runtime_prompt_bundle(f: &Fixture) -> (StatusCode, Value) {
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/runtime-config?profile=builtin%3Aasync-chat");
+        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&f.runtime_identity)
+            .issue("server-test", TEST_WORKSPACE_ID, None,
+                worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION, "GET", &path, b"",
+                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap(), 30).unwrap();
+        let request = Request::builder().uri(&path)
+            .header(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof)
+            .body(Body::empty()).unwrap();
+        f.call(request).await
+    }
+
+    #[tokio::test]
+    async fn schema_default_refresh_reaches_new_worker_bundle_without_source_edit() {
+        let f = Fixture::new().await;
+        let current = f.api.current_workspace_config().unwrap();
+        let expected = crate::prompt_settings::project_prompts_from_workspace_config(&current).unwrap();
+        let prior_default = "test-owned prior builtin language";
+        let mut providers = current.contract.schema_bundle.contributions.clone();
+        let prompt = providers.iter_mut().find(|p| p.namespace == "prompts").unwrap();
+        let encoded = serde_json::to_string(&expected.templates["common.language"]).unwrap();
+        assert!(prompt.source.contains(&encoded));
+        let source = prompt.source.replace(&encoded, &serde_json::to_string(prior_default).unwrap());
+        let mut changed = config_source::ConfigSchemaContribution::new(
+            prompt.provider_id.clone(), prompt.namespace.clone(), prompt.version.clone(), source,
+        ).unwrap();
+        changed.projection_validator = prompt.projection_validator.clone();
+        *prompt = changed;
+        let head = f.source().await.history_head;
+        let old = retain_test_evaluation(&f, current.snapshot.clone(), config_source::WorkspaceConfigSchemaBundle::compose(providers).unwrap());
+        old.contract.validate().unwrap();
+        assert_eq!(old.contract.decodal_version, current.contract.decodal_version);
+        let held = f.api.prompt_projection_cache.resolve(TEST_WORKSPACE_ID, &old).unwrap();
+        assert_eq!(held.catalog().templates["common.language"], prior_default);
+        assert!(f.api.current_workspace_config().unwrap_err().configuration_update_required().is_some());
+        let (status, body) = runtime_prompt_bundle(&f).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        let f = f.reopen().await;
+        let refreshed = f.api.current_workspace_config().unwrap();
+        assert_eq!(refreshed.snapshot, old.snapshot);
+        assert_eq!(f.source().await.history_head, head);
+        assert_eq!(refreshed.contract, current.contract);
+        assert_eq!(held.catalog().templates["common.language"], prior_default);
+        let (status, body) = runtime_prompt_bundle(&f).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["prompt_catalog"]["templates"]["common.language"], expected.templates["common.language"]);
+        let (_, _, bundle, _) = core_worker_creation::resolve_creation_profile(
+            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
+            Some("builtin:async-chat".into()), None, true,
+        ).unwrap();
+        assert_eq!(bundle.unwrap().prompt_catalog.unwrap().templates, expected.templates);
+        f.assert_subject_policy_unchanged();
+        let before = f.durable();
+        let f = f.reopen().await;
+        assert_eq!(f.durable(), before, "unchanged evaluation must not write again");
+    }
+
+    #[tokio::test]
+    async fn same_version_schema_failure_blocks_new_bundles_but_keeps_saved_replay_and_owner_repair() {
+        let f = Fixture::new().await;
+        let operation = WorkerControlOperation {
+            operation_id: "saved-before-schema-upgrade".into(),
+            input_fingerprint: "saved-launch-input".into(),
+        };
+        let (_, _, bundle, grant) = core_worker_creation::resolve_creation_profile(
+            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
+            Some("builtin:async-chat".into()), Some(&operation), false,
+        ).unwrap();
+        let bundle = bundle.unwrap();
+        let memory = f.api.config_store.get_workspace_memory_settings(TEST_WORKSPACE_ID).unwrap();
+        f.api.config_store.reserve_worker_create_with_core(
+            TEST_WORKSPACE_ID, "adoption-http-runtime", &operation.operation_id,
+            &operation.input_fingerprint, &operation.input_fingerprint, None,
+            &memory, &grant.unwrap(), &bundle,
+        ).unwrap();
+        let saved = f.api.config_store.saved_core_worker_launch(
+            TEST_WORKSPACE_ID, &operation.operation_id, &operation.input_fingerprint,
+        ).unwrap().unwrap();
+        let current = f.api.current_workspace_config().unwrap();
+        let path = config_source::VirtualPath::parse("main.dcdl").unwrap();
+        let main = current.snapshot.get(&path).unwrap();
+        let original = main.content.clone();
+        let snapshot = current.snapshot.apply(&[config_source::ConfigTreeChange::Update {
+            path: path.clone(), expected_digest: main.content_digest.clone(),
+            content: original.replacen('{', "{ retired_test_setting = true;", 1),
+        }]).unwrap();
+        let mut providers = current.contract.schema_bundle.contributions.clone();
+        providers.push(config_source::ConfigSchemaContribution::new(
+            "builtin:retired-test", "retired_test_setting", "1", "{ retired_test_setting = Bool default false; }",
+        ).unwrap());
+        let old = retain_test_evaluation(&f, snapshot, config_source::WorkspaceConfigSchemaBundle::compose(providers).unwrap());
+        old.contract.validate().unwrap();
+        let before = f.durable();
+        let f = f.reopen().await;
+        assert_eq!(f.durable(), before, "failed refresh must roll back");
+        assert!(f.api.current_workspace_config().unwrap_err().configuration_update_required().is_some());
+        let (_, _, replay_bundle, replay_grant) = core_worker_creation::resolve_creation_profile(
+            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
+            Some("builtin:async-chat".into()), Some(&operation), false,
+        ).unwrap();
+        assert_eq!(serde_json::to_value(replay_bundle.unwrap()).unwrap(), serde_json::to_value(&bundle).unwrap());
+        assert_eq!(replay_grant.unwrap(), saved.0);
+        assert_eq!(f.durable(), before, "saved launch replay must not refresh configuration");
+        let fresh_operation = WorkerControlOperation {
+            operation_id: "new-after-schema-upgrade".into(),
+            input_fingerprint: "new-launch-input".into(),
+        };
+        assert!(core_worker_creation::resolve_creation_profile(
+            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
+            Some("builtin:async-chat".into()), Some(&fresh_operation), false,
+        ).is_err());
+        let (status, body) = runtime_prompt_bundle(&f).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let source = f.source().await;
+        let repair = request(&source, "repair-same-version-schema", vec![update(&source, "main.dcdl", &original)]);
+        f.owner_call("/preview", &repair, StatusCode::OK).await;
+        assert_eq!(f.durable(), before);
+        f.commit(&repair).await;
+        f.api.current_workspace_config().unwrap();
+        let (status, body) = runtime_prompt_bundle(&f).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        f.assert_subject_policy_unchanged();
+    }
+
     #[tokio::test]
     async fn failed_startup_reevaluation_keeps_owner_http_repair_available() {
         let f = Fixture::new().await;

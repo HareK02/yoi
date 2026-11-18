@@ -1,6 +1,9 @@
 //! System reevaluation and owner repair preserve persisted evaluation evidence.
-//! The fixture models the old storage format and byte-wise lexer result; it does not
-//! run the old evaluator (the independent version probe is a separate test surface).
+//! These component tests connect real evaluation, SQLite persistence and Prompt projection
+//! using isolated temporary databases; only schema inputs and storage faults are test-owned.
+//! Run with `cargo test -p yoi-workspace-server --lib toolchain_refresh`.
+//! The legacy fixture models the old storage format and byte-wise lexer result; it does
+//! not run the old evaluator (the independent version probe is a separate test surface).
 use super::*;
 use config_source::{
     CONFIG_SOURCE_CONTRACT_VERSION, ConfigContentType, ConfigEntry, DECODAL_VERSION,
@@ -61,7 +64,7 @@ fn legacy_contract(mut contract: ToolchainContract) -> ToolchainContract {
     contract
 }
 
-struct LegacyFixture {
+struct ToolchainFixture {
     dir: tempfile::TempDir,
     db: SqliteWorkspaceStore,
     state: WorkspaceConfigState,
@@ -69,7 +72,7 @@ struct LegacyFixture {
     receipt: Option<ConfigurationAdoptionResult>,
 }
 
-fn legacy_fixture(published: bool) -> LegacyFixture {
+fn legacy_fixture(published: bool) -> ToolchainFixture {
     assert_eq!(
         DECODAL_VERSION, "0.4.1",
         "run after the dependency/toolchain update"
@@ -96,16 +99,32 @@ fn legacy_fixture(published: bool) -> LegacyFixture {
         contract: legacy_contract(preview.state.contract),
         projection_digest: digest(&evaluated.projections),
     };
+    persisted_fixture(dir, db, state, original, published, "legacy-time")
+}
+
+fn persisted_fixture(
+    dir: tempfile::TempDir,
+    db: SqliteWorkspaceStore,
+    state: WorkspaceConfigState,
+    original: ConfigurationAdoptionRequest,
+    published: bool,
+    materialized_at: &str,
+) -> ToolchainFixture {
     let receipt = db
         .with_immediate_transaction(|tx| {
             tx.execute(
                 "DELETE FROM workspace_config_entries WHERE workspace_id=?1",
                 [WORKSPACE],
             )?;
-            crate::config_source::insert_materialized_state(tx, WORKSPACE, &state, "legacy-time")?;
+            crate::config_source::insert_materialized_state(
+                tx,
+                WORKSPACE,
+                &state,
+                materialized_at,
+            )?;
             tx.execute(
-                "UPDATE workspace_config_trees SET decodal_version='0.4.0' WHERE workspace_id=?1",
-                [WORKSPACE],
+                "UPDATE workspace_config_trees SET decodal_version=?2 WHERE workspace_id=?1",
+                params![WORKSPACE, state.contract.decodal_version],
             )?;
             if !published {
                 return Ok(None);
@@ -138,13 +157,61 @@ fn legacy_fixture(published: bool) -> LegacyFixture {
             Ok(Some(receipt))
         })
         .unwrap();
-    LegacyFixture {
+    ToolchainFixture {
         dir,
         db,
         state,
         original,
         receipt,
     }
+}
+
+fn default_schema(value: &str) -> WorkspaceConfigSchemaBundle {
+    let value = serde_json::to_string(value).unwrap();
+    WorkspaceConfigSchemaBundle::compose([
+        PermissionConfigSchemaProvider.contribution().unwrap(),
+        config_source::ConfigSchemaContribution::new(
+            "builtin:prompts",
+            "prompts",
+            "1",
+            format!(
+                "{{ prompts = {{ common = {{ language = String default {value}; \
+                 workspace = String default {value}; }} default {{}}; }} default {{}}; }}"
+            ),
+        )
+        .unwrap(),
+    ])
+    .unwrap()
+}
+
+fn current_fixture(published: bool, source: &str) -> ToolchainFixture {
+    let (dir, db) = fixture();
+    let original = request(&db, &host(false), "current-schema", Some(source));
+    // Install valid, unformatted source bytes so an accidental owner-normalization
+    // path cannot masquerade as a source-preserving system reevaluation.
+    let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+        VirtualPath::parse(MAIN_CONFIG_ENTRYPOINT).unwrap(),
+        ConfigContentType::Decodal,
+        source,
+    )
+    .unwrap()])
+    .unwrap();
+    let contract = ToolchainContract::with_schema_bundle(
+        config_source::DEFAULT_SCHEMA_VERSION,
+        vec![VirtualPath::parse(MAIN_CONFIG_ENTRYPOINT).unwrap()],
+        config_source::DEFAULT_IMPORT_POLICY_VERSION,
+        default_schema("old-default"),
+    );
+    contract.validate().unwrap();
+    let evaluation = SnapshotEnvironment::new(snapshot.clone())
+        .evaluate_contract(&contract)
+        .unwrap();
+    let state = WorkspaceConfigState {
+        snapshot,
+        contract,
+        projection_digest: evaluation.projection_digest,
+    };
+    persisted_fixture(dir, db, state, original, published, "schema-time")
 }
 
 // Compare raw rows, including old timestamps, manifests, receipt bytes and content
@@ -193,6 +260,294 @@ fn assert_retained(db: &SqliteWorkspaceStore, state: &WorkspaceConfigState) {
         Some(state.snapshot.clone())
     );
     assert_native_policy(db);
+}
+
+#[test]
+fn schema_default_change_preserves_source_history_receipts_and_subject_policy() {
+    for published in [false, true] {
+        let f = current_fixture(published, "{} as WorkspaceConfigSchema");
+        let before = evidence(&f.db);
+        let head = f.db.configuration_head(WORKSPACE, OWNER).unwrap();
+        assert_eq!(head.is_some(), published);
+        let cache = crate::prompt_settings::WorkspacePromptProjectionCache::default();
+        let previous = cache.resolve(WORKSPACE, &f.state).unwrap();
+        assert_eq!(
+            previous.catalog().templates["common.language"],
+            "old-default"
+        );
+
+        let changed = default_schema("new-default");
+        let refreshed =
+            f.db.ensure_workspace_config_materialized_with_schema(
+                WORKSPACE,
+                "schema-update",
+                changed.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            refreshed.contract.decodal_version,
+            f.state.contract.decodal_version
+        );
+        assert_eq!(refreshed.contract.decodal_version, DECODAL_VERSION);
+        refreshed.contract.validate().unwrap();
+        assert_eq!(refreshed.contract.schema_bundle, changed);
+        assert_ne!(refreshed.contract.fingerprint, f.state.contract.fingerprint);
+        assert_ne!(refreshed.projection_digest, f.state.projection_digest);
+        assert_eq!(refreshed.snapshot, f.state.snapshot);
+        assert_eq!(f.db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
+        let saved = f.db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+        assert_eq!(saved, refreshed);
+        let projected = cache.resolve(WORKSPACE, &saved).unwrap();
+        assert_eq!(
+            projected.catalog().templates["common.language"],
+            "new-default"
+        );
+        assert_eq!(
+            projected.catalog().templates["common.workspace"],
+            "new-default"
+        );
+        assert_eq!(
+            previous.catalog().templates["common.language"],
+            "old-default"
+        );
+        let after = evidence(&f.db);
+        for index in [1, 3, 4, 5, 6, 7, 8] {
+            assert_eq!(
+                after[index], before[index],
+                "retained table {index}, published={published}"
+            );
+        }
+        for row in &before[2] {
+            assert!(
+                after[2].contains(row),
+                "old evaluation evidence must be retained"
+            );
+        }
+        assert_eq!(after[2].len(), before[2].len() + 1);
+        assert_eq!(
+            f.db.load_workspace_config_history(WORKSPACE, &f.state.snapshot.digest)
+                .unwrap(),
+            Some(f.state.snapshot.clone())
+        );
+        assert_native_policy(&f.db);
+        assert_eq!(
+            f.db.ensure_workspace_config_materialized_with_schema(
+                WORKSPACE,
+                "repeat",
+                changed.clone()
+            )
+            .unwrap(),
+            refreshed
+        );
+        assert_eq!(evidence(&f.db), after);
+        drop(f.db);
+        let db = open(&f.dir.path().join("server.sqlite"));
+        assert_eq!(
+            db.ensure_workspace_config_materialized_with_schema(
+                WORKSPACE,
+                "reopen",
+                changed.clone()
+            )
+            .unwrap(),
+            refreshed
+        );
+        assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
+        if let Some(receipt) = f.receipt {
+            assert_eq!(
+                db.adopt_configuration(WORKSPACE, OWNER, &f.original, changed, &host(false))
+                    .unwrap(),
+                receipt
+            );
+        }
+        assert_eq!(
+            db.load_workspace_config(WORKSPACE).unwrap(),
+            Some(refreshed)
+        );
+        assert_native_policy(&db);
+        assert_eq!(evidence(&db), after, "repeat/reopen/replay must not write");
+    }
+}
+
+#[test]
+fn schema_default_change_retains_explicit_and_empty_prompt_overrides() {
+    for value in [VALUE, ""] {
+        let source = format!(
+            "{{ prompts = {{ common = {{ language = {}; }}; }}; }} as WorkspaceConfigSchema",
+            serde_json::to_string(value).unwrap()
+        );
+        let f = current_fixture(true, &source);
+        let refreshed =
+            f.db.ensure_workspace_config_materialized_with_schema(
+                WORKSPACE,
+                "schema-update",
+                default_schema("new-default"),
+            )
+            .unwrap();
+        assert_eq!(refreshed.snapshot, f.state.snapshot);
+        let catalog =
+            crate::prompt_settings::project_prompts_from_workspace_config(&refreshed).unwrap();
+        assert_eq!(catalog.templates["common.language"], value);
+        assert_eq!(catalog.templates["common.workspace"], "new-default");
+        assert_native_policy(&f.db);
+    }
+}
+
+#[test]
+fn schema_change_failed_reevaluation_preserves_rows_and_requires_owner_update() {
+    let incompatible = WorkspaceConfigSchemaBundle::compose([PermissionConfigSchemaProvider
+        .contribution()
+        .unwrap()])
+    .unwrap();
+    for published in [false, true] {
+        for changed in [
+            incompatible.clone(),
+            default_schema("{% include \"missing\" %}"),
+        ] {
+            let f = current_fixture(published, SOURCE);
+            let before = evidence(&f.db);
+            let error =
+                f.db.ensure_workspace_config_materialized_with_schema(
+                    WORKSPACE,
+                    "rejected",
+                    changed.clone(),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::ConfigurationUpdateRequired(_)),
+                "{error:?}"
+            );
+            assert_eq!(evidence(&f.db), before);
+            assert_eq!(
+                f.db.load_workspace_config(WORKSPACE).unwrap(),
+                Some(f.state.clone())
+            );
+            assert!(matches!(
+                crate::config_source::evaluate_workspace_config_state(&f.state, changed.clone()),
+                Err(Error::ConfigurationUpdateRequired(_))
+            ));
+            drop(f.db);
+            let db = open(&f.dir.path().join("server.sqlite"));
+            assert_eq!(evidence(&db), before);
+            assert!(matches!(
+                db.ensure_workspace_config_materialized_with_schema(
+                    WORKSPACE,
+                    "retry-rejected",
+                    changed
+                ),
+                Err(Error::ConfigurationUpdateRequired(_))
+            ));
+            assert_eq!(evidence(&db), before);
+            let current = db.configuration_current(WORKSPACE, OWNER).unwrap();
+            assert_eq!(current.state, f.state);
+            assert_eq!(
+                current.history_head,
+                f.receipt.map(|receipt| receipt.history_head)
+            );
+            assert_native_policy(&db);
+            let repair = request(
+                &db,
+                &host(false),
+                "repair-schema",
+                Some("{} as WorkspaceConfigSchema"),
+            );
+            db.adopt_configuration(
+                WORKSPACE,
+                OWNER,
+                &repair,
+                default_schema("new-default"),
+                &host(false),
+            )
+            .unwrap();
+            assert_native_policy(&db);
+        }
+    }
+}
+
+#[test]
+fn schema_default_change_storage_failure_rolls_back_without_requesting_owner_repair() {
+    for published in [false, true] {
+        for (table, event) in [
+            ("workspace_config_trees", "UPDATE"),
+            ("workspace_config_entries", "INSERT"),
+            ("workspace_config_tree_history", "INSERT"),
+        ] {
+            let f = current_fixture(published, "{} as WorkspaceConfigSchema");
+            let before = evidence(&f.db);
+            f.db.with_conn(|conn| {
+                conn.execute_batch(&format!("CREATE TEMP TRIGGER fail_schema_update BEFORE {event} ON {table} BEGIN SELECT RAISE(ABORT, 'injected schema write failure'); END;"))?;
+                Ok(())
+            }).unwrap();
+            let error =
+                f.db.ensure_workspace_config_materialized_with_schema(
+                    WORKSPACE,
+                    "schema-update",
+                    default_schema("new-default"),
+                )
+                .unwrap_err();
+            assert!(error.configuration_update_required().is_none(), "{error:?}");
+            assert!(
+                error.to_string().contains("injected schema write failure"),
+                "{error:?}"
+            );
+            assert_eq!(evidence(&f.db), before, "{table}, published={published}");
+            drop(f.db);
+            let db = open(&f.dir.path().join("server.sqlite"));
+            assert_eq!(evidence(&db), before, "{table} after reopen");
+            assert_eq!(
+                db.load_workspace_config(WORKSPACE).unwrap(),
+                Some(f.state.clone())
+            );
+            let refreshed = db
+                .ensure_workspace_config_materialized_with_schema(
+                    WORKSPACE,
+                    "retry",
+                    default_schema("new-default"),
+                )
+                .unwrap();
+            assert_eq!(refreshed.snapshot, f.state.snapshot);
+            let catalog =
+                crate::prompt_settings::project_prompts_from_workspace_config(&refreshed).unwrap();
+            assert_eq!(catalog.templates["common.language"], "new-default");
+            assert_native_policy(&db);
+        }
+    }
+}
+
+#[test]
+fn schema_default_change_rejects_stale_candidate_with_unchanged_source() {
+    let f = current_fixture(false, "{} as WorkspaceConfigSchema");
+    let stale =
+        f.db.evaluate_workspace_config_candidate_with_schema(
+            WORKSPACE,
+            &request(&f.db, &host(false), "stale-schema", None).source,
+            default_schema("old-default"),
+        )
+        .unwrap();
+    let refreshed =
+        f.db.ensure_workspace_config_materialized_with_schema(
+            WORKSPACE,
+            "schema-update",
+            default_schema("new-default"),
+        )
+        .unwrap();
+    assert_eq!(refreshed.snapshot.digest, stale.base_digest);
+    assert_ne!(
+        refreshed.contract.fingerprint,
+        stale.base_toolchain_fingerprint
+    );
+    let before = evidence(&f.db);
+    let error =
+        f.db.commit_evaluated_workspace_config(WORKSPACE, &stale)
+            .unwrap_err();
+    assert!(
+        matches!(error, Error::WorkspaceConfigConflict(_)),
+        "{error:?}"
+    );
+    assert_eq!(evidence(&f.db), before);
+    assert_eq!(
+        f.db.load_workspace_config(WORKSPACE).unwrap(),
+        Some(refreshed)
+    );
 }
 
 #[test]
