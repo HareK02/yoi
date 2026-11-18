@@ -1401,7 +1401,7 @@ export function applyProtocolEvent(
       applyWorkerStateSnapshot(next, event.data.snapshot);
       break;
     case "command_acknowledged":
-      applyWorkerStateSnapshot(next, event.data.acknowledgement.state);
+      // Replayed admission evidence must not overwrite a later live state.
       break;
     case "command":
       applyCommandEvent(next, envelope.eventId, event.data.event);

@@ -1851,6 +1851,44 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_compact_rejection_is_an_execution_failure_with_command_evidence() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        let command = protocol::WorkerCommandResult::Acknowledged {
+            acknowledgement: protocol::WorkerCommandAcknowledgement {
+                command_id: 92,
+                command: protocol::WorkerCommandKind::Compact,
+                disposition: protocol::WorkerCommandDisposition::InvalidState,
+                state: protocol::WorkerStatus::Running.into(),
+            },
+        };
+        let input = server_api::RuntimeWorkerInputResult {
+            command: Some(command.clone()),
+            control: Some(C::ExecutionRejected),
+            control_explanation: None,
+            state: server_api::WorkerOperationState::Rejected,
+            disposition: server_api::WorkerInputDisposition::Rejected,
+            runtime_id: "remote".into(),
+            worker_id: "worker".into(),
+            diagnostics: Vec::new(),
+        };
+        let error = tool_output(
+            WorkerOperation::SendInput,
+            WorkspaceResponse {
+                content_type: None,
+                status: 200,
+                body: serde_json::to_string(&input).unwrap(),
+            },
+        )
+        .unwrap_err();
+        let result = assert_control_failure(
+            error,
+            tools::failure::ToolFailureBoundary::Execution,
+            C::ExecutionRejected,
+        );
+        assert_eq!(result["command"], serde_json::to_value(command).unwrap());
+    }
+
+    #[test]
     fn shared_control_problem_reaches_model_failure_without_disclosing_received_prose() {
         for cause in protocol::control_failure::RuntimeControlCause::ALL {
             let response = server_api::control_failure::control_problem(*cause).unwrap();

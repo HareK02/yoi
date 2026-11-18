@@ -6135,7 +6135,6 @@ fn apply_protocol_worker_state(
     let incoming = match event {
         Event::WorkerState { snapshot } => snapshot,
         Event::Snapshot { state, .. } => state,
-        Event::CommandAcknowledged { acknowledgement } => &mut acknowledgement.state,
         _ => return Ok(true),
     };
     let mut current = current
@@ -11627,7 +11626,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_bridge_replaces_every_full_state_snapshot() {
+    fn protocol_bridge_applies_state_events_but_preserves_acknowledgements_as_evidence() {
         let running = protocol::WorkerStateSnapshot {
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
@@ -11663,7 +11662,10 @@ mod tests {
             },
         };
         assert!(apply_protocol_worker_state(&current, &mut acknowledgement).unwrap());
-        assert_eq!(*current.read().unwrap(), paused);
+        assert_eq!(*current.read().unwrap(), idle);
+        assert!(
+            matches!(acknowledgement, Event::CommandAcknowledged { acknowledgement } if acknowledgement.state == paused)
+        );
     }
 
     #[test]

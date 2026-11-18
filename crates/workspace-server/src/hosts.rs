@@ -8104,7 +8104,17 @@ fn remote_input_rejected(
     WorkerInputResult {
         command: diagnostic.command.clone(),
         state: InternalWorkerOperationState::Rejected,
-        disposition: WorkerInputDisposition::Unknown,
+        disposition: match diagnostic.command.as_ref() {
+            Some(protocol::WorkerCommandResult::NotDelivered { .. }) => {
+                WorkerInputDisposition::Rejected
+            }
+            Some(protocol::WorkerCommandResult::Acknowledged { acknowledgement })
+                if acknowledgement.disposition != protocol::WorkerCommandDisposition::Accepted =>
+            {
+                WorkerInputDisposition::Rejected
+            }
+            _ => WorkerInputDisposition::Unknown,
+        },
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         runtime_run_id: None,
         diagnostics: vec![diagnostic],
@@ -9587,18 +9597,45 @@ mod tests {
                         )
                         .command
                 } else {
-                    runtime
-                        .send_input(
-                            &worker_id,
-                            WorkerInputRequest {
-                                kind: WorkerInputKind::Compact,
-                                content: String::new(),
-                                source: None,
-                                submission_request_id: None,
-                                segments: None,
-                            },
-                        )
-                        .command
+                    let result = runtime.send_input(
+                        &worker_id,
+                        WorkerInputRequest {
+                            kind: WorkerInputKind::Compact,
+                            content: String::new(),
+                            source: None,
+                            submission_request_id: None,
+                            segments: None,
+                        },
+                    );
+                    assert_eq!(
+                        result.state,
+                        if accepted {
+                            InternalWorkerOperationState::Accepted
+                        } else {
+                            InternalWorkerOperationState::Rejected
+                        }
+                    );
+                    assert_eq!(
+                        result.disposition,
+                        if accepted {
+                            WorkerInputDisposition::Accepted
+                        } else if disposition.is_some() {
+                            WorkerInputDisposition::Rejected
+                        } else {
+                            WorkerInputDisposition::Unknown
+                        }
+                    );
+                    if !accepted {
+                        assert_eq!(
+                            result.diagnostics[0].control,
+                            Some(if disposition.is_none() {
+                                RuntimeControlCause::ResultUnavailable
+                            } else {
+                                RuntimeControlCause::ExecutionRejected
+                            })
+                        );
+                    }
+                    result.command
                 };
                 assert_eq!(observed, Some(evidence));
                 server.join().unwrap();

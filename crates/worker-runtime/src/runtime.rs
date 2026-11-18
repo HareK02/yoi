@@ -7847,13 +7847,7 @@ impl RuntimeState {
                 Self::touch_internal_worker_activity(activity, worker);
                 Self::remove_internal_worker_subtree(activity, removed_worker);
             }
-            protocol::Event::WorkerState { snapshot }
-            | protocol::Event::CommandAcknowledged {
-                acknowledgement:
-                    protocol::WorkerCommandAcknowledgement {
-                        state: snapshot, ..
-                    },
-            } => {
+            protocol::Event::WorkerState { snapshot } => {
                 activity.workers.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
@@ -7914,12 +7908,6 @@ impl RuntimeState {
             protocol::Event::WorkerState { snapshot }
             | protocol::Event::Snapshot {
                 state: snapshot, ..
-            }
-            | protocol::Event::CommandAcknowledged {
-                acknowledgement:
-                    protocol::WorkerCommandAcknowledgement {
-                        state: snapshot, ..
-                    },
             } => snapshot,
             _ => return false,
         };
@@ -9577,6 +9565,37 @@ mod tests {
             state: protocol::WorkerStatus::Idle.into(),
             in_flight: protocol::InFlightSnapshot::default(),
             internal_workers,
+        }
+    }
+
+    #[test]
+    fn command_replay_does_not_rewrite_internal_worker_activity() {
+        let mut activity = InternalWorkerActivityProjection::default();
+        let child = internal_worker_ref("command-child", None);
+        RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(child.clone(), protocol::WorkerStatus::Running),
+        );
+        for command in [
+            protocol::WorkerCommandKind::Cancel,
+            protocol::WorkerCommandKind::Compact,
+        ] {
+            let replay = protocol::Event::InternalWorker {
+                worker: child.clone(),
+                event: Box::new(protocol::Event::CommandAcknowledged {
+                    acknowledgement: protocol::WorkerCommandAcknowledgement {
+                        command_id: 1,
+                        command,
+                        disposition: protocol::WorkerCommandDisposition::Accepted,
+                        state: protocol::WorkerStateSnapshot::initial(),
+                    },
+                }),
+            };
+            RuntimeState::update_internal_worker_activity(&mut activity, &replay);
+            assert_eq!(
+                activity.workers["command-child"].status,
+                Some(protocol::WorkerStatus::Running)
+            );
         }
     }
 
