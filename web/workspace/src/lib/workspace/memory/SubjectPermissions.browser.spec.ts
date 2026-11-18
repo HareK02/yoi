@@ -8,17 +8,23 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import SubjectPermissions from "./SubjectPermissions.svelte";
-import { permissionSource } from "../../../../test/permissions-fixture.ts";
+import {
+  permissionPolicyResponse,
+  permissionSource,
+} from "../../../../test/permissions-fixture.ts";
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 const props = { workspaceId: "w", subjectId: "s" };
-function harness(source = permissionSource(), status = 200) {
-  const fetcher = vi.fn(async (_input: string, _init?: RequestInit) =>
-    new Response(JSON.stringify(source), { status })
-  );
+const policyPath = "/api/w/w/subjektiv/subjects/s/permission-policy";
+function harness(source: unknown = permissionPolicyResponse(), status = 200) {
+  const fetcher = vi.fn(async (input: string, init?: RequestInit) => {
+    expect(input).toBe(policyPath);
+    expect(init?.method ?? "GET").toBe("GET");
+    return new Response(JSON.stringify(source), { status });
+  });
   vi.stubGlobal("fetch", fetcher);
   return fetcher;
 }
@@ -30,14 +36,11 @@ async function ready() {
   );
   return view;
 }
-test("Subject source view separates Set/Namespace, direct/delegation and server origins; no legacy resource editor", async () => {
+test("current policy separates Set/Namespace, direct/delegation and origins without a configuration editor", async () => {
   const fetcher = harness();
   const view = await ready();
-  expect(
-    view.getByRole("link", { name: "Edit configuration sources" }).getAttribute(
-      "href",
-    ),
-  ).toBe("/w/w/settings/configuration");
+  expect(view.queryByRole("link", { name: "Edit configuration sources" }))
+    .toBeNull();
   const execution = within(
     view.getByRole("region", { name: "Direct operations" }),
   );
@@ -47,7 +50,7 @@ test("Subject source view separates Set/Namespace, direct/delegation and server 
   expect(execution.getByText("Set · companion")).not.toBeNull();
   expect(execution.getByText("Namespace · ticket · ticket.hoge.fuga.finish"))
     .not.toBeNull();
-  expect(delegation.getByText("Revoked")).not.toBeNull();
+  expect(delegation.getByText("Revoked assignment")).not.toBeNull();
   expect(delegation.getByText("No allowed operation keys.")).not.toBeNull();
   expect(
     execution.getByText("ticket.hoge.fuga.finish", {
@@ -61,7 +64,7 @@ test("Subject source view separates Set/Namespace, direct/delegation and server 
   expect(view.container.querySelectorAll("input, select, textarea"))
     .toHaveLength(0);
   expect(view.queryByRole("button", { name: /Save|Add|Remove/ })).toBeNull();
-  expect(fetcher).toHaveBeenCalledExactlyOnceWith("/api/w/w/config/adoption");
+  expect(fetcher).toHaveBeenCalledExactlyOnceWith(policyPath);
   await fireEvent.click(view.getByText("Retained domain restrictions"));
   expect(view.container.querySelector("pre")?.textContent).toContain(
     '"ticket_id": "T-837"',
@@ -73,65 +76,13 @@ test("Subject source view separates Set/Namespace, direct/delegation and server 
   expect(view.container.textContent).toContain("Same prefix, not included");
   expect(view.container.textContent).toContain("Disabled");
 });
-test("migration draft cannot be displayed as an adopted effective policy", async () => {
-  const source = permissionSource();
-  source.source_stored = false;
-  source.history_head = null;
-  harness(source);
-  const view = await ready();
-  expect(view.getByText("Migration draft · not adopted")).not.toBeNull();
-  expect(view.getAllByText("Draft operation key resolution")).toHaveLength(2);
-  expect(view.queryByText("Adopted configuration source")).toBeNull();
-});
-test("empty and missing source assignments never restore defaults", async () => {
-  const source = permissionSource();
-  source.policies = [];
-  harness(source);
-  const view = await ready();
-  expect(view.container.textContent).toContain(
-    "No default or effective permission is inferred",
-  );
-  expect(view.queryByRole("region", { name: "Direct operations" })).toBeNull();
-});
-test.each([401, 403])(
-  "owner rejection %s shows neither edit link nor invented policy",
-  async (status) => {
-    harness(permissionSource(), status);
-    const view = render(SubjectPermissions, props);
-    await waitFor(() =>
-      expect(view.getByRole("alert").textContent).toContain(
-        "Workspace owner only",
-      )
-    );
-    expect(view.queryByRole("link", { name: "Edit configuration sources" }))
-      .toBeNull();
-  },
-);
-test("failed refresh removes previous authority and requires explicit reload", async () => {
-  const fetcher = harness();
-  const view = await ready();
-  fetcher.mockResolvedValueOnce(new Response("Denied", { status: 403 }));
-  await fireEvent.click(
-    view.getByRole("button", { name: "Reload permissions" }),
-  );
-  await waitFor(() =>
-    expect(view.getByRole("alert").textContent).toContain(
-      "Workspace owner only",
-    )
-  );
-  expect(view.queryByRole("region", { name: "Direct operations" })).toBeNull();
-  expect(view.queryByRole("link", { name: "Edit configuration sources" }))
-    .toBeNull();
-});
-test.each(["execution_resolution", "delegation_resolution"] as const)(
-  "missing %s is an invalid source snapshot, not a separate resolver error or empty allow",
-  async (field) => {
-    const fetcher = harness();
+test.each([false, true])(
+  "configuration snapshot source_stored=%s cannot become current policy",
+  async (stored) => {
     const source = permissionSource();
-    const { [field]: _missing, ...policy } = source.policies[0];
-    fetcher.mockResolvedValueOnce(
-      new Response(JSON.stringify({ ...source, policies: [policy] })),
-    );
+    source.source_stored = stored;
+    source.history_head = stored ? "head:adopted" : null;
+    harness(source);
     const view = render(SubjectPermissions, props);
     await waitFor(() =>
       expect(view.getByRole("alert").textContent).toContain(
@@ -141,12 +92,121 @@ test.each(["execution_resolution", "delegation_resolution"] as const)(
     expect(view.queryByRole("region", { name: "Direct operations" }))
       .toBeNull();
     expect(view.queryByText("Permission origin")).toBeNull();
-    expect(view.queryByRole("link", { name: "Edit configuration sources" }))
-      .toBeNull();
-    expect(fetcher).toHaveBeenCalledExactlyOnceWith("/api/w/w/config/adoption");
   },
 );
-test("source load stays pending without showing an empty or previous policy", async () => {
+test.each([null, "policy:removed"])(
+  "unset policy with change_id=%s never restores defaults",
+  async (change_id) => {
+    harness({
+      ...permissionPolicyResponse(),
+      policy: null,
+      change_id,
+      execution_resolution: {
+        workspace: "w",
+        allowed: {},
+        diagnostics: [{ kind: "unset" }],
+      },
+      delegation_resolution: {
+        workspace: "w",
+        allowed: {},
+        diagnostics: [{ kind: "unset" }],
+      },
+    });
+    const view = await ready();
+    expect(view.container.textContent).toContain(
+      "No default assignment or effective permission is inferred",
+    );
+    expect(view.getAllByText("Unset assignment")).toHaveLength(2);
+    expect(view.getAllByText("No allowed operation keys.")).toHaveLength(2);
+    expect(view.queryByText("Permission origin")).toBeNull();
+    expect(view.getByText(change_id ?? "No policy change recorded")).not
+      .toBeNull();
+    if (change_id) {
+      expect(view.container.textContent).toContain(
+        "removal tombstone",
+      );
+    }
+  },
+);
+test("explicitly empty assignments remain distinct from unset and revoked", async () => {
+  const response = permissionPolicyResponse();
+  for (const lane of ["execution", "delegation"] as const) {
+    response.policy[lane] = { grants: [], exclusions: [], revoked: false };
+  }
+  for (
+    const lane of ["execution_resolution", "delegation_resolution"] as const
+  ) response[lane] = { workspace: "w", allowed: {}, diagnostics: [] };
+  harness(response);
+  const view = await ready();
+  expect(view.getAllByText("Explicitly empty assignment")).toHaveLength(2);
+  expect(view.getAllByText("No allowed operation keys.")).toHaveLength(2);
+  expect(view.queryByText("Unset assignment")).toBeNull();
+  expect(view.queryByText("Revoked assignment")).toBeNull();
+});
+test.each(
+  [
+    [401, "Sign in to read the current Subject policy."],
+    [403, "You do not have permission to read the current Subject policy."],
+  ] as const,
+)(
+  "HTTP %s shows its failure without inventing policy",
+  async (status, message) => {
+    harness(permissionPolicyResponse(), status);
+    const view = render(SubjectPermissions, props);
+    await waitFor(() =>
+      expect(view.getByRole("alert").textContent).toContain(message)
+    );
+    expect(view.queryByRole("region", { name: "Direct operations" }))
+      .toBeNull();
+    expect(view.queryByRole("link", { name: "Edit configuration sources" }))
+      .toBeNull();
+  },
+);
+test("failed refresh removes previous authority and permits explicit reload", async () => {
+  const fetcher = harness();
+  const view = await ready();
+  fetcher.mockResolvedValueOnce(new Response("Denied", { status: 403 }));
+  await fireEvent.click(
+    view.getByRole("button", { name: "Reload permissions" }),
+  );
+  await waitFor(() =>
+    expect(view.getByRole("alert").textContent).toContain(
+      "You do not have permission",
+    )
+  );
+  expect(view.queryByRole("region", { name: "Direct operations" })).toBeNull();
+  expect(view.queryByRole("link", { name: "Edit configuration sources" }))
+    .toBeNull();
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  await fireEvent.click(
+    view.getByRole("button", { name: "Reload permissions" }),
+  );
+  await waitFor(() =>
+    expect(view.getByRole("region", { name: "Direct operations" })).not
+      .toBeNull()
+  );
+  expect(fetcher.mock.calls).toEqual([[policyPath], [policyPath], [
+    policyPath,
+  ]]);
+});
+test.each(["execution_resolution", "delegation_resolution"] as const)(
+  "missing %s invalidates the dedicated response rather than becoming empty allow",
+  async (field) => {
+    const { [field]: _missing, ...source } = permissionPolicyResponse();
+    const fetcher = harness(source);
+    const view = render(SubjectPermissions, props);
+    await waitFor(() =>
+      expect(view.getByRole("alert").textContent).toContain(
+        "No effective permission is inferred",
+      )
+    );
+    expect(view.queryByRole("region", { name: "Direct operations" }))
+      .toBeNull();
+    expect(view.queryByText("Permission origin")).toBeNull();
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(policyPath);
+  },
+);
+test("policy load stays pending without showing an empty or previous policy", async () => {
   let complete!: (response: Response) => void;
   const fetcher = vi.fn(() =>
     new Promise<Response>((resolve) => {
@@ -156,14 +216,14 @@ test("source load stays pending without showing an empty or previous policy", as
   vi.stubGlobal("fetch", fetcher);
   const view = render(SubjectPermissions, props);
   expect(view.getByRole("status").textContent).toContain(
-    "Reading configuration source and permissions",
+    "Reading current Subject policy",
   );
   expect(view.queryByRole("region", { name: "Direct operations" })).toBeNull();
   expect(view.queryByText("No allowed operation keys.")).toBeNull();
-  complete(new Response(JSON.stringify(permissionSource())));
+  complete(new Response(JSON.stringify(permissionPolicyResponse())));
   await waitFor(() =>
     expect(view.getByRole("region", { name: "Direct operations" })).not
       .toBeNull()
   );
-  expect(fetcher).toHaveBeenCalledOnce();
+  expect(fetcher).toHaveBeenCalledExactlyOnceWith(policyPath);
 });

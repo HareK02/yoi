@@ -1,3 +1,7 @@
+import type {
+  CurrentSubjectPolicy,
+  SubjectPermissionPolicyResponse,
+} from "#lib/generated/memory-api.ts";
 import type { ConfigurationSourceResponse } from "#lib/generated/configuration-adoption.generated.ts";
 import type { PermissionResolution } from "#lib/generated/feature-permissions.generated.ts";
 
@@ -112,6 +116,29 @@ export function permissionSource(
     }],
   };
 }
+// Dedicated current-policy projection. This fixture does not resolve authority.
+export function permissionPolicyResponse(
+  workspace = "w",
+  subject = "s",
+): SubjectPermissionPolicyResponse & { policy: CurrentSubjectPolicy } {
+  const source = permissionSource(workspace, subject);
+  const observed = source.policies[0];
+  return {
+    change_id: observed.change_id,
+    policy: {
+      change_id: observed.change_id,
+      execution: observed.execution,
+      delegation: observed.delegation,
+      legacy_constraints: observed.legacy_constraints,
+      reference_encoding: "feature_sets_v2",
+    },
+    can_manage: true,
+    catalog: source.catalog,
+    execution_resolution: observed.execution_resolution,
+    delegation_resolution: observed.delegation_resolution,
+  };
+}
+
 export function permissionResolution(
   workspace = "w",
   revoked = false,
