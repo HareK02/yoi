@@ -15106,6 +15106,17 @@ mod tests {
             .send_input(&detail.worker_ref, input("running-input"))
             .unwrap_err();
         assert!(error.to_string().contains("WorkerNotify"), "{error}");
+        // Notify resumes Paused turns. Observe its durable receipt while the
+        // model is still Running, before testing the Paused admission boundary.
+        let mut notify = WorkerInput::user("advisory");
+        notify.kind = WorkerInputKind::Notify;
+        assert!(
+            runtime
+                .send_input(&detail.worker_ref, notify)
+                .unwrap()
+                .notification
+                .is_some()
+        );
         runtime
             .send_protocol_method(
                 &detail.worker_ref,
@@ -15148,22 +15159,13 @@ mod tests {
             })
             .unwrap();
         assert!(pending.submissions.is_empty());
-        // Human Submit still queues while paused, and Notify remains advisory.
+        // Human Submit still queues while paused; idle-only input never does.
         let ack = runtime
             .send_input(&detail.worker_ref, WorkerInput::user("human-input"))
             .unwrap();
         assert_eq!(
             ack.submission.unwrap().disposition,
             protocol::SubmissionDisposition::Queued
-        );
-        let mut notify = WorkerInput::user("advisory");
-        notify.kind = WorkerInputKind::Notify;
-        assert!(
-            runtime
-                .send_input(&detail.worker_ref, notify)
-                .unwrap()
-                .notification
-                .is_some()
         );
         wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused);
         let handle = backend

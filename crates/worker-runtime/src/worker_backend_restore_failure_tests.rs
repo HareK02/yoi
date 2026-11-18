@@ -292,12 +292,14 @@ impl ProfileFailureFixture {
                 let mut events = handle.subscribe();
                 handle.send(Method::submit_text("revocation-seed", "hold for saved input setup")).await.unwrap();
                 event(&mut events, |next| matches!(next, Event::TextDelta { .. })).await;
-                handle.send(Method::Pause { command: protocol::WorkerCommandEnvelope::new(handle.shared_state.snapshot().last_command_id + 1) }).await.unwrap();
-                event(&mut events, |next| matches!(next, Event::WorkerState { snapshot } if snapshot.catalog_status() == protocol::WorkerStatus::Paused)).await;
+                // Notify resumes Paused turns; seed both durable inputs while
+                // the model is hanging in Running, before acknowledging Pause.
                 handle.send(Method::submit_text("revocation-saved-submit", "must stay queued")).await.unwrap();
                 event(&mut events, |next| matches!(next, Event::SubmissionAccepted { submission_request_id, disposition: protocol::SubmissionDisposition::Queued, .. } if submission_request_id == "revocation-saved-submit")).await;
                 handle.send(Method::Notify { notification_request_id: "revocation-saved-notice".into(), message: "must also stay queued".into() }).await.unwrap();
                 event(&mut events, |next| matches!(next, Event::NotificationAccepted { notification_request_id } if notification_request_id == "revocation-saved-notice")).await;
+                handle.send(Method::Pause { command: protocol::WorkerCommandEnvelope::new(handle.shared_state.snapshot().last_command_id + 1) }).await.unwrap();
+                event(&mut events, |next| matches!(next, Event::WorkerState { snapshot } if snapshot.catalog_status() == protocol::WorkerStatus::Paused)).await;
                 Ok(())
             }).unwrap();
         }
