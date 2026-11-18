@@ -368,6 +368,22 @@ async fn failed_consolidation_retains_unreleased_stale_inactive_and_erased_contr
     }
 }
 
+// Only the fixture-owned connection's SQLite wait is replaced. The competing
+// transaction, typed Busy, domain operations and recovery owner remain real.
+// Reopening through this manager returns the same managed connection used by
+// SubjektivStore, not a separate connection whose PRAGMA would have no effect.
+fn fail_fast_on_domain_busy(catalog: &StandaloneSubjects) {
+    let scope = catalog.manager.scope(&catalog.scope_id).unwrap();
+    scope
+        .open(&catalog.registration)
+        .unwrap()
+        .with_connection(|connection| {
+            connection.busy_timeout(std::time::Duration::ZERO)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 fn assert_real_busy(error: &ConsolidationRecoveryError, domain: bool) {
     let cause = match error {
         ConsolidationRecoveryError::Domain(subjektiv::api::OperationError::Storage(
@@ -381,27 +397,27 @@ fn assert_real_busy(error: &ConsolidationRecoveryError, domain: bool) {
     assert_eq!(cause.code, rusqlite::ErrorCode::DatabaseBusy);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn failed_consolidation_real_sqlite_busy_beyond_fast_budget_recovers_without_restore() {
     real_sqlite_busy_consolidation_recovery(false, None).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn failed_consolidation_real_domain_busy_beyond_fast_budget_recovers_without_restore() {
     real_sqlite_busy_consolidation_recovery(true, None).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn failed_consolidation_real_busy_retained_owner_rejects_stale_domain() {
     real_sqlite_busy_consolidation_recovery(true, Some("stale")).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn failed_consolidation_real_busy_retained_owner_rejects_retired_input() {
     real_sqlite_busy_consolidation_recovery(true, Some("retired")).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn failed_consolidation_real_busy_retained_owner_requires_actual_execution_cleanup() {
     real_sqlite_busy_consolidation_recovery(true, Some("cleanup")).await;
 }
@@ -429,6 +445,14 @@ async fn real_sqlite_busy_consolidation_recovery(domain: bool, control: Option<&
                 ),
             )
             .unwrap();
+    }
+    // Advance the real retry/backoff schedule on a local virtual clock. Each
+    // pass still reaches SQLite with the competing writer held; no Busy result
+    // or recovery/authority decision is fabricated.
+    if domain {
+        fail_fast_on_domain_busy(&fixture.body.host.catalog);
+    } else {
+        fixture.jobs.fail_fast_on_busy().unwrap();
     }
     let before = fixture.saved.clone();
     let path = if domain {

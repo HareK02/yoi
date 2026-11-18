@@ -305,6 +305,13 @@ pub(crate) struct JobStore {
 }
 
 impl JobStore {
+    /// Fail immediately at real SQLite contention in this fixture's connection.
+    #[cfg(test)]
+    pub(crate) fn fail_fast_on_busy(&self) -> Result<(), JobStoreError> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        Ok(())
+    }
+
     /// The caller must hold the Host's Worker lease for this connection's entire
     /// lifetime. Recovery must never run beside a live service for this Worker.
     pub(crate) fn open(path: &Path) -> Result<Self, JobStoreError> {
