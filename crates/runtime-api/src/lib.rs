@@ -108,6 +108,8 @@ pub struct RuntimeApiError {
     management: Option<workdir::management_failure::WorkdirManagementFailure>,
     #[serde(skip)]
     control: Option<control_failure::RuntimeControlCause>,
+    #[serde(skip)]
+    command: Option<protocol::WorkerCommandResult>,
     pub error: RuntimeApiErrorDetail,
     #[serde(skip)]
     status: u16,
@@ -143,6 +145,13 @@ impl RuntimeApiError {
         self.control = Some(cause);
         self
     }
+    pub fn with_command(mut self, command: Option<protocol::WorkerCommandResult>) -> Self {
+        self.command = command;
+        self
+    }
+    pub fn command_result(&self) -> Option<&protocol::WorkerCommandResult> {
+        self.command.as_ref()
+    }
     pub fn control_cause(&self) -> Option<control_failure::RuntimeControlCause> {
         self.control
     }
@@ -155,6 +164,7 @@ impl RuntimeApiError {
             },
             status,
             control: None,
+            command: None,
             management: None,
             create_failure: None,
         }
@@ -185,7 +195,7 @@ impl api_macros::HttpError for RuntimeApiError {
             let encoded = if let Some(cause) = self.management {
                 management_failure::management_problem(cause)
             } else if let Some(cause) = self.control {
-                control_failure::control_problem(cause)
+                control_failure::control_problem_with_command(cause, self.command.clone())
             } else {
                 return None;
             };
@@ -804,6 +814,8 @@ pub struct EmptyObjectRequest {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerLifecycleAck {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     /// Historical typed stop receipt, not a fresh stop of the current execution.
     /// Consumers must not repeat cleanup of current resources when this is true.
     #[serde(default)]
@@ -828,6 +840,8 @@ pub struct WorkerSubmissionAck {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerInteractionAck {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
     #[serde(skip_serializing_if = "Option::is_none")]

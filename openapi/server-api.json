@@ -13650,6 +13650,29 @@
               "remote_rejected"
             ],
             "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Evidence-bearing details within the common failure contract, not a new envelope.",
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/RuntimeControlCause"
+              },
+              "command": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/WorkerCommandResult"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "cause"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -15189,6 +15212,16 @@
       "RuntimeWorkerInputResult": {
         "additionalProperties": false,
         "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerCommandResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "control": {
             "anyOf": [
               {
@@ -15274,6 +15307,16 @@
               "$ref": "#/components/schemas/StartupFailureAttachment"
             },
             "type": "array"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerCommandResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "control": {
             "anyOf": [
@@ -23405,6 +23448,150 @@
           }
         ]
       },
+      "WorkerCommandAcknowledgement": {
+        "properties": {
+          "command": {
+            "$ref": "#/components/schemas/WorkerCommandKind"
+          },
+          "command_id": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/WorkerCommandDisposition"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WorkerStateSnapshot",
+            "description": "The complete authoritative state observed after command admission."
+          }
+        },
+        "required": [
+          "command_id",
+          "command",
+          "disposition",
+          "state"
+        ],
+        "type": "object"
+      },
+      "WorkerCommandDelivery": {
+        "enum": [
+          "enqueued",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WorkerCommandDisposition": {
+        "enum": [
+          "accepted",
+          "stale_command_id",
+          "conflict",
+          "invalid_state"
+        ],
+        "type": "string"
+      },
+      "WorkerCommandKind": {
+        "enum": [
+          "resume",
+          "cancel",
+          "pause",
+          "compact",
+          "shutdown"
+        ],
+        "type": "string"
+      },
+      "WorkerCommandObservationFailure": {
+        "enum": [
+          "timed_out",
+          "lagged",
+          "closed",
+          "send_failed"
+        ],
+        "type": "string"
+      },
+      "WorkerCommandResult": {
+        "description": "Evidence from a command attempt, not Run or maintenance completion.\nAn acknowledgement snapshot is an admission observation, not a current-state update.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "acknowledgement": {
+                "$ref": "#/components/schemas/WorkerCommandAcknowledgement"
+              },
+              "kind": {
+                "const": "acknowledged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "acknowledgement"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "$ref": "#/components/schemas/WorkerCommandKind"
+              },
+              "command_id": {
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "delivery": {
+                "$ref": "#/components/schemas/WorkerCommandDelivery"
+              },
+              "kind": {
+                "const": "unconfirmed",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/WorkerCommandObservationFailure"
+              }
+            },
+            "required": [
+              "kind",
+              "command",
+              "delivery",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "$ref": "#/components/schemas/WorkerCommandKind"
+              },
+              "command_id": {
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "not_delivered",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "command"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WorkerCreationAuthorization": {
         "description": "Caller-neutral initial assignment selection. Omission selects the Workspace\nWorker default; an explicit assignment (including empty) takes precedence.\nExplicit policy selection remains a separate, usage-authorized launch path.",
         "oneOf": [
@@ -26575,7 +26762,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:90175d2e303b305715d36cb87581f8d3340323fe7219910b92bc090185a787e5"
+    "x-yoi-source-digest": "sha256:fe8df140419d56866b73cdf3e580011c144fcacd5ac6a47e3d21ec66aaf434cc"
   },
   "openapi": "3.1.0",
   "paths": {

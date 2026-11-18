@@ -101,6 +101,10 @@ pub fn generated_protocol_types() -> String {
     push_decl::<WorkerCommandKind>(&cfg, &mut output);
     push_decl::<WorkerCommandDisposition>(&cfg, &mut output);
     push_decl::<WorkerCommandAcknowledgement>(&cfg, &mut output);
+    push_decl::<crate::WorkerCommandResult>(&cfg, &mut output);
+    push_decl::<crate::WorkerCommandDelivery>(&cfg, &mut output);
+    push_decl::<crate::WorkerCommandObservationFailure>(&cfg, &mut output);
+    push_decl::<crate::control_failure::RuntimeControlFailure>(&cfg, &mut output);
     push_decl::<WorkerRunState>(&cfg, &mut output);
     push_decl::<WorkerMaintenanceState>(&cfg, &mut output);
     push_decl::<WorkerBusyState>(&cfg, &mut output);

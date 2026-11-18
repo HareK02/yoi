@@ -116,6 +116,50 @@ project_control!(
     error_contract::Telemetry,
 );
 
+/// Evidence-bearing details within the common failure contract, not a new envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeControlFailure {
+    pub cause: RuntimeControlCause,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<crate::WorkerCommandResult>,
+}
+
+impl FailureCause for RuntimeControlFailure {
+    fn identity(&self) -> FailureIdentity {
+        self.cause.identity()
+    }
+    fn validate(&self) -> Result<(), ContractError> {
+        self.cause.validate()
+    }
+}
+impl WireDetails for RuntimeControlFailure {
+    fn supports(domain: &str, reason: &str, version: u16) -> bool {
+        RuntimeControlCause::supports(domain, reason, version)
+    }
+}
+macro_rules! project_control_failure {
+    ($($audience:ty),+ $(,)?) => {$(
+        impl error_contract::ProjectFor<$audience> for RuntimeControlFailure {
+            type Authorization = ();
+            type Details = Self;
+            fn disclose(&self, _: &error_contract::FailureFacts<Self>, _: &())
+                -> Result<error_contract::Disclosure<Self>, ContractError> {
+                Ok(error_contract::Disclosure::new(self.clone(), self.cause.explanation()))
+            }
+        }
+    )+};
+}
+project_control_failure!(
+    error_contract::Browser,
+    error_contract::Tool,
+    error_contract::InternalTransfer,
+    error_contract::Storage,
+    error_contract::Telemetry,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +219,47 @@ mod tests {
             2
         ));
         assert!(serde_json::from_str::<RuntimeControlCause>("\"future_reason\"").is_err());
+    }
+    #[test]
+    fn command_evidence_survives_tool_and_browser_failure_projection() {
+        use crate::{
+            WorkerCommandDelivery as D, WorkerCommandKind as K,
+            WorkerCommandObservationFailure as F, WorkerCommandResult as R,
+        };
+        for (delivery, reason) in [
+            (D::Enqueued, F::TimedOut),
+            (D::Enqueued, F::Lagged),
+            (D::Unknown, F::Closed),
+            (D::Unknown, F::SendFailed),
+        ] {
+            let evidence = R::Unconfirmed {
+                command: K::Compact,
+                command_id: Some(42),
+                delivery,
+                reason,
+            };
+            let facts = FailureFacts::new(RuntimeControlFailure {
+                cause: RuntimeControlCause::ResultUnavailable,
+                command: Some(evidence.clone()),
+            })
+            .unwrap();
+            let browser =
+                error_contract::project_failure::<error_contract::Browser, _>(&facts, &()).unwrap();
+            let tool =
+                error_contract::project_failure::<error_contract::Tool, _>(&facts, &()).unwrap();
+            let encoded =
+                error_contract::encode_projected_failure(&tool, Budget::new(16384, 16384)).unwrap();
+            match error_contract::decode_failure::<RuntimeControlFailure>(
+                encoded.as_bytes(),
+                Budget::new(16384, 16384),
+            ) {
+                DecodeFailure::Known(value) => {
+                    assert_eq!(value.facts().cause().command, Some(evidence));
+                    assert_eq!(value.facts().cause(), browser.details());
+                }
+                _ => panic!("command evidence lost"),
+            }
+        }
+        assert!(serde_json::from_value::<R>(serde_json::json!({"kind":"completed"})).is_err());
     }
 }
