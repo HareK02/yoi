@@ -79,6 +79,9 @@ pub struct StandaloneSubjects {
     memory_language: String,
     manager: FeatureStorage,
     store: SubjektivStore,
+    // Retain the registration only for fixture-local SQLite connection policy.
+    #[cfg(test)]
+    registration: feature_storage::RegisteredFeature,
     permissions: Mutex<worker::feature::permissions::FeaturePermissionRegistry>,
 }
 
@@ -171,6 +174,8 @@ impl StandaloneSubjects {
             memory_language,
             manager,
             store,
+            #[cfg(test)]
+            registration,
             permissions: Mutex::new(permissions),
         })
     }

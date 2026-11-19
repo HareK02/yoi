@@ -292,12 +292,16 @@ async fn consolidation_admission_reserved_domain_busy_release_beyond_fast_budget
 async fn reserved_domain_busy_release(beyond: bool) {
     let fixture = AdmissionFixture::new();
     let before = fixture.reserve();
+    super::fail_fast_on_domain_busy(&fixture.body.host.catalog);
+    // Virtualize only the retained-recovery wait, not Job execution/admission.
+    // The real SQLite writer remains held until the required pass is observed.
+    tokio::time::pause();
     let connection = rusqlite::Connection::open(fixture.domain_path()).unwrap();
     connection.execute_batch("BEGIN IMMEDIATE").unwrap();
     // Production restore entry, not a manually armed retry or failed-attempt fixture.
     fixture.body.host.recover_jobs();
     let required_passes = if beyond { 8 } else { 1 };
-    // Real SQLite busy_timeout makes eight attempts longer than the short wait.
+    // Keep the existing hang bound; production backoff is unchanged.
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let owners = fixture.body.host.consolidation_recovery.lock().unwrap();
@@ -325,6 +329,7 @@ async fn reserved_domain_busy_release(beyond: bool) {
     eprintln!(
         "D2 actual reserved Feature Busy retained; beyond_fast_budget={beyond}; rollback ONLY"
     );
+    tokio::time::resume();
     connection.execute_batch("ROLLBACK").unwrap();
     // No restore/recover_jobs/reclick/new request after releasing the SQLite fault.
     fixture.assert_completed_once(&before).await;

@@ -69,10 +69,14 @@ export function shardRustCommand(
   }
   // RuntimeDirSandbox changes process-global paths. Do not overlap its writes
   // with restore guards in the same process, including small integration targets.
+  const packageName = task.name.split("/")[0];
   const serial = ["worker", "worker-runtime", "yoi-workspace-server"].includes(
-    task.name.split("/")[0],
+    packageName,
   );
-  if (names.length <= (serial ? 36 : 72)) {
+  // Server cases include real DB migration and Runtime startup. Measured groups
+  // of 36 exceeded the unchanged 180s deadline even after fixture optimization.
+  const caseBudget = packageName === "yoi-workspace-server" ? 16 : 36;
+  if (names.length <= (serial ? caseBudget : 72)) {
     return [{
       task: serial
         ? { ...task, args: [...task.args, "--test-threads", "1"] }
@@ -82,7 +86,7 @@ export function shardRustCommand(
   }
   // Shard size and concurrency are independent: a growing test inventory must
   // not silently pack more serial cases into the same fixed timeout window.
-  const count = Math.ceil(names.length / 36);
+  const count = Math.ceil(names.length / caseBudget);
   const shards: string[][] = Array.from({ length: count }, () => []);
   names.forEach((name, index) => shards[index % count].push(name));
   return shards.map((selectedNames, index) => ({

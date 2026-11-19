@@ -198,7 +198,7 @@ async function search(page: Page, query: string) {
   await page.getByRole("searchbox", { name: "Search tickets", exact: true }).fill(query);
   await page.getByRole("button", { name: "Search", exact: true }).click();
 }
-const queryPattern = "**/api/w/tickets/tickets/query";
+const queryPattern = "**/api/w/tickets/tickets/browse";
 
 Deno.test("immediate navigation: Orchestrator -> Tickets -> detail before responses, visual matrix", async () => {
   await withFixture(async (browser, base) => {
@@ -360,6 +360,7 @@ Deno.test("immediate navigation: slow workspace switch clears old identity and p
       const old = body.workspace_id === "tickets";
       body.display_name = old ? "Old privileged workspace" : "New read-only workspace";
       body.permissions = {
+        ...body.permissions,
         manage_repositories: old,
         manage_secrets: old,
         manage_runtimes: old,

@@ -57,7 +57,7 @@
       const base = `/runtimes/${encodeURIComponent(runtimeId)}`;
       const [inventory, plan] = await Promise.all([
         loadWorkdirJson(fetch, workspaceApiPath(workspaceId, `${base}/working-directories`), parseWorkingDirectoryListResponse),
-        loadJson(fetch, workspaceApiPath(workspaceId, `${base}/cleanup-plan`), undefined, parseRuntimeCleanupPlan),
+        loadJson(fetch, workspaceApiPath(workspaceId, `${base}/cleanup-plan`), undefined, parseRuntimeCleanupPlan, { diagnosticLabel: 'Cleanup plan', maxResponseBytes: 512 * 1024 }),
       ]);
       if (workspaceId !== data.workspaceId || runtimeId !== data.runtimeId) return;
       // Keep the last observed list on failure, but never authorize another deletion with stale eligibility.

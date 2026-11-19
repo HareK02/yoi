@@ -1,3 +1,4 @@
+import { authenticatedFixtureResponse } from "./authenticated_fixture.ts";
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 import { dashboardFixture } from "../../../web/workspace/src/lib/workspace/home/dashboard.test-fixtures.ts";
 
@@ -31,6 +32,8 @@ const mime: Record<string, string> = {
 };
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
+  const authentication = authenticatedFixtureResponse(request);
+  if (authentication) return authentication;
   if (url.pathname === "/health") return new Response("ok");
   const workdirsResponse = await workdirsFixture(request);
   if (workdirsResponse) return workdirsResponse;
@@ -76,6 +79,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           manage_secrets: owner,
           manage_runtimes: owner,
           delete_workspace: owner,
+          delete_subjects: owner,
         },
         extension_points: {
           store: "fixture",

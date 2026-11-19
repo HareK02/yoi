@@ -1,0 +1,9 @@
+# 現行ソースから取得したrestore fixture
+
+生成元はclean source `e40316bac9507fc772a8f960fe58da7bb71104bd`。`tests/e2e/examples/acquire_restore_fixture.rs`により、隔離したfeatureless Server/Runtimeと実Codex OAuthの人工会話2往復から取得した。実利用者の履歴の複製ではない。
+
+取得時に公開live snapshotとoffline projectionを照合し、元Session bytes・source file hash・公開manifestを検証した。認証情報、元Worker metadata、実行grantは含まない。取得元processと一時rootは回収済み。
+
+featureless restoreの製品4ケースと、opt-in checkpointの7ケースの検証後に標準fixtureとした。最初の復元試験は、旧offline seedが現行の実行権限を作らずAPI境界で拒否された。seedは現在のProfileと権限選択を解決し、通常の検証器を通して新規owner由来の実行権限を保存するよう更新した。本番restoreの認可は変更していない。
+
+この記録はassetディレクトリの外に置く。安全性検査はmanifestと宣言された3資産だけを許可する。seedの修正・標準資産の選択に際して、取得済み資産のbytesや出自は変更していない。

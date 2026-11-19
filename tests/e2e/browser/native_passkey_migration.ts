@@ -7,7 +7,13 @@
 // 現行製品の登録動作の再現ではなく、旧random handle保存状態の明示的な合成である。
 // 実スマホ/OSのprovider選択/物理鍵は対象外。mobileはChromiumのviewportのみ。
 import { join } from "@std/path";
-import { type Browser, type CDPSession, chromium, type Page } from "playwright";
+import {
+  type Browser,
+  type CDPSession,
+  chromium,
+  type Page,
+  type Response as BrowserResponse,
+} from "playwright";
 import { serveProductionShell } from "./static_shell.ts";
 
 const [backend, origin, build, handlePrefix, artifacts] = Deno.args;
@@ -17,9 +23,68 @@ if (!backend || !origin || !build || !handlePrefix || !artifacts) {
   );
 }
 const started = performance.now();
-const server = await serveProductionShell(backend, origin, build);
+// ChromiumのNetwork.getResponseBodyは実HTTP成功後にも本文を失い得る。
+// 透過proxyの実応答を変更せずcloneで観測し、browserで観測した要求/HTTP statusと照合する。
+// POST再送・route.fulfill・fetch/navigatorの置換はしない。本文はメモリ内だけに保持する。
+const observedPaths = new Set([
+  "/api/auth/passkeys/login/options",
+  "/api/auth/passkeys/login/complete",
+  "/api/auth/passkeys/addition/options",
+  "/api/auth/passkeys/addition/complete",
+]);
+const observedResponses: {
+  path: string;
+  input: string;
+  status: number;
+  body: ReturnType<Response["json"]>;
+}[] = [];
+const server = await serveProductionShell(
+  backend,
+  origin,
+  build,
+  async (request) => {
+    const url = new URL(request.url);
+    if (request.method !== "POST" || !observedPaths.has(url.pathname)) return;
+    const bytes = await request.arrayBuffer();
+    const input = new TextDecoder().decode(bytes);
+    const headers = new Headers(request.headers);
+    headers.delete("host");
+    headers.delete("connection");
+    const response = await fetch(new URL(url.pathname + url.search, backend), {
+      method: request.method,
+      headers,
+      body: bytes,
+      redirect: "manual",
+    });
+    const body = response.clone().json();
+    // 消費前にparseが失敗しても未処理拒否を出さず、browserJsonのawaitで失敗させる。
+    void body.catch(() => {});
+    observedResponses.push({
+      path: url.pathname,
+      input,
+      status: response.status,
+      body,
+    });
+    return response;
+  },
+);
 let browser: Browser | undefined;
 let phase = "launch";
+async function browserJson(response: BrowserResponse) {
+  const path = new URL(response.url()).pathname;
+  const input = response.request().postData();
+  const matching = observedResponses.filter((item) =>
+    item.path === path && item.input === input
+  );
+  check(matching.length === 1, "expected one matching proxy response");
+  const observed = matching[0];
+  observedResponses.splice(observedResponses.indexOf(observed), 1);
+  check(
+    observed.status === response.status(),
+    "proxy/browser response status mismatch",
+  );
+  return await observed.body;
+}
 const rows: {
   resident: boolean;
   authenticator: string;
@@ -138,30 +203,34 @@ async function login(page: Page, user: User, legacy: boolean) {
       "normal login asks for ID",
     );
   }
-  const options = page.waitForResponse((r) =>
-    new URL(r.url()).pathname === "/api/auth/passkeys/login/options"
-  );
-  const complete = page.waitForResponse((r) =>
-    new URL(r.url()).pathname === "/api/auth/passkeys/login/complete"
-  );
-  await button.click();
-  const optionResponse = await options;
-  check(optionResponse.status() === 200, "login options status");
-  const input = optionResponse.request().postDataJSON();
-  if (!legacy) {
-    check(
-      Object.keys(input).every((key) => key === "browser_origin"),
-      "normal login selected an account",
-    );
-    const wire = await optionResponse.json();
-    check(
-      !wire.public_key.publicKey.allowCredentials?.length,
-      "normal login sends an allow-list",
-    );
-  }
-  const response = await complete;
-  check(response.status() === 200, "native login complete status");
-  const issued = await response.json();
+  // clickはlogin後の遷移まで待ち得る。HTTP応答は到着時に実proxyの観測と照合し、
+  // Chromiumの一時的なresponse bufferには依存しない。全waiterの拒否も同時に捕捉する。
+  const [, issued] = await Promise.all([
+    page.waitForResponse((r) =>
+      new URL(r.url()).pathname === "/api/auth/passkeys/login/options"
+    ).then(async (optionResponse) => {
+      check(optionResponse.status() === 200, "login options status");
+      const input = optionResponse.request().postDataJSON();
+      const wire = await browserJson(optionResponse);
+      if (!legacy) {
+        check(
+          Object.keys(input).every((key) => key === "browser_origin"),
+          "normal login selected an account",
+        );
+        check(
+          !wire.public_key.publicKey.allowCredentials?.length,
+          "normal login sends an allow-list",
+        );
+      }
+    }),
+    page.waitForResponse((r) =>
+      new URL(r.url()).pathname === "/api/auth/passkeys/login/complete"
+    ).then((response) => {
+      check(response.status() === 200, "native login complete status");
+      return browserJson(response);
+    }),
+    button.click(),
+  ]);
   check(
     issued.user.user_id === user.user_id &&
       issued.user.account_id === user.account_id,
@@ -312,11 +381,9 @@ try {
       const optionsResponse = page.waitForResponse((r) =>
         new URL(r.url()).pathname === "/api/auth/passkeys/addition/options"
       );
-      await add().click();
-      check(
-        (await optionsResponse).status() === 200,
-        "addition options status",
-      );
+      const [sameOptions] = await Promise.all([optionsResponse, add().click()]);
+      check(sameOptions.status() === 200, "addition options status");
+      await browserJson(sameOptions);
       const excluded = page.getByRole("alert").filter({
         hasText: "[authenticator/excluded]",
       });
@@ -374,8 +441,13 @@ try {
       const additionComplete = page.waitForResponse((r) =>
         new URL(r.url()).pathname === "/api/auth/passkeys/addition/complete"
       );
-      await add().click();
-      const optionResponse = await additionOptions;
+      // 別の検査が先に失敗してcontextを閉じても、この長寿命waiterの拒否を未処理にしない。
+      // 元promiseを保持するので、後のawaitは失敗をそのまま伝える。
+      void additionComplete.catch(() => {});
+      const [optionResponse] = await Promise.all([
+        additionOptions,
+        add().click(),
+      ]);
       check(
         optionResponse.status() === 200,
         "other authenticator options status",
@@ -388,7 +460,7 @@ try {
             beforeAddition.authentication_reference,
         "addition must fence displayed owner and session",
       );
-      let wire = await optionResponse.json();
+      let wire = await browserJson(optionResponse);
       check(
         wire.public_key.publicKey.excludeCredentials.length === 1,
         "old credential must remain excluded",
@@ -452,15 +524,14 @@ try {
       const freshOptions = page.waitForResponse((r) =>
         new URL(r.url()).pathname === "/api/auth/passkeys/addition/options"
       );
-      await add().click();
-      const freshResponse = await freshOptions;
+      const [freshResponse] = await Promise.all([freshOptions, add().click()]);
       check(freshResponse.status() === 200, "fresh addition options status");
       optionsInput = freshResponse.request().postDataJSON();
-      wire = await freshResponse.json();
+      wire = await browserJson(freshResponse);
       phase = `other-authenticator-completion-resident-${resident}`;
       const complete = await additionComplete;
       check(complete.status() === 200, "native addition complete status");
-      const issued = await complete.json();
+      const issued = await browserJson(complete);
       check(
         issued.user.user_id === user.user_id &&
           issued.user.account_id === user.account_id &&
@@ -543,6 +614,7 @@ try {
         "older login must preserve new key verification",
       );
       check(pageErrors === 0, "product page emitted an uncaught error");
+      check(observedResponses.length === 0, "unconsumed proxy responses");
       rows.push({
         resident,
         authenticator: "other",
@@ -580,6 +652,15 @@ try {
 } catch (error) {
   const diagnostic = error instanceof NativeCheckError
     ? error.message
+    : error instanceof Error &&
+        /No resource with given identifier found|No data found for resource with given identifier/
+          .test(error.message)
+    ? "chromium-response-body-unavailable"
+    : error instanceof Error &&
+        /Execution context was destroyed/.test(error.message)
+    ? "navigation-destroyed-execution-context"
+    : error instanceof Error && /Timeout/.test(error.name)
+    ? "browser-operation-timeout"
     : "browser-or-tool-operation-failed";
   await Deno.writeTextFile(
     join(artifacts, "native-migration-result.json"),

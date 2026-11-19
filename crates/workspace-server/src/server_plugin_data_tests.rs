@@ -153,7 +153,7 @@ pub(super) fn ticket_policy(f: &Fixture, tickets: &[(&str, bool, bool)]) {
 }
 
 async fn data_host(f: &Fixture, owner: Arc<dyn PluginHostOwner>, call: &str) -> Arc<OwnerHost> {
-    host_for_plan(f, owner, &f.plan, &f.component, call).await
+    host_for_plan(f, owner, &f.plan, f.component(), call).await
 }
 
 async fn host_for_plan(
@@ -346,9 +346,9 @@ async fn component_ticket_data_remote_and_embedded_preserve_ordinary_ticket() {
         let host = data_host(&f, owner.clone(), "component-data").await;
         let invocation = host.context().invocation_id.clone();
         let result = f
-            .executor
+            .executor()
             .invoke(
-                &f.component,
+                f.component(),
                 host.context().clone(),
                 host,
                 f.tool,
@@ -1368,10 +1368,10 @@ async fn same_installation_schema_upgrade_and_original_pin_restore_keep_cells_se
     let package = package_manifest(&schema_artifact_manifest("2"));
     assert_ne!(
         package.package_digest,
-        f.component.identity().package_digest
+        f.component().identity().package_digest
     );
     let compiled = f
-        .executor
+        .executor()
         .compile(
             &package.bytes,
             &package.package_digest,
@@ -1462,7 +1462,7 @@ async fn same_installation_schema_upgrade_and_original_pin_restore_keep_cells_se
             .unwrap(),
     );
     assert_eq!(
-        f.executor
+        f.executor()
             .invoke(
                 &compiled,
                 new_host.context().clone(),
@@ -1521,11 +1521,11 @@ async fn same_installation_schema_upgrade_and_original_pin_restore_keep_cells_se
         .unwrap();
     let restored = data_host(&f, remote.clone(), "original-pin-call").await;
     assert_eq!(restored.context().invocation_id, old_invocation);
-    assert_eq!(restored.context().artifact, *f.component.identity());
+    assert_eq!(restored.context().artifact, *f.component().identity());
     assert_eq!(
-        f.executor
+        f.executor()
             .invoke(
-                &f.component,
+                f.component(),
                 restored.context().clone(),
                 restored,
                 f.tool,

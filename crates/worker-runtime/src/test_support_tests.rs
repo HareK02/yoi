@@ -5,6 +5,36 @@ use crate::profile_archive::ProfileSourceGraphSummary;
 use session_store::{LogEntry, Store};
 use sha2::{Digest, Sha256};
 
+#[test]
+fn decode_diagnostic_identifies_type_and_position_without_private_values() {
+    let error = decode::<SessionManifest>(br#"{"private-source-marker":1}"#)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("SessionManifest at 1:"), "{error}");
+    assert!(error.contains("(Data)"), "{error}");
+    assert!(!error.contains("private-source-marker"), "{error}");
+}
+
+#[test]
+fn public_workdir_guidance_does_not_mask_sensitive_fixture_material() {
+    let public = "Resolved targets remain subject to scope, symlink and command authorization.";
+    let encoded = serde_json::to_vec(public).unwrap();
+    assert!(decode::<PortableJson>(&encoded).is_ok());
+    for private in [
+        "authorization",
+        "Authorization: secret",
+        "bearer secret",
+        "access_token",
+        "sk-secret",
+        "/private/host/path",
+        "https://private.example",
+    ] {
+        let encoded = serde_json::to_vec(&format!("{public}\n{private}")).unwrap();
+        assert!(decode::<PortableJson>(&encoded).is_err(), "{private}");
+    }
+}
+
 const RUNTIME: &str = "fixture-runtime";
 const WORKSPACE: &str = "fixture-workspace";
 const NEW_URL: &str = "http://127.0.0.1:34567";
@@ -682,6 +712,53 @@ fn fresh_manifest_and_memory_settings_are_required() {
     binding.memory_settings.as_mut().unwrap().workspace_id = "other-workspace".into();
     assert!(template.install(&options, binding, &resolved()).is_err());
     assert_fresh(&options);
+}
+
+#[test]
+fn empty_protected_input_checkpoint_preserves_bytes_and_rejects_protected_or_unknown_data() {
+    let (_source, worker, template) = source();
+    let segment = worker.join(format!("session/segments/{}.jsonl", template.segment_id));
+    for (payload, accepted) in [
+        (serde_json::json!({"version": 1, "kinds": []}), true),
+        (serde_json::json!({"version": 2, "kinds": []}), false),
+        (
+            serde_json::json!({"version": 1, "kinds": ["workspace-memory"]}),
+            false,
+        ),
+        (
+            serde_json::json!({"version": 1, "kinds": [], "unknown": 1}),
+            false,
+        ),
+        (
+            serde_json::json!({"version": 1, "kinds": [], "subject_jobs": []}),
+            false,
+        ),
+    ] {
+        let mut bytes = template.segment_jsonl.clone();
+        bytes.extend(
+            serde_json::to_vec(&LogEntry::Extension {
+                ts: 1,
+                domain: "worker.protected_inputs.v1".into(),
+                payload,
+            })
+            .unwrap(),
+        );
+        bytes.push(b'\n');
+        fs::write(&segment, &bytes).unwrap();
+        let extracted = StoppedWorkerTemplate::extract(&worker);
+        assert_eq!(extracted.is_ok(), accepted);
+        if let Ok(extracted) = extracted {
+            let (_target, options) = destination(&extracted);
+            extracted.install(&options, request(), &resolved()).unwrap();
+            let installed = options
+                .root
+                .join(WORKERS_DIR)
+                .join(worker_id().to_string())
+                .join(format!("session/segments/{}.jsonl", template.segment_id));
+            assert_eq!(fs::read(installed).unwrap(), bytes);
+        }
+        assert_eq!(fs::read(&segment).unwrap(), bytes);
+    }
 }
 
 #[test]

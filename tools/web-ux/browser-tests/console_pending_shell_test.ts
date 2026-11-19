@@ -1,17 +1,12 @@
 /// <reference lib="dom" />
+import { productionBuild } from "./production_build.ts";
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
 import { chromium } from "playwright";
 
 const root = join(dirname(fromFileUrl(import.meta.url)), "../../..");
 Deno.test("Console pending scopes are independent and match Tasks row typography", async () => {
-  const build = await new Deno.Command(Deno.execPath(), {
-    args: ["task", "build"],
-    cwd: join(root, "web/workspace"),
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  assert(build.success, new TextDecoder().decode(build.stderr));
+  const buildRoot = await productionBuild(join(root, "web/workspace"));
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
   listener.close();
@@ -23,7 +18,7 @@ Deno.test("Console pending scopes are independent and match Tasks row typography
       "--allow-read",
       join(root, "tools/web-ux/browser-tests/console_history_fixture_server.ts"),
       String(port),
-      join(root, "web/workspace/build"),
+      buildRoot,
     ],
     stdout: "null",
     stderr: "null",

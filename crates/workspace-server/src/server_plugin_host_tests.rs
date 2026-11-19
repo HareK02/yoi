@@ -46,8 +46,8 @@ struct Fixture {
     subject: String,
     installed: server_api::PluginOperationResponse,
     plan: PluginPlanCreateReceipt,
-    executor: Executor,
-    component: CompiledTool,
+    package: manifest::plugin::CanonicalPluginArtifact,
+    execution: std::sync::OnceLock<(Executor, CompiledTool)>,
     tool: &'static str,
     binding: Option<PluginConnectionBinding>,
     _directory: tempfile::TempDir,
@@ -359,15 +359,6 @@ impl Fixture {
                 PlanPinState::Active,
             )
             .unwrap();
-        let executor = Executor::new(Limits::default()).unwrap();
-        let component = executor
-            .compile(
-                &package.bytes,
-                &package.package_digest,
-                &package.artifact_digest,
-                package.artifact_size,
-            )
-            .unwrap();
         Self {
             api,
             runtime,
@@ -376,12 +367,38 @@ impl Fixture {
             subject,
             installed,
             plan,
-            executor,
-            component,
+            package,
+            execution: std::sync::OnceLock::new(),
             tool,
             binding,
             _directory: directory,
         }
+    }
+
+    // Host-boundary cases still upload/install the real package and authorize a
+    // real plan, but do not execute a guest. Compile only when a guest/context
+    // is actually needed; no component or mutable runtime is shared across tests.
+    fn execution(&self) -> &(Executor, CompiledTool) {
+        self.execution.get_or_init(|| {
+            let executor = Executor::new(Limits::default()).unwrap();
+            let component = executor
+                .compile(
+                    &self.package.bytes,
+                    &self.package.package_digest,
+                    &self.package.artifact_digest,
+                    self.package.artifact_size,
+                )
+                .unwrap();
+            (executor, component)
+        })
+    }
+
+    fn executor(&self) -> &Executor {
+        &self.execution().0
+    }
+
+    fn component(&self) -> &CompiledTool {
+        &self.execution().1
     }
 
     fn context(&self) -> InvocationContext {
@@ -391,7 +408,7 @@ impl Fixture {
             plan: self.plan.plan_id.clone(),
             subject: self.plan.plan.execution().principal_id.clone(),
             invocation_id: String::new(),
-            artifact: self.component.identity().clone(),
+            artifact: self.component().identity().clone(),
             tool_name: self.tool.into(),
             grants: Grants {
                 logging: false,
@@ -484,9 +501,9 @@ impl Fixture {
         } else {
             r#"{"text":"ordinary result"}"#
         };
-        self.executor
+        self.executor()
             .invoke(
-                &self.component,
+                self.component(),
                 host.context().clone(),
                 host,
                 self.tool,

@@ -15130,6 +15130,17 @@ mod tests {
             .send_input(&detail.worker_ref, input("running-input"))
             .unwrap_err();
         assert!(error.to_string().contains("WorkerNotify"), "{error}");
+        // Notify resumes Paused turns. Observe its durable receipt while the
+        // model is still Running, before testing the Paused admission boundary.
+        let mut notify = WorkerInput::user("advisory");
+        notify.kind = WorkerInputKind::Notify;
+        assert!(
+            runtime
+                .send_input(&detail.worker_ref, notify)
+                .unwrap()
+                .notification
+                .is_some()
+        );
         runtime
             .send_protocol_method(
                 &detail.worker_ref,

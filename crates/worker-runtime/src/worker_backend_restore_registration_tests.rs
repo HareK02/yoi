@@ -282,6 +282,22 @@ fn partial_registration_recovers_same_controller(hub: bool) {
     assert!(old.protocol_is_closed());
     assert!(transport.validate().is_err());
     let replacement_request = runtime.test_restore_request(&worker_ref);
+    let replacement_result = runtime
+        .restore_worker_operation_scoped(scope, &worker_ref, replacement_request.clone())
+        .unwrap();
+    // The injected 250ms foreground budget also applies to this normal restore.
+    // Observe the same operation's continuation rather than requiring synchronous
+    // completion or issuing a fresh restore when the foreground budget expires.
+    if replacement_result.state == server_api::WorkerRestoreState::ReconciliationRequired {
+        let owner = restore_owner(&runtime, &worker_ref, &replacement_request.request_id);
+        let operation = serde_json::from_value(owner["operation_id"].clone()).unwrap();
+        runtime.test_wait_restore_continuation(&worker_ref, operation, WAIT);
+    } else {
+        assert_eq!(
+            replacement_result.state,
+            server_api::WorkerRestoreState::Accepted
+        );
+    }
     assert_eq!(
         runtime
             .restore_worker_operation_scoped(scope, &worker_ref, replacement_request.clone())

@@ -122,6 +122,7 @@ pub fn start_in_with_source_setup(
             memory_settings: Some(bootstrap.memory_settings.clone()),
             subjektiv_attached: false,
             backend_job: None,
+            plugin_execution: None,
         };
         support(template.install(&options, request, &bootstrap.manifest))?;
         setup(
@@ -343,7 +344,7 @@ fn bootstrap(
             request_fingerprint: "restore-e2e-bootstrap".into(),
             workspace: WorkspaceRecord {
                 workspace_id: fixture.manifest.workspace_id.clone(),
-                owner_account_id: account_id,
+                owner_account_id: account_id.clone(),
                 display_name: "Restore E2E".into(),
                 state: "active".into(),
                 created_at: now.clone(),
@@ -378,6 +379,9 @@ fn bootstrap(
 
     let schema = support(
         WorkspaceConfigSchemaRegistry::default()
+            .with_provider(Arc::new(
+                yoi_workspace_server::policy_config::PermissionConfigSchemaProvider,
+            ))
             .with_provider(Arc::new(ProfileConfigSchemaProvider))
             .with_provider(Arc::new(
                 yoi_workspace_server::prompt_settings::PromptConfigSchemaProvider,
@@ -454,7 +458,8 @@ fn bootstrap(
         singleton_key: None,
         acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
         profile: ProfileSelector::Named(PROFILE.into()),
-        ticket_assignment: None,
+        authorization: None,
+        resolved_core_execution_grant: None,
         initial_submit: vec![],
         workdir_attachment_requests: vec![],
         resolved_workdir_attachment_requests: vec![],
@@ -472,6 +477,7 @@ fn bootstrap(
         &store,
         FixedWorkerSeed {
             workspace_id: &fixture.manifest.workspace_id,
+            owner_account_id: account_id,
             runtime_id: &fixture.manifest.runtime_id,
             worker_id: support(fixture.manifest.worker_id.parse())?,
             allocation_key: "restore-e2e-worker",

@@ -85,6 +85,43 @@
     ]
   },
   {
+    "path": "tests/e2e/examples/acquire_restore_fixture.rs",
+    "kind": "saved_data",
+    "reason": "既存の固定fixture format v1へ生成元Git commitを保存するwire key。loaderの保存契約と取得証拠を維持し、新しい状態番号や競合制御には使わない。Rust側の変数名はsource_commitとする。",
+    "lines": [
+      {
+        "sha256": "9ef8436aefef7525e9cd0f9ced78c6348c13208785022cc5dce60942510ba762",
+        "count": 1
+      },
+      {
+        "sha256": "b60a48d3a232aa771134603d9defeabc9c8b9f79d1f1955c21e2743055be8a93",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "tests/e2e/fixtures/worker-codex-v2/expected.json",
+    "kind": "saved_data",
+    "reason": "実Codex人工会話の取得済み固定資産に記録された生成元Git commit。既存formatの保存keyと取得時bytes/hashを維持する。実行状態やCASには使わない。",
+    "lines": [
+      {
+        "sha256": "362ec472be87ae3b97b284ad854592678dd9e7c55d3b40cba948f3709b93eaa6",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "tests/e2e/fixtures/worker-codex-v2/manifest.json",
+    "kind": "saved_data",
+    "reason": "実Codex人工会話の取得済み固定資産に記録された生成元Git commit。既存formatの保存keyと取得時bytes/hashを維持する。実行状態やCASには使わない。",
+    "lines": [
+      {
+        "sha256": "362ec472be87ae3b97b284ad854592678dd9e7c55d3b40cba948f3709b93eaa6",
+        "count": 1
+      }
+    ]
+  },
+  {
     "path": "tests/e2e/fixtures/worker-codex-v1/manifest.json",
     "kind": "saved_data",
     "reason": "ユーザー提供済v1固定資産の生成元Git commitの保存key。原本の取得証拠とSHA-256を保持するため変更しない。Worker実行状態や競合制御の番号ではなく、生成元resources照合のみに使う。",

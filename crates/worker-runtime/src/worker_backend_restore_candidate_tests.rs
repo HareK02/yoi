@@ -308,6 +308,7 @@ mod restore_candidate {
                             simple_text_events().into_iter().take(2).collect(),
                         )])
                     };
+                    let seed_calls = seed_model.call_count.clone();
                     let mut engine = Engine::<
                         _,
                         agen::state::Mutable,
@@ -401,12 +402,15 @@ mod restore_candidate {
                                 }
                             ));
                             receipts.push(serde_json::to_value(receipt).unwrap());
+                            if id == FIRST {
+                                // The second Submit checkpoints the accepted but
+                                // uncommitted notification activation for restore.
+                                notify_from_source(&handle, notice_source.clone()).await;
+                            }
                         }
-                        // Accept the notice last, so the saved checkpoint is the
-                        // pending receipt before any later activation checkpoint.
-                        notify_from_source(&handle, notice_source.clone()).await;
                         assert_eq!(pending(&handle).await.submissions.len(), 2);
                         shutdown_profile_controller(seed.0.take().unwrap()).await;
+                        assert_eq!(seed_calls.load(Ordering::SeqCst), 1);
                         receipts
                     };
                     // This orphan pin would be removed by the normal activation
@@ -457,13 +461,31 @@ mod restore_candidate {
             if !no_model {
                 let checkpoint = queue_checkpoint(&fixture.entries());
                 assert_eq!(checkpoint["pending"].as_array().unwrap().len(), 2);
-                assert_eq!(
+                // Running Notify stages the accepted notice in the live buffer.
+                // The next Submit checkpoints that uncommitted activation; restore
+                // must recover it exactly once, not treat it as already delivered.
+                assert!(
                     checkpoint["pending_notifications"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                let notifications = checkpoint["activating_notification"].as_array().unwrap();
+                assert_eq!(notifications.len(), 1);
+                assert_eq!(notifications[0]["notification_request_id"], NOTICE);
+                assert_eq!(notifications[0]["message"], NOTICE);
+                assert_eq!(
+                    checkpoint["notification_receipts"]
                         .as_array()
                         .unwrap()
                         .len(),
                     1
                 );
+                assert!(!fixture.entries().iter().any(|entry| matches!(
+                    entry,
+                    LogEntry::AnnotatedSystemItem { entry, .. }
+                        if matches!(entry.item, session_store::SystemItem::Notification { .. })
+                )));
             }
             fixture.assert_quiet();
             fixture

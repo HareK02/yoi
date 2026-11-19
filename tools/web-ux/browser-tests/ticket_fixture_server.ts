@@ -11,8 +11,9 @@ import type {
   TicketAssignmentTrackingHistoryEntry,
   TicketAssignmentTrackingProjection,
   TicketDetail,
+  TicketBrowseQueryItem,
   TicketQueryItem,
-  TicketQueryRequest,
+  TicketBrowseQueryRequest,
   WorkspaceTag,
 } from "../../../web/workspace/src/lib/generated/ticket-api.ts";
 import { emptyLaunchOptions } from "../../../web/workspace/src/lib/workspace/sidebar/worker-launch.test-fixtures.ts";
@@ -63,21 +64,26 @@ function remember(row: TicketAssignmentTrackingProjection) {
     );
   }
 }
-function queryItem(t: TicketDetail): TicketQueryItem {
+function browseItem(t: TicketDetail): TicketBrowseQueryItem {
   return {
     id: t.id,
     resource_key: t.resource_key,
     title: t.title,
     state: t.state,
-    priority: t.priority,
     tags: t.tags,
     assignment_tracking: t.assignment_tracking,
-    closure_operation_key: t.closure_operation_key,
     current_closure: t.current_closure,
+    updated_at: t.updated_at,
+  };
+}
+function queryItem(t: TicketDetail): TicketQueryItem {
+  return {
+    ...browseItem(t),
+    priority: t.priority,
+    closure_operation_key: t.closure_operation_key,
     current_worker: t.current_worker,
     content_digest: t.content_digest,
     created_at: t.created_at,
-    updated_at: t.updated_at,
     legacy_handoff: t.legacy_handoff,
     readiness: t.readiness,
     workspace_action_priority: "background",
@@ -153,8 +159,8 @@ function ticket(key: string) {
       assignment_id: `assignment-${key}`,
       role: "orchestrator",
       principal: {
-        kind: "workspace_agent",
-        agent_key: "workspace-orchestrator",
+        kind: "subject",
+        subject_id: "subject-fixture",
       },
       assigned_at: "2026-01-01T00:00:00Z",
       assigned_by: "fixture-owner",
@@ -524,6 +530,17 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         diagnostics: [],
       });
     }
+    if (path === "/subjektiv/subjects") {
+      return Response.json({
+        items: ["subject-fixture", "subject-other"].map((subjectId) => ({
+          id: subjectId, role: subjectId === "subject-fixture" ? "Investigation" : "Review",
+          behavior_md: "Synthetic browser fixture", state: "active", memory_fingerprint: "fixture",
+          created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+          current_body: null, current_worker: null, current_worker_diagnostics: [],
+        })),
+        limit: 100, next_cursor: null, has_more: false,
+      });
+    }
     if (path === "/orchestrator") {
       return Response.json({
         workspace_id: id,
@@ -617,14 +634,14 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       };
       return response;
     }
-    if (path === "/tickets/query" && request.method !== "POST") {
+    if ((path === "/tickets/browse" || path === "/tickets/query") && request.method !== "POST") {
       return Response.json(
-        { message: "Use POST with TicketQueryRequest JSON" },
+        { message: "Use POST with TicketBrowseQueryRequest JSON" },
         { status: 405 },
       );
     }
-    if (path === "/tickets/query" && request.method === "POST") {
-      const body: TicketQueryRequest = await request.json();
+    if ((path === "/tickets/browse" || path === "/tickets/query") && request.method === "POST") {
+      const body: TicketBrowseQueryRequest = await request.json();
       bodies.push({ path, method: request.method, body });
       if (id === "tickets-error") {
         return Response.json({
@@ -679,7 +696,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           !rows.some((row) => row.tracking?.status === body.handling_status)
         ) return false;
         return true;
-      }).map(queryItem);
+      }).map((ticket) => path === "/tickets/browse" ? browseItem(ticket) : queryItem(ticket));
       return Response.json({
         ...pageSlice(items, body.cursor ?? null, body.limit ?? 30),
         record_authority: "fixture",

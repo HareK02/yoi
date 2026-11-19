@@ -6,14 +6,19 @@
 //! credentials are accepted here. Install Profile configuration through the existing
 //! config-source mechanisms before starting the product processes.
 //!
-//! This module seeds Backend ownership only. It neither writes Runtime storage nor
-//! launches a Worker, fabricates Runtime observations, changes authorization, or sends
-//! initial input. The caller must separately install the matching stopped Runtime
-//! fixture. Build product binaries in a separate Cargo invocation **without** this
-//! feature (Cargo features unify within an invocation).
+//! This module seeds Backend ownership and fresh owner-issued execution authority
+//! through the normal validators. It neither writes Runtime storage nor launches a
+//! Worker, fabricates Runtime observations, weakens authorization, or sends initial
+//! input. The caller must separately install the matching stopped Runtime fixture.
+//! Build product binaries in a separate Cargo invocation **without** this feature
+//! (Cargo features unify within an invocation).
 
 use super::*;
 use crate::hosts::{WorkerSpawnIntent, WorkerSpawnRequest, worker_spawn_create_fingerprint};
+use server_api::authorization::{
+    CoreWorkerExecutionGrant, CoreWorkerGrantSource, PermissionReferenceEncoding,
+};
+use server_api::launch_policy::WorkerCreationAuthorization;
 use worker_runtime::catalog::ProfileSelector;
 
 /// One ordinary, attachment-free Worker from an externally validated fixture.
@@ -26,13 +31,15 @@ use worker_runtime::catalog::ProfileSelector;
 /// unsupported.
 pub struct FixedWorkerSeed<'a> {
     pub workspace_id: &'a str,
+    /// Fresh owner account established by the isolated harness bootstrap, never fixture data.
+    pub owner_account_id: String,
     pub runtime_id: &'a str,
     pub worker_id: WorkerId,
     pub allocation_key: &'a str,
     pub request: &'a WorkerSpawnRequest,
 }
 
-/// Insert a fixed Worker catalog entry and completed creation reservation atomically.
+/// Insert catalog, completed reservation, owner grant and frozen launch bundle atomically.
 ///
 /// Uses the normal reservation validators, authoritative Memory snapshot, fingerprint
 /// binding, resource-key allocator and immediate transaction. Even an exact repeat is
@@ -54,7 +61,6 @@ pub fn seed_fixed_worker(
     }
     if !matches!(request.intent, WorkerSpawnIntent::WorkspaceCoding)
         || request.singleton_key.is_some()
-        || request.ticket_assignment.is_some()
         || request.resolved_subjektiv_attached
         || !request.workdir_attachment_requests.is_empty()
         || !request.resolved_workdir_attachment_requests.is_empty()
@@ -66,6 +72,7 @@ pub fn seed_fixed_worker(
         || !request.resolved_worker_observation_grants.is_empty()
         || request.resolved_control_operation.is_some()
         || request.resolved_execution_grant.is_some()
+        || request.resolved_core_execution_grant.is_some()
     {
         return Err(Error::InvalidInput(
             "fixture Worker must be ordinary unresolved create intent without singleton, assignments, attachments or grants".into(),
@@ -76,6 +83,62 @@ pub fn seed_fixed_worker(
         ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => name,
     };
     validate_non_empty("fixture Profile selector", profile)?;
+    server_api::launch_policy::validate_canonical_profile(profile).map_err(Error::InvalidInput)?;
+    let explicit = match &request.authorization {
+        None => None,
+        Some(WorkerCreationAuthorization::Assignment { assignment }) => assignment.as_ref(),
+        Some(WorkerCreationAuthorization::Policy { .. }) => {
+            return Err(Error::InvalidInput(
+                "offline fixture requires owner Account issuance, not Worker policy use".into(),
+            ));
+        }
+    };
+    // Follow the ordinary account issuance model, using current installed source and
+    // builtin declarations, not authority or a Profile digest supplied by the fixture.
+    // Plugin-contributed permissions are intentionally unsupported by this offline helper.
+    let created_at: String = store.with_conn(|conn| {
+        crate::launch_policy::require_owner(conn, seed.workspace_id, &seed.owner_account_id)?;
+        Ok(conn.query_row(
+            "SELECT created_at FROM workspaces WHERE workspace_id=?1",
+            [seed.workspace_id],
+            |row| row.get(0),
+        )?)
+    })?;
+    let state = store
+        .load_workspace_config(seed.workspace_id)?
+        .ok_or_else(|| {
+            Error::InvalidInput("fixture requires installed Workspace configuration".into())
+        })?;
+    let projection =
+        crate::profile_settings::project_profiles_from_workspace_config(seed.workspace_id, &state)?;
+    let bundle = crate::profile_settings::build_virtual_profile_config_bundle(
+        &projection,
+        &state,
+        seed.workspace_id,
+        &created_at,
+        profile,
+    )?
+    .ok_or_else(|| Error::InvalidInput("fixture Profile is not registered".into()))?;
+    let registry = worker::feature::permissions::builtin_permission_registry(
+        feature_permissions::WorkspaceId::parse(seed.workspace_id).map_err(Error::InvalidInput)?,
+    )
+    .map_err(|error| Error::Config(error.to_string()))?;
+    let assignment = store.worker_assignment(seed.workspace_id, registry.host(), explicit)?;
+    let grant = CoreWorkerExecutionGrant {
+        grant_id: crate::auth::new_id("weg"),
+        workspace_id: seed.workspace_id.into(),
+        creation_operation_id: seed.allocation_key.into(),
+        runtime_id: seed.runtime_id.into(),
+        worker_id: seed.worker_id.to_string(),
+        profile: profile.clone(),
+        profile_digest: bundle.computed_digest(),
+        assignment,
+        reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
+        issuance_ceiling: None,
+        source: CoreWorkerGrantSource::Account {
+            account_id: seed.owner_account_id.clone(),
+        },
+    };
     let worker_id = seed.worker_id.to_string();
     let display_name = request
         .requested_worker_name
@@ -96,6 +159,14 @@ pub fn seed_fixed_worker(
             Ok(Some(seed.worker_id))
         },
         |tx, reservation| {
+            // The normal binder rechecks owner authority and validates immutable grant
+            // identity/lineage inside the reservation transaction. Never seed raw grants.
+            crate::launch_policy::bind_core_grant(tx, &grant)?;
+            tx.execute(
+                "INSERT INTO core_worker_launch_bindings(workspace_id,operation_id,caller_fingerprint,runtime_id,worker_id,config_bundle_json) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![seed.workspace_id, seed.allocation_key, fingerprint, seed.runtime_id, worker_id,
+                    serde_json::to_string(&bundle).map_err(|error| Error::Store(error.to_string()))?],
+            )?;
             let now = chrono::Utc::now().to_rfc3339();
             tx.execute(
                 "INSERT INTO worker_registry (
@@ -149,6 +220,8 @@ fn require_seed_target(tx: &rusqlite::Transaction<'_>, seed: &FixedWorkerSeed<'_
     // Check by WorkerId, not just the proposed Runtime tuple: orphaned and terminal
     // ownership is still a collision. These tables are owned by this store schema.
     for table in [
+        "core_worker_execution_grants",
+        "core_worker_launch_bindings",
         "worker_create_reservations",
         "worker_registry",
         "worker_registry_observations",
@@ -276,6 +349,23 @@ mod tests {
                 false,
             )
             .unwrap();
+        let schema = crate::config_source::WorkspaceConfigSchemaRegistry::default()
+            .with_provider(Arc::new(
+                crate::profile_settings::ProfileConfigSchemaProvider,
+            ))
+            .with_provider(Arc::new(crate::prompt_settings::PromptConfigSchemaProvider))
+            .with_provider(Arc::new(
+                crate::policy_config::PermissionConfigSchemaProvider,
+            ))
+            .compose()
+            .unwrap();
+        store
+            .ensure_workspace_config_materialized_with_schema(
+                WORKSPACE,
+                "2026-10-24T00:00:00Z",
+                schema,
+            )
+            .unwrap();
         store
     }
 
@@ -286,7 +376,6 @@ mod tests {
             singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
             profile: ProfileSelector::Builtin("builtin:coder".into()),
-            ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
@@ -304,9 +393,21 @@ mod tests {
         }
     }
 
-    fn seed(request: &WorkerSpawnRequest) -> FixedWorkerSeed<'_> {
+    fn seed<'a>(
+        store: &SqliteWorkspaceStore,
+        request: &'a WorkerSpawnRequest,
+    ) -> FixedWorkerSeed<'a> {
         FixedWorkerSeed {
             workspace_id: WORKSPACE,
+            owner_account_id: store
+                .with_conn(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT owner_account_id FROM workspaces WHERE workspace_id=?1",
+                        [WORKSPACE],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap(),
             runtime_id: RUNTIME,
             worker_id: WORKER.parse().unwrap(),
             allocation_key: "fixture-allocation",
@@ -323,8 +424,8 @@ mod tests {
         let a = bootstrap();
         let b = bootstrap();
         let request = request();
-        let first = seed_fixed_worker(&a, seed(&request)).unwrap();
-        let second = seed_fixed_worker(&b, seed(&request)).unwrap();
+        let first = seed_fixed_worker(&a, seed(&a, &request)).unwrap();
+        let second = seed_fixed_worker(&b, seed(&b, &request)).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.worker_id.to_string(), WORKER);
         assert_eq!(first.memory_settings.workspace_id, WORKSPACE);
@@ -382,7 +483,85 @@ mod tests {
                 .unwrap();
             assert!(projection.observation.is_none());
             assert!(projection.job.is_none());
+            let fingerprint = worker_spawn_create_fingerprint(&request).unwrap();
+            let (grant, bundle) = store
+                .saved_core_worker_launch(WORKSPACE, "fixture-allocation", &fingerprint)
+                .unwrap()
+                .unwrap();
+            assert_eq!(grant.worker_id, WORKER);
+            assert_eq!(grant.profile_digest, bundle.computed_digest());
+            assert_eq!(grant.profile, registry.profile.unwrap());
+            assert!(
+                matches!(grant.source, CoreWorkerGrantSource::Account { ref account_id } if account_id == &seed(store, &request).owner_account_id)
+            );
+            let host = worker::feature::permissions::builtin_permission_registry(
+                feature_permissions::WorkspaceId::parse(WORKSPACE).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                grant.assignment,
+                store
+                    .worker_assignment(WORKSPACE, host.host(), None)
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .saved_core_worker_launch(WORKSPACE, "fixture-allocation", "changed")
+                    .is_err()
+            );
+            store
+                .with_conn(|conn| crate::launch_policy::validate_policy_lineage(conn, &grant))
+                .unwrap();
         }
+    }
+
+    #[test]
+    fn owner_selection_and_frozen_authority_are_checked() {
+        let store = bootstrap();
+        let mut request = request();
+        let mut nonowner = seed(&store, &request);
+        nonowner.owner_account_id = "not-the-owner".into();
+        assert!(matches!(
+            seed_fixed_worker(&store, nonowner),
+            Err(Error::WorkspacePermissionDenied(_))
+        ));
+        request.authorization = Some(WorkerCreationAuthorization::Policy {
+            policy_id: "not-an-owner-launch".into(),
+            policy_authorization_key: "key".into(),
+        });
+        assert!(seed_fixed_worker(&store, seed(&store, &request)).is_err());
+        request.authorization = Some(WorkerCreationAuthorization::Assignment {
+            assignment: Some(Default::default()),
+        });
+        seed_fixed_worker(&store, seed(&store, &request)).unwrap();
+        let grant = store
+            .core_worker_execution_grant(WORKSPACE, RUNTIME, WORKER)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            grant.assignment,
+            feature_permissions::PermissionAssignment::default()
+        );
+        let mut injected = request.clone();
+        injected.resolved_core_execution_grant = Some(grant.clone());
+        let other = bootstrap();
+        assert!(
+            matches!(seed_fixed_worker(&other, seed(&other, &injected)), Err(Error::InvalidInput(ref message)) if message.contains("unresolved"))
+        );
+        // Revocation remains authoritative, including for a perfectly valid seed.
+        store
+            .revoke_core_worker_execution_grant(
+                WORKSPACE,
+                &seed(&store, &request).owner_account_id,
+                &grant.grant_id,
+                "revoke-fixture",
+            )
+            .unwrap();
+        assert!(
+            store
+                .with_conn(|conn| crate::launch_policy::validate_policy_lineage(conn, &grant))
+                .is_err()
+        );
     }
 
     #[test]
@@ -392,7 +571,7 @@ mod tests {
         // Even an empty text segment is new input; the vector itself must be empty.
         for text in ["new input must not be seeded", ""] {
             request.initial_submit = vec![protocol::Segment::text(text)];
-            let error = seed_fixed_worker(&store, seed(&request)).unwrap_err();
+            let error = seed_fixed_worker(&store, seed(&store, &request)).unwrap_err();
             assert!(
                 matches!(error, Error::InvalidInput(ref message) if message.contains("initial_submit"))
             );
@@ -416,7 +595,7 @@ mod tests {
         }
         // The rejected attempts must not consume the allocation or resource counter.
         request.initial_submit.clear();
-        seed_fixed_worker(&store, seed(&request)).unwrap();
+        seed_fixed_worker(&store, seed(&store, &request)).unwrap();
         assert_eq!(
             store
                 .worker_resource_key(WORKSPACE, &worker())
@@ -430,15 +609,15 @@ mod tests {
     fn exact_replay_changed_input_and_cross_runtime_identity_are_refused() {
         let store = bootstrap();
         let mut request = request();
-        seed_fixed_worker(&store, seed(&request)).unwrap();
+        seed_fixed_worker(&store, seed(&store, &request)).unwrap();
         let before = store.get_worker_registry(WORKSPACE, &worker()).unwrap();
-        assert!(seed_fixed_worker(&store, seed(&request)).is_err());
+        assert!(seed_fixed_worker(&store, seed(&store, &request)).is_err());
         request.requested_worker_name = Some("Must not overwrite".into());
-        assert!(seed_fixed_worker(&store, seed(&request)).is_err());
-        let mut new_allocation = seed(&request);
+        assert!(seed_fixed_worker(&store, seed(&store, &request)).is_err());
+        let mut new_allocation = seed(&store, &request);
         new_allocation.allocation_key = "another-allocation";
         assert!(seed_fixed_worker(&store, new_allocation).is_err());
-        let mut same_allocation = seed(&request);
+        let mut same_allocation = seed(&store, &request);
         same_allocation.worker_id = WorkerId::now_v7();
         assert!(seed_fixed_worker(&store, same_allocation).is_err());
         assert_eq!(
@@ -450,7 +629,7 @@ mod tests {
         let mut record = before.unwrap();
         record.worker.runtime_id = "different-runtime".into();
         other.upsert_worker_registry(&record).unwrap();
-        assert!(seed_fixed_worker(&other, seed(&request)).is_err());
+        assert!(seed_fixed_worker(&other, seed(&other, &request)).is_err());
         assert!(
             other
                 .get_worker_registry(WORKSPACE, &worker())
@@ -467,7 +646,7 @@ mod tests {
         let ordinary = store
             .reserve_worker_create(WORKSPACE, RUNTIME, "ordinary", "fingerprint", None, &memory)
             .unwrap();
-        let mut collision = seed(&request);
+        let mut collision = seed(&store, &request);
         collision.worker_id = ordinary.worker_id;
         assert!(seed_fixed_worker(&store, collision).is_err());
         // Store-level fault setup only: the external harness never writes SQL.
@@ -483,7 +662,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(seed_fixed_worker(&store, seed(&request)).is_err());
+        assert!(seed_fixed_worker(&store, seed(&store, &request)).is_err());
         assert!(
             store
                 .get_worker_registry(WORKSPACE, &worker())
@@ -509,7 +688,7 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            seed_fixed_worker(&malformed, seed(&request)),
+            seed_fixed_worker(&malformed, seed(&malformed, &request)),
             Err(Error::InvalidInput(_))
         ));
         assert!(
@@ -528,7 +707,7 @@ mod tests {
             Ok(())
         }).unwrap();
         assert!(matches!(
-            seed_fixed_worker(&removed, seed(&request)),
+            seed_fixed_worker(&removed, seed(&removed, &request)),
             Err(Error::InvalidInput(_))
         ));
         assert!(
@@ -543,16 +722,16 @@ mod tests {
     fn unknown_workspace_runtime_and_revoked_binding_are_refused() {
         let store = bootstrap();
         let request = request();
-        let mut unknown = seed(&request);
+        let mut unknown = seed(&store, &request);
         unknown.workspace_id = "unknown";
         assert!(seed_fixed_worker(&store, unknown).is_err());
-        let mut unknown = seed(&request);
+        let mut unknown = seed(&store, &request);
         unknown.runtime_id = "unknown";
         assert!(seed_fixed_worker(&store, unknown).is_err());
         store
             .revoke_workspace_runtime_binding(WORKSPACE, RUNTIME, "2026-10-24T01:00:00Z")
             .unwrap();
-        assert!(seed_fixed_worker(&store, seed(&request)).is_err());
+        assert!(seed_fixed_worker(&store, seed(&store, &request)).is_err());
         assert!(
             store
                 .worker_resource_key(WORKSPACE, &worker())
@@ -587,7 +766,7 @@ mod tests {
             });
         requests.push(request);
         for request in requests {
-            assert!(seed_fixed_worker(&store, seed(&request)).is_err());
+            assert!(seed_fixed_worker(&store, seed(&store, &request)).is_err());
         }
         assert!(
             store
@@ -602,7 +781,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            seed_fixed_worker(&store, seed(&base))
+            seed_fixed_worker(&store, seed(&store, &base))
                 .unwrap()
                 .worker_id
                 .to_string(),
@@ -623,7 +802,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(seed_fixed_worker(&store, seed(&request)).is_err());
+        assert!(seed_fixed_worker(&store, seed(&store, &request)).is_err());
         assert!(
             !store
                 .has_active_worker_create_reservation(WORKSPACE, &worker())
@@ -635,13 +814,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            store
+                .core_worker_execution_grant(WORKSPACE, RUNTIME, WORKER)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .saved_core_worker_launch(
+                    WORKSPACE,
+                    "fixture-allocation",
+                    &worker_spawn_create_fingerprint(&request).unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
         store
             .with_conn(|conn| {
                 conn.execute_batch("DROP TRIGGER fail_fixture_catalog")?;
                 Ok(())
             })
             .unwrap();
-        seed_fixed_worker(&store, seed(&request)).unwrap();
+        seed_fixed_worker(&store, seed(&store, &request)).unwrap();
         assert_eq!(
             store
                 .worker_resource_key(WORKSPACE, &worker())

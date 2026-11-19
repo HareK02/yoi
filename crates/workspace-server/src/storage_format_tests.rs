@@ -6,6 +6,51 @@ use super::*;
 use rusqlite::{backup::Backup, params};
 
 #[test]
+fn copied_reference_stages_match_independent_frozen_schema_construction() {
+    let copied = build_references().unwrap();
+    let stages = std::iter::once(Stage::Base)
+        .chain(FAMILIES.into_iter().flat_map(|family| {
+            (1..=family.names().len()).map(move |count| Stage::Published(family, count))
+        }))
+        .chain((119..=121).map(Stage::Converged));
+    let base = snapshot(&reference_base().unwrap()).unwrap();
+    let mut tables = BTreeSet::new();
+    let mut new_columns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let base_conn = reference_base().unwrap();
+    let mut count = 0;
+    for stage in stages {
+        // Independent construction is the oracle: do not use the copy helper.
+        let conn = reference_base().unwrap();
+        install_reference(&conn, stage).unwrap();
+        let shape = snapshot(&conn).unwrap();
+        assert_eq!(copied.stages[&stage], shape, "stage {stage:?}");
+        for (name, object) in &shape {
+            if base.get(name) != Some(object) {
+                tables.insert(object.1.clone());
+            }
+            if object.0 == "table" {
+                let old: BTreeSet<_> = super::super::table_columns(&base_conn, name)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+                let fields: BTreeSet<_> = super::super::table_columns(&conn, name)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+                new_columns
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(fields.difference(&old).cloned());
+            }
+        }
+        count += 1;
+    }
+    assert_eq!(copied.stages.len(), count);
+    assert_eq!(copied.tables, tables);
+    assert_eq!(copied.new_columns, new_columns);
+}
+
+#[test]
 fn table_declaration_normalization_is_idempotent_after_extension() {
     let connection = Connection::open_in_memory().unwrap();
     connection
@@ -27,19 +72,12 @@ fn table_declaration_normalization_is_idempotent_after_extension() {
     assert_eq!(snapshot(&connection).unwrap()["sample"].2, extended);
 }
 
-fn save_history(
-    conn: &Connection,
+fn published_history_rows(
     stage: Stage,
     baseline: i64,
     predecessor: Option<(Family, usize)>,
-) {
-    conn.execute("DELETE FROM __yoi_schema_migrations", [])
-        .unwrap();
-    conn.execute(
-        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
-        params![baseline, super::super::SCHEMA_BASELINE_NAME],
-    )
-    .unwrap();
+) -> Vec<(i64, String)> {
+    let mut rows = vec![(baseline, super::super::SCHEMA_BASELINE_NAME.to_owned())];
     let published = match stage {
         Stage::Published(family, count) => Some((family, count)),
         _ => predecessor,
@@ -48,11 +86,7 @@ fn save_history(
         for (index, name) in family.names().iter().take(count).enumerate() {
             let version = 114 + index as i64;
             if version > baseline {
-                conn.execute(
-                    "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
-                    params![version, name],
-                )
-                .unwrap();
+                rows.push((version, (*name).to_owned()));
             }
         }
     }
@@ -63,13 +97,27 @@ fn save_history(
             (121, CLEANUP_COVERAGE),
         ] {
             if version > baseline && version <= current {
-                conn.execute(
-                    "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
-                    params![version, name],
-                )
-                .unwrap();
+                rows.push((version, (*name).to_owned()));
             }
         }
+    }
+    rows
+}
+
+fn save_history(
+    conn: &Connection,
+    stage: Stage,
+    baseline: i64,
+    predecessor: Option<(Family, usize)>,
+) {
+    conn.execute("DELETE FROM __yoi_schema_migrations", [])
+        .unwrap();
+    for (version, name) in published_history_rows(stage, baseline, predecessor) {
+        conn.execute(
+            "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+            params![version, name],
+        )
+        .unwrap();
     }
 }
 
@@ -184,51 +232,49 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
 }
 
 #[test]
-fn each_published_receipt_prefix_and_fresh_branch_baseline_requires_its_real_shape() {
+fn fresh_published_baselines_require_their_real_shape_and_named_receipts_cannot_substitute_it() {
     for family in FAMILIES {
         for count in 1..=family.names().len() {
             let stage = Stage::Published(family, count);
             let current = 113 + count as i64;
-            // A baseline can start at any retained branch stage, not just 113.
-            for baseline in 113..=current {
-                let conn = fixture(stage, baseline, None);
-                assert_accepted_without_domain_changes(&conn, current);
+            let conn = fixture(stage, current, None);
+            assert_accepted_without_domain_changes(&conn, current);
+            // A baseline alone is ambiguous; a named receipt from another family
+            // must not make this physical database acceptable to the planner.
+            let shape = snapshot(&conn).unwrap();
+            for other in FAMILIES
+                .into_iter()
+                .filter(|other| *other != family && count <= other.names().len())
+            {
+                save_history(&conn, Stage::Published(other, count), 113, None);
+                let rows = saved_rows(&conn);
+                assert!(
+                    published_plan(&conn, current).is_err(),
+                    "{stage:?}, {other:?}"
+                );
+                assert_eq!(saved_rows(&conn), rows);
+                assert_eq!(snapshot(&conn).unwrap(), shape);
             }
         }
     }
 }
 
 #[test]
-fn converged_shapes_keep_all_real_predecessor_receipts_and_erasure_fences() {
-    let origins = std::iter::once(None).chain(
-        FAMILIES
-            .into_iter()
-            .flat_map(|family| (1..=family.names().len()).map(move |count| Some((family, count)))),
-    );
-    for origin in origins {
-        for current in 119..=121 {
-            let conn = fixture(Stage::Converged(current), 113, origin);
-            assert_accepted_without_domain_changes(&conn, current);
-            let erased: i64 = conn
-                .query_row("SELECT erased FROM content_history_targets", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(erased, 1);
-            // A physical check must not act as the Job owner's new Failed migration.
-            let state: String = conn
-                .query_row("SELECT state FROM backend_jobs", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(state, "pending");
-        }
-    }
+fn fresh_converged_shapes_keep_erasure_fences_and_job_state_without_writes() {
     for current in 119..=121 {
-        for baseline in 119..=current {
-            assert_accepted_without_domain_changes(
-                &fixture(Stage::Converged(current), baseline, None),
-                current,
-            );
-        }
+        let conn = fixture(Stage::Converged(current), current, None);
+        assert_accepted_without_domain_changes(&conn, current);
+        let erased: i64 = conn
+            .query_row("SELECT erased FROM content_history_targets", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(erased, 1);
+        // A physical check must not act as the Job owner's new Failed migration.
+        let state: String = conn
+            .query_row("SELECT state FROM backend_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "pending");
     }
 }
 
@@ -304,10 +350,21 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
     result
 }
 
+fn receipt_values_through(conn: &Connection, version: i64) -> Vec<(i64, String, String)> {
+    conn.prepare("SELECT version,name,applied_at FROM __yoi_schema_migrations WHERE version<=?1 ORDER BY version")
+        .unwrap()
+        .query_map([version], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
 fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(Family, usize)>) {
     let source = fixture(stage, baseline, predecessor);
     let expected = immutable_rows(&source);
     let original_receipts = super::super::workspace_schema_migration_history(&source).unwrap();
+    let original_version = original_receipts.last().unwrap().0;
+    let original_receipt_values = receipt_values_through(&source, original_version);
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("catalog.db");
     let mut destination = Connection::open(&path).unwrap();
@@ -357,6 +414,11 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             assert_eq!(history.pop(), Some((version, name.into())));
         }
         assert_eq!(history, original_receipts);
+        assert_eq!(
+            receipt_values_through(&conn, original_version),
+            original_receipt_values,
+            "receipt prefix, including applied_at, must remain unchanged"
+        );
         verify_history(&conn, super::super::LATEST_SCHEMA_VERSION).unwrap();
         let saved = saved_rows(&conn);
         if let Some(previous) = &committed_history {
@@ -369,25 +431,286 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
 
 #[test]
 fn published_database_runs_normal_store_preparation_and_reopens_without_downgrade() {
+    // Every physical stage still runs the real migrations and disk reopen. Only
+    // receipt/baseline permutations move to the pure matrix below: they select
+    // the same canonical tail and do not alter the fixture's schema or data.
+    for family in FAMILIES {
+        for count in 1..=family.names().len() {
+            // Baseline 114 leaves all three families possible. Exercise both
+            // non-first candidates through migration and reopen, where reference
+            // shapes also include later extensions, not just initial acceptance.
+            // Later stages retain named prefixes for these families.
+            let baseline = match (family, count) {
+                (Family::Removal | Family::Jobs, 1) => 114,
+                _ => 113,
+            };
+            exercise_published_runner(Stage::Published(family, count), baseline, None);
+        }
+    }
+    // Retain each family's named predecessor receipts through convergence, too.
+    for (current, predecessor) in [
+        (119, (Family::Permissions, 2)),
+        (120, (Family::Removal, 4)),
+        (121, (Family::Jobs, 5)),
+    ] {
+        exercise_published_runner(Stage::Converged(current), 113, Some(predecessor));
+    }
+}
+
+fn published_histories() -> Vec<(Stage, i64, Option<(Family, usize)>)> {
+    let mut histories = Vec::new();
     for family in FAMILIES {
         for count in 1..=family.names().len() {
             let stage = Stage::Published(family, count);
             for baseline in 113..=113 + count as i64 {
-                exercise_published_runner(stage, baseline, None);
+                histories.push((stage, baseline, None));
             }
         }
     }
     for current in 119..=121 {
         for baseline in 119..=current {
-            exercise_published_runner(Stage::Converged(current), baseline, None);
+            histories.push((Stage::Converged(current), baseline, None));
         }
         for origin in
             std::iter::once(None).chain(FAMILIES.into_iter().flat_map(|family| {
                 (1..=family.names().len()).map(move |count| Some((family, count)))
             }))
         {
-            exercise_published_runner(Stage::Converged(current), 113, origin);
+            histories.push((Stage::Converged(current), 113, origin));
         }
+    }
+    histories
+}
+
+// Exercise the production receipt recognizers without constructing SQLite.
+// This composes receipt rules only; the runner/shape tests own their DB wiring.
+fn published_origin_stages(
+    mut current: i64,
+    mut rows: &[(i64, String)],
+) -> Result<BTreeSet<Stage>> {
+    if current >= 124 {
+        verify_failure_receipts(current, rows, FailureTail::Canonical)?;
+        let end = rows
+            .iter()
+            .position(|row| row.0 >= 124)
+            .unwrap_or(rows.len());
+        rows = &rows[..end];
+        current = 123;
+    }
+    while current >= 122 {
+        rows = pre_failure_receipt_prefix(current, rows)?
+            .ok_or_else(|| invalid("matrix requires a retained published origin"))?;
+        current = rows.last().unwrap().0;
+    }
+    let stages: BTreeSet<_> = retained_receipt_stages(current, rows)?
+        .into_iter()
+        .collect();
+    if stages.is_empty() {
+        return Err(invalid("no matching published receipts"));
+    }
+    Ok(stages)
+}
+
+fn expected_origin_stages(stage: Stage, baseline: i64, current: i64) -> BTreeSet<Stage> {
+    if let Stage::Published(_, count) = stage {
+        if baseline == current {
+            // Independent expectation for ambiguous branch-local baseline names.
+            let families: &[Family] = match current {
+                114 | 115 => &[Family::Permissions, Family::Removal, Family::Jobs],
+                116 | 117 => &[Family::Removal, Family::Jobs],
+                118 => &[Family::Jobs],
+                _ => panic!("unexpected published baseline {current}"),
+            };
+            return families
+                .iter()
+                .map(|family| Stage::Published(*family, count))
+                .collect();
+        }
+    }
+    BTreeSet::from([stage])
+}
+
+#[test]
+fn published_receipt_matrix_preserves_prefixes_and_plans_only_the_missing_tail() {
+    let histories = published_histories();
+    assert_eq!(histories.len(), 81, "retained receipt input matrix");
+    for (stage, baseline, predecessor) in histories {
+        let original = published_history_rows(stage, baseline, predecessor);
+        let current = original.last().unwrap().0;
+        let expected_stages = expected_origin_stages(stage, baseline, current);
+        assert_eq!(
+            published_origin_stages(current, &original).unwrap(),
+            expected_stages
+        );
+        let plan = FailureTail::Canonical.plan(current);
+        assert_eq!(plan.current_schema_version, current);
+        assert_eq!(plan.target_schema_version, 137);
+        assert_eq!(
+            plan.migrations
+                .iter()
+                .map(|step| (step.version, step.name.as_str()))
+                .collect::<Vec<_>>(),
+            expected_published_tail()
+        );
+        // This is a receipt fixture, not a fake migration. Every intermediate
+        // appended prefix must remain recognizable, with no invented 114..121
+        // rows and with the exact independent canonical suffix. Real insertion
+        // and saved prefix preservation are checked by the 14-stage runner.
+        let mut appended = original.clone();
+        for (index, step) in plan.migrations.iter().enumerate() {
+            appended.push((step.version, step.name.clone()));
+            if step.version == 122 || step.version == 123 {
+                let prefix = pre_failure_receipt_prefix(step.version, &appended).unwrap();
+                assert_eq!(prefix, Some(&appended[..original.len() + index]));
+                if step.version == 122 {
+                    assert_eq!(prefix, Some(original.as_slice()));
+                }
+            }
+            assert_eq!(
+                appended[original.len()..]
+                    .iter()
+                    .map(|(version, name)| (*version, name.as_str()))
+                    .collect::<Vec<_>>(),
+                expected_published_tail()[..=index]
+            );
+            assert_eq!(
+                published_origin_stages(step.version, &appended).unwrap(),
+                expected_stages,
+                "{stage:?}, baseline {baseline}, predecessor {predecessor:?}, at {}",
+                step.version
+            );
+            let remaining = FailureTail::Canonical.plan(step.version);
+            assert_eq!(
+                remaining
+                    .migrations
+                    .iter()
+                    .map(|step| (step.version, step.name.as_str()))
+                    .collect::<Vec<_>>(),
+                expected_published_tail()[index + 1..]
+            );
+        }
+    }
+}
+
+#[test]
+fn published_receipt_matrix_rejects_damaged_appended_tail() {
+    for (stage, baseline, predecessor) in published_histories() {
+        let mut rows = published_history_rows(stage, baseline, predecessor);
+        for (current, name) in expected_published_tail() {
+            rows.push((current, name.to_owned()));
+            let mut damaged = rows.clone();
+            damaged.last_mut().unwrap().1 = "unknown receipt".into();
+            assert!(published_origin_stages(current, &damaged).is_err());
+            damaged = rows.clone();
+            damaged.pop();
+            assert!(published_origin_stages(current, &damaged).is_err());
+            damaged = rows.clone();
+            damaged.push(rows.last().unwrap().clone());
+            assert!(published_origin_stages(current, &damaged).is_err());
+            // A later correct receipt must not hide damage to an earlier bridge
+            // or tail receipt. Keep original histories valid: some shortened
+            // published prefixes are themselves legitimate converged origins.
+            for index in rows.iter().position(|row| row.0 == 122).unwrap()..rows.len() {
+                damaged = rows.clone();
+                damaged[index].1 = "counterfeit predecessor".into();
+                assert!(published_origin_stages(current, &damaged).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_receipt_recognition_rejects_unknown_mixed_missing_or_reordered_rows() {
+    let rows = published_history_rows(Stage::Published(Family::Jobs, 5), 113, None);
+    assert_eq!(
+        published_origin_stages(118, &rows).unwrap(),
+        BTreeSet::from([Stage::Published(Family::Jobs, 5)])
+    );
+    let mut invalid_histories = vec![Vec::new()];
+    for baseline in [49, 119, 122] {
+        let mut changed = rows.clone();
+        changed[0].0 = baseline;
+        invalid_histories.push(changed);
+    }
+    for index in 0..rows.len() {
+        let mut changed = rows.clone();
+        changed[index].1 = "unknown receipt".into();
+        invalid_histories.push(changed);
+        let mut changed = rows.clone();
+        changed.remove(index);
+        invalid_histories.push(changed);
+        let mut changed = rows.clone();
+        changed.insert(index, rows[index].clone());
+        invalid_histories.push(changed);
+    }
+    let mut mixed = rows.clone();
+    mixed[2].1 = Family::Removal.names()[1].to_owned();
+    invalid_histories.push(mixed);
+    let mut reordered = rows.clone();
+    reordered.swap(1, 2);
+    invalid_histories.push(reordered);
+    let mut suffix = rows.clone();
+    suffix.push((119, "unknown suffix".into()));
+    invalid_histories.push(suffix);
+    for changed in invalid_histories {
+        assert!(
+            published_origin_stages(118, &changed).is_err(),
+            "{changed:?}"
+        );
+    }
+    assert!(published_origin_stages(117, &rows).is_err());
+    assert!(published_origin_stages(119, &rows).is_err());
+}
+
+#[test]
+fn retained_receipts_keep_both_schema_103_identities_and_baseline_bounds() {
+    for name in [
+        "Passkey metadata and atomic addition results",
+        "Job input retirement independent of immutable receipts",
+    ] {
+        let rows = vec![
+            (102, super::super::SCHEMA_BASELINE_NAME.to_owned()),
+            (103, name.to_owned()),
+        ];
+        assert!(retained_receipt_stages(103, &rows).unwrap().is_empty());
+        let mut counterfeit = rows;
+        counterfeit[1].1 = "counterfeit schema-103 identity".into();
+        assert!(retained_receipt_stages(103, &counterfeit).is_err());
+    }
+    for current in [50, 103, 113] {
+        let rows = [(current, super::super::SCHEMA_BASELINE_NAME.to_owned())];
+        let expected = if current == 113 {
+            vec![Stage::Base]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(retained_receipt_stages(current, &rows).unwrap(), expected);
+    }
+    for current in [49, 122] {
+        let rows = [(current, super::super::SCHEMA_BASELINE_NAME.to_owned())];
+        assert!(retained_receipt_stages(current, &rows).is_err());
+    }
+}
+
+#[test]
+fn bridge_receipts_distinguish_fresh_baselines_and_require_exact_predecessors() {
+    for (current, name, wrong_prior) in [
+        (122, crate::config_adoption::MIGRATION_NAME, 112),
+        (123, super::super::backend_job_upgrade::MIGRATION_NAME, 121),
+    ] {
+        let fresh = [(current, super::super::SCHEMA_BASELINE_NAME.to_owned())];
+        assert!(
+            pre_failure_receipt_prefix(current, &fresh)
+                .unwrap()
+                .is_none()
+        );
+        let missing = [(current, name.to_owned())];
+        assert!(pre_failure_receipt_prefix(current, &missing).is_err());
+        let wrong = [
+            (wrong_prior, super::super::SCHEMA_BASELINE_NAME.to_owned()),
+            (current, name.to_owned()),
+        ];
+        assert!(pre_failure_receipt_prefix(current, &wrong).is_err());
     }
 }
 

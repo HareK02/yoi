@@ -252,9 +252,10 @@ fn cli_help_and_input_errors_are_actionable_without_runtime() -> Result {
         "NEW",
         "edit.json",
         "source/",
-        "Configuration example",
+        "Shared permission configuration example",
         "Example workflow",
-        "subject_id",
+        "worker_default",
+        "Individual Subject policies are Server-managed domain data, not config source.",
         "Exit codes",
     ] {
         assert!(

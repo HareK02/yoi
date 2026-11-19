@@ -107,6 +107,12 @@ Deno.test("Subject selection, paging, audit, permission failure and exact retry 
           await page.getByText("Self-reported handling: waiting", {
             exact: true,
           }).waitFor();
+          await page.locator(".ticket-handling").getByText(
+            "Subject: subject-a",
+            {
+              exact: true,
+            },
+          ).waitFor();
           await page.getByText("Choose responsible Subject", { exact: true })
             .click();
           const select = page.getByRole("combobox", {

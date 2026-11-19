@@ -66,7 +66,7 @@ Deno.test("dedicated policy GET fixtures satisfy the production current-policy p
       "policy",
     ]);
     const view = parsePermissionResponse(body, workspace);
-    assertEquals(view.can_manage, id !== "permissions-reader", id);
+    assertEquals(view.can_manage, id !== "permissions-reader" && id !== "permissions-legacy", id);
     assertEquals(view.catalog.workspace, workspace);
     assertEquals(view.execution_resolution.workspace, workspace);
     assertEquals(view.delegation_resolution.workspace, workspace);

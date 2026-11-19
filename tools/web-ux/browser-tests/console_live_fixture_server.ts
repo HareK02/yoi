@@ -1,3 +1,4 @@
+import { authenticatedFixtureResponse } from "./authenticated_fixture.ts";
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 
 // Synthetic authority, real production shell and protocol transport. No UI overrides.
@@ -182,6 +183,8 @@ async function staticResponse(pathname: string): Promise<Response> {
 }
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
+  const authentication = authenticatedFixtureResponse(request);
+  if (authentication) return authentication;
   if (url.pathname === "/health") return new Response("ok");
   if (url.pathname === "/fixture-state") {
     return json({
@@ -243,6 +246,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         manage_secrets: false,
         manage_runtimes: false,
         delete_workspace: false,
+        delete_subjects: false,
       },
       extension_points: {
         store: "fixture",

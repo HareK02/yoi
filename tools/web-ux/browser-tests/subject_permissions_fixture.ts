@@ -171,7 +171,7 @@ function currentView(id: string): SubjectPermissionPolicyResponse {
       break;
     case "permissions-legacy":
       // 旧参照を新しい包括grantへ読み替えず、限定された対象の証拠を残す。
-      delete policy.reference_encoding;
+      view.can_manage = false;
       policy.execution = assignment([namespace("ticket", ["ticket.read"])]);
       policy.delegation = assignment([set("legacy-worker-notify")]);
       policy.legacy_constraints = {

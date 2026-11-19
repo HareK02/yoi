@@ -430,124 +430,135 @@ fn assert_plan(plan: &WorkspaceSchemaMigrationPlan, tail: Tail, current: i64) {
     );
 }
 
-#[test]
-fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen() {
+fn exercise_failure_histories(tail: Tail) {
     let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
     let expected = fresh.with_conn(|conn| Ok(failure_signature(conn))).unwrap();
-    for tail in [Tail::Canonical, Tail::Published] {
-        for origin in [Origin::Fresh, Origin::Ordered, Origin::Fresh124Prefix] {
-            for current in 123..=127 {
-                if matches!(origin, Origin::Fresh124Prefix) && current < 124 {
-                    continue;
-                }
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join("combined.sqlite");
-                fixture(&path, tail, current, origin);
-                let conn = Connection::open(&path).unwrap();
-                let before_schema = schema(&conn);
-                let mut old_columns = all_columns(&conn);
-                let before_all = values(&conn, &old_columns);
-                let old_receipts = receipts(&conn);
-                let old_failure_columns = FAILURE_COLUMNS
-                    .iter()
-                    .filter(|(table, column)| column_exists(&conn, table, column).unwrap())
-                    .copied()
-                    .collect::<Vec<_>>();
-                let plan = SqliteWorkspaceStore::migration_plan(&path)
-                    .unwrap_or_else(|error| panic!("{tail:?} {origin:?} {current}: {error}"));
-                assert_plan(&plan, tail, current);
-                assert_eq!(schema(&conn), before_schema, "dry run changed source DDL");
-                assert_eq!(
-                    values(&conn, &old_columns),
-                    before_all,
-                    "dry run changed source data/receipts"
-                );
-                old_columns.remove("__yoi_schema_migrations");
-                // This suite owns failure-tail preservation. Ticket17 intentionally
-                // appends its receipt and retires this empty historical table;
-                // populated-row coverage belongs to ticket_plan_retirement.
-                assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
-                old_columns.remove("typed_ticket_orchestration_plans");
-                old_columns.remove("ticket_schema_migrations");
-                exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
-                // Result-only completion is intentionally reopened by schema134;
-                // every other retained value stays byte-for-byte identical.
-                old_columns
-                    .get_mut("backend_jobs")
-                    .unwrap()
-                    .retain(|column| column != "state" && column != "completed_at");
-                let retained = values(&conn, &old_columns);
-                drop(conn);
-
-                let applied = SqliteWorkspaceStore::migrate_database(&path).unwrap();
-                assert_plan(&applied, tail, current);
-                for _ in 0..2 {
-                    let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
-                    store
-                        .with_conn(|conn| {
-                            assert_eq!(
-                                current_schema_version(conn).unwrap(),
-                                LATEST_SCHEMA_VERSION
-                            );
-                            assert_appended_receipts(conn, &old_receipts, &plan);
-                            assert_obsolete_job_tables_removed(conn);
-                            assert_result_only_job_finalizing(conn);
-                            assert_eq!(
-                                values(conn, &old_columns),
-                                retained,
-                                "{tail:?} {origin:?} {current}: retained column data changed"
-                            );
-                            assert_eq!(
-                                failure_signature(conn),
-                                expected,
-                                "{tail:?} {origin:?} {current}: schema differs from fresh owner"
-                            );
-                            for &(table, column) in FAILURE_COLUMNS {
-                                if !old_failure_columns.contains(&(table, column)) {
-                                    assert_eq!(
-                                        rows(conn, &format!("SELECT {column} FROM {table}")),
-                                        vec![vec![Value::Null]]
-                                    );
-                                }
-                            }
-                            assert_bounds_and_restore(conn);
-                            assert_eq!(values(conn, &old_columns), retained);
-                            assert!(rows(conn, "PRAGMA foreign_key_check").is_empty());
-                            Ok(())
-                        })
-                        .unwrap();
-                }
-                let conn = Connection::open(&path).unwrap();
-                assert!(
-                    rows(
-                        &conn,
-                        "SELECT * FROM external_workdir_connection_observations"
-                    )
-                    .is_empty()
-                );
-                let final_receipts = receipts(&conn);
-                assert_eq!(
-                    final_receipts.len(),
-                    old_receipts.len() + plan.migrations.len()
-                );
-                assert_eq!(
-                    final_receipts[old_receipts.len()..]
-                        .iter()
-                        .map(|row| (row[0].clone(), row[1].clone()))
-                        .collect::<Vec<_>>(),
-                    plan.migrations
-                        .iter()
-                        .map(|step| (Value::Integer(step.version), Value::Text(step.name.clone())))
-                        .collect::<Vec<_>>(),
-                    "apply must append exactly the planned identities"
-                );
-                drop(conn);
-                let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
-                assert_plan(&plan, tail, LATEST_SCHEMA_VERSION);
-                assert_eq!(receipts(&Connection::open(&path).unwrap()), final_receipts);
+    for origin in [Origin::Fresh, Origin::Ordered, Origin::Fresh124Prefix] {
+        for current in 123..=127 {
+            if matches!(origin, Origin::Fresh124Prefix) && current < 124 {
+                continue;
             }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("combined.sqlite");
+            fixture(&path, tail, current, origin);
+            let conn = Connection::open(&path).unwrap();
+            let before_schema = schema(&conn);
+            let mut old_columns = all_columns(&conn);
+            let before_all = values(&conn, &old_columns);
+            let old_receipts = receipts(&conn);
+            let old_failure_columns = FAILURE_COLUMNS
+                .iter()
+                .filter(|(table, column)| column_exists(&conn, table, column).unwrap())
+                .copied()
+                .collect::<Vec<_>>();
+            let plan = SqliteWorkspaceStore::migration_plan(&path)
+                .unwrap_or_else(|error| panic!("{tail:?} {origin:?} {current}: {error}"));
+            assert_plan(&plan, tail, current);
+            assert_eq!(schema(&conn), before_schema, "dry run changed source DDL");
+            assert_eq!(
+                values(&conn, &old_columns),
+                before_all,
+                "dry run changed source data/receipts"
+            );
+            old_columns.remove("__yoi_schema_migrations");
+            // This suite owns failure-tail preservation. Ticket17 intentionally
+            // appends its receipt and retires this empty historical table;
+            // populated-row coverage belongs to ticket_plan_retirement.
+            assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
+            old_columns.remove("typed_ticket_orchestration_plans");
+            old_columns.remove("ticket_schema_migrations");
+            exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
+            // Result-only completion is intentionally reopened by schema134;
+            // every other retained value stays byte-for-byte identical.
+            old_columns
+                .get_mut("backend_jobs")
+                .unwrap()
+                .retain(|column| column != "state" && column != "completed_at");
+            let retained = values(&conn, &old_columns);
+            drop(conn);
+
+            // The dry-run above already migrated a disposable copy. Use the
+            // ordinary open for the real apply, then reopen once: calling
+            // migrate_database here would repeat that same dry-run before
+            // opening, followed by two more already-current opens. The CLI
+            // wrapper's plan/result contract is owned by entrypoint tests.
+            // Keep all 28 origin/tail cases and compare their exact appended
+            // receipts to the dry-run plan below.
+            for _ in 0..2 {
+                let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+                store
+                    .with_conn(|conn| {
+                        assert_eq!(current_schema_version(conn).unwrap(), LATEST_SCHEMA_VERSION);
+                        assert_appended_receipts(conn, &old_receipts, &plan);
+                        assert_obsolete_job_tables_removed(conn);
+                        assert_result_only_job_finalizing(conn);
+                        assert_eq!(
+                            values(conn, &old_columns),
+                            retained,
+                            "{tail:?} {origin:?} {current}: retained column data changed"
+                        );
+                        assert_eq!(
+                            failure_signature(conn),
+                            expected,
+                            "{tail:?} {origin:?} {current}: schema differs from fresh owner"
+                        );
+                        for &(table, column) in FAILURE_COLUMNS {
+                            if !old_failure_columns.contains(&(table, column)) {
+                                assert_eq!(
+                                    rows(conn, &format!("SELECT {column} FROM {table}")),
+                                    vec![vec![Value::Null]]
+                                );
+                            }
+                        }
+                        assert_bounds_and_restore(conn);
+                        assert_eq!(values(conn, &old_columns), retained);
+                        assert!(rows(conn, "PRAGMA foreign_key_check").is_empty());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let conn = Connection::open(&path).unwrap();
+            assert!(
+                rows(
+                    &conn,
+                    "SELECT * FROM external_workdir_connection_observations"
+                )
+                .is_empty()
+            );
+            let final_receipts = receipts(&conn);
+            assert_eq!(
+                final_receipts.len(),
+                old_receipts.len() + plan.migrations.len()
+            );
+            assert_eq!(
+                final_receipts[old_receipts.len()..]
+                    .iter()
+                    .map(|row| (row[0].clone(), row[1].clone()))
+                    .collect::<Vec<_>>(),
+                plan.migrations
+                    .iter()
+                    .map(|step| (Value::Integer(step.version), Value::Text(step.name.clone())))
+                    .collect::<Vec<_>>(),
+                "apply must append exactly the planned identities"
+            );
+            drop(conn);
+            let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+            assert_plan(&plan, tail, LATEST_SCHEMA_VERSION);
+            assert_eq!(receipts(&Connection::open(&path).unwrap()), final_receipts);
         }
     }
+}
+
+// Distinct published tails are independent runner units. Each retains every
+// fresh/ordered/prefix origin and all five physical boundaries; no case is skipped.
+#[test]
+fn canonical_failure_histories_plan_apply_and_reopen() {
+    exercise_failure_histories(Tail::Canonical);
+}
+
+#[test]
+fn published_failure_histories_plan_apply_and_reopen() {
+    exercise_failure_histories(Tail::Published);
 }
 
 #[test]

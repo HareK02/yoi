@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import ConfigSourceEditor from "./ConfigSourceEditor.svelte";
 import SubjectPermissions from "../memory/SubjectPermissions.svelte";
 import {
+  permissionPolicyResponse,
   permissionResolution,
   permissionSource,
 } from "../../../../test/permissions-fixture.ts";
@@ -741,6 +742,22 @@ test.each(["saved", "lost_response", "conflict"])(
           receipt: receipt(request.operation_id),
         });
       }
+      if (path === "/api/w/w/subjektiv/subjects/s/permission-policy") {
+        expect(init?.method ?? "GET").toBe("GET");
+        const response = permissionPolicyResponse();
+        response.change_id = adopted ? "policy:adopted" : "policy:old";
+        response.policy.change_id = response.change_id;
+        if (!adopted) {
+          response.policy.execution = {
+            grants: [],
+            exclusions: [],
+            revoked: true,
+          };
+          response.execution_resolution = permissionResolution("w", true);
+        }
+        return jsonResponse(response);
+      }
+      expect(path).toBe("/api/w/w/config/adoption");
       const source = permissionSource();
       source.history_head = adopted ? "head:adopted" : "head:observed";
       source.state = adopted ? candidateState : tree;
@@ -782,11 +799,11 @@ test.each(["saved", "lost_response", "conflict"])(
     expect(permissions.container.textContent).toContain(
       adopted ? "policy:adopted" : "policy:old",
     );
-    expect(permissions.container.textContent).toContain(
-      adopted ? "head:adopted" : "head:observed",
-    );
+    // Configuration head is owned by the editor, not the dedicated policy UI.
+    expect(permissions.container.textContent).not.toContain("head:adopted");
+    expect(permissions.container.textContent).not.toContain("head:observed");
     expect(fetcher.mock.calls.slice(permissionReadAt)).toEqual([[
-      "/api/w/w/config/adoption",
+      "/api/w/w/subjektiv/subjects/s/permission-policy",
     ]]);
     const direct = permissions.getByRole("region", {
       name: "Direct operations",

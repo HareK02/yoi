@@ -48,13 +48,34 @@ YOI_E2E_RESTORE_FIXTURE=target/fixture-candidate-v1 \
   cargo test -p yoi-e2e --features e2e,fixture-support --test worker_restore
 ```
 
-標準資産は`tests/e2e/fixtures/worker-codex-v1`の`manifest.json`・`worker-template.json`・`expected.json`・`workspace-config.dcdl`。manifestの各asset hash/size、schemaと固定ID、生成元commit、modelを検証する。Workspace configのimport参照を黙って最新へ置換せず、Gitで生成元commitに対する`resources`と`crates/builtin-source`の一致を確認する（Git履歴がない場合も失敗）。移植したSessionの正規公開projectionを供給された会話行と照合し、その全snapshotを実executionのWebSocketと比較する。欠落fixture・hash不一致・未実行は成功扱いしない。
+標準資産は`tests/e2e/fixtures/worker-codex-v2`の`manifest.json`・`worker-template.json`・`expected.json`・`workspace-config.dcdl`。manifestの各asset hash/size、schemaと固定ID、生成元commit、modelを検証する。Workspace configのimport参照を黙って最新へ置換せず、Gitで生成元commitに対する`resources`と`crates/builtin-source`の一致を確認する（Git履歴がない場合も失敗）。移植したSessionの正規公開projectionを供給された会話行と照合し、その全snapshotを実executionのWebSocketと比較する。欠落fixture・hash不一致・未実行は成功扱いしない。
 
 応答喪失ケースは同じ`WorkerE2eEnvironment`内の単発loopback relayで公開restore要求をそのまま転送し、完全なupstream応答を受け取った後に呼出元へ0byteで切断する。呼出元のtransport失敗とrelay側のAccepted観測は別の事実として記録する。回収は元のrequest ID・観測tokenをそのまま使い、fresh intentへの古いtokenはHTTP409を要求する。
 
 process終了ケースはそのAccepted receipt確認後に環境が所有するRuntime childだけをkill/reapし、同じroot・Runtime identity・trustから再起動する。seedの再実行・tokenの差替えはしない。再起動前後のcanonical owner全体のhash・operation ID・owner数が一致し、公開APIの保存結果とfull Session snapshotを回収できることを確認する。公開Worker投影の観測tokenは再起動で変わるため、そのfieldだけはcurrent detailとの一致を別に確認する。canonical診断はboundedな読取りのみで、要求・receiptの内容や認証情報はartifactへ保存しない。
 
 これは**commit済みかつterminal receipt保存後**のprocess終了であり、未commit候補やcommit直後・receipt前の終了証明ではない。固定Codex資産へSubmit/Notifyを送らないため、通常入力・Paused admissionの製品E2Eの証明でもない。検証jobはこの明示targetを選択する必要があり、通常suiteだけでは代替しない。
+
+## 固定fixtureの明示的な再取得
+
+`acquire_restore_fixture` exampleは通常テストから呼ばれない、実Codex OAuthの取得入口。明示した認証ディレクトリをRuntime子processだけへ渡し、隔離Server/Runtimeの公開create/input/stopを使って人工会話を2往復取得する。認証providerによるtoken refreshを含め、その認証利用を許可した場合にだけ実行する。認証情報はfixtureや診断へcopyせず、通常restoreテストはこの設定を使わない。
+
+```sh
+# 製品と抽出supportを別invocation/targetに分離する。
+cargo build --locked -p yoi -p yoi-workspace-server -p worker-runtime \
+  --bin yoi --bin yoi-server --bin yoi-runtime --target-dir target/e2e-products
+cargo build -p yoi-e2e --features e2e,fixture-support --example acquire_restore_fixture
+# 取得元を固定するため、tracked sourceはcommitしてcleanにしておく。
+YOI_E2E_BIN="$PWD/target/e2e-products/debug/yoi" \
+YOI_E2E_SERVER_BIN="$PWD/target/e2e-products/debug/yoi-server" \
+YOI_E2E_RUNTIME_BIN="$PWD/target/e2e-products/debug/yoi-runtime" \
+  target/debug/examples/acquire_restore_fixture \
+    --codex-home "$HOME/.codex" \
+    --output tests/e2e/fixtures/worker-codex-v2 \
+    --model codex-oauth/gpt-6.1-sol
+```
+
+出力先は未存在の新versionを指定する。稼働Workspaceを借りず、modelをscripted応答へ置換しない。入力の受付と実行完了を区別し、実WSのIdle観測後に公開snapshotを取得する。Worker停止とRuntime終了後に型付き抽出し、元Session bytes、実WSの会話とoffline projection、asset hash/size、生成元commitを照合する。失敗時は自動再送・既存fixture上書きをせず、harnessが所有processを回収する。候補の公開restore/checkpoint検証と内容確認を終えてから標準fixtureを更新する。
 
 ## Opt-in Runtime checkpoint process試験
 

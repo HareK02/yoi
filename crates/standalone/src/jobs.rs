@@ -192,6 +192,11 @@ impl StandaloneJobs {
         Ok(QuiescentJobClosure { executions })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_fast_on_busy(&self) -> Result<(), JobServiceError> {
+        self.with_store(|store| store.fail_fast_on_busy())
+    }
+
     pub(crate) fn open(path: &Path, cwd: PathBuf) -> Result<Self, JobServiceError> {
         let mut store = JobStore::open(path)?;
         // A Subject connection must drain its pinned retirement queue under its

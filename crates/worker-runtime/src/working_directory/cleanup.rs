@@ -1165,9 +1165,20 @@ pub(super) mod tests {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     }
 
+    fn bind_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        use std::os::fd::AsRawFd;
+
+        // Linux sockaddr_un limits the bind name, not the filesystem location.
+        // Bind through the owned parent directory without changing process cwd,
+        // so deeply nested checkouts still exercise the real socket entry.
+        let directory = fs::File::open(path.parent().unwrap()).unwrap();
+        let short_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+            .join(path.file_name().unwrap());
+        std::os::unix::net::UnixListener::bind(short_path).unwrap()
+    }
+
     #[test]
     fn cleanup_unlinks_fifo_and_socket_without_opening_or_connecting() {
-        use std::os::unix::net::UnixListener;
         for retry in [false, true] {
             let (runtime, materializer, binding) = fixture();
             fs::write(binding.root.join(".git/info/exclude"), "target/\n").unwrap();
@@ -1176,7 +1187,7 @@ pub(super) mod tests {
             let fifo = output.join("ready.fifo");
             let socket = output.join("service.sock");
             create_fifo(&fifo);
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = bind_socket(&socket);
             listener.set_nonblocking(true).unwrap();
             let mut watch = BodyWatch::new(&[fifo, socket]);
             let id = &binding.working_directory.id;
@@ -1210,7 +1221,6 @@ pub(super) mod tests {
 
     #[test]
     fn cleanup_preserves_replaced_fifo_and_socket_before_unlink() {
-        use std::os::unix::net::UnixListener;
         for socket in [false, true] {
             let (runtime, materializer, binding) = fixture();
             fs::write(binding.root.join(".git/info/exclude"), "target/\n").unwrap();
@@ -1218,7 +1228,7 @@ pub(super) mod tests {
             fs::create_dir(&output).unwrap();
             let path = output.join("endpoint");
             let _original = if socket {
-                Some(UnixListener::bind(&path).unwrap())
+                Some(bind_socket(&path))
             } else {
                 create_fifo(&path);
                 None
@@ -1229,7 +1239,7 @@ pub(super) mod tests {
                 |tree, relative, entries| {
                     fs::rename(&path, runtime.path().join("original-endpoint")).unwrap();
                     let _replacement = if socket {
-                        Some(UnixListener::bind(&path).unwrap())
+                        Some(bind_socket(&path))
                     } else {
                         create_fifo(&path);
                         None

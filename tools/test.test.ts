@@ -213,7 +213,10 @@ Deno.test("global runtime-path packages serialize every normal target without lo
         args: [],
         cwd: "/pkg",
       };
-      for (const count of [0, 1, 36, 37, 59, 72, 73, 1135, 1716, 2000]) {
+      const caseBudget = pkg === "yoi-workspace-server" ? 16 : 36;
+      for (
+        const count of [0, 1, 16, 17, 32, 36, 37, 59, 72, 73, 1135, 1716, 2000]
+      ) {
         const names = listedNames(count);
         const shards = shardRustCommand(task, names);
         assert(
@@ -223,8 +226,9 @@ Deno.test("global runtime-path packages serialize every normal target without lo
         for (const shard of shards) {
           const args = shard.task.args;
           assert(args[args.indexOf("--test-threads") + 1] === "1");
-          assert(shard.selectedNames.length <= 36);
-          if (count > 36) {
+          assert(shard.selectedNames.length <= caseBudget);
+          assert(shards.length === Math.max(1, Math.ceil(count / caseBudget)));
+          if (count > caseBudget) {
             assert(args[0] === "--exact");
             assert(args.slice(3).join() === shard.selectedNames.join());
           } else {

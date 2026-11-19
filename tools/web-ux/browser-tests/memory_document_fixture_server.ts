@@ -1,4 +1,8 @@
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
+import type {
+  MessagingCommand,
+  MessagingResult,
+} from "../../../web/workspace/src/lib/generated/chat-api.ts";
 import { journalBrowserFixture } from "./journal_browser_fixture.ts";
 import {
   createSubjectPermissionsFixture,
@@ -17,6 +21,7 @@ if (
 
 // 既存Memory scenarioとpaginationを変えないよう、明示選択時だけ有効にする。
 const navigationMode = Deno.args[3] === "navigation";
+const bodyRecoveryMode = Deno.args[3] === "body-recovery";
 const permissionsMode = Deno.args[3] === "permissions" || navigationMode;
 if (permissionsMode) {
   // 権限の証拠は親から渡された実製品buildを使って採取する。
@@ -680,6 +685,38 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     const { socket, response } = Deno.upgradeWebSocket(request);
     socket.onmessage = (event) => {
       const frame = JSON.parse(String(event.data));
+      // These explicit modes need only empty public history, not delivery or Runtime work.
+      if ((navigationMode || bodyRecoveryMode) && frame.frame === "messaging_request") {
+        const command = frame.message.command as MessagingCommand;
+        const conversation = {
+          id: "conversation",
+          subject_id: emptySubjectId,
+          participant_account_id: "owner",
+          last_user_message_id: null,
+        };
+        let result: MessagingResult = { kind: "rejected", status: 400 };
+        if (command.kind === "open" && command.request.subject_id === emptySubjectId) {
+          result = { kind: "opened", conversation };
+        } else if (
+          command.kind === "subscribe" && command.selector.subject_id === emptySubjectId &&
+          command.selector.conversation_id === conversation.id
+        ) {
+          result = {
+            kind: "subscribed",
+            subscription_id: "fixture-conversation",
+            selector: command.selector,
+            page: { conversation, messages: [], has_more: false },
+          };
+        } else if (command.kind === "unsubscribe") {
+          result = { kind: "unsubscribed", subscription_id: command.subscription_id };
+        }
+        socket.send(JSON.stringify({
+          protocol_version: 2,
+          frame: "messaging_response",
+          message: { request_id: frame.message.request_id, result },
+        }));
+        return;
+      }
       if (frame?.message?.method !== "subscribe_events") return;
       const requestId = frame.message.params.request_id;
       socket.send(JSON.stringify({

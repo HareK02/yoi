@@ -122,30 +122,6 @@ try {
           });
         }
       });
-      // 公開chat APIの外側だけを合成。会話UI・loader・routerは本番のまま。
-      await context.route(
-        "**/api/w/memory-review/chat/conversations**",
-        (route) =>
-          route.fulfill({
-            json: new URL(route.request().url()).pathname.endsWith("/conversations")
-              ? {
-                id: "conversation",
-                subject_id: "empty-subject",
-                participant_account_id: "owner",
-                last_user_message_id: null,
-              }
-              : {
-                conversation: {
-                  id: "conversation",
-                  subject_id: "empty-subject",
-                  participant_account_id: "owner",
-                  last_user_message_id: null,
-                },
-                messages: [],
-                has_more: false,
-              },
-          }),
-      );
       async function direct(path: string, selector: string, canonical = path) {
         const response = await page.goto(base + path);
         assertEquals(response?.status(), 200);
@@ -183,6 +159,9 @@ try {
         );
       }
       async function capture(id: string) {
+        if (id === "chat") {
+          await page.locator(".conversation-page .body-controls > summary").click();
+        }
         if (id === "detail" || id === "chat") {
           await page.locator(".subject-body .actions").waitFor();
           assertEquals(await page.locator(".subject-body [role=alert]").count(), 0);
@@ -264,20 +243,25 @@ try {
           subjects + "/permissions-edit/permissions",
           "#permissions-heading",
         );
-        await page.getByRole("combobox", { name: "Operation", exact: true })
-          .waitFor();
+        // Current policy renders Feature references and resolved keys, not the legacy editor.
+        await page.getByRole("region", { name: "Direct operations", exact: true })
+          .locator(".resolved > li > code").filter({ hasText: /^ticket\.read$/ }).waitFor();
+        await page.getByRole("region", { name: "Delegation ceiling", exact: true })
+          .locator(".resolved > li > code").filter({ hasText: /^ticket\.comment$/ }).waitFor();
+        assertEquals(await page.locator(".permissions [role=alert]").count(), 0);
+        assertEquals(await page.getByText("Read-only policy access.", { exact: true }).count(), 0);
         await selected();
         await capture("permissions-owner");
         await direct(
           subjects + "/permissions-reader/permissions",
           "#permissions-heading",
         );
-        await page.getByRole("status").filter({ hasText: "Read-only." })
-          .waitFor();
+        await page.getByText("Read-only policy access.", { exact: true }).waitFor();
+        assertEquals(await page.locator(".permissions [role=alert]").count(), 0);
         await capture("permissions-reader");
         await direct(
           subjects + "/empty-subject/chat",
-          ".conversation-page textarea",
+          '.conversation-page [role="textbox"]',
         );
         await page.getByText("No public messages yet.").waitFor();
         await selected();
@@ -345,12 +329,12 @@ try {
             [
               `${ws}/memory/empty-subject/conversation?from=bookmark#conversation-subject-heading`,
               `${subjects}/empty-subject/chat?from=bookmark#conversation-subject-heading`,
-              ".conversation-page textarea",
+              '.conversation-page [role="textbox"]',
             ],
             [
               `${ws}/memory/empty-subject/chat`,
               `${subjects}/empty-subject/chat`,
-              ".conversation-page textarea",
+              '.conversation-page [role="textbox"]',
             ],
           ]
         ) await direct(old, selector, next);

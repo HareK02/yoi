@@ -88,7 +88,16 @@ fn io<T>(result: std::io::Result<T>) -> Result<T, RuntimeError> {
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, RuntimeError> {
-    serde_json::from_slice(bytes).map_err(|_| reject("invalid typed document"))
+    serde_json::from_slice(bytes).map_err(|error| {
+        // Never include the serde message: it may quote private source values.
+        RuntimeError::InvalidRequest(format!(
+            "stopped Worker fixture: invalid typed document {} at {}:{} ({:?})",
+            std::any::type_name::<T>(),
+            error.line(),
+            error.column(),
+            error.classify(),
+        ))
+    })
 }
 
 fn no_symlink_components(path: &Path) -> Result<(), RuntimeError> {
@@ -621,11 +630,20 @@ impl StoppedWorkerTemplate {
                         return Err(reject("duplicate or invalid entry identity"));
                     }
                 }
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == "worker.protected_inputs.v1"
+                    && *payload == serde_json::json!({"version": 1, "kinds": []}) => {}
                 LogEntry::Invoke { .. } | LogEntry::LlmUsage { .. } | LogEntry::TurnEnd { .. } => {}
                 _ => {
-                    return Err(reject(
-                        "unsupported conversation record or pending operation",
-                    ));
+                    // The discriminator is generated from the typed enum, not
+                    // arbitrary source content. Do not print the record payload.
+                    let value = serde_json::to_value(log)
+                        .map_err(|_| reject("invalid typed Session record"))?;
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "stopped Worker fixture: unsupported conversation record {} at index {index}",
+                        value["kind"].as_str().unwrap_or("unknown"),
+                    )));
                 }
             }
         }
@@ -824,7 +842,16 @@ impl<'de> Deserialize<'de> for PortableJson {
                 Ok(PortableJson)
             }
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<PortableJson, E> {
-                let lower = value.to_ascii_lowercase();
+                // Current Workers persist this fixed public Workdir guidance even
+                // without attachments. Its literal word "authorization" is not
+                // credential material. Exempt only this exact sentence during
+                // validation, never alter the preserved Session bytes; every
+                // other occurrence and all other markers still fail closed.
+                let inspected = value.replace(
+                    "Resolved targets remain subject to scope, symlink and command authorization.",
+                    "",
+                );
+                let lower = inspected.to_ascii_lowercase();
                 if [
                     "://",
                     "private key",

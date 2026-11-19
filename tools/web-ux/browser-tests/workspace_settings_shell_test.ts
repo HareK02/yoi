@@ -1,4 +1,5 @@
 /// <reference lib="dom" />
+import { productionBuild } from "./production_build.ts";
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
 import { chromium, type Page } from "playwright";
@@ -19,13 +20,7 @@ async function noOverflow(page: Page) {
   );
 }
 Deno.test("production Workspace Settings separates read/edit, discloses details, and preserves keyboard and destructive safety", async () => {
-  const build = await new Deno.Command(Deno.execPath(), {
-    args: ["task", "build"],
-    cwd: join(root, "web/workspace"),
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  assert(build.success, new TextDecoder().decode(build.stderr));
+  const buildRoot = await productionBuild(join(root, "web/workspace"));
   await Deno.mkdir(evidence, { recursive: true });
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
@@ -38,7 +33,7 @@ Deno.test("production Workspace Settings separates read/edit, discloses details,
       "--allow-read",
       join(root, "tools/web-ux/browser-tests/workspace_home_fixture_server.ts"),
       String(port),
-      join(root, "web/workspace/build"),
+      buildRoot,
     ],
     stdout: "null",
     stderr: "null",

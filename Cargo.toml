@@ -119,6 +119,17 @@ opt-level = 2
 [profile.test.package.yoi-workspace-server]
 opt-level = 1
 
+# Repeated configuration and persisted-contract checks exercise these dependencies
+# throughout the test suite. Keep debug assertions and overflow checks enabled.
+[profile.test.package."sha2:0.11.0"]
+opt-level = 2
+
+[profile.test.package.decodal]
+opt-level = 2
+
+[profile.test.package.serde_json]
+opt-level = 2
+
 [workspace.dependencies]
 subjektiv-api = { path = "crates/subjektiv-api" }
 # Internal crates

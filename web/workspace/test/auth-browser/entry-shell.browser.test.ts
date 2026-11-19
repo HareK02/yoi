@@ -176,6 +176,10 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
             "Workspace notifications do not cross logout into the public entry",
             async (page) => {
               page.setDefaultTimeout(5000);
+              // Acceptance is not a stopped lifecycle observation. Still require
+              // a real Workspace notification before testing logout isolation.
+              const stopNotice =
+                "Stop accepted for Private Workspace Orion. Check the refreshed Worker state for confirmation.";
               await page.routeWebSocket(/\/protocol\/ws/, (socket) => {
                 socket.onMessage((message) => {
                   const frame = JSON.parse(String(message));
@@ -233,7 +237,7 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
               await actions.press("Enter");
               await page.getByRole("menuitem", { name: "Stop", exact: true })
                 .click();
-              await page.getByText("Private Workspace Orion stopped", {
+              await page.getByText(stopNotice, {
                 exact: true,
               }).waitFor();
               if (width === 390) {
@@ -339,7 +343,7 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
               await page.getByText(/Login status is unknown/).waitFor();
               assertEquals(await page.locator(".workspace-alert").count(), 0);
               assertEquals(
-                await page.getByText("Private Workspace Orion stopped", {
+                await page.getByText(stopNotice, {
                   exact: true,
                 }).count(),
                 0,

@@ -87,8 +87,12 @@ impl Fixture {
                 }
             })
             .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker-codex-v1")
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker-codex-v2")
             });
+        Self::load_from(root)
+    }
+
+    pub fn load_from(root: PathBuf) -> Result<Self> {
         let file_names: Vec<_> = std::iter::once("manifest.json").chain(ASSETS).collect();
         let source = FixtureSource::capture_flat(&root, &file_names)?;
         let manifest: Manifest =
