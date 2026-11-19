@@ -367,7 +367,18 @@ impl RemovalFixture {
         listener: tokio::net::TcpListener,
         model: RemovalModel,
     ) -> (WorkspaceApi, RemovalServer) {
-        let control = Arc::new(test_control_store(&config));
+        // Reuse only the verified pristine schema for initial setup. A restart
+        // must still validate the persisted database through production startup.
+        let preparation = if config.database_path.exists() {
+            WorkspaceDatabasePreparation::Startup
+        } else {
+            WorkspaceDatabasePreparation::PreparedFixture
+        };
+        if let Some(parent) = config.database_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let control =
+            Arc::new(SqliteWorkspaceStore::open_api_fixture(&config.database_path).unwrap());
         seed_test_registered_workspace(control.as_ref(), &config)
             .await
             .unwrap();
@@ -401,13 +412,14 @@ impl RemovalFixture {
             .with_spawn_model_client_factory(move || Box::new(factory_model.clone())),
         )
         .unwrap();
-        let api = WorkspaceApi::new_with_execution_backend_and_broker(
+        let api = WorkspaceApi::new_with_database_preparation(
             config,
             control,
             Arc::new(execution),
             broker,
             HostExecutors::default(),
             Some(dispatcher),
+            preparation,
         )
         .await
         .unwrap();
