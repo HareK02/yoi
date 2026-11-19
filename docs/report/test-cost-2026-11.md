@@ -1,6 +1,6 @@
 # T-871: 全体時間分布とテスト責務の見直し
 
-通常Rustの初回8,039名を計測し、履歴組合せの単体化、実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。最終通常runnerはwarm build後、399区分を中断なしで完走。Rustは8,045名＝7,999成功＋46既存ignored、欠落・重複0。Web実browser32ファイルと、再生成した固定fixtureによるrestore4件・checkpoint7件も成功した。**全ての明示・手動入口が成功したわけではない**。独立したChat接続browserとnavigation reviewの失敗、cold内部buildのtimeout、目視・外部実環境の未検証は末尾「最終照合と独立した残件」にまとめた。途中の失敗・未完記録は経緯として以下に保持し、最新結果で消していない。
+通常Rustの初回8,039名を計測し、履歴組合せの単体化、実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。通常runnerはwarm build後、399区分を中断なしで完走。Rustは8,045名＝7,999成功＋46既存ignored、欠落・重複0。Web実browser32ファイルと、再生成した固定fixtureによるrestore4件・checkpoint7件も成功した。前回残したChat接続browserとnavigation reviewの失敗は、追加調査で古いtest/fixtureの原因を確定して修正し、各2回成功した。doctest/Web timeoutも同じCargo targetへseed検証buildを重ねたロック競合と切り分けた。原因未確定のまま完了とした判断は撤回しT-871を再開した。最新の訂正・確証は末尾「未確定原因を残した完了判断の撤回と追加検証」に記録する。途中の失敗・未完記録は経緯として保持する。
 
 ## 計測条件と範囲
 
@@ -284,7 +284,9 @@ fixture-support回帰は15成功・既存1 ignored、実行1.93秒（build別）
 
 新候補は保存するが標準fixtureはまだ切替えない。次は新規の隔離seedに現行の正規実行権限を整合させ、認可を迂回せず4 restoreケースと7 checkpointケースを再検証する。checkpoint候補実行、phase別計測、通常runnerの最終単一ソース完走は引き続き未完。T-871全体完了や全E2E成功は主張しない。
 
-## 最終照合と独立した残件
+## 前回の照合と独立した残件（a15f99301時点の記録）
+
+以下の「原因未確定」「cold内部build」および完了判断は当時の記録であり、末尾の追加検証で訂正した。
 
 上の阻害記録以後の最終結果。専用`work/t871-test-cost`で実施し、通常runnerの採用ソースは`77ab0dc0f`。その後の`cb1a75821`は取得exampleの内部変数命名と既存保存keyの例外登録、`9bbd796bb`はrestoreテストの単調時計記録だけで、通常runner対象の製品コード・検証条件は変えていない。各変更targetは別途検証した。元の`yoi-origin`、稼働サービス、`yoi-data`は変更せず、push/deployはしていない。
 
@@ -380,3 +382,62 @@ cargo test --locked -p yoi-e2e --features e2e --test panel --test rewind -- --te
 ```
 
 最終root `cargo check`、全Rust format、`git diff --check`、状態契約命名検査は成功。命名検査は639該当行・未承認0・古い例外0。取得exampleの内部変数は`source_commit`へ変更し、既存fixture formatの保存keyだけを出自の説明付きで例外登録した。fixtureの保存bytesは書換えていない。
+
+## 未確定原因を残した完了判断の撤回と追加検証
+
+利用者の「独立した問題はスキップして報告」は、原因調査も打ち切ってよいという意味ではなかった。原因未確定のままCompletedとした判断を撤回し、T-871をreopenした。以下は`a15f99301`からの追加調査。前回の失敗ログは保持し、製品・保存fixture資産・timeoutは変更していない。
+
+### 1. Chat接続browser: 現行UIへ追従していないdriver
+
+最初の失敗を34.65秒で再現。安全な診断fieldを追加し、`open`/`subscribe`送信後に実BackendのSubscribe ACKをdriverが意図どおり保留したこと、保留中のまま、page errorなしで`Conversation history could not be loaded.`が表示されたことを確認した。これは認可拒否や履歴破損ではなく、意図したACK喪失の表示である。driverは旧`ConversationApiError`の汎用文言`outcome could not be confirmed`を待っていた。
+
+`abf8439a9`で変更された`SubjectConversation.svelte`/chat pageに対し、明示driverだけが古かった。最初のalertだけを修正すると履歴は読み込めたが、次に旧`Start conversation body`が存在せず失敗した。現行DOM/sourceとの照合により、次も同じ追従漏れと確定した:
+
+- body操作は折畳み`Subject controls`内の`Start Subject`/`Stop Subject`。
+- 履歴listは`Conversation messages`。送信結果は長い説明文ではなくbubbleの`Retry message`/`delivered`。
+- 送信ACK不明のalertは`Delivery could not be confirmed.`。
+
+`f11835b77`でdriverを修正。旧文言を消すだけでなく、初回`delivery.state=unknown`、最後の同一入力retryは`accepted`、Subscribe/POST ACKが実際に保留・喪失したことを明示的に検証する。途中の喪失応答は保存済み`unknown`でも`accepted`でもよく、必ずacceptedとした追加診断assertは不適切だったため撤回した（中間失敗ログ保持）。同一の全入力3送信、model call数3、公開履歴2件、内部assistant文非公開、再読込み時のpending入力保持・重複なし、遅延ACK購読解除、body再起動、他Subject/他account分離は維持した。
+
+修正後の実Browser/Backend/SQLite/signed Runtimeケースは**42.77秒・50.56秒の2回成功**。HTTP chat polling0、Subscribe/POST ACK故障注入あり、page errors0、各6 captures。既存binaryと同じproduction Web buildを使用し、製品変更で試験を通したわけではない。
+
+証拠: `target/t871-cause-investigation/chat-before.*`, `chat-after-alerts.*`, `chat-current-ui.*`, `chat-current-ui-2.*`, `chat-repeat.*`。最初のprotocol/DOM証拠は`target/t855-validation/browser/messaging-1795076993565/review-context.json`、成功は`messaging-1795077273552`/`messaging-1795077538966`。診断は状態名・command種別のみでcredential/request本文は追加保存しない。
+
+### 2. Navigation review: 削除済みUIと未対応WebSocket fixture
+
+SubWorkerの保存Session・具体的差分・実行artifactを親が照合した。元の15秒timeoutを再現し、policyがロード済みでも`Operation` comboboxが存在しないことを確認。`f19b69061205bdec710dd843026b89549308e673`で旧editorが廃止され、現行`SubjectPermissions.svelte`はFeature参照とresolved operation keysを表示する。readerも旧`role=status / Read-only.`ではなく`Read-only policy access.`。policy応答自体は現行契約であり変更不要だった。
+
+owner locatorだけを修正してreaderの旧期待値で失敗する対照実行を残した。両方を直すと次の追従漏れが順に現れたため、個別に観測・修正した:
+
+- chatはHTTPではなくWebSocket `messaging_request/open`を送信するが、fixtureは`subscribe_events`以外を無視していた。送信frameと未応答を記録。navigation mode限定で空会話のopen/subscribe/unsubscribe応答を追加し、使われないHTTP mockを削除した。送信/Runtime処理をfake成功にせず、未対応commandは拒否する。
+- chat入力は`textarea`ではなくCodeMirrorのcontenteditable textbox。DOMを記録してrole locatorへ変更した。
+- body actionsはDOMに存在するが折畳みdetails内で非表示。summaryを開いてから従来の表示/no-alert assertionを検証する。
+
+`e1a0882af`で修正し、**light/dark × 1440/768/390の6条件・各56 capturesを2回完走**。失敗0・予期しないfault0。15秒timeoutを維持。navigation・history・canonical/legacy URL・overflow・denied access等のassertionは維持した。shared fixtureを使うMemory/Journal browserも親側で3 tests＋10 steps成功（32秒）。
+
+証拠: `target/t871-navigation-investigation/RESULTS.md`、before/段階修正log、WebSocket/DOM probe、`target/web-ux/t817/t871-cause-{before,corrected,corrected-repeat}`。同じbuild index hashで比較した。自動検証の成功であり、画像の目視承認や実Backend認可の証拠とは区別する。
+
+### 3. doctest/Web timeout: 同一targetへ重ねたseed buildのCargo lock競合
+
+前回の「cold内部buildが180秒を超えた」という説明を訂正する。doctestのstdoutは空で、stderrはpackage cache/artifact directoryのlock待ちだけだった。Webも`generate:profile-schema`の`cargo run -q -p manifest --example profile_authoring_schema`で止まり、Deno testは一件も開始していない。**テスト実行が遅くてtimeoutしたのではない。**
+
+保存logの生成/更新時刻とbuild内容を照合した:
+
+| 証拠 | 時刻（UTC、11/19） |
+|---|---|
+| 通常runner外側build | 07:05:11.946–07:10:33.964 |
+| 別途起動したseed検証build log | 07:06:41.426–07:13:54.143 |
+| doctest lock待ち→timeout | 07:10:34.897–07:13:34.902 |
+| Web schema生成待ち→timeout | 07:10:34.927–07:13:34.933 |
+
+`target/t871-restore-authority/seed-tests.log`は最初にartifact lock待ち、その後同じroot targetでtest-support付き依存/Serverをcompileし、`owner_account_id`不足で終了していた。外側build完了を、以後にCargoを使わない純粋なテスト実行とみなして別のbuildを重ねた私の実行調整が誤りだった。通常runner内には引き続きCargoを使うdoctestとWeb schema生成がある。
+
+対照実験として、この専用checkoutの`target/debug/.cargo-lock`だけを`flock`で保持し、元と同じdoctest/Cargo schema生成commandを既存runnerの隔離・process回収で起動した。診断用3秒deadlineまで両方が進まないことを確認。doctestは元と同じ3つのpackage cache待ち＋artifact directory待ち、`cargo run -q`は診断を出さず待機するログを再現した。holderを回収した後、**外部buildを重ねず元の2入口を同時実行してdoctest23.39秒、Web unit7.43秒で成功**（9成功/21ignored、897成功）。製品・テスト・runnerの180秒timeoutは変更していない。
+
+この原因への対処は、同一targetのcompileを親で直列調整し、必要なら明示的な別targetを使うこと。Web schema生成とdoctestを別々の重いbuildへ無条件分離する製品/runner改修は今回の原因修正として不要。warm一括完走とこの対照実験をcold全依存buildの性能保証へ読み替えないが、報告した2 timeoutの原因を「cold」や「不明」のまま残さない。
+
+証拠: `target/t871-cause-investigation/lock.ts`, `lock-reproduction.json`, `lock-{doctest,schema-quiet}.*`, `uncontended.ts`, `uncontended.json`, `uncontended-{doctest,web-unit}.*`。既存seed失敗と07-05の元logは保持。
+
+### 追加検証の境界
+
+変更は明示browser driver/合成fixtureの3ファイルと本報告だけ。通常Rust/製品コード・固定restore資産は不変なので、通常399区分を再び全実行したとは主張しない。今回の実接続Chat2回、navigation2回、shared fixture回帰、Web unit/doctest対照実行、編集3ファイルのDeno typecheck、diff/命名検査で変更と原因を検証した。以前の全体計測における179.44秒shardの余裕の小ささは実測値として残すが、失敗原因不明と同一扱いにしない。未実行の物理認証器/全platformや起動区間の未細分化は検証・計測範囲の限界であり、観測済み失敗の原因として推測しない。
