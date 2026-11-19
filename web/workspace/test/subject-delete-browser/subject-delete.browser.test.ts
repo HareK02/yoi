@@ -1,5 +1,6 @@
 import { assert, assertEquals } from "@std/assert";
 import { chromium, type Page } from "playwright";
+import { productionBuild } from "../../../../tools/web-ux/browser-tests/production_build.ts";
 import { join, resolve } from "@std/path";
 import {
   assertNoPageWideOverflow,
@@ -25,13 +26,7 @@ Deno.test({
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
-    const build = await new Deno.Command(Deno.execPath(), {
-      args: ["task", "build"],
-      cwd: join(root, "web/workspace"),
-      stdout: "null",
-      stderr: "piped",
-    }).output();
-    assert(build.success, new TextDecoder().decode(build.stderr));
+    const buildRoot = await productionBuild(join(root, "web/workspace"));
     const port = await freePort();
     const server = new Deno.Command(Deno.execPath(), {
       args: [
@@ -39,7 +34,7 @@ Deno.test({
         "-A",
         join(import.meta.dirname!, "fixture-server.ts"),
         String(port),
-        join(root, "web/workspace/build"),
+        buildRoot,
       ],
       stdout: "null",
       stderr: "inherit",
