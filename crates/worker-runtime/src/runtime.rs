@@ -11828,45 +11828,98 @@ mod tests {
 
     #[test]
     fn concurrent_snapshot_and_worker_creation_cross_the_boundary_exactly_once() {
-        let runtime = runtime_with_backend();
-        let barrier = Arc::new(Barrier::new(2));
-        let subscribing_runtime = runtime.clone();
-        let subscribing_barrier = barrier.clone();
-        let subscriber = std::thread::spawn(move || {
-            subscribing_barrier.wait();
-            subscribing_runtime
-                .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
-                .unwrap()
-        });
-        let creating_runtime = runtime.clone();
-        let creating_barrier = barrier.clone();
-        let creator = std::thread::spawn(move || {
-            creating_barrier.wait();
-            creating_runtime
-                .create_worker(task_request("concurrent-boundary"))
-                .unwrap()
-        });
+        use SubscriptionWorkerState::{Idle, Stopped};
 
-        let mut subscription = subscriber.join().unwrap();
-        let created = creator.join().unwrap();
-        let SubscriptionSnapshot::Workers { workers } = subscription.snapshot() else {
-            panic!("runtime_workers must return a Worker snapshot");
-        };
-        let in_snapshot = workers
-            .iter()
-            .any(|worker| worker.worker_id.as_str() == created.worker_id.to_string());
-        let in_event = match subscription.receiver.try_recv() {
-            Ok(RuntimeSubscriptionUpdate {
-                payload: SubscriptionEventPayload::WorkerUpserted { worker },
-            }) => worker.worker_id.as_str() == created.worker_id.to_string(),
-            Ok(update) => panic!("unexpected subscription update: {update:?}"),
-            Err(mpsc::error::TryRecvError::Empty) => false,
-            Err(error) => panic!("unexpected subscription receive error: {error}"),
-        };
-        assert_ne!(
-            in_snapshot, in_event,
-            "the concurrent creation must appear in the snapshot or its ordered suffix, never both"
-        );
+        // Exercise the real Runtime snapshot/publication boundary, substituting
+        // only execution. A reservation is visible as Stopped while spawn runs;
+        // its later Idle publication is a state change, not a duplicate creation.
+        let (runtime, backend) = runtime_and_backend();
+        let before_reservation = runtime
+            .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
+            .unwrap();
+        let (created, while_spawning) = std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let timeout = std::time::Duration::from_secs(5);
+            *backend.before_spawn_result.lock().unwrap() = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(timeout)
+                    .expect("spawn was not released");
+            }));
+            let creator = scope.spawn(|| {
+                runtime
+                    .create_worker(task_request("concurrent-boundary"))
+                    .unwrap()
+            });
+            entered_rx
+                .recv_timeout(timeout)
+                .expect("creation did not reach spawn");
+            let while_spawning =
+                runtime.subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers);
+            // Release and join before asserting, including on subscription errors.
+            release_tx.send(()).unwrap();
+            (creator.join().unwrap(), while_spawning.unwrap())
+        });
+        let completed = runtime
+            .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
+            .unwrap();
+        assert_eq!(created.status, WorkerStatus::Idle);
+
+        // Queue a subsequent transition as well: the completion must precede it
+        // exactly once, with neither a gap nor an extra event at any cut.
+        runtime.stop_worker(&created.worker_ref, None).unwrap();
+        for (cut, mut subscription, expected_snapshot, expected_suffix) in [
+            (
+                "before reservation",
+                before_reservation,
+                vec![],
+                vec![Idle, Stopped],
+            ),
+            (
+                "reservation while spawning",
+                while_spawning,
+                vec![Stopped],
+                vec![Idle, Stopped],
+            ),
+            ("completed", completed, vec![Idle], vec![Stopped]),
+        ] {
+            let SubscriptionSnapshot::Workers { workers } = subscription.snapshot() else {
+                panic!("runtime_workers must return a Worker snapshot");
+            };
+            let snapshot: Vec<_> = workers
+                .iter()
+                .map(|worker| {
+                    assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
+                    worker.state
+                })
+                .collect();
+            assert_eq!(snapshot, expected_snapshot, "snapshot at {cut}");
+            let mut suffix = Vec::new();
+            loop {
+                match subscription.receiver.try_recv() {
+                    Ok(RuntimeSubscriptionUpdate {
+                        payload: SubscriptionEventPayload::WorkerUpserted { worker },
+                    }) => {
+                        assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
+                        suffix.push(worker.state);
+                    }
+                    Ok(update) => panic!("unexpected subscription update at {cut}: {update:?}"),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(error) => panic!("unexpected subscription receive error at {cut}: {error}"),
+                }
+            }
+            assert_eq!(suffix, expected_suffix, "ordered suffix at {cut}");
+            assert_eq!(
+                snapshot
+                    .iter()
+                    .chain(&suffix)
+                    .filter(|&&state| state == Idle)
+                    .count(),
+                1,
+                "completed creation must occur exactly once across snapshot and suffix at {cut}"
+            );
+        }
     }
 
     #[cfg(feature = "fs-store")]
