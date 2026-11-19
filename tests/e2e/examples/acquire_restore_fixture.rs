@@ -218,6 +218,11 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
     cli_config(&env, &binaries.binary("yoi")?, "push", &checkout)?;
     env.start_runtime_with_seed(|_| Ok(()))?;
     let created = env.create_acquisition_worker(fixture::PROFILE)?;
+    // Public response only, never the authorized request or its headers.
+    write_json(
+        &env.artifacts_dir.join("acquisition-create-response.json"),
+        &created,
+    )?;
     let id = created
         .pointer("/worker/worker_id")
         .and_then(Value::as_str)
