@@ -203,7 +203,16 @@ fn rows(snapshot: &SessionSnapshot) -> Result<Vec<Value>> {
             SessionSnapshotEntryData::RunStats { .. } | SessionSnapshotEntryData::Invoke { .. } => {
                 continue;
             }
-            _ => return Err("unexpected non-conversation entry".into()),
+            SessionSnapshotEntryData::RunError { message, .. } => {
+                return Err(format!("acquisition model run failed: {message}").into());
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected non-conversation entry kind: {}",
+                    serde_json::to_value(&entry.data)?["kind"]
+                )
+                .into());
+            }
         };
         rows.push(json!({"entry_id":entry.entry_id,"timestamp":entry.timestamp,"role":role,"parts":parts}));
     }
