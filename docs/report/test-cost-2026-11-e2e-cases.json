@@ -1,5 +1,5 @@
 {
-  "base_revision": "a412713c910f85b1ffdc59c3f41a0df040e9323b",
+  "base_commit": "a412713c910f85b1ffdc59c3f41a0df040e9323b",
   "source": "8386f29b3 (source-equivalent pre-commit execution; server rebuilt, unchanged harness/runtime binaries reused)",
   "conditions": {
     "test_threads": 1,

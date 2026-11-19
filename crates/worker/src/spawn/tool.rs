@@ -28,9 +28,10 @@ use workdir::{
 use crate::PromptCatalogSource;
 use crate::controller::register_worker_tools;
 use crate::feature::builtin::drive::delegation::restrict_internal_child_drive;
+#[cfg(test)]
+use crate::internal_worker::InternalWorkerSessionStatus;
 use crate::internal_worker::{
-    EphemeralSessionStore, InternalWorkerSessionStatus, InternalWorkerVisibility,
-    prepare_internal_worker_session,
+    EphemeralSessionStore, InternalWorkerVisibility, prepare_internal_worker_session,
 };
 use crate::prompt::catalog::PromptCatalog;
 use crate::spawn::registry::SpawnedWorkerRegistry;
@@ -253,9 +254,9 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
 pub(crate) enum ParentNotificationTarget {
     Controller {
         sender: mpsc::WeakSender<Method>,
-        fallback: Arc<dyn Fn(Method) + Send + Sync>,
+        fallback: Arc<dyn Fn(Method) -> std::io::Result<()> + Send + Sync>,
     },
-    Durable(Arc<dyn Fn(Method) + Send + Sync>),
+    Durable(Arc<dyn Fn(Method) -> std::io::Result<()> + Send + Sync>),
 }
 
 impl ParentNotificationTarget {
@@ -269,34 +270,101 @@ impl ParentNotificationTarget {
         Self::Controller { sender, fallback }
     }
 
-    pub(crate) fn notify(&self, child_session_id: String, message: String) {
-        let method = Method::NotifyTracked {
+    pub(crate) fn notify(
+        &self,
+        child_session_id: String,
+        source_id: String,
+        message: String,
+    ) -> std::io::Result<()> {
+        self.deliver(Method::NotifyTracked {
             receipt_scope: protocol::NotificationReceiptScope::Source,
-            notification_request_id: protocol::new_submission_request_id(),
+            notification_request_id: source_id,
             message,
             source: protocol::AuthenticatedInputSource::SubWorker {
                 session_id: child_session_id,
             },
-        };
+        })
+    }
+
+    fn deliver(&self, method: Method) -> std::io::Result<()> {
         match self {
             Self::Controller { sender, fallback } => {
-                // Persist through the Worker-owned pending authority before the
-                // child completion path returns. The Controller delivery is only
-                // a wake-up hint; replay is idempotent by notification_request_id.
-                fallback(method.clone());
-                let Some(parent_method_tx) = sender.upgrade() else {
-                    return;
-                };
-                tokio::spawn(async move {
-                    if parent_method_tx.send(method).await.is_err() {
-                        tracing::warn!(
-                            "failed to wake parent Controller after durable notification acceptance"
-                        );
-                    }
-                });
+                // Acceptance precedes wakeup. A failed save must not be reported
+                // as acceptance; every retry reuses the original method identity.
+                fallback(method.clone())?;
+                if let Some(parent_method_tx) = sender.upgrade() {
+                    tokio::spawn(async move {
+                        if !matches!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                parent_method_tx.send(method)
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
+                            tracing::warn!(
+                                "parent notification accepted but Controller wakeup was not confirmed"
+                            );
+                        }
+                    });
+                }
+                Ok(())
             }
             Self::Durable(notify) => notify(method),
         }
+    }
+
+    pub(crate) fn notify_lifecycle(
+        &self,
+        child_name: &str,
+        event: crate::internal_worker::InternalWorkerLifecycleEvent,
+    ) {
+        let child_name: String = child_name
+            .chars()
+            .filter(|ch| !ch.is_control() && *ch != '`')
+            .take(128)
+            .collect();
+        let message = format!(
+            "SubWorker `{child_name}` lifecycle {:?}; session={}, source={}, input={:?}, timestamp_ms={}, terminal_entry={:?}, source_recorded={}. This is an execution fact, not task fulfillment. Stopped refers to the actor and its Feature runtime, not registry removal or descendant/scope cleanup. Session observation is available only while the parent retains this ephemeral child; removal/restart may make it unavailable.",
+            event.fact,
+            event.session_id,
+            event.source_id,
+            event.input_id,
+            event.timestamp_ms,
+            event.terminal_entry_id,
+            event.source_recorded,
+        );
+        if self
+            .notify(
+                event.session_id.clone(),
+                event.source_id.clone(),
+                message.clone(),
+            )
+            .is_ok()
+        {
+            return;
+        }
+        // Retain the exact source/body for bounded in-process recovery. This is
+        // not a disk outbox and cannot survive parent/Host process loss. Pending
+        // acceptance and later history commit have separate existing receipts.
+        let target = self.clone();
+        tokio::spawn(async move {
+            for delay_ms in [100, 500, 2000] {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                if target
+                    .notify(
+                        event.session_id.clone(),
+                        event.source_id.clone(),
+                        message.clone(),
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            tracing::warn!(source_id = %event.source_id, child_session_id = %event.session_id,
+                "Internal lifecycle notification acceptance unconfirmed after bounded retries; source recovery ends with ephemeral producer lifetime");
+        });
     }
 }
 
@@ -594,10 +662,10 @@ impl Tool for SubWorkerSpawnTool {
             store,
             InternalWorkerVisibility::ParentClient,
             Some(child_registry.clone()),
-            Some(Arc::new(move |status| {
-                if matches!(
-                    status,
-                    InternalWorkerSessionStatus::Failed | InternalWorkerSessionStatus::Stopped
+            Some(Arc::new(move |event| {
+                if !matches!(
+                    event.fact,
+                    crate::internal_worker::InternalWorkerLifecycleFact::RunFinished
                 ) {
                     if let Some(registry) = registry.upgrade() {
                         let child_name = child_name.clone();
@@ -612,10 +680,7 @@ impl Tool for SubWorkerSpawnTool {
                         });
                     }
                 }
-                let message = format!(
-                    "SubWorker `{child_name}` turn ended with status {status:?}. Inspect its committed session with worker-observation tools before making completion decisions."
-                );
-                parent_notifications.notify(child_name.clone(), message);
+                parent_notifications.notify_lifecycle(&child_name, event);
             })),
             Some(child_workdir_tool_broker.clone()),
         )
@@ -1253,13 +1318,20 @@ enabled = false
             parent_method_tx.downgrade(),
             ParentNotificationTarget::Durable(Arc::new(move |_| {
                 *captured_for_fallback.lock().unwrap() = true;
+                Ok(())
             })),
         );
 
         drop(parent_method_tx);
 
         assert!(parent_method_rx.recv().await.is_none());
-        target.notify("child-session".into(), "late completion".to_string());
+        target
+            .notify(
+                "child-session".into(),
+                "source-id".into(),
+                "late completion".to_string(),
+            )
+            .unwrap();
         assert!(*captured.lock().unwrap());
     }
 
@@ -1272,10 +1344,17 @@ enabled = false
             parent_method_tx.downgrade(),
             ParentNotificationTarget::Durable(Arc::new(move |_| {
                 durable_for_fallback.store(true, Ordering::Release);
+                Ok(())
             })),
         );
 
-        target.notify("child-session".into(), "completed".into());
+        target
+            .notify(
+                "child-session".into(),
+                "source-id".into(),
+                "completed".into(),
+            )
+            .unwrap();
         let wakeup = parent_method_rx.recv().await.unwrap();
         assert!(durable.load(Ordering::Acquire));
         assert!(matches!(
@@ -1293,9 +1372,16 @@ enabled = false
         let captured_for_target = captured.clone();
         let target = ParentNotificationTarget::Durable(Arc::new(move |method| {
             *captured_for_target.lock().unwrap() = Some(method);
+            Ok(())
         }));
 
-        target.notify("child-session".into(), "completed".into());
+        target
+            .notify(
+                "child-session".into(),
+                "source-id".into(),
+                "completed".into(),
+            )
+            .unwrap();
 
         assert!(matches!(
             captured.lock().unwrap().take(),
@@ -1342,7 +1428,7 @@ enabled = false
             SubWorkerSpawnTool::new(
                 "parent".into(),
                 context,
-                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+                ParentNotificationTarget::Durable(Arc::new(|_| Ok(()))),
                 runtime.path().to_path_buf(),
                 workspace_root.clone(),
                 Some(broker.clone()),
@@ -1474,7 +1560,7 @@ enabled = false
             workspace_context,
             ParentNotificationTarget::with_controller_fallback(
                 parent_method_tx.downgrade(),
-                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+                ParentNotificationTarget::Durable(Arc::new(|_| Ok(()))),
             ),
             runtime.path().to_path_buf(),
             workspace_root.clone(),
@@ -1597,8 +1683,8 @@ enabled = false
                 message,
                 source: protocol::AuthenticatedInputSource::SubWorker { session_id },
                 ..
-            } if session_id == "reviewer-child"
-                && message.contains("SubWorker `reviewer-child` turn ended with status Idle")
+            } if session_id == record.session.session_id_string()
+                && message.contains("SubWorker `reviewer-child` lifecycle RunFinished")
         ));
         assert!(!runtime.path().join("reviewer-child/sock").exists());
 
@@ -1799,7 +1885,7 @@ enabled = false
                     Some(WorkspaceId::new("workspace-test").unwrap()),
                     parent_client.clone(),
                 ),
-                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+                ParentNotificationTarget::Durable(Arc::new(|_| Ok(()))),
                 runtime.path().to_path_buf(),
                 workspace_root.clone(),
                 Some(workdir_tool_broker),
@@ -1930,7 +2016,7 @@ enabled = false
             workspace_context,
             ParentNotificationTarget::with_controller_fallback(
                 parent_method_tx.downgrade(),
-                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+                ParentNotificationTarget::Durable(Arc::new(|_| Ok(()))),
             ),
             runtime.path().to_path_buf(),
             workspace_root.clone(),

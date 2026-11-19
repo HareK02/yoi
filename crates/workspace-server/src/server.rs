@@ -38,6 +38,7 @@ mod service_authority;
 mod session_registration;
 mod subject_authorization;
 mod subject_permission_policy;
+mod worker_lifecycle_notifications;
 pub(crate) use launch_policy_registry::sync_launch_policy_permissions;
 mod subject_body;
 mod subjektiv_deletion;
@@ -23966,6 +23967,12 @@ fn maybe_dispatch_orchestrator_turn_end(
 ) {
     use protocol::subscription::SubscriptionWorkerState;
 
+    if current == SubscriptionWorkerState::Stopped
+        || (current == SubscriptionWorkerState::Idle
+            && previous == Some(SubscriptionWorkerState::Running))
+    {
+        worker_lifecycle_notifications::recover(api);
+    }
     if current != SubscriptionWorkerState::Idle
         || previous != Some(SubscriptionWorkerState::Running)
     {

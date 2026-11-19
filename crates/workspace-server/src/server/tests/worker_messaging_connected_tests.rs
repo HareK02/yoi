@@ -9,6 +9,8 @@ use agen::llm_client::{
 };
 use worker_runtime::worker_backend::RuntimeWorkerFactory;
 
+include!("worker_lifecycle_connected_tests.rs");
+
 const ORIGIN: &str = "ROUNDTRIP_ORIGIN";
 const PING: &str = "ROUNDTRIP_QUESTION";
 const REPLY: &str = "ROUNDTRIP_PROGRESS_RESULT";

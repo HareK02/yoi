@@ -456,7 +456,7 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .collect::<Vec<_>>(),
         (92..=113)
             .chain([
-                122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136
+                122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137
             ])
             .collect::<Vec<_>>()
     );
@@ -545,7 +545,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (133, crate::subject_policy::MIGRATION_NAME.into()),
                     (134, backend_job_finalizing::MIGRATION_NAME.into()),
                     (135, subject_release_recording_store::MIGRATION_NAME.into()),
-                    (136, launch_policy_identity_migration::MIGRATION_NAME.into())
+                    (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
+                    (137, worker_lifecycle_notifications::MIGRATION_NAME.into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

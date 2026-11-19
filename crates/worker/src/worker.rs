@@ -6900,6 +6900,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
         if !has_invocations && self.should_rollback_empty_turn(&result, &rollback_snapshot) {
             self.rollback_empty_turn(rollback_snapshot)?;
+            // Roll back unmaterialized input, not the fact that the run was
+            // cancelled. This early return bypasses normal terminal persistence.
+            if matches!(
+                result,
+                EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
+            ) {
+                self.commit_entry(LogEntry::RunCancelled {
+                    ts: segment_log::now_millis(),
+                    entry_id: None,
+                })?;
+            }
             return Ok(WorkerRunResult::RolledBack);
         }
 
@@ -13486,6 +13497,26 @@ status: 200,
             .unwrap();
             assert_eq!(result.unwrap(), WorkerRunResult::RolledBack);
             let after = store.read_all(loc.session_id, loc.segment_id).unwrap();
+            let cancelled = after
+                .iter()
+                .filter_map(|entry| match entry {
+                    LogEntry::RunCancelled { entry_id, .. } => Some(entry_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cancelled.len(),
+                usize::from(!pause),
+                "input rollback must preserve cancellation, but pause is not cancellation"
+            );
+            assert!(
+                cancelled.iter().all(Option::is_some),
+                "saved cancellation needs a stable terminal identity"
+            );
+            assert!(!after.iter().any(|entry| matches!(
+                entry,
+                LogEntry::RunCompleted { .. } | LogEntry::RunErrored { .. }
+            )));
             assert_eq!(
                 serde_json::to_value(&after[..before.len()]).unwrap(),
                 serde_json::to_value(&before).unwrap()
@@ -13502,6 +13533,17 @@ status: 200,
             drop(store);
             let reopened = session_store::FsStore::new(dir.path()).unwrap();
             let entries = reopened.read_all(loc.session_id, loc.segment_id).unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        LogEntry::RunCancelled { entry_id, .. } => Some(entry_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                cancelled,
+                "reopen must retain the same cancellation identity"
+            );
             assert_eq!(
                 restore_history_entries(loc.session_id, loc.segment_id, &entries).unwrap(),
                 restore_history_entries(loc.session_id, loc.segment_id, &before).unwrap()

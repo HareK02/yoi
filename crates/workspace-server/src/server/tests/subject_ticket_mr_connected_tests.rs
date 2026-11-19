@@ -1201,10 +1201,12 @@ impl FullModel {
             return call(request, "full-coder-reviewer-list", "WorkerList", json!({}));
         }
         if summary_ok(request, "full-coder-spawn-reviewer") {
-            // Only the real child's ordinary turn-ended notification wakes this
-            // branch. No shared test channel supplies a verdict to the Coder.
+            // Only the real child's run-finished lifecycle notification wakes
+            // this branch. No shared test channel supplies a verdict to the Coder.
             let incoming = text(request);
-            if !incoming.contains(&format!("SubWorker `{REVIEWER_NAME}` turn ended")) {
+            if !incoming.contains(&format!(
+                "SubWorker `{REVIEWER_NAME}` lifecycle RunFinished"
+            )) {
                 return done();
             }
             let mr = success(request, "full-coder-pre-review-mr").unwrap();

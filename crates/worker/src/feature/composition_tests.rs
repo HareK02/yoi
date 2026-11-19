@@ -55,7 +55,7 @@ fn compose_sub_worker(registry: &mut FeatureRegistryBuilder, enabled: bool, cont
         registry,
         manifest,
         WorkerWorkspaceContext::no_workspace(),
-        ParentNotificationTarget::Durable(Arc::new(|_| {})),
+        ParentNotificationTarget::Durable(Arc::new(|_| Ok(()))),
         std::path::PathBuf::from("unused-runtime"),
         None,
         None,
@@ -208,8 +208,7 @@ fn late_install_failure_rolls_back_migrated_tools_instructions_services_and_wip_
     let existing = mounts
         .allocate_namespace("objective", "existing-objectives")
         .unwrap();
-    objective::mount_workspace_http_objective_wip(&mut mounts, client.clone(), &existing)
-        .unwrap();
+    objective::mount_workspace_http_objective_wip(&mut mounts, client.clone(), &existing).unwrap();
     let before = mounts.routes().map(str::to_owned).collect::<Vec<_>>();
     let mut registry = FeatureRegistryBuilder::new();
     let route = mounts
@@ -269,11 +268,7 @@ impl FeatureModule for PartialWipFailure {
                 available: true,
                 identity: true,
             });
-            objective::mount_workspace_http_objective_wip(
-                mounts,
-                client.clone(),
-                &self.route,
-            )?;
+            objective::mount_workspace_http_objective_wip(mounts, client.clone(), &self.route)?;
             // Deterministic failure after the first mount changed publication metadata.
             objective::mount_workspace_http_objective_wip(mounts, client, &self.route)
         })

@@ -15070,9 +15070,10 @@ mod tests {
     #[cfg(feature = "ws-server")]
     #[serial_test::serial(worker_allocation)]
     fn idle_only_input_acknowledges_idle_and_rejects_running_paused_and_stopped() {
-        let client = MockClient::sequential(vec![MockResponse::Hang(
-            simple_text_events().into_iter().take(2).collect(),
-        )]);
+        let client = MockClient::sequential(vec![
+            MockResponse::Hang(simple_text_events().into_iter().take(2).collect()),
+            MockResponse::Hang(simple_text_events().into_iter().take(2).collect()),
+        ]);
         let runtime_base = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
@@ -15097,10 +15098,33 @@ mod tests {
             input.submission_request_id = Some(id.to_string());
             input
         };
+        let mut streaming = backend
+            .workers
+            .lock()
+            .unwrap()
+            .get(&detail.worker_ref)
+            .unwrap()
+            .handle
+            .subscribe();
         let ack = runtime
             .send_input(&detail.worker_ref, input("idle-input"))
             .unwrap();
         assert_eq!(ack.submission.unwrap().submission_request_id, "idle-input");
+        // Pausing before any assistant output rolls back rather than retaining a
+        // paused run. Synchronize on output, not merely accepted/running input.
+        backend
+            .run_on_adapter_runtime(async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !matches!(
+                        streaming.recv().await.map_err(|e| e.to_string())?,
+                        Event::TextDelta { .. }
+                    ) {}
+                    Ok::<(), String>(())
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            })
+            .unwrap();
         wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
         let error = runtime
             .send_input(&detail.worker_ref, input("running-input"))
@@ -15159,7 +15183,7 @@ mod tests {
             })
             .unwrap();
         assert!(pending.submissions.is_empty());
-        // Human Submit still queues while paused; idle-only input never does.
+        // Human Submit queues while paused; Notify resumes the existing run.
         let ack = runtime
             .send_input(&detail.worker_ref, WorkerInput::user("human-input"))
             .unwrap();
@@ -15167,7 +15191,16 @@ mod tests {
             ack.submission.unwrap().disposition,
             protocol::SubmissionDisposition::Queued
         );
-        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused);
+        let mut notify = WorkerInput::user("advisory");
+        notify.kind = WorkerInputKind::Notify;
+        assert!(
+            runtime
+                .send_input(&detail.worker_ref, notify)
+                .unwrap()
+                .notification
+                .is_some()
+        );
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
         let handle = backend
             .workers
             .lock()

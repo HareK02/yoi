@@ -387,9 +387,10 @@ mod restore_candidate {
                             },
                         )
                         .await;
-                        // Notify resumes a Paused turn. Accept the saved inputs
-                        // while the seed model is still hanging in Running, then
-                        // pause only after their durable receipts are observed.
+                        // Keep the seed model hanging while accepting saved inputs.
+                        // Notify resumes a Paused Controller, so pausing here would
+                        // consume the notice (and could start the queued submissions)
+                        // before the restore fixture has shut down.
                         let mut receipts = Vec::new();
                         for id in [FIRST, SECOND] {
                             let receipt = submit(&handle, id).await;
@@ -402,22 +403,11 @@ mod restore_candidate {
                             ));
                             receipts.push(serde_json::to_value(receipt).unwrap());
                             if id == FIRST {
+                                // The second Submit checkpoints the accepted but
+                                // uncommitted notification activation for restore.
                                 notify_from_source(&handle, notice_source.clone()).await;
                             }
                         }
-                        let state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
-                        let mut events = handle.subscribe();
-                        handle
-                            .send(Method::Pause {
-                                command: next_internal_command(&state).unwrap(),
-                            })
-                            .await
-                            .unwrap();
-                        receive_matching(&mut events, "seed pause acknowledgement", |event| {
-                            matches!(event, Event::WorkerState { snapshot }
-                                if snapshot.catalog_status() == protocol::WorkerStatus::Paused)
-                        })
-                        .await;
                         assert_eq!(pending(&handle).await.submissions.len(), 2);
                         shutdown_profile_controller(seed.0.take().unwrap()).await;
                         assert_eq!(seed_calls.load(Ordering::SeqCst), 1);

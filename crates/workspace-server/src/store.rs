@@ -108,10 +108,15 @@ mod assignment_delivery;
 mod notification_diagnostics;
 #[path = "notification_routing.rs"]
 mod notification_routing;
+#[path = "worker_lifecycle_notifications.rs"]
+mod worker_lifecycle_notifications;
 pub use notification_routing::{
     JobNotificationFacts, JobNotificationSource, NotificationDeliveryKey, NotificationEventKind,
     NotificationFailureCode, NotificationPurpose, NotificationReason, TicketWorkerNotification,
     TicketWorkerNotificationTarget,
+};
+pub use worker_lifecycle_notifications::{
+    WorkerLifecycleEvent, WorkerLifecycleNotification, WorkerLifecycleOutcome, WorkerLifecycleScan,
 };
 #[path = "assignment_tracking.rs"]
 mod assignment_tracking;
@@ -161,7 +166,7 @@ pub(crate) use subject_release_recording_store::{
 
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
-const LATEST_SCHEMA_VERSION: i64 = 136;
+const LATEST_SCHEMA_VERSION: i64 = 137;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -617,6 +622,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 136,
         name: launch_policy_identity_migration::MIGRATION_NAME,
         apply: launch_policy_identity_migration::migrate,
+    },
+    Migration {
+        version: 137,
+        name: worker_lifecycle_notifications::MIGRATION_NAME,
+        apply: worker_lifecycle_notifications::migrate,
     },
 ];
 
@@ -2515,6 +2525,42 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         failure_cause: Option<&crate::backend_job::BackgroundFailure>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord>;
+    fn lifecycle_scan_targets(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkerLifecycleScan>>;
+    fn checkpoint_worker_lifecycle(
+        &self,
+        workspace: &str,
+        scan: &WorkerLifecycleScan,
+        run_cursor: Option<&str>,
+        stop_after: Option<&str>,
+    ) -> Result<()>;
+    fn capture_worker_lifecycle(
+        &self,
+        workspace: &str,
+        grant_id: &str,
+        event: &WorkerLifecycleEvent,
+    ) -> Result<()>;
+    fn pending_worker_lifecycle(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkerLifecycleNotification>>;
+    fn prepare_worker_lifecycle(
+        &self,
+        workspace: &str,
+        source: &WorkerLifecycleNotification,
+        content: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<String>;
+    fn ack_worker_lifecycle(
+        &self,
+        workspace: &str,
+        id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<()>;
     fn job_notification_source(
         &self,
         workspace: &str,
@@ -9652,6 +9698,54 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn lifecycle_scan_targets(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkerLifecycleScan>> {
+        worker_lifecycle_notifications::scan_targets(self, workspace, limit)
+    }
+    fn checkpoint_worker_lifecycle(
+        &self,
+        workspace: &str,
+        scan: &WorkerLifecycleScan,
+        run_cursor: Option<&str>,
+        stop_after: Option<&str>,
+    ) -> Result<()> {
+        worker_lifecycle_notifications::checkpoint(self, workspace, scan, run_cursor, stop_after)
+    }
+    fn capture_worker_lifecycle(
+        &self,
+        workspace: &str,
+        grant_id: &str,
+        event: &WorkerLifecycleEvent,
+    ) -> Result<()> {
+        worker_lifecycle_notifications::capture(self, workspace, grant_id, event)
+    }
+    fn pending_worker_lifecycle(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkerLifecycleNotification>> {
+        worker_lifecycle_notifications::pending(self, workspace, limit)
+    }
+    fn prepare_worker_lifecycle(
+        &self,
+        workspace: &str,
+        source: &WorkerLifecycleNotification,
+        content: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<String> {
+        worker_lifecycle_notifications::prepare(self, workspace, source, content, target)
+    }
+    fn ack_worker_lifecycle(
+        &self,
+        workspace: &str,
+        id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<()> {
+        worker_lifecycle_notifications::ack(self, workspace, id, target)
+    }
     fn job_notification_source(
         &self,
         workspace: &str,
@@ -17453,6 +17547,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(subject_release_recording_store::SCHEMA_SQL)?;
     conn.execute_batch(crate::config_publication::SCHEMA)?;
     conn.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
+    worker_lifecycle_notifications::install(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!("fresh Ticket schema verification failed: {error}"))
     })?;
@@ -18648,6 +18743,7 @@ mod tests {
     include!("notification_routing_tests.rs");
     include!("notification_diagnostics_tests.rs");
     include!("job_notification_tests.rs");
+    include!("worker_lifecycle_notification_tests.rs");
     include!("implementation_result_tests.rs");
     include!("store_workspace_config_tests.rs");
     include!("plugin_plan/launch_migration_tests.rs");
@@ -22133,6 +22229,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 136,
                 name: launch_policy_identity_migration::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 137,
+                name: worker_lifecycle_notifications::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -22281,6 +22381,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (134, backend_job_finalizing::MIGRATION_NAME.into()),
 (135, subject_release_recording_store::MIGRATION_NAME.into()),
                     (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
+                    (137, worker_lifecycle_notifications::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);

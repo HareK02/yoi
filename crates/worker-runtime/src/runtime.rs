@@ -5617,7 +5617,20 @@ impl Runtime {
         }
         candidate
             .retain_stop_termination(operation_id, termination.expect("validated termination"))?;
-        let (candidate, ack) = candidate.stopped_candidate(operation_id);
+        let (mut candidate, ack) = candidate.stopped_candidate(operation_id);
+        let event_id = operation_id.to_string();
+        candidate
+            .restore_guard
+            .completed_stop_facts
+            .entry(event_id.clone())
+            .or_insert_with(|| runtime_api::WorkerStoppedFact {
+                operation_id: event_id,
+                occurred_at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            });
         state.persist_worker_record_with_fence(&candidate)?;
         state.workers.insert(worker_ref.worker_id, candidate);
         state.publish_worker_upsert(worker_ref.worker_id)?;
@@ -6295,6 +6308,119 @@ impl Runtime {
         request: &runtime_api::SessionMaterialReadRequest,
     ) -> runtime_api::SessionMaterialReadAvailability {
         crate::session_material::read(self, scope, request)
+    }
+
+    /// Read committed activity without restoring a Worker or running cleanup.
+    #[cfg(feature = "fs-store")]
+    pub fn worker_activity_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::WorkerActivityRequest,
+    ) -> Result<runtime_api::WorkerActivityResponse, RuntimeError> {
+        use runtime_api::{RunTerminalAvailability as A, SessionPublicUnavailableReason as R};
+        if scope.workspace_id != request.workspace_id
+            || request.stop_after.as_ref().is_some_and(|v| v.len() > 128)
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Invalid Worker activity scope or cursor".into(),
+            ));
+        }
+        let worker_id: WorkerId = request
+            .worker_id
+            .parse()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid Worker identity".into()))?;
+        let worker_ref = WorkerRef::new(worker_id);
+        let operation = self.worker_operation_lock(worker_id)?;
+        let _operation_guard = operation.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        let (runtime_root, stops, next_stop) = {
+            let state = self.lock()?;
+            let worker = state.worker(&worker_ref)?;
+            if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
+                return Err(RuntimeError::WorkerNotFound { worker_id });
+            }
+            let store = state.fs_store().ok_or_else(|| {
+                RuntimeError::InvalidRequest("Worker activity requires retained storage".into())
+            })?;
+            let mut stops: Vec<_> = worker
+                .restore_guard
+                .completed_stop_facts
+                .iter()
+                .filter(|(id, _)| request.stop_after.as_ref().is_none_or(|after| *id > after))
+                .take(101)
+                .map(|(_, fact)| fact.clone())
+                .collect();
+            let more = stops.len() > 100;
+            stops.truncate(100);
+            let next_stop = more.then(|| {
+                stops
+                    .last()
+                    .expect("nonempty bounded page")
+                    .operation_id
+                    .clone()
+            });
+            (store.runtime_dir().to_path_buf(), stops, next_stop)
+        };
+        let aggregate = runtime_root.join("workers").join(worker_id.to_string());
+        let run = (|| -> Result<_, crate::worker_backend::SessionMaterialSourceError> {
+            let metadata = session_store::worker_metadata::WorkerAggregateStore::open_read_only(
+                &aggregate,
+                crate::worker_backend::ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(
+                    &worker_ref,
+                ),
+            )
+            .and_then(|s| s.read_read_only())
+            .map_err(|_| "Worker Session metadata unavailable")?
+            .ok_or("Worker Session metadata missing")?;
+            if metadata.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
+                return Err("Session Workspace mismatch".into());
+            }
+            let active = metadata.active.ok_or("Session pointer missing")?;
+            if active.segment_id.is_none() {
+                if crate::retention::unmaterialized_session(&aggregate, &scope.workspace_id)
+                    .map_err(|_| "Session storage unavailable")?
+                    == Some(active.session_id)
+                {
+                    return Ok(A::NotMaterialized);
+                }
+                return Err("Session active Segment missing".into());
+            }
+            let retention = crate::retention::runtime_session_retention(&runtime_root);
+            let guard = retention
+                .lock_live(active.session_id)
+                .map_err(|_| "Session is unavailable or erased")?;
+            let page = session_store::public_material::scan_worker_run_terminals_guarded(
+                &aggregate.join("session"),
+                active.session_id,
+                request.run_cursor.as_ref(),
+                &guard,
+            )?;
+            Ok(A::Page { page })
+        })();
+        let run = run.unwrap_or_else(|error| {
+            use session_store::public_material::PublicMaterialError as E;
+            A::Unavailable {
+                reason: match error {
+                    crate::worker_backend::SessionMaterialSourceError::Material(
+                        E::ResourceLimit,
+                    ) => R::ResourceLimit,
+                    crate::worker_backend::SessionMaterialSourceError::Material(
+                        E::InvalidOffset | E::Changed,
+                    ) => R::InvalidCursor,
+                    crate::worker_backend::SessionMaterialSourceError::Material(
+                        E::Missing | E::Erased,
+                    ) => R::RetentionMissing,
+                    crate::worker_backend::SessionMaterialSourceError::Material(
+                        E::Inconsistent | E::Record(_),
+                    ) => R::CorruptLog,
+                    _ => R::StorageUnavailable,
+                },
+            }
+        });
+        Ok(runtime_api::WorkerActivityResponse {
+            run,
+            stops,
+            next_stop,
+        })
     }
 
     #[cfg(feature = "fs-store")]
@@ -8090,6 +8216,11 @@ pub(crate) struct RestoreGuard {
     // eviction would forget request-ID conflicts and historical receipts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     stop_owners: BTreeMap<String, StopRequestOwner>,
+    // Committed Stop events are historical facts, not an alternative current
+    // execution state. Recorded by the same canonical stop commit, including
+    // internal stops that have no public request owner. Older stops are not invented.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    completed_stop_facts: BTreeMap<String, runtime_api::WorkerStoppedFact>,
     // Original execution-owner evidence, independent of lifecycle/cleanup success.
     // Older aggregates lack it; neither migration nor a stopped status creates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8103,6 +8234,7 @@ impl Default for RestoreGuard {
             active_request_id: None,
             owners: BTreeMap::new(),
             stop_owners: BTreeMap::new(),
+            completed_stop_facts: BTreeMap::new(),
             execution_termination: None,
         }
     }

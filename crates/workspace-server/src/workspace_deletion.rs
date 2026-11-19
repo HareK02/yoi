@@ -125,6 +125,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workdir_create_operations",
     "workdir_registry",
     "workdir_removal_operations",
+    "worker_lifecycle_scan_offers",
     "worker_control_grants",
     // Snapshot children precede their fence parent and canonical Worker removal
     // receipts (subject_deletion_workers.prior_removal_operation_id).

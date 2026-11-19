@@ -963,6 +963,139 @@ impl Drop for ServerTask {
 }
 
 #[tokio::test]
+async fn worker_activity_signed_read_keeps_run_and_committed_stop_separate() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let f = Fixture::new();
+        let identity = RuntimeIdentityMaterial::generate("activity-key").unwrap();
+        let trust = workspace_trust(&identity);
+        let app = runtime_http_router_with_workspace_auth(
+            f.runtime.clone(),
+            None,
+            workspace_test_auth(vec![trust.clone()]),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = ServerTask(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let client = runtime_api::RuntimeApiClient::builder(&format!("http://{address}"))
+            .unwrap()
+            .authorizer(SignedAuthorizer { identity, trust })
+            .build()
+            .unwrap();
+        let request = runtime_api::WorkerActivityRequest {
+            workspace_id: f.scope.workspace_id.clone(),
+            worker_id: f.worker.worker_id.to_string(),
+            run_cursor: None,
+            stop_after: None,
+        };
+        let before = client.worker_activity(request.clone()).await.unwrap();
+        let runtime_api::RunTerminalAvailability::Page { page } = before.run else {
+            panic!("expected terminal page")
+        };
+        assert_eq!(page.facts.len(), 1);
+        assert_eq!(
+            page.facts[0].boundary,
+            session_store::public_material::PublicRunBoundary::Cancelled
+        );
+        assert!(before.stops.is_empty());
+        f.stop();
+        let stopped = client.worker_activity(request.clone()).await.unwrap();
+        assert_eq!(stopped.stops.len(), 1);
+        assert!(!stopped.stops[0].operation_id.is_empty());
+        assert!(stopped.stops[0].occurred_at_ms > 0);
+        let runtime_api::RunTerminalAvailability::Page { page: after } = stopped.run else {
+            panic!("stopped Worker must retain terminal read")
+        };
+        assert_eq!(after.facts, page.facts);
+        f.stop();
+        let replay = client.worker_activity(request.clone()).await.unwrap();
+        assert_eq!(
+            replay.stops.len(),
+            1,
+            "already-stopped request is not a new execution stop"
+        );
+        assert_eq!(replay.stops[0].operation_id, stopped.stops[0].operation_id);
+        assert!(
+            !serde_json::to_string(&replay)
+                .unwrap()
+                .contains("private-system-prompt")
+        );
+        assert!(
+            client
+                .worker_activity(runtime_api::WorkerActivityRequest {
+                    workspace_id: "foreign".into(),
+                    ..request
+                })
+                .await
+                .is_err()
+        );
+    })
+    .await
+    .expect("bounded signed activity read");
+}
+
+#[test]
+fn worker_activity_reopen_recovers_same_stop_and_does_not_invent_missing_run() {
+    let f = Fixture::new();
+    let request = runtime_api::WorkerActivityRequest {
+        workspace_id: f.scope.workspace_id.clone(),
+        worker_id: f.worker.worker_id.to_string(),
+        run_cursor: None,
+        stop_after: None,
+    };
+    f.stop();
+    let before = f
+        .runtime
+        .worker_activity_scoped(&f.scope, &request)
+        .unwrap();
+    assert_eq!(before.stops.len(), 1);
+    drop(f.runtime);
+    let reopened = Runtime::with_fs_store_and_execution_backend(
+        crate::FsRuntimeStoreOptions::new(f.temp.path()).with_runtime_id("runtime-test"),
+        Arc::new(AcceptingBackend),
+    )
+    .unwrap();
+    reopened.bind_runtime_identity("runtime-test").unwrap();
+    let after = reopened.worker_activity_scoped(&f.scope, &request).unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    let foreign = RuntimeWorkspaceScope::new("foreign", "https://backend.test");
+    assert!(
+        reopened
+            .worker_activity_scoped(
+                &foreign,
+                &runtime_api::WorkerActivityRequest {
+                    workspace_id: foreign.workspace_id.clone(),
+                    ..request.clone()
+                }
+            )
+            .is_err()
+    );
+    // Missing retained Session evidence is unavailable, never a fabricated success.
+    std::fs::remove_dir_all(
+        f.temp
+            .path()
+            .join("workers")
+            .join(&request.worker_id)
+            .join("session"),
+    )
+    .unwrap();
+    let missing = reopened.worker_activity_scoped(&f.scope, &request).unwrap();
+    assert!(matches!(
+        missing.run,
+        runtime_api::RunTerminalAvailability::Unavailable { .. }
+    ));
+    assert_eq!(
+        missing.stops.len(),
+        1,
+        "independent confirmed Stop remains readable"
+    );
+}
+
+#[tokio::test]
 async fn signed_generated_client_reads_canonical_pages_and_pins_with_real_router() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let f = Fixture::new();

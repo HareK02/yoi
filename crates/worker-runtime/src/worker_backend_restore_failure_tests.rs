@@ -292,19 +292,46 @@ impl ProfileFailureFixture {
                 let mut events = handle.subscribe();
                 handle.send(Method::submit_text("revocation-seed", "hold for saved input setup")).await.unwrap();
                 event(&mut events, |next| matches!(next, Event::TextDelta { .. })).await;
-                // Notify resumes Paused turns; seed both durable inputs while
-                // the model is hanging in Running, before acknowledging Pause.
+                // Keep the model hanging: Notify would resume a Paused
+                // Controller and consume the notice before Stop preserves it.
                 handle.send(Method::submit_text("revocation-saved-submit", "must stay queued")).await.unwrap();
                 event(&mut events, |next| matches!(next, Event::SubmissionAccepted { submission_request_id, disposition: protocol::SubmissionDisposition::Queued, .. } if submission_request_id == "revocation-saved-submit")).await;
                 handle.send(Method::Notify { notification_request_id: "revocation-saved-notice".into(), message: "must also stay queued".into() }).await.unwrap();
                 event(&mut events, |next| matches!(next, Event::NotificationAccepted { notification_request_id } if notification_request_id == "revocation-saved-notice")).await;
-                handle.send(Method::Pause { command: protocol::WorkerCommandEnvelope::new(handle.shared_state.snapshot().last_command_id + 1) }).await.unwrap();
-                event(&mut events, |next| matches!(next, Event::WorkerState { snapshot } if snapshot.catalog_status() == protocol::WorkerStatus::Paused)).await;
                 Ok(())
             }).unwrap();
         }
         if !pending_head {
             runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        }
+        if let Some(handle) = seed_handle.as_ref() {
+            let entries = handle.committed_entries();
+            let checkpoint = entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    LogEntry::Extension {
+                        domain, payload, ..
+                    } if domain == "worker.pending_activations.v1" => Some(payload),
+                    _ => None,
+                })
+                .expect("seed Controller must persist the saved input checkpoint");
+            assert_eq!(checkpoint["pending"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                checkpoint["pending"][0]["submission_request_id"],
+                "revocation-saved-submit"
+            );
+            assert_eq!(
+                checkpoint["pending_notifications"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                checkpoint["pending_notifications"][0]["notification_request_id"],
+                "revocation-saved-notice"
+            );
         }
         // Count restore provider access, not the initial create/stop setup.
         provider_opens.store(0, Ordering::SeqCst);

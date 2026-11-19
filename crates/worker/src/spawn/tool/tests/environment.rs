@@ -3,6 +3,8 @@
 //! LocalWorkdirSession providers; only the external LLM is scripted. Selected by
 //! the normal worker lib suite, without network credentials or live Workspace data.
 
+mod lifecycle;
+
 use super::*;
 use agen::Item;
 use serde_json::{Value, json};
@@ -112,7 +114,7 @@ async fn parent_feature_off_child_feature_on_uses_live_parent_direct_authority()
     let tool = SubWorkerSpawnTool::new(
         "parent".into(),
         crate::worker::WorkerWorkspaceContext::local_filesystem(None),
-        ParentNotificationTarget::Durable(Arc::new(|_| {})),
+        ParentNotificationTarget::Durable(Arc::new(|_| Ok(()))),
         fixture.runtime.path().into(),
         fixture.root.clone(),
         Some(workdir::WorkdirToolBrokerRouter::new(authorized)),
@@ -289,7 +291,7 @@ impl EnvironmentFixture {
         let tool = SubWorkerSpawnTool::new(
             spawner.into(),
             crate::worker::WorkerWorkspaceContext::local_filesystem(None),
-            ParentNotificationTarget::Durable(Arc::new(|_| {})),
+            ParentNotificationTarget::Durable(Arc::new(|_| Ok(()))),
             self.runtime.path().to_path_buf(),
             self.root.clone(),
             Some(broker),
