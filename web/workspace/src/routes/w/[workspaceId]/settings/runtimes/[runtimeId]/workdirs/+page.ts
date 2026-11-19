@@ -30,6 +30,7 @@ export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0])
       ),
       undefined,
       parseRuntimeCleanupPlan,
+      { diagnosticLabel: "Cleanup plan", maxResponseBytes: 512 * 1024 },
     ),
   ]);
 

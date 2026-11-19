@@ -44,7 +44,14 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
   const observations: unknown[] = [];
   const injectedConsoleErrors: string[] = [];
   const injectedUnexpectedErrors: string[] = [];
+  const cancelledErrorBodies: string[] = [];
   const observeInjectedFailure = (page: Page) => {
+    const rejectedReads = new Set<object>();
+    page.on("response", (response) => {
+      if (response.status() === 503 && /\/(cleanup-plan|working-directories)$/.test(new URL(response.url()).pathname)) {
+        rejectedReads.add(response.request());
+      }
+    });
     page.on("console", (message) => {
       if (message.type() === "error") {
         injectedConsoleErrors.push(message.text());
@@ -56,7 +63,13 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
     );
     page.on(
       "requestfailed",
-      (request) => injectedUnexpectedErrors.push(request.url()),
+      (request) => {
+        // The bounded loader cancels an injected HTTP error body without reading it.
+        // Other transport failures remain unexpected, including unobserved statuses.
+        if (rejectedReads.has(request) && request.failure()?.errorText === "net::ERR_ABORTED") {
+          cancelledErrorBodies.push(request.url());
+        } else injectedUnexpectedErrors.push(request.url());
+      },
     );
   };
   const control = async (value: unknown) => {
@@ -227,10 +240,14 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
           const final = await state();
           const mutations = final.requests.filter((r: { method: string }) => r.method === "DELETE");
           assertEquals(mutations.length, 2);
+          // mount_present is a confirmed refusal, not an unknown outcome.
+          // Once the mount is released, the explicit new attempt needs a new ID.
+          assert(typeof mutations[0].body.operation_id === "string");
+          assert(typeof mutations[1].body.operation_id === "string");
+          assert(mutations[0].body.operation_id !== mutations[1].body.operation_id);
           assertEquals(
-            mutations[0],
-            mutations[1],
-            "ordinary retry changed its request",
+            { ...mutations[0], body: { ...mutations[0].body, operation_id: null } },
+            { ...mutations[1], body: { ...mutations[1].body, operation_id: null } },
           );
           const gets = final.requests.filter((
             r: { workspace: string; method: string },
@@ -276,6 +293,29 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
         }
       }
     }
+
+    // Unknown outcomes retain the exact request; a confirmed refusal above does not.
+    await control({ reset: true, mountReleased: true });
+    const unknown = await browser.newPage();
+    const unknownRequests: string[] = [];
+    await unknown.route("**/working-directories/retry-dir", async (route) => {
+      unknownRequests.push(route.request().postData()!);
+      if (unknownRequests.length === 1) {
+        await route.fulfill({ status: 200, json: {
+          working_directory_id: "retry-dir",
+          disposition: "attention_required",
+          retryable: true,
+          failure_category: "provider_cleanup_outcome_unknown",
+        } });
+      } else await route.continue();
+    });
+    await unknown.goto(`${url}/w/home-owner/settings/runtimes/fixture-runtime/workdirs`);
+    await unknown.getByRole("button", { name: "Delete retry-dir", exact: true }).click();
+    await unknown.getByRole("button", { name: "Retry Delete retry-dir", exact: true }).click();
+    await unknown.getByRole("status").filter({ hasText: "Deletion confirmed" }).waitFor();
+    assertEquals(unknownRequests.length, 2);
+    assertEquals(unknownRequests[0], unknownRequests[1], "unknown outcome changed its request");
+    await unknown.close();
 
     // Lost/HTTP failure responses still trigger fresh inventory and eligibility. Never echo provider bodies.
     await control({ reset: true });
@@ -332,7 +372,7 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
     );
     await stale.getByRole("button", { name: "Delete retry-dir", exact: true })
       .click();
-    await stale.getByRole("alert").filter({ hasText: "could not be refreshed" })
+    await stale.getByRole("alert").filter({ hasText: "Inventory or removal eligibility is unavailable. Refresh before deletion." })
       .waitFor();
     assert(
       await stale.getByRole("button", {
@@ -461,6 +501,7 @@ Deno.test("ordinary removal refreshes failed and successful inventory, supports 
           observations,
           injectedConsoleErrors,
           injectedUnexpectedErrors,
+          cancelledErrorBodies,
           failureRefresh: failed.requests,
           refreshFailureRecovered: true,
           newChangesProtected: true,
