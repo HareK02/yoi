@@ -1458,7 +1458,13 @@ async fn stopped_removal_hands_off_originals_before_recording_and_recovers_witho
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn unnotified_multisession_multisegment_utf8_history_chains_bounded_jobs_without_gaps() {
     let f = RemovalFixture::new().await;
-    let long = "界\\\"\n".repeat(28_000);
+    // Each repetition costs 9 canonical bytes and 14 bytes when that JSON body
+    // is escaped again in the Job input. 10,000 repetitions therefore exceed
+    // the 128KiB envelope before metadata, keeping a partial first prefix in
+    // both Sessions without the redundant prefixes of the former 28,000 input.
+    // Keep the >48KiB capture, >2 inputs, and complete fork/range/hash assertions
+    // below: the real Job/HTTP/Controller teardown chain is still exercised.
+    let long = "界\\\"\n".repeat(10_000);
     f.seed_active(vec![RemovalFixture::history("active", &long)]);
     let retained = f.seed_retained(vec![
         RemovalFixture::history("repeated-original", &long),

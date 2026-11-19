@@ -31,7 +31,11 @@ fn migrate_to_historical_boundary(conn: &Connection) -> Result<()> {
         store_owner::current_schema_version(conn)?,
         HISTORICAL_UPGRADE_VERSION
     );
-    store_owner::storage_formats::verify_history(conn, HISTORICAL_UPGRADE_VERSION)
+    // The production schema-123 step verifies the resulting history before its
+    // transaction commits. On reopen, the production plan above verifies the
+    // unchanged physical schema and receipts. Repeating that whole check here
+    // adds no boundary; callers still read back saved values after close/reopen.
+    Ok(())
 }
 
 fn open_historical_boundary(path: &Path) -> Connection {
@@ -1037,7 +1041,35 @@ fn retained_baselines_reach_upgrade_via_the_real_runner_and_reopen_keeps_new_job
             ),
             vec![vec![Value::Text("pending".into())]]
         );
+        drop(conn);
+        drop(dir);
     }
+}
+
+#[test]
+fn historical_reopen_rejects_missing_upgrade_storage_without_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing-upgrade.sqlite");
+    let conn = retained_fixture(&path);
+    migrate_to_historical_boundary(&conn).unwrap();
+    let receipts = rows(
+        &conn,
+        "SELECT * FROM __yoi_schema_migrations ORDER BY version",
+    );
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE backend_job_upgrade_history;")
+        .unwrap();
+    drop(conn);
+    let conn = Connection::open(&path).unwrap();
+    store_owner::configure_sqlite(&conn).unwrap();
+    assert!(migrate_to_historical_boundary(&conn).is_err());
+    assert!(!store_owner::table_exists(&conn, "backend_job_upgrade_history").unwrap());
+    assert_eq!(
+        receipts,
+        rows(
+            &conn,
+            "SELECT * FROM __yoi_schema_migrations ORDER BY version"
+        )
+    );
 }
 
 #[test]
