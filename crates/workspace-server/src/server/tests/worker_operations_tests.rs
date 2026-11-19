@@ -837,7 +837,14 @@ async fn generic_management_aliases_cannot_bypass_worker_grants_or_target_bound_
 
 #[test]
 fn uncertain_unary_input_preserves_typed_disposition_without_claiming_acceptance() {
+    let evidence = protocol::WorkerCommandResult::Unconfirmed {
+        command: protocol::WorkerCommandKind::Compact,
+        command_id: Some(42),
+        delivery: protocol::WorkerCommandDelivery::Enqueued,
+        reason: protocol::WorkerCommandObservationFailure::TimedOut,
+    };
     let result = worker_input_result_to_api(WorkerInputResult {
+        command: Some(evidence.clone()),
         state: InternalWorkerOperationState::Rejected,
         disposition: WorkerInputDisposition::Unknown,
         worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
@@ -849,6 +856,7 @@ fn uncertain_unary_input_preserves_typed_disposition_without_claiming_acceptance
     assert!(result.diagnostics.is_empty());
     let wire = serde_json::to_value(&result).unwrap();
     assert_eq!(wire["disposition"], "unknown");
+    assert_eq!(wire["command"], serde_json::to_value(evidence).unwrap());
     let mut legacy = wire;
     legacy.as_object_mut().unwrap().remove("disposition");
     let decoded: server_api::RuntimeWorkerInputResult = serde_json::from_value(legacy).unwrap();
@@ -1814,4 +1822,28 @@ async fn restore_public_wire_keeps_session_primary_and_independent_cleanup_obser
         serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
         fixture
     );
+}
+
+#[test]
+fn command_evidence_lifecycle_api_projection_retains_rejection_snapshot_as_observation() {
+    let command = protocol::WorkerCommandResult::Acknowledged {
+        acknowledgement: protocol::WorkerCommandAcknowledgement {
+            command_id: 42,
+            command: protocol::WorkerCommandKind::Cancel,
+            disposition: protocol::WorkerCommandDisposition::InvalidState,
+            state: protocol::WorkerStateSnapshot::initial(),
+        },
+    };
+    let result = worker_lifecycle_result_to_api(WorkerLifecycleResult {
+        command: Some(command.clone()),
+        cleanup_failures: Vec::new(),
+        replayed: false,
+        state: InternalWorkerOperationState::Rejected,
+        worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
+        diagnostics: Vec::new(),
+    });
+    let wire = serde_json::to_value(&result).unwrap();
+    let received: server_api::RuntimeWorkerLifecycleResult = serde_json::from_value(wire).unwrap();
+    assert_eq!(received.command, Some(command));
+    assert_eq!(received.state, server_api::WorkerOperationState::Rejected);
 }

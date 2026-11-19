@@ -1187,8 +1187,26 @@ fn tool_output(
         #[derive(serde::Serialize)]
         struct HttpObservation {
             status: u16,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            command: Option<protocol::WorkerCommandResult>,
         }
-        let cause = match api_macros_control_decode(&response) {
+        let details = match error_contract::problem::decode_problem_details::<
+            protocol::control_failure::RuntimeControlFailure,
+        >(
+            response.body.as_bytes(),
+            response.status,
+            response.content_type.as_deref().unwrap_or(""),
+            &server_api::control_failure::ControlBoundary,
+            error_contract::Budget::new(16384, 16384),
+        ) {
+            error_contract::DecodeFailure::Known(value) => Some(value.facts().cause().clone()),
+            _ => None,
+        };
+        let cause = match details
+            .as_ref()
+            .map(|details| details.cause)
+            .or_else(|| api_macros_control_decode(&response))
+        {
             Some(cause) => cause,
             None => C::ResultUnavailable,
         };
@@ -1197,6 +1215,7 @@ fn tool_output(
             B::Observation,
             &HttpObservation {
                 status: response.status,
+                command: details.and_then(|details| details.command),
             },
         ));
     }
@@ -1328,7 +1347,14 @@ fn tool_output(
             };
             return Err(worker_tool_failure(
                 lifecycle.control.unwrap_or(cause),
-                B::Execution,
+                if matches!(
+                    lifecycle.command,
+                    Some(protocol::WorkerCommandResult::Unconfirmed { .. })
+                ) {
+                    B::Observation
+                } else {
+                    B::Execution
+                },
                 &lifecycle,
             ));
         }
@@ -1581,6 +1607,7 @@ mod tests {
                     .to_string()
                 } else if is_worker_input {
                     serde_json::to_string(&server_api::RuntimeWorkerInputResult {
+                        command: None,
                         control_explanation: None,
                         control: None,
                         state: server_api::WorkerOperationState::Accepted,
@@ -1592,6 +1619,7 @@ mod tests {
                     .unwrap()
                 } else if is_worker_lifecycle {
                     serde_json::to_string(&server_api::RuntimeWorkerLifecycleResult {
+                        command: None,
                         cleanup_failures: vec![],
                         control_explanation: None,
                         control: None,
@@ -1762,6 +1790,105 @@ mod tests {
     }
 
     #[test]
+    fn command_evidence_reaches_model_from_domain_and_http_failures() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        use protocol::{
+            WorkerCommandDelivery, WorkerCommandKind, WorkerCommandObservationFailure,
+            WorkerCommandResult,
+        };
+        let command = WorkerCommandResult::Unconfirmed {
+            command: WorkerCommandKind::Cancel,
+            command_id: Some(31),
+            delivery: WorkerCommandDelivery::Enqueued,
+            reason: WorkerCommandObservationFailure::TimedOut,
+        };
+        let lifecycle = server_api::RuntimeWorkerLifecycleResult {
+            command: Some(command.clone()),
+            control: Some(C::ResultUnavailable),
+            control_explanation: None,
+            state: server_api::WorkerOperationState::Rejected,
+            runtime_id: "runtime".into(),
+            worker_id: "worker".into(),
+            diagnostics: Vec::new(),
+            cleanup_failures: Vec::new(),
+            replayed: false,
+        };
+        let error = tool_output(
+            WorkerOperation::Cancel,
+            WorkspaceResponse {
+                status: 200,
+                content_type: None,
+                body: serde_json::to_string(&lifecycle).unwrap(),
+            },
+        )
+        .unwrap_err();
+        let result = assert_control_failure(
+            error,
+            tools::failure::ToolFailureBoundary::Observation,
+            C::ResultUnavailable,
+        );
+        assert_eq!(result["command"], serde_json::to_value(&command).unwrap());
+        let problem = server_api::control_failure::control_problem_with_command(
+            C::ResultUnavailable,
+            Some(command.clone()),
+        )
+        .unwrap();
+        let error = tool_output(
+            WorkerOperation::Cancel,
+            WorkspaceResponse {
+                status: problem.status,
+                content_type: Some(problem.content_type.into()),
+                body: String::from_utf8(problem.body.to_vec()).unwrap(),
+            },
+        )
+        .unwrap_err();
+        let result = assert_control_failure(
+            error,
+            tools::failure::ToolFailureBoundary::Observation,
+            C::ResultUnavailable,
+        );
+        assert_eq!(result["command"], serde_json::to_value(&command).unwrap());
+    }
+
+    #[test]
+    fn confirmed_compact_rejection_is_an_execution_failure_with_command_evidence() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        let command = protocol::WorkerCommandResult::Acknowledged {
+            acknowledgement: protocol::WorkerCommandAcknowledgement {
+                command_id: 92,
+                command: protocol::WorkerCommandKind::Compact,
+                disposition: protocol::WorkerCommandDisposition::InvalidState,
+                state: protocol::WorkerStatus::Running.into(),
+            },
+        };
+        let input = server_api::RuntimeWorkerInputResult {
+            command: Some(command.clone()),
+            control: Some(C::ExecutionRejected),
+            control_explanation: None,
+            state: server_api::WorkerOperationState::Rejected,
+            disposition: server_api::WorkerInputDisposition::Rejected,
+            runtime_id: "remote".into(),
+            worker_id: "worker".into(),
+            diagnostics: Vec::new(),
+        };
+        let error = tool_output(
+            WorkerOperation::SendInput,
+            WorkspaceResponse {
+                content_type: None,
+                status: 200,
+                body: serde_json::to_string(&input).unwrap(),
+            },
+        )
+        .unwrap_err();
+        let result = assert_control_failure(
+            error,
+            tools::failure::ToolFailureBoundary::Execution,
+            C::ExecutionRejected,
+        );
+        assert_eq!(result["command"], serde_json::to_value(command).unwrap());
+    }
+
+    #[test]
     fn shared_control_problem_reaches_model_failure_without_disclosing_received_prose() {
         for cause in protocol::control_failure::RuntimeControlCause::ALL {
             let response = server_api::control_failure::control_problem(*cause).unwrap();
@@ -1877,6 +2004,7 @@ mod tests {
             ),
         ] {
             let input = server_api::RuntimeWorkerInputResult {
+                command: None,
                 control_explanation: None,
                 control: None,
                 state,
@@ -1936,6 +2064,7 @@ mod tests {
         );
 
         let input = server_api::RuntimeWorkerInputResult {
+            command: None,
             control_explanation: None,
             control: None,
             state: S::Accepted,
@@ -2178,6 +2307,7 @@ mod tests {
         use tools::failure::ToolFailureBoundary as B;
 
         let rejected = server_api::RuntimeWorkerInputResult {
+            command: None,
             control_explanation: None,
             control: None,
             state: server_api::WorkerOperationState::Rejected,

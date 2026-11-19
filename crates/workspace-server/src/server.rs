@@ -8916,6 +8916,7 @@ fn restore_public_evidence(
 
 fn worker_input_result_to_api(result: WorkerInputResult) -> server_api::RuntimeWorkerInputResult {
     server_api::RuntimeWorkerInputResult {
+        command: result.command,
         control: retained_control_cause(&result.diagnostics),
         control_explanation: retained_control_explanation(&result.diagnostics),
         state: result.state.into(),
@@ -8946,6 +8947,7 @@ fn worker_lifecycle_result_to_api(
         })
         .collect();
     server_api::RuntimeWorkerLifecycleResult {
+        command: result.command,
         cleanup_failures,
         control: retained_control_cause(&result.diagnostics),
         control_explanation: retained_control_explanation(&result.diagnostics),
@@ -27802,6 +27804,7 @@ fn skill_api_error(error: skills::SkillError) -> ApiError {
                 message: format!("unknown Skill `{name}`"),
             },
             vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -31475,6 +31478,7 @@ fn prepare_workspace_workdir_create(
                             .to_string(),
                     ),
                     vec![RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             startup: None,
@@ -31633,6 +31637,7 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 Error::UnknownRuntime(reserved.resolved_runtime_id),
                 vec![RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: None,
                     control: None,
@@ -31660,6 +31665,7 @@ async fn create_workspace_working_directory(
                 message: "Selected Runtime is not connected".to_string(),
             },
             vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -31720,6 +31726,7 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 error.into_error(),
                 vec![RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: None,
                     control: None,
@@ -31762,6 +31769,7 @@ async fn create_workspace_working_directory(
                 return Err(ApiError::with_diagnostics(
                     error.into_error(),
                     vec![RuntimeDiagnostic {
+                        command: None,
                         session: None,
                         workdir: None,
                         control: None,
@@ -31805,6 +31813,7 @@ async fn create_workspace_working_directory(
             diagnostics.insert(
                 0,
                 RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: None,
                     control: None,
@@ -32558,6 +32567,7 @@ fn build_runtime_cleanup_plan(
                 let mut diagnostics = error.diagnostics;
                 if diagnostics.is_empty() {
                     diagnostics.push(RuntimeDiagnostic {
+                        command: None,
                         session: None,
                         workdir: None,
                         control: None,
@@ -36508,6 +36518,7 @@ fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> A
             message: "The embedded Runtime does not accept working directories".to_string(),
         },
         vec![RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             control: None,
@@ -36931,6 +36942,7 @@ fn lifecycle_failure_detail(
 
 fn spawn_compensation_diagnostic(code: &str, message: String) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        command: None,
         session: None,
         workdir: None,
         control: None,
@@ -37919,6 +37931,7 @@ fn project_workspace_worker_with_attachments(
             summary.state = "unavailable".to_string();
             summary.worker_state = None;
             summary.diagnostics.push(RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -38884,6 +38897,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
         },
         workdir_attachments: Vec::new(),
         diagnostics: vec![RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             control: None,
@@ -38932,6 +38946,7 @@ fn worker_summary_from_projection(
         Vec::new()
     } else {
         vec![RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             control: None,
@@ -39605,6 +39620,7 @@ fn validate_working_directory_claims_for_browser(
                         message: "working directory relative_cwd must stay inside the Runtime-owned working directory".to_string(),
                     },
                     vec![RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             startup: None,
@@ -40199,6 +40215,7 @@ fn settings_diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        command: None,
         session: None,
         workdir: None,
         control: None,
@@ -40375,6 +40392,7 @@ fn workspace_id_mismatch_error() -> ApiError {
     ApiError::with_diagnostics(
         Error::WorkspaceIdMismatch,
         vec![RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             control: None,
@@ -40492,6 +40510,7 @@ impl ApiErrorLog {
                 .diagnostics
                 .iter()
                 .map(|diagnostic| RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: None,
                     control: None,
@@ -40531,6 +40550,7 @@ impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
             Error::RepositoryLookup(cause) => vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 control: None,
                 workdir: None,
@@ -40551,6 +40571,7 @@ impl From<Error> for ApiError {
             Error::DbCapacityExceeded
             | Error::DbExecutorUnavailable
             | Error::DbOperationOutcomeUnknown => vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -40565,6 +40586,7 @@ impl From<Error> for ApiError {
                 message: error.to_string(),
             }],
             Error::WorkdirSessionOpenFailed { transport, .. } => vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -40574,6 +40596,7 @@ impl From<Error> for ApiError {
                 message: transport.message.clone(),
             }],
             Error::RuntimeOperationFailed { code, message, .. } => vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -40583,6 +40606,7 @@ impl From<Error> for ApiError {
                 message: sanitize_backend_error(message),
             }],
             Error::WorkspaceSigningIdentity { code, message } => vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -40592,6 +40616,7 @@ impl From<Error> for ApiError {
                 message: sanitize_backend_error(message),
             }],
             Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -40642,6 +40667,7 @@ impl From<Error> for ApiError {
                 subjektiv_diagnostic_code(message)
                     .map(|code| {
                         vec![RuntimeDiagnostic {
+                            command: None,
                             session: None,
                             workdir: None,
                             control: None,
@@ -40686,6 +40712,7 @@ impl ApiError {
         Self::with_diagnostics(
             error,
             vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 control: None,
                 code: reason.as_str().into(),
@@ -41296,6 +41323,7 @@ mod failure_boundary_tests {
             vec![extra.clone(), primary.clone()],
         ] {
             let result = worker_input_result_to_api(WorkerInputResult {
+                command: None,
                 runtime_run_id: None,
                 worker: RuntimeWorkerRef::new("runtime", "worker"),
                 state: InternalWorkerOperationState::Rejected,
@@ -44468,6 +44496,7 @@ mod tests {
             let idle_only = request.kind == WorkerInputKind::UserIfIdle;
             self.input_requests.lock().unwrap().push(request);
             crate::hosts::WorkerInputResult {
+                command: None,
                 state: if idle_only {
                     InternalWorkerOperationState::Rejected
                 } else {
@@ -44581,6 +44610,7 @@ mod tests {
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![RuntimeDiagnostic {
+                        command: None,
                         session: None,
                         workdir: None,
                         control: None,
@@ -44628,6 +44658,7 @@ mod tests {
                 callback();
             }
             WorkerLifecycleResult {
+                command: None,
                 cleanup_failures: Vec::new(),
                 replayed: false,
                 state: InternalWorkerOperationState::Accepted,
@@ -44642,6 +44673,7 @@ mod tests {
             _request: WorkerLifecycleRequest,
         ) -> WorkerLifecycleResult {
             WorkerLifecycleResult {
+                command: None,
                 cleanup_failures: Vec::new(),
                 replayed: false,
                 state: InternalWorkerOperationState::Accepted,
@@ -46536,6 +46568,7 @@ mod tests {
             kind: "ticket_backend_error".to_string(),
             message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
             diagnostics: vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -53070,6 +53103,7 @@ mod tests {
     #[test]
     fn unrecoverable_pending_workspace_restore_is_typed_for_replacement() {
         let diagnostics = [RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             control: None,
@@ -53085,6 +53119,7 @@ mod tests {
     #[test]
     fn workdir_runtime_miss_uses_exact_typed_code() {
         let typed_not_found = [RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                 operation: workdir::management_failure::WorkdirManagementOperation::Detail,
@@ -53103,6 +53138,7 @@ mod tests {
         assert!(workdir_runtime_miss_is_not_found(&typed_not_found));
 
         let unrelated = [RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             control: None,
@@ -64916,6 +64952,7 @@ mod tests {
             &api,
             deleted,
             &[RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
@@ -64949,6 +64986,7 @@ mod tests {
             &api,
             unknown,
             &[RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -66777,6 +66815,7 @@ mod tests {
             InternalWorkerOperationState::Rejected,
             None,
             vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
@@ -66834,7 +66873,7 @@ mod tests {
             workdir_removal_result(
                 InternalWorkerOperationState::Rejected,
                 None,
-                vec![RuntimeDiagnostic { session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy }),
+                vec![RuntimeDiagnostic { command: None, session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy }),
                     control: None,
                     startup: None,
                     code: "working_directory_cleanup_resource_busy".into(),
@@ -67066,6 +67105,7 @@ mod tests {
 
         let (missing_operation, _) = reserve_removal_fixture(&api, "provider-not-found");
         let not_found = RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                 operation: workdir::management_failure::WorkdirManagementOperation::Detail,
@@ -67108,6 +67148,7 @@ mod tests {
                 InternalWorkerOperationState::Accepted,
                 None,
                 vec![RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: None,
                     control: None,
@@ -67228,6 +67269,7 @@ mod tests {
                 InternalWorkerOperationState::Unsupported,
                 None,
                 vec![RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: None,
                     control: None,
@@ -67281,6 +67323,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: reason.map(|reason| WorkdirManagementFailure {
                         operation: Operation::Cleanup,
@@ -67319,6 +67362,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    command: None,
                     session: None,
                     workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupMountPresent }),
                     control: None,
@@ -67472,7 +67516,7 @@ mod tests {
                 workdir_removal_result(
                     InternalWorkerOperationState::Rejected,
                     None,
-                    vec![RuntimeDiagnostic { session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Detail, reason: workdir::management_failure::WorkdirManagementReason::CleanupPermissionDenied }),
+                    vec![RuntimeDiagnostic { command: None, session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Detail, reason: workdir::management_failure::WorkdirManagementReason::CleanupPermissionDenied }),
                     control: None,
                         startup: None,
                         code: "working_directory_cleanup_permission_denied".into(),
@@ -67665,6 +67709,7 @@ mod tests {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
@@ -67695,6 +67740,7 @@ mod tests {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -69404,6 +69450,7 @@ mod tests {
     fn provider_rejection_ignores_opaque_code_and_severity() {
         let diagnostics = vec![
             RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -69413,6 +69460,7 @@ mod tests {
                 message: "capacity is low".to_string(),
             },
             RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,
@@ -69476,6 +69524,7 @@ mod tests {
             })
             .unwrap();
         let diagnostics = vec![RuntimeDiagnostic {
+            command: None,
             session: None,
             workdir: None,
             control: None,

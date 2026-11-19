@@ -391,7 +391,7 @@ Deno.test("console routing projects live errors but not completion replies", () 
   );
 });
 
-Deno.test("Worker state events and acknowledgements replace the full state", () => {
+Deno.test("Worker state events replace state while acknowledgement replay does not", () => {
   const projector = createConsoleProjector();
   const running: WorkerStateSnapshot = {
     last_command_id: 2,
@@ -429,8 +429,14 @@ Deno.test("Worker state events and acknowledgements replace the full state", () 
       },
     },
   ]);
-  assertEquals(projection.workerState, paused);
-  assertEquals(projection.status, "paused");
+  assertEquals(projection.workerState, freshIdle);
+  assertEquals(projection.status, "idle");
+  for (const command of ["cancel", "compact"] as const) {
+    projection = projector.append([{ eventId: `new-run-${command}`, event: { event: "worker_state", data: { snapshot: running } } },
+      { eventId: `replay-${command}`, event: { event: "command_acknowledged", data: { acknowledgement: { command_id: 1, command, disposition: "accepted", state: paused } } } }]);
+    assertEquals(projection.workerState, running);
+    assertEquals(projection.status, "running");
+  }
 
   projection = projector.append([{
     eventId: "replacement",

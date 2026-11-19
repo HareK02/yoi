@@ -144,6 +144,9 @@ impl WorkerExecutionTermination {
 pub struct WorkerExecutionResult {
     pub operation: WorkerExecutionOperation,
     pub outcome: WorkerExecutionOutcome,
+    /// Controller admission evidence only; never Run or maintenance completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     /// Actual Controller targeted or observed by this operation. Receipt lookup
     /// does not identify the originating run of a receipt retained across restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,10 +188,37 @@ pub enum WorkerExecutionOutcome {
 }
 
 impl WorkerExecutionResult {
+    /// An adapter cannot substitute transport success for Controller admission.
+    pub(crate) fn require_command_acknowledgement(&mut self, kind: protocol::WorkerCommandKind) {
+        if !self.is_accepted() {
+            return;
+        }
+        match self.command.as_ref() {
+            Some(protocol::WorkerCommandResult::Acknowledged { acknowledgement })
+                if acknowledgement.command == kind =>
+            {
+                if acknowledgement.disposition != protocol::WorkerCommandDisposition::Accepted {
+                    self.outcome = WorkerExecutionOutcome::Rejected;
+                    self.message = Some(format!(
+                        "Controller rejected {kind:?}: {:?}",
+                        acknowledgement.disposition
+                    ));
+                }
+            }
+            _ => {
+                self.outcome = WorkerExecutionOutcome::Errored;
+                self.message = Some(format!(
+                    "{kind:?} admission is unconfirmed; execution backend returned no matching Controller acknowledgement; do not retry as a fresh command"
+                ));
+            }
+        }
+    }
+
     pub fn accepted(operation: WorkerExecutionOperation) -> Self {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
+            command: None,
             execution_id: None,
             worker_state: None,
             message: None,
@@ -217,6 +247,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
+            command: None,
             execution_id: None,
             worker_state: None,
             message: None,
@@ -242,6 +273,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
+            command: None,
             execution_id: None,
             worker_state: None,
             message: None,
@@ -262,6 +294,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Busy,
+            command: None,
             execution_id: None,
             worker_state: None,
             message: Some(message.into()),
@@ -280,6 +313,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Rejected,
+            command: None,
             execution_id: None,
             worker_state: None,
             message: Some(message.into()),
@@ -298,6 +332,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Errored,
+            command: None,
             execution_id: None,
             worker_state: None,
             message: Some(message.into()),
@@ -316,6 +351,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Unsupported,
+            command: None,
             execution_id: None,
             worker_state: None,
             message: Some(message.into()),

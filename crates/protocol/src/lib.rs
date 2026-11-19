@@ -182,11 +182,65 @@ pub enum WorkerCommandDisposition {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WorkerCommandAcknowledgement {
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub command_id: u64,
     pub command: WorkerCommandKind,
     pub disposition: WorkerCommandDisposition,
     /// The complete authoritative state observed after command admission.
     pub state: WorkerStateSnapshot,
+}
+
+/// Evidence from a command attempt, not Run or maintenance completion.
+/// An acknowledgement snapshot is an admission observation, not a current-state update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerCommandResult {
+    Acknowledged {
+        acknowledgement: WorkerCommandAcknowledgement,
+    },
+    Unconfirmed {
+        command: WorkerCommandKind,
+        #[cfg_attr(
+            feature = "json-schema",
+            schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+        )]
+        command_id: Option<u64>,
+        delivery: WorkerCommandDelivery,
+        reason: WorkerCommandObservationFailure,
+    },
+    NotDelivered {
+        command: WorkerCommandKind,
+        #[cfg_attr(
+            feature = "json-schema",
+            schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+        )]
+        command_id: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCommandDelivery {
+    Enqueued,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCommandObservationFailure {
+    TimedOut,
+    Lagged,
+    Closed,
+    SendFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

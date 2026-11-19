@@ -118,6 +118,7 @@ impl WorkspaceWorkerRuntime for AttachmentRuntime {
                     .expect("fixture worker remains present"),
             ),
             diagnostics: vec![RuntimeDiagnostic {
+                command: None,
                 session: None,
                 workdir: None,
                 control: None,

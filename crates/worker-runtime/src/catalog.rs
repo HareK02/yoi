@@ -397,6 +397,9 @@ pub struct WorkerDetail {
 /// Acknowledgement returned by stop/cancel lifecycle operations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLifecycleAck {
+    /// Exact endpoint command evidence; the snapshot is not current-state authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     /// Historical typed stop receipt; never authorizes cleanup of current resources.
     #[serde(default)]
     pub replayed: bool,

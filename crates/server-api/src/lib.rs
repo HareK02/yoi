@@ -117,6 +117,8 @@ pub struct RepositoryApiError {
     repository_problem: Option<Vec<u8>>,
     #[serde(skip)]
     control: Option<protocol::control_failure::RuntimeControlCause>,
+    #[serde(skip)]
+    command: Option<protocol::WorkerCommandResult>,
     pub error: String,
     pub message: String,
     #[serde(default)]
@@ -146,8 +148,7 @@ struct RepositoryProblemPublicationSchema {
     yoi_failure: error_contract::codec::FailureEnvelope<RepositoryProblemCauseSchema>,
 }
 
-// The details owners have exclusive wire shapes, rather than two overlapping
-// Problem objects: Repository is a closed object and control is a string enum.
+// Each domain retains its exclusive details shape within the common envelope.
 struct RepositoryProblemCauseSchema;
 impl JsonSchema for RepositoryProblemCauseSchema {
     fn schema_name() -> std::borrow::Cow<'static, str> {
@@ -156,7 +157,8 @@ impl JsonSchema for RepositoryProblemCauseSchema {
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({"oneOf": [
             repository_failure::RepositoryFailureDetails::json_schema(generator),
-            protocol::control_failure::RuntimeControlCause::json_schema(generator)
+            protocol::control_failure::RuntimeControlCause::json_schema(generator),
+            protocol::control_failure::RuntimeControlFailure::json_schema(generator)
         ]})
     }
 }
@@ -184,6 +186,14 @@ const fn default_repository_error_status() -> u16 {
 }
 
 impl RepositoryApiError {
+    pub fn command_result(&self) -> Option<&protocol::WorkerCommandResult> {
+        self.command.as_ref()
+    }
+    pub fn with_command(mut self, command: Option<protocol::WorkerCommandResult>) -> Self {
+        self.command = command;
+        self
+    }
+
     pub fn control_cause(&self) -> Option<protocol::control_failure::RuntimeControlCause> {
         self.control
     }
@@ -206,6 +216,7 @@ impl RepositoryApiError {
             repository_problem: None,
             failure: None,
             control: None,
+            command: None,
             status,
         }
     }
@@ -231,6 +242,7 @@ impl api_macros::HttpError for RepositoryApiError {
         self.control.and_then(|cause| {
             runtime_api::RuntimeApiError::new(500, cause.reason(), cause.explanation())
                 .with_control(cause)
+                .with_command(self.command.clone())
                 .custom_response()
         })
     }
@@ -285,7 +297,8 @@ impl api_macros::reqwest::HttpClientError for RepositoryApiError {
                 cause.explanation(),
                 Vec::new(),
             )
-            .with_control(cause));
+            .with_control(cause)
+            .with_command(source.command_result().cloned()));
         }
         let mut error: Self = serde_json::from_slice(response.body()).map_err(|_| {
             ClientFailure::ErrorResponseDecode {
@@ -10174,6 +10187,8 @@ pub enum WorkerInputDisposition {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerInputResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_explanation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<protocol::control_failure::RuntimeControlCause>,
@@ -10207,6 +10222,8 @@ pub struct RuntimeWorkerLifecycleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerLifecycleResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     /// Independent post-operation failures; they do not change the accepted Runtime result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_failures: Vec<protocol::startup_failure::StartupFailureAttachment>,

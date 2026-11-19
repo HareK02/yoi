@@ -2481,6 +2481,7 @@ impl IntoResponse for RuntimeHttpWorkdirError {
 
 #[derive(Debug)]
 struct RuntimeHttpRestError {
+    command: Option<protocol::WorkerCommandResult>,
     management: Option<workdir::management_failure::WorkdirManagementFailure>,
     control: Option<protocol::control_failure::RuntimeControlCause>,
     create_failure: Option<runtime_api::startup::WorkerCreateFailure>,
@@ -2500,12 +2501,14 @@ impl RuntimeHttpRestError {
             control: None,
             management: None,
             create_failure: None,
+            command: None,
         }
     }
 
     fn runtime(error: RuntimeError) -> Self {
         // Working-directory refusal/cleanup classification is owned by that domain.
         // Do not replace its existing 400/403/409/503 boundary with a generic control 502.
+        let command = error.command_result().cloned();
         let control = if matches!(&error, RuntimeError::WorkingDirectory(_)) {
             None
         } else {
@@ -2538,6 +2541,7 @@ impl RuntimeHttpRestError {
             control,
             management: None,
             create_failure,
+            command,
         }
     }
 
@@ -2571,6 +2575,7 @@ impl RuntimeHttpRestError {
             cause.explanation(),
         );
         response.control = Some(cause);
+        response.command = error.command_result().cloned();
         response
     }
 
@@ -2619,7 +2624,14 @@ impl IntoResponse for RuntimeHttpRestError {
         }
         if self.startup.is_none() {
             if let Some(cause) = self.control {
-                return api_macros_control_response(cause);
+                let error = runtime_api::RuntimeApiError::new(
+                    self.status.as_u16(),
+                    cause.reason(),
+                    cause.explanation(),
+                )
+                .with_control(cause)
+                .with_command(self.command);
+                return runtime_api::server_support::http_error_response(self.status, error);
             }
         }
         let body = RuntimeHttpErrorResponse {
@@ -2816,6 +2828,7 @@ mod tests {
     mod attachment_operation_tests;
     #[cfg(feature = "fs-store")]
     mod attachment_sync_tests;
+    mod command_admission_result_tests;
     mod command_transport_tests;
     mod runtime_workdir_failure_tests;
     #[cfg(feature = "fs-store")]
@@ -6338,10 +6351,4 @@ mod ws_tests {
             protocol::Event::Error { .. }
         ));
     }
-}
-
-fn api_macros_control_response(cause: protocol::control_failure::RuntimeControlCause) -> Response {
-    let error = runtime_api::RuntimeApiError::new(500, cause.reason(), cause.explanation())
-        .with_control(cause);
-    runtime_api::server_support::http_error_response(StatusCode::INTERNAL_SERVER_ERROR, error)
 }

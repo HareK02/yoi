@@ -432,12 +432,12 @@ async fn queued_or_actor_staged_work_cannot_pass_the_exclusive_ack_boundary() {
         .unwrap();
     let pending = prepared.worker().pending_submission_handle();
     let buffer = prepared.worker().notify_buffer_handle();
-    let shared = WorkerSharedState::new(
+    let shared = Arc::new(WorkerSharedState::new(
         "queue-boundary".into(),
         prepared.worker().segment_id(),
         String::new(),
         build_greeting(prepared.worker()),
-    );
+    ));
     let control =
         crate::subject_release::ReleaseControl::new(prepared.worker().mutation_authority());
     for condition in [
@@ -448,12 +448,13 @@ async fn queued_or_actor_staged_work_cannot_pass_the_exclusive_ack_boundary() {
         "durable-notification",
     ] {
         let (sender, receiver) = mpsc::channel(1);
+        let receiver = ControllerReceiver::new(receiver, shared.clone(), broadcast::channel(16).0);
         if condition == "queued" {
             sender
-                .send(Method::submit_text(
+                .send(ControllerMessage::Protocol(Method::submit_text(
                     protocol::new_submission_request_id(),
                     "already enqueued",
-                ))
+                )))
                 .await
                 .unwrap();
         }

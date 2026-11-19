@@ -373,6 +373,7 @@ mod tests {
             ),
         ] {
             let result = Ok(WorkerInputResult {
+                command: None,
                 state,
                 disposition,
                 worker: RuntimeWorkerRef::new("runtime", "worker"),

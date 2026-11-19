@@ -104,6 +104,14 @@ export type WorkerCommandAcknowledgement = { command_id: number, command: Worker
  */
 state: WorkerStateSnapshot, };
 
+export type WorkerCommandResult = { "kind": "acknowledged", acknowledgement: WorkerCommandAcknowledgement, } | { "kind": "unconfirmed", command: WorkerCommandKind, command_id: number | null, delivery: WorkerCommandDelivery, reason: WorkerCommandObservationFailure, } | { "kind": "not_delivered", command: WorkerCommandKind, command_id: number | null, };
+
+export type WorkerCommandDelivery = "enqueued" | "unknown";
+
+export type WorkerCommandObservationFailure = "timed_out" | "lagged" | "closed" | "send_failed";
+
+export type RuntimeControlFailure = { cause: RuntimeControlCause, command?: WorkerCommandResult | null, };
+
 export type WorkerRunState = "running" | "pausing" | "paused" | "cancelling";
 
 export type WorkerMaintenanceState = "compacting";

@@ -194,6 +194,8 @@ pub struct RuntimePromptProjectionObservation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     /// Closed Runtime observations, not historical authorization or retry permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<workdir::management_failure::WorkdirManagementFailure>,
@@ -1021,6 +1023,8 @@ pub struct WorkerLifecycleRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLifecycleResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     /// Local post-operation cleanup facts, never inferred from Runtime diagnostics.
     #[serde(skip)]
     pub cleanup_failures: Vec<workdir::failure::WorkdirFailureDetails>,
@@ -1095,6 +1099,8 @@ pub use server_api::WorkerInputDisposition;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerInputResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     pub state: InternalWorkerOperationState,
     pub disposition: WorkerInputDisposition,
     #[serde(flatten)]
@@ -1587,6 +1593,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            command: None,
             cleanup_failures: Vec::new(),
             replayed: false,
             state: InternalWorkerOperationState::Unsupported,
@@ -1607,6 +1614,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            command: None,
             cleanup_failures: Vec::new(),
             replayed: false,
             state: InternalWorkerOperationState::Unsupported,
@@ -1884,6 +1892,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
         WorkerInputResult {
+            command: None,
             state: InternalWorkerOperationState::Unsupported,
             disposition: WorkerInputDisposition::Rejected,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
@@ -4168,6 +4177,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             },
         ) {
             Ok(response) => WorkerLifecycleResult {
+                command: response.command,
                 cleanup_failures: Vec::new(),
                 replayed: response.replayed,
                 state: InternalWorkerOperationState::Accepted,
@@ -4212,7 +4222,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             );
         };
         match self.runtime.cancel_worker(&worker_ref, request.reason) {
-            Ok(_) => WorkerLifecycleResult {
+            Ok(response) => WorkerLifecycleResult {
+                command: response.command,
                 cleanup_failures: Vec::new(),
                 replayed: false,
                 state: InternalWorkerOperationState::Accepted,
@@ -4776,6 +4787,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             })?;
         if receipt.is_accepted() {
             Ok(WorkerInputResult {
+                command: None,
                 state: InternalWorkerOperationState::Accepted,
                 disposition: WorkerInputDisposition::Accepted,
                 worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
@@ -4838,6 +4850,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         };
         match self.runtime.send_input(&worker_ref, input) {
             Ok(ack) => WorkerInputResult {
+                command: ack.command,
                 state: InternalWorkerOperationState::Accepted,
                 disposition: WorkerInputDisposition::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
@@ -6222,6 +6235,7 @@ impl RemoteWorkerRuntime {
         response: worker_runtime::catalog::WorkerLifecycleAck,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            command: response.command,
             cleanup_failures: Vec::new(),
             replayed: response.replayed,
             state: InternalWorkerOperationState::Accepted,
@@ -7671,6 +7685,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(input) => input,
             Err(diagnostic) => {
                 return WorkerInputResult {
+                    command: None,
                     state: InternalWorkerOperationState::Rejected,
                     disposition: WorkerInputDisposition::Rejected,
                     worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
@@ -7686,6 +7701,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             move |client| async move { client.send_worker_input(worker_id_owned, input).await },
         ) {
             Ok(response) => WorkerInputResult {
+                command: response.ack.command,
                 state: InternalWorkerOperationState::Accepted,
                 disposition: WorkerInputDisposition::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
@@ -8114,6 +8130,7 @@ fn embedded_input_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerInputResult {
     WorkerInputResult {
+        command: diagnostic.command.clone(),
         state: InternalWorkerOperationState::Rejected,
         disposition,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
@@ -8128,8 +8145,19 @@ fn remote_input_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerInputResult {
     WorkerInputResult {
+        command: diagnostic.command.clone(),
         state: InternalWorkerOperationState::Rejected,
-        disposition: WorkerInputDisposition::Unknown,
+        disposition: match diagnostic.command.as_ref() {
+            Some(protocol::WorkerCommandResult::NotDelivered { .. }) => {
+                WorkerInputDisposition::Rejected
+            }
+            Some(protocol::WorkerCommandResult::Acknowledged { acknowledgement })
+                if acknowledgement.disposition != protocol::WorkerCommandDisposition::Accepted =>
+            {
+                WorkerInputDisposition::Rejected
+            }
+            _ => WorkerInputDisposition::Unknown,
+        },
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         runtime_run_id: None,
         diagnostics: vec![diagnostic],
@@ -8142,6 +8170,7 @@ fn embedded_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
+        command: diagnostic.command.clone(),
         cleanup_failures: Vec::new(),
         replayed: false,
         state: InternalWorkerOperationState::Rejected,
@@ -8156,6 +8185,7 @@ fn remote_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
+        command: diagnostic.command.clone(),
         cleanup_failures: Vec::new(),
         replayed: false,
         state: InternalWorkerOperationState::Rejected,
@@ -8414,6 +8444,7 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
     if let EmbeddedRuntimeError::WorkerCreateFailed { failure, .. } = error {
         projection.startup = internal_startup_transfer(failure.startup().clone());
     }
+    projection.command = error.command_result().cloned();
     projection
 }
 
@@ -8585,6 +8616,12 @@ fn runtime_api_diagnostic(
     runtime_id: &str,
     error: runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
 ) -> RuntimeDiagnostic {
+    let command = match &error {
+        runtime_api::client_support::ClientError::Public { error, .. } => {
+            error.command_result().cloned()
+        }
+        _ => None,
+    };
     let cause = remote_control_cause(&error);
     let mut result = match error {
         runtime_api::client_support::ClientError::Public { status, error } => {
@@ -8678,6 +8715,7 @@ fn runtime_api_diagnostic(
         }
     };
     result.control = Some(cause);
+    result.command = command;
     result
 }
 
@@ -8839,6 +8877,7 @@ fn diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        command: None,
         session: None,
         workdir: None,
         control: None,
@@ -9378,6 +9417,275 @@ mod tests {
         }
     }
 
+    fn command_evidence(
+        command: protocol::WorkerCommandKind,
+        disposition: Option<protocol::WorkerCommandDisposition>,
+    ) -> protocol::WorkerCommandResult {
+        match disposition {
+            Some(disposition) => protocol::WorkerCommandResult::Acknowledged {
+                acknowledgement: protocol::WorkerCommandAcknowledgement {
+                    command_id: 42,
+                    command,
+                    disposition,
+                    state: protocol::WorkerStateSnapshot {
+                        last_command_id: 42,
+                        ..protocol::WorkerStatus::Running.into()
+                    },
+                },
+            },
+            None => protocol::WorkerCommandResult::Unconfirmed {
+                command,
+                command_id: Some(42),
+                delivery: protocol::WorkerCommandDelivery::Enqueued,
+                reason: protocol::WorkerCommandObservationFailure::TimedOut,
+            },
+        }
+    }
+
+    #[test]
+    fn command_evidence_embedded_runtime_retains_admission_rejection_and_timeout() {
+        use worker_runtime::execution::{
+            WorkerExecutionBackend, WorkerExecutionOperation as O, WorkerExecutionOutcome,
+            WorkerExecutionResult,
+        };
+        struct Backend {
+            spawn: AcceptingExecutionBackend,
+            evidence: Mutex<(WorkerExecutionOutcome, protocol::WorkerCommandResult)>,
+        }
+        impl WorkerExecutionBackend for Backend {
+            fn backend_id(&self) -> &str {
+                "command-evidence"
+            }
+            fn spawn_worker(
+                &self,
+                request: worker_runtime::execution::WorkerExecutionSpawnRequest,
+            ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+                self.spawn.spawn_worker(request)
+            }
+            fn dispatch_input(
+                &self,
+                _: &EmbeddedWorkerRef,
+                _: EmbeddedWorkerInput,
+            ) -> WorkerExecutionResult {
+                self.result(O::Input)
+            }
+            fn cancel_worker(&self, _: &EmbeddedWorkerRef) -> WorkerExecutionResult {
+                self.result(O::Cancel)
+            }
+        }
+        impl Backend {
+            fn result(&self, operation: O) -> WorkerExecutionResult {
+                let (outcome, evidence) = self.evidence.lock().unwrap().clone();
+                let mut result = WorkerExecutionResult::accepted(operation);
+                result.outcome = outcome;
+                result.command = Some(evidence);
+                result
+            }
+        }
+        let backend = Arc::new(Backend {
+            spawn: AcceptingExecutionBackend::default(),
+            evidence: Mutex::new((
+                WorkerExecutionOutcome::Accepted,
+                command_evidence(
+                    protocol::WorkerCommandKind::Cancel,
+                    Some(protocol::WorkerCommandDisposition::Accepted),
+                ),
+            )),
+        });
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "local:command",
+            backend.clone(),
+        )
+        .unwrap();
+        let worker = runtime
+            .spawn_worker(test_create_binding(), embedded_spawn_request())
+            .worker
+            .unwrap();
+        for (outcome, disposition) in [
+            (
+                WorkerExecutionOutcome::Accepted,
+                Some(protocol::WorkerCommandDisposition::Accepted),
+            ),
+            (
+                WorkerExecutionOutcome::Rejected,
+                Some(protocol::WorkerCommandDisposition::Conflict),
+            ),
+            (
+                WorkerExecutionOutcome::Rejected,
+                Some(protocol::WorkerCommandDisposition::StaleCommandId),
+            ),
+            (
+                WorkerExecutionOutcome::Rejected,
+                Some(protocol::WorkerCommandDisposition::InvalidState),
+            ),
+            (WorkerExecutionOutcome::Errored, None),
+        ] {
+            for command in [
+                protocol::WorkerCommandKind::Cancel,
+                protocol::WorkerCommandKind::Compact,
+            ] {
+                let evidence = command_evidence(command, disposition);
+                *backend.evidence.lock().unwrap() = (outcome, evidence.clone());
+                let observed = if command == protocol::WorkerCommandKind::Cancel {
+                    runtime
+                        .cancel_worker(
+                            &worker.worker.worker_id,
+                            WorkerLifecycleRequest {
+                                reason: None,
+                                stop_intent: None,
+                                ticket_assignment: None,
+                            },
+                        )
+                        .command
+                } else {
+                    runtime
+                        .send_input(
+                            &worker.worker.worker_id,
+                            WorkerInputRequest {
+                                kind: WorkerInputKind::Compact,
+                                content: String::new(),
+                                source: None,
+                                submission_request_id: None,
+                                segments: None,
+                            },
+                        )
+                        .command
+                };
+                assert_eq!(observed, Some(evidence));
+                // The correlated acknowledgement snapshot must not become a second state writer.
+                assert_eq!(
+                    runtime
+                        .worker(&worker.worker.worker_id)
+                        .into_worker(runtime.runtime_id(), &worker.worker.worker_id)
+                        .unwrap()
+                        .state,
+                    "idle"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_evidence_remote_http_retains_admission_rejection_and_timeout() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        for disposition in [
+            Some(protocol::WorkerCommandDisposition::Accepted),
+            Some(protocol::WorkerCommandDisposition::Conflict),
+            Some(protocol::WorkerCommandDisposition::StaleCommandId),
+            Some(protocol::WorkerCommandDisposition::InvalidState),
+            None,
+        ] {
+            for command in [
+                protocol::WorkerCommandKind::Cancel,
+                protocol::WorkerCommandKind::Compact,
+            ] {
+                let evidence = command_evidence(command, disposition);
+                let accepted = disposition == Some(protocol::WorkerCommandDisposition::Accepted);
+                let suffix = if command == protocol::WorkerCommandKind::Cancel {
+                    "cancel"
+                } else {
+                    "input"
+                };
+                let mut response = if accepted {
+                    mock_response("POST", format!("/v1/workers/{worker_id}/{suffix}"), true, 200,
+                        json!({ "ack": {"worker_ref": {"worker_id":worker_id}, "status":"idle", "command":evidence} }).to_string())
+                } else {
+                    let cause = if disposition.is_none() {
+                        RuntimeControlCause::ResultUnavailable
+                    } else {
+                        RuntimeControlCause::ExecutionRejected
+                    };
+                    let problem = runtime_api::control_failure::control_problem_with_command(
+                        cause,
+                        Some(evidence.clone()),
+                    )
+                    .unwrap();
+                    let mut response = mock_response(
+                        "POST",
+                        format!("/v1/workers/{worker_id}/{suffix}"),
+                        true,
+                        problem.status,
+                        String::from_utf8(problem.body.to_vec()).unwrap(),
+                    );
+                    response.content_type = problem.content_type;
+                    response
+                };
+                response.request_body = Some(if command == protocol::WorkerCommandKind::Cancel {
+                    json!({})
+                } else {
+                    json!({"kind":"compact","content":""})
+                });
+                let (base_url, server) = serve_mock_http(vec![response]);
+                let runtime = RemoteWorkerRuntime::new(
+                    RemoteRuntimeConfig::new(
+                        "remote:command",
+                        "Remote",
+                        base_url,
+                        Some("secret-token".into()),
+                    )
+                    .with_timeout(Duration::from_secs(2)),
+                    "workspace-test".into(),
+                    "http://backend.invalid".into(),
+                )
+                .unwrap();
+                let observed = if command == protocol::WorkerCommandKind::Cancel {
+                    runtime
+                        .cancel_worker(
+                            &worker_id,
+                            WorkerLifecycleRequest {
+                                reason: None,
+                                stop_intent: None,
+                                ticket_assignment: None,
+                            },
+                        )
+                        .command
+                } else {
+                    let result = runtime.send_input(
+                        &worker_id,
+                        WorkerInputRequest {
+                            kind: WorkerInputKind::Compact,
+                            content: String::new(),
+                            source: None,
+                            submission_request_id: None,
+                            segments: None,
+                        },
+                    );
+                    assert_eq!(
+                        result.state,
+                        if accepted {
+                            InternalWorkerOperationState::Accepted
+                        } else {
+                            InternalWorkerOperationState::Rejected
+                        }
+                    );
+                    assert_eq!(
+                        result.disposition,
+                        if accepted {
+                            WorkerInputDisposition::Accepted
+                        } else if disposition.is_some() {
+                            WorkerInputDisposition::Rejected
+                        } else {
+                            WorkerInputDisposition::Unknown
+                        }
+                    );
+                    if !accepted {
+                        assert_eq!(
+                            result.diagnostics[0].control,
+                            Some(if disposition.is_none() {
+                                RuntimeControlCause::ResultUnavailable
+                            } else {
+                                RuntimeControlCause::ExecutionRejected
+                            })
+                        );
+                    }
+                    result.command
+                };
+                assert_eq!(observed, Some(evidence));
+                server.join().unwrap();
+            }
+        }
+    }
+
     #[test]
     fn session_registration_embedded_and_remote_host_projection_is_internal_only() {
         use protocol::session_failure::{
@@ -9899,6 +10207,7 @@ mod tests {
         assert!(value.get("worker").is_none());
 
         let lifecycle = WorkerLifecycleResult {
+            command: None,
             cleanup_failures: Vec::new(),
             replayed: false,
             state: InternalWorkerOperationState::Accepted,

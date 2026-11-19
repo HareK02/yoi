@@ -253,7 +253,7 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
 #[derive(Clone)]
 pub(crate) enum ParentNotificationTarget {
     Controller {
-        sender: mpsc::WeakSender<Method>,
+        sender: mpsc::WeakSender<crate::controller::commands::ControllerMessage>,
         fallback: Arc<dyn Fn(Method) -> std::io::Result<()> + Send + Sync>,
     },
     Durable(Arc<dyn Fn(Method) -> std::io::Result<()> + Send + Sync>),
@@ -261,7 +261,7 @@ pub(crate) enum ParentNotificationTarget {
 
 impl ParentNotificationTarget {
     pub(crate) fn with_controller_fallback(
-        sender: mpsc::WeakSender<Method>,
+        sender: mpsc::WeakSender<crate::controller::commands::ControllerMessage>,
         fallback: ParentNotificationTarget,
     ) -> Self {
         let ParentNotificationTarget::Durable(fallback) = fallback else {
@@ -297,7 +297,11 @@ impl ParentNotificationTarget {
                         if !matches!(
                             tokio::time::timeout(
                                 std::time::Duration::from_secs(2),
-                                parent_method_tx.send(method)
+                                parent_method_tx.send(
+                                    crate::controller::commands::ControllerMessage::Protocol(
+                                        method
+                                    )
+                                )
                             )
                             .await,
                             Ok(Ok(()))
@@ -1359,10 +1363,10 @@ enabled = false
         assert!(durable.load(Ordering::Acquire));
         assert!(matches!(
             wakeup,
-            Method::NotifyTracked {
+            crate::controller::commands::ControllerMessage::Protocol(Method::NotifyTracked {
                 source: protocol::AuthenticatedInputSource::SubWorker { session_id },
                 ..
-            } if session_id == "child-session"
+            }) if session_id == "child-session"
         ));
     }
 
@@ -1679,11 +1683,11 @@ enabled = false
             .expect("parent method channel remains open");
         assert!(matches!(
             completion,
-            Method::NotifyTracked {
+            crate::controller::commands::ControllerMessage::Protocol(Method::NotifyTracked {
                 message,
                 source: protocol::AuthenticatedInputSource::SubWorker { session_id },
                 ..
-            } if session_id == record.session.session_id_string()
+            }) if session_id == record.session.session_id_string()
                 && message.contains("SubWorker `reviewer-child` lifecycle RunFinished")
         ));
         assert!(!runtime.path().join("reviewer-child/sock").exists());

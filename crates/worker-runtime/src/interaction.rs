@@ -97,6 +97,9 @@ mod tests {
 /// Acknowledgement returned after input is accepted into the Worker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerInteractionAck {
+    /// Present for Controller commands such as Compact, not execution completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<protocol::WorkerCommandResult>,
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
     /// Present for User Submit and absent for non-Submit interactions.
