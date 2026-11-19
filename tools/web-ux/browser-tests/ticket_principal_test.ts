@@ -28,9 +28,8 @@ Deno.test("principal replacement snapshots the target and observed assignment fo
     const page = await browser.newPage();
     await page.goto(`${base}/w/tickets/tickets/T-2`);
     await page.getByText("Self-reported handling: waiting", { exact: true }).waitFor();
-    await page.getByText("Choose responsibility principal", { exact: true }).click();
-    await page.getByRole("combobox", { name: "Principal kind", exact: true }).selectOption("user");
-    await page.getByLabel("Account identity", { exact: true }).fill("alice");
+    await page.getByText("Choose responsible Subject", { exact: true }).click();
+    await page.getByRole("combobox", { name: "Subject", exact: true }).selectOption("subject-other");
     await page.getByText("Replace this delegation", { exact: true }).click();
     const sent: string[] = [];
     await page.route("**/assignments/orchestrator", async (route) => {
@@ -44,10 +43,10 @@ Deno.test("principal replacement snapshots the target and observed assignment fo
     await page.getByRole("alert").filter({ hasText: "Outcome unknown" }).waitFor();
     assertEquals(sent.length, 1);
     const input = JSON.parse(sent[0]);
-    assertEquals(input.principal, { kind: "user", account_id: "alice" });
+    assertEquals(input.principal, { kind: "subject", subject_id: "subject-other" });
     assertEquals(input.expected_assignment_id, "assignment-T-2");
     assert(typeof input.operation_id === "string" && input.operation_id.length > 0);
-    assert(await page.getByRole("combobox", { name: "Principal kind", exact: true }).isDisabled());
+    assert(await page.getByRole("combobox", { name: "Subject", exact: true }).isDisabled());
     const retryFailed = page.waitForEvent(
       "requestfailed",
       (request) =>

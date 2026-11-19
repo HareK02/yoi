@@ -51,9 +51,10 @@ async function control(base: string, body: unknown) {
 function queryResponse(
   page: Page,
   predicate: (body: Record<string, unknown>) => boolean,
+  path = "/tickets/browse",
 ) {
   return page.waitForResponse((response) =>
-    response.url().endsWith("/tickets/query") &&
+    response.url().endsWith(path) &&
     response.request().method() === "POST" &&
     predicate(response.request().postDataJSON())
   );
@@ -69,7 +70,7 @@ function ticketKey(page: Page, key: string) {
 }
 async function queryRequests(base: string) {
   const requests = await (await fetch(`${base}/fixture-state`)).json();
-  return requests.filter((row: { path: string }) => row.path === "/tickets/query");
+  return requests.filter((row: { path: string }) => row.path === "/tickets/browse");
 }
 
 Deno.test("Ticket parser failures stay local, retain Workspace navigation, and recover on retry", async () => {
@@ -132,12 +133,12 @@ Deno.test("single Ticket query searches beyond loaded rows and preserves qualifi
     assertEquals(await page.getByRole("checkbox").count(), 0);
     assertEquals((await queryRequests(base)).length, 1);
     const filtered = queryResponse(page, (body) => (body.tag_ids as string[])?.includes("tag-ui"));
-    await search(page, 'state:open tag:"UI" assignee:orchestrator');
+    await search(page, 'state:open tag:"UI" assignee:subject:subject-fixture');
     assertEquals((await filtered).request().postDataJSON(), {
       query: null,
       states: ["open"],
       tag_ids: ["tag-ui"],
-      assigned_principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+      assigned_principal: { kind: "subject", subject_id: "subject-fixture" },
       handling_status: null,
       sort: "updated_desc",
       limit: 30,
@@ -148,7 +149,7 @@ Deno.test("single Ticket query searches beyond loaded rows and preserves qualifi
     assertEquals((await queryRequests(base)).length, 2);
     await page.goto(
       `${base}/w/tickets-pages/tickets?q=${
-        encodeURIComponent("state:open assignee:orchestrator tag:tag-investigation")
+        encodeURIComponent("state:open assignee:subject:subject-fixture tag:tag-investigation")
       }`,
     );
     await page.getByRole("button", { name: "Load more tickets", exact: true }).waitFor();
@@ -158,8 +159,8 @@ Deno.test("single Ticket query searches beyond loaded rows and preserves qualifi
     assertEquals(nextRequest.tag_ids, ["tag-investigation"]);
     assertEquals(nextRequest.states, ["open"]);
     assertEquals(nextRequest.assigned_principal, {
-      kind: "workspace_agent",
-      agent_key: "workspace-orchestrator",
+      kind: "subject",
+      subject_id: "subject-fixture",
     });
     await ticketKey(page, "T-40").waitFor();
     assertEquals(await page.locator(".ticket-list-row").count(), 39);
@@ -177,17 +178,18 @@ Deno.test("single Ticket query searches beyond loaded rows and preserves qualifi
 Deno.test("Orchestrator retains handling filters and assignment pagination independently of Ticket search", async () => {
   await withFixture(async (browser, base) => {
     const page = await browser.newPage();
-    await page.goto(`${base}/w/tickets-pages/orchestrator?handling=done`);
+    await page.goto(`${base}/w/tickets-pages/orchestrator?handling=done&principal=subject&subject=subject-fixture`);
     await page.getByRole("button", { name: "Load more assignments" }).waitFor();
     const moreHandling = queryResponse(
       page,
       (body) => body.cursor === "30" && body.handling_status === "done",
+      "/tickets/query",
     );
     await page.getByRole("button", { name: "Load more assignments" }).click();
     const handlingRequest = (await moreHandling).request().postDataJSON();
     assertEquals(handlingRequest.assigned_principal, {
-      kind: "workspace_agent",
-      agent_key: "workspace-orchestrator",
+      kind: "subject",
+      subject_id: "subject-fixture",
     });
     assertEquals(handlingRequest.states, []);
     await page.locator(".orchestrator-assignment").filter({ hasText: "T-40" }).waitFor();
@@ -197,6 +199,7 @@ Deno.test("Orchestrator retains handling filters and assignment pagination indep
     const waiting = queryResponse(
       page,
       (body) => body.handling_status === "waiting" && body.cursor === null,
+      "/tickets/query",
     );
     await page.getByRole("button", { name: "Apply filters", exact: true }).click();
     await waiting;
@@ -402,13 +405,13 @@ async function assertThreadLayout(page: Page) {
     element.previousElementSibling?.matches(".ticket-timeline") &&
     element.firstElementChild?.matches(".bevel-line")
   ));
-  const metadata = ".ticket-handling, .ticket-tags, .ticket-relations, .ticket-orchestrator-worker, .ticket-worker-observation, .ticket-worker-card, .ticket-resources";
+  const metadata = ".ticket-handling, .ticket-tags, .ticket-relations, .ticket-subject-worker, .ticket-worker-observation, .ticket-worker-card, .ticket-resources";
   assertEquals(await main.locator(metadata).count(), 0);
   assertEquals(await rail.locator(metadata).count(), 7);
   assertEquals(await page.locator(".ticket-delivery").count(), 0);
   assertEquals(await page.getByText("Delivery and execution", { exact: true }).count(), 0);
   assertEquals(await rail.locator(".ticket-thread-event[data-initial=true], .ticket-thread-event, .ticket-thread-composer").count(), 0);
-  for (const selector of [".ticket-orchestrator-worker", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resource-editor"]) {
+  for (const selector of [".ticket-subject-worker", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resource-editor"]) {
     const details = rail.locator(selector);
     assertEquals(await details.evaluate((element) => element.tagName), "DETAILS");
     assertEquals(await details.getAttribute("open"), null);
@@ -467,7 +470,7 @@ Deno.test("late old-query pagination cannot append rows after query navigation",
     const held = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const finished = Promise.withResolvers<void>();
-    await page.route("**/tickets/query", async (route) => {
+    await page.route("**/tickets/browse", async (route) => {
       if (route.request().postDataJSON().cursor !== "30") return await route.continue();
       const response = await route.fetch();
       held.resolve();
@@ -572,8 +575,8 @@ Deno.test("waiting answers retain a delegation, done reissue retains results, an
     const request = (await reissueResponse).request().postDataJSON();
     assertEquals(request.expected_assignment_id, original.assignment_id);
     assertEquals(request.principal, {
-      kind: "workspace_agent",
-      agent_key: "workspace-orchestrator",
+      kind: "subject",
+      subject_id: "subject-fixture",
     });
     assert(typeof request.operation_id === "string");
     await page.getByText("Self-reported handling: waiting", { exact: true })
@@ -797,7 +800,7 @@ Deno.test("repository-free creation and canonical tag create/attach/rename/delet
       name: "Repository-free investigation",
       exact: true,
     }).waitFor();
-    await page.getByText("No current Orchestrator assignment.", { exact: true })
+    await page.getByText("No current Subject assignment.", { exact: true })
       .waitFor();
     await page.getByText("Manage Workspace tags", { exact: true }).click();
     await page.getByLabel("Tag name", { exact: true }).fill("Comparisons");
@@ -940,8 +943,8 @@ Deno.test("ambiguous saved Assign retries exact JSON once, while stale and permi
               operation_id: "concurrent-replacement",
               expected_assignment_id: "assignment-T-1",
               principal: {
-                kind: "workspace_agent",
-                agent_key: "workspace-orchestrator",
+                kind: "subject",
+                subject_id: "subject-fixture",
               },
             }),
           },
@@ -1301,14 +1304,13 @@ Deno.test("case and handling matrix renders without overflow in both themes and 
                 );
               }
               if (workspace === "tickets-running") {
-                await page.locator("aside .ticket-orchestrator-worker > summary").click();
-                await page.locator("aside .ticket-orchestrator-worker strong").waitFor();
-                assert(
-                  await page.locator(".ticket-orchestrator-worker").getByText(
-                    "Running",
-                    { exact: true },
-                  ).isVisible(),
-                );
+                await page.locator("aside .ticket-subject-worker > summary").click();
+                const subjectLink = page.locator(".ticket-subject-worker").getByRole("link", {
+                  name: "Open responsible Subject and current Worker", exact: true,
+                });
+                assert(await subjectLink.isVisible());
+                assert((await subjectLink.getAttribute("href"))?.endsWith("/subjektiv/subject-fixture"));
+                assertEquals(await page.locator(".ticket-orchestrator-worker").count(), 0);
               }
             }
             if (route === "tickets/T-3") {

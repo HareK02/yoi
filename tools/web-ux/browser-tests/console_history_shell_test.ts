@@ -1,3 +1,4 @@
+import { productionBuild } from "./production_build.ts";
 /// <reference lib="dom" />
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
@@ -96,7 +97,9 @@ async function checkSidebarPointerModeSwitch(page: Page, pinning: boolean): Prom
   await page.waitForTimeout(100);
   assertEquals(await page.locator(".sidebar-frame.folded").count(), pinning ? 1 : 0,
     "pointer-down must not open a preview before the mode changes on click");
-  const sampling = button.evaluate(async (button) => {
+  // The click changes the accessible name. Start sampling on the stable node
+  // and acknowledge the initial sample before releasing the pointer.
+  const sampling = page.locator(".sidebar-fold-button").evaluate(async (button) => {
     const frame = button.closest<HTMLElement>(".sidebar-frame")!;
     const panel = frame.querySelector<HTMLElement>(".sidebar-frame__bevel")!;
     const main = document.querySelector<HTMLElement>(".app-shell__main")!;
@@ -111,6 +114,7 @@ async function checkSidebarPointerModeSwitch(page: Page, pinning: boolean): Prom
       buttonBottom: button.getBoundingClientRect().bottom,
     });
     const samples = [sample()];
+    button.setAttribute("data-pointer-sampling", "started");
     const start = performance.now();
     do {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -118,8 +122,10 @@ async function checkSidebarPointerModeSwitch(page: Page, pinning: boolean): Prom
     } while (performance.now() - start < 450);
     return samples;
   });
+  await page.locator(".sidebar-fold-button[data-pointer-sampling='started']").waitFor();
   await page.mouse.up();
   const samples = await sampling;
+  await page.locator(".sidebar-fold-button").evaluate((button) => button.removeAttribute("data-pointer-sampling"));
   for (const sample of samples) {
     assert(Math.abs(sample.frameWidth - sample.panelWidth) <= 1,
       `sidebar and main must move together throughout the click: ${JSON.stringify(sample)}`);
@@ -214,17 +220,7 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
 }
 
 async function checkConsoleHistory(viewportHeight: number): Promise<void> {
-  const build = await new Deno.Command(Deno.execPath(), {
-    args: ["task", "build"],
-    cwd: workspaceRoot,
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  if (!build.success) {
-    throw new Error(
-      `Workspace production build failed:\n${new TextDecoder().decode(build.stderr)}`,
-    );
-  }
+  const buildRoot = await productionBuild(workspaceRoot);
 
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -235,7 +231,7 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       "--allow-read",
       fixtureServer,
       String(port),
-      join(workspaceRoot, "build"),
+      buildRoot,
     ],
     stdout: "null",
     stderr: "null",

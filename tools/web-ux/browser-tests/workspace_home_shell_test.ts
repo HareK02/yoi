@@ -1,3 +1,4 @@
+import { productionBuild } from "./production_build.ts";
 /// <reference lib="dom" />
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
@@ -10,13 +11,7 @@ const ready = async (page: Page) => {
   }
 };
 Deno.test("production Home dashboard isolates failures, shows authoritative records, and supports responsive keyboard navigation", async () => {
-  const build = await new Deno.Command(Deno.execPath(), {
-    args: ["task", "build"],
-    cwd: join(root, "web/workspace"),
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  assert(build.success, new TextDecoder().decode(build.stderr));
+  const buildRoot = await productionBuild(join(root, "web/workspace"));
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
   listener.close();
@@ -28,7 +23,7 @@ Deno.test("production Home dashboard isolates failures, shows authoritative reco
       "--allow-read",
       join(root, "tools/web-ux/browser-tests/workspace_home_fixture_server.ts"),
       String(port),
-      join(root, "web/workspace/build"),
+      buildRoot,
     ],
     stdout: "null",
     stderr: "null",
@@ -70,7 +65,11 @@ Deno.test("production Home dashboard isolates failures, shows authoritative reco
               if (response.status() >= 400) errors.push(`${response.status()} ${response.url()}`);
             });
             for (const workspace of ["home-owner", "home-member", "home-long"]) {
+              const workers = page.waitForResponse((response) =>
+                new URL(response.url()).pathname === `/api/w/${workspace}/workers`
+              );
               await page.goto(`${url}/w/${workspace}`);
+              assertEquals(await (await workers).finished(), null);
               await ready(page);
               assertEquals(await page.locator("main h1").allTextContents(), ["Activity"]);
               assertEquals(await page.locator("main nav").count(), 0);

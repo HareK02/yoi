@@ -1,3 +1,4 @@
+import { productionBuild } from "./production_build.ts";
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
 import { chromium, type Page } from "playwright";
@@ -110,17 +111,7 @@ async function swipeMainToEnd(page: Page): Promise<void> {
 }
 
 Deno.test("production subject Memory and Worker launch shells preserve exact scoped behavior", async () => {
-  const build = await new Deno.Command(Deno.execPath(), {
-    args: ["task", "build"],
-    cwd: workspaceRoot,
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  if (!build.success) {
-    throw new Error(
-      `Workspace production build failed:\n${new TextDecoder().decode(build.stderr)}`,
-    );
-  }
+  const buildRoot = await productionBuild(workspaceRoot);
   await Deno.mkdir(createInteractionArtifacts, { recursive: true });
 
   const port = await freePort();
@@ -132,7 +123,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       "--allow-read",
       fixtureServer,
       String(port),
-      join(workspaceRoot, "build"),
+      buildRoot,
     ],
     stdout: "null",
     stderr: "null",
@@ -451,7 +442,10 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         await createPage.locator("code.subject-id", { hasText: "created-subject-0001" }).count(),
         1,
       );
-      await createPage.locator(".subject-body").getByText("No current conversation body.", { exact: true }).waitFor();
+      const startSubject = createPage.locator(".subject-body").getByRole("button", { name: "Start Subject", exact: true });
+      await startSubject.waitFor();
+      assert(await startSubject.isEnabled());
+      assertEquals(await createPage.locator(".subject-body").getByRole("button", { name: "Stop Subject", exact: true }).count(), 0);
       await createPage.getByText("Resident context has not been generated.").waitFor();
       await createPage.getByText("No committed Memories yet.").waitFor();
       await createPage.getByRole("button", { name: "Edit" }).click();
