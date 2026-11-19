@@ -833,7 +833,16 @@ impl<'de> Deserialize<'de> for PortableJson {
                 Ok(PortableJson)
             }
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<PortableJson, E> {
-                let lower = value.to_ascii_lowercase();
+                // Current Workers persist this fixed public Workdir guidance even
+                // without attachments. Its literal word "authorization" is not
+                // credential material. Exempt only this exact sentence during
+                // validation, never alter the preserved Session bytes; every
+                // other occurrence and all other markers still fail closed.
+                let inspected = value.replace(
+                    "Resolved targets remain subject to scope, symlink and command authorization.",
+                    "",
+                );
+                let lower = inspected.to_ascii_lowercase();
                 if [
                     "://",
                     "private key",

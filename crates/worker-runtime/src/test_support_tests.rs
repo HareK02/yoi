@@ -16,6 +16,25 @@ fn decode_diagnostic_identifies_type_and_position_without_private_values() {
     assert!(!error.contains("private-source-marker"), "{error}");
 }
 
+#[test]
+fn public_workdir_guidance_does_not_mask_sensitive_fixture_material() {
+    let public = "Resolved targets remain subject to scope, symlink and command authorization.";
+    let encoded = serde_json::to_vec(public).unwrap();
+    assert!(decode::<PortableJson>(&encoded).is_ok());
+    for private in [
+        "authorization",
+        "Authorization: secret",
+        "bearer secret",
+        "access_token",
+        "sk-secret",
+        "/private/host/path",
+        "https://private.example",
+    ] {
+        let encoded = serde_json::to_vec(&format!("{public}\n{private}")).unwrap();
+        assert!(decode::<PortableJson>(&encoded).is_err(), "{private}");
+    }
+}
+
 const RUNTIME: &str = "fixture-runtime";
 const WORKSPACE: &str = "fixture-workspace";
 const NEW_URL: &str = "http://127.0.0.1:34567";
