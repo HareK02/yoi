@@ -4893,6 +4893,31 @@ impl WorkspaceApi {
     }
 
     async fn new_with_database_preparation(
+        config: ServerConfig,
+        store: Arc<dyn ControlPlaneStore>,
+        execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+        resource_broker: BackendResourceBroker,
+        host_executors: HostExecutors,
+        worker_remove_dispatcher: Option<
+            Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
+        >,
+        database_preparation: WorkspaceDatabasePreparation,
+    ) -> Result<Self> {
+        Self::new_with_startup_recovery(
+            config,
+            store,
+            execution_backend,
+            resource_broker,
+            host_executors,
+            worker_remove_dispatcher,
+            database_preparation,
+            #[cfg(test)]
+            Arc::default(),
+        )
+        .await
+    }
+
+    async fn new_with_startup_recovery(
         mut config: ServerConfig,
         store: Arc<dyn ControlPlaneStore>,
         execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
@@ -4902,6 +4927,9 @@ impl WorkspaceApi {
             Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
         >,
         database_preparation: WorkspaceDatabasePreparation,
+        // Fixtures can acquire the real step gate before startup restores owners.
+        // Production always creates fresh owners and runs the same recovery path.
+        #[cfg(test)] backend_job_recovery: Arc<backend_job_recovery::RecoveryOwners>,
     ) -> Result<Self> {
         if store.get_workspace(&config.workspace_id).await?.is_none() {
             return Err(crate::Error::Config(format!(
@@ -5110,7 +5138,10 @@ impl WorkspaceApi {
             notification_delivery_lifecycle: Arc::new(Default::default()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
+            #[cfg(not(test))]
             backend_job_recovery: Arc::default(),
+            #[cfg(test)]
+            backend_job_recovery,
             journal_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             journal_dispatch_owner: None,
             plugin_runtime_owner: None,

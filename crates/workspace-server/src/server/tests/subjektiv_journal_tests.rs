@@ -5971,15 +5971,21 @@ mod immutable {
         drop(api);
         drop(store);
         drop(job_store);
-        // Reopen after input save but before dispatch, with no readable original source.
+        // Gate background receipt reconciliation before startup can restore its owner.
+        // The constructor still performs real recovery, including dispatch of the saved
+        // reservation, while the original source remains unreadable.
+        let recovery = Arc::new(backend_job_recovery::RecoveryOwners::default());
+        let recovery_steps = recovery.pause_steps_for_test().await;
         let job_store = Arc::new(test_control_store(&config));
-        let api = WorkspaceApi::new_with_execution_backend_and_broker(
+        let api = WorkspaceApi::new_with_startup_recovery(
             config.clone(),
             job_store.clone(),
             execution.clone(),
             BackendResourceBroker::default(),
             HostExecutors::default(),
             None,
+            WorkspaceDatabasePreparation::Startup,
+            recovery.clone(),
         )
         .await
         .unwrap();
@@ -5998,19 +6004,11 @@ mod immutable {
             range,
             id,
         };
-        // The production constructor itself restores the accepted owner and may
-        // dispatch. Join that test owner's work, then use its real dispatch gate
-        // to order the two receipt-reconciliation cuts below. No live Worker is stopped.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            f.api.stop_backend_job_recovery(),
-        )
-        .await
-        .expect("startup recovery did not quiesce for the frozen-generation cut");
-        let gate = f
-            .api
-            .backend_job_recovery
-            .dispatch_gate(&generation.job.attempt_id);
+        assert_eq!(
+            recovery.recovery_owner_ids(),
+            std::collections::HashSet::from([generation.job.attempt_id.clone()]),
+            "startup must restore the exact accepted owner before the gate is released"
+        );
         let saved = current_journal_job(&f);
         let reopened = frozen_lifetime_evidence(&f, &generation, "reopen_before_checkpoint");
         assert_eq!(
@@ -6019,19 +6017,16 @@ mod immutable {
         );
         assert_eq!(saved.input_digest, digest);
         assert_eq!(saved.state, BackendJobState::Pending, "{reopened}");
-        let dispatched = f
-            .api
-            .dispatch_backend_job_reservation(f.reserved.clone())
-            .unwrap();
+        // Do not manually dispatch: this must be the constructor's saved-input recovery.
+        let dispatched = current_journal_attempt(&f, &generation.job.attempt_id);
         assert_eq!(
-            dispatched.attempt.state,
+            dispatched.state,
             BackendJobAttemptState::Dispatched,
             "{reopened}"
         );
-        let worker = dispatched.attempt.worker.as_ref().unwrap();
-        // Background recovery was joined; initial dispatch has returned. Hold the
-        // existing producer gate through the unreflected recovery and checkpoint.
-        let dispatch_finished = gate.lock().unwrap();
+        let worker = dispatched.worker.as_ref().unwrap();
+        // Startup dispatch has returned; the preinstalled step gate still orders
+        // the unreflected receipt check and checkpoint before background recovery.
         let before = frozen_lifetime_evidence(&f, &generation, "dispatch_finished");
         assert_eq!(before["domain"]["active"], 1, "{before}");
         assert!(before["domain"]["completion"].is_null(), "{before}");
@@ -6053,9 +6048,7 @@ mod immutable {
         );
         assert_eq!(
             inputs[0].1,
-            f.request
-                .worker_input(&dispatched.attempt.attempt_id)
-                .unwrap()
+            f.request.worker_input(&dispatched.attempt_id).unwrap()
         );
 
         // Same callee as recover_backend_job_step, at an exact current owner cut.
@@ -6102,16 +6095,14 @@ mod immutable {
         );
         assert_eq!(checkpointed["domain"]["checkpoints"], 1, "{checkpointed}");
         assert_eq!(checkpointed["domain"]["process_order"], 1, "{checkpointed}");
-        f.api.backend_job_recovery.resume_after_test_pause();
-        f.api.own_backend_job_recovery(&dispatched.attempt);
-        drop(dispatch_finished);
+        drop(recovery_steps);
 
-        // Release only the producer gate. No explicit finish/result/second input:
-        // the actual root owner must recover the saved checkpoint on the same Job.
+        // Release only the step gate. No owner restart, explicit finish/result or
+        // second input: the startup owner must recover the checkpoint on the same Job.
         let completed = observe_journal_outcome(&f).await;
         let settled = frozen_lifetime_evidence(&f, &generation, "owner_completed_cleanup_blocked");
         assert_eq!(completed.state, BackendJobState::Finalizing, "{settled}");
-        assert_eq!(completed.current_attempt, dispatched.attempt.attempt);
+        assert_eq!(completed.current_attempt, dispatched.attempt);
         assert_eq!(completed.input_digest, digest);
         let completion: JournalJobCompletion =
             serde_json::from_value(completed.result.clone().unwrap()).unwrap();
@@ -6136,8 +6127,8 @@ mod immutable {
         assert_eq!(settled["domain"]["checkpoints"], 1, "{settled}");
         assert_eq!(settled["execution_fence"], false, "{settled}");
         let terminal = current_journal_attempt(&f, &generation.job.attempt_id);
-        assert_eq!(terminal.worker, dispatched.attempt.worker);
-        assert_eq!(terminal.runtime_run_id, dispatched.attempt.runtime_run_id);
+        assert_eq!(terminal.worker, dispatched.worker);
+        assert_eq!(terminal.runtime_run_id, dispatched.runtime_run_id);
         assert_eq!(
             terminal.worker_cleanup_state,
             Some(BackendJobWorkerCleanupState::Pending)
@@ -6173,7 +6164,7 @@ mod immutable {
         wait_for_backend_job_worker_cleanup(
             &f.api,
             &f.request.job_id,
-            &dispatched.attempt.attempt_id,
+            &dispatched.attempt_id,
             BackendJobWorkerCleanupState::Completed,
         )
         .await;
