@@ -448,6 +448,7 @@ impl WorkerE2eEnvironment {
                 "Server is already running".to_string(),
             ));
         }
+        let started = Instant::now();
         let server_binary = self.binaries.binary("yoi-server")?;
         let mut command = self.isolated_command(&server_binary);
         command.args([
@@ -464,11 +465,21 @@ impl WorkerE2eEnvironment {
             &self.artifacts_dir.join("server.stderr.log"),
         )?;
         let server_addr = server.wait_for_address("on http://", STARTUP_WAIT)?;
+        let listening = started.elapsed();
         let server_url = format!("http://{server_addr}");
         self.server = Some(server);
         self.server_url = Some(server_url.clone());
         self.wait_for_server_health(&server_url)?;
+        let healthy = started.elapsed();
         self.write_metadata("empty-backend-running")?;
+        fs::write(
+            self.artifacts_dir.join("server-startup-timing.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "spawn_to_listen_ns": listening.as_nanos(),
+                "health_check_ns": (healthy - listening).as_nanos(),
+                "metadata_ns": (started.elapsed() - healthy).as_nanos(),
+            }))?,
+        )?;
         Ok(())
     }
 
@@ -509,8 +520,18 @@ impl WorkerE2eEnvironment {
         self.runtime_id = runtime_id;
         self.access_token = Some(access_token);
         self.start_server_process()?;
+        let started = Instant::now();
         self.export_workspace_public_identity()?;
-        self.write_metadata("seeded-backend-running")
+        let exported = started.elapsed();
+        self.write_metadata("seeded-backend-running")?;
+        fs::write(
+            self.artifacts_dir.join("seeded-identity-timing.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "public_identity_export_ns": exported.as_nanos(),
+                "metadata_ns": (started.elapsed() - exported).as_nanos(),
+            }))?,
+        )?;
+        Ok(())
     }
 
     pub fn start_backend(&mut self) -> Result<()> {
