@@ -138,30 +138,34 @@ async function login(page: Page, user: User, legacy: boolean) {
       "normal login asks for ID",
     );
   }
-  const options = page.waitForResponse((r) =>
-    new URL(r.url()).pathname === "/api/auth/passkeys/login/options"
-  );
-  const complete = page.waitForResponse((r) =>
-    new URL(r.url()).pathname === "/api/auth/passkeys/login/complete"
-  );
-  await button.click();
-  const optionResponse = await options;
-  check(optionResponse.status() === 200, "login options status");
-  const input = optionResponse.request().postDataJSON();
-  if (!legacy) {
-    check(
-      Object.keys(input).every((key) => key === "browser_origin"),
-      "normal login selected an account",
-    );
-    const wire = await optionResponse.json();
-    check(
-      !wire.public_key.publicKey.allowCredentials?.length,
-      "normal login sends an allow-list",
-    );
-  }
-  const response = await complete;
-  check(response.status() === 200, "native login complete status");
-  const issued = await response.json();
+  // clickはlogin後の遷移まで待ち得る。応答本文は到着時に読み、遷移後の
+  // Chromium response bufferに依存しない。全waiterの拒否も同時に捕捉する。
+  const [, issued] = await Promise.all([
+    page.waitForResponse((r) =>
+      new URL(r.url()).pathname === "/api/auth/passkeys/login/options"
+    ).then(async (optionResponse) => {
+      check(optionResponse.status() === 200, "login options status");
+      const input = optionResponse.request().postDataJSON();
+      if (!legacy) {
+        check(
+          Object.keys(input).every((key) => key === "browser_origin"),
+          "normal login selected an account",
+        );
+        const wire = await optionResponse.json();
+        check(
+          !wire.public_key.publicKey.allowCredentials?.length,
+          "normal login sends an allow-list",
+        );
+      }
+    }),
+    page.waitForResponse((r) =>
+      new URL(r.url()).pathname === "/api/auth/passkeys/login/complete"
+    ).then((response) => {
+      check(response.status() === 200, "native login complete status");
+      return response.json();
+    }),
+    button.click(),
+  ]);
   check(
     issued.user.user_id === user.user_id &&
       issued.user.account_id === user.account_id,
