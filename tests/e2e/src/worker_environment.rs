@@ -943,7 +943,7 @@ impl WorkerE2eEnvironment {
 
     /// Explicit acquisition caller only; never used by ordinary restore tests.
     #[cfg(feature = "fixture-support")]
-    pub fn create_acquisition_worker(&self, profile: &str) -> Result<Value> {
+    pub fn create_acquisition_worker(&self, profile: &str, input: &str) -> Result<Value> {
         if self.acquisition_codex_home.is_none() {
             return Err(HarnessError::Protocol(
                 "model acquisition was not enabled".into(),
@@ -961,7 +961,8 @@ impl WorkerE2eEnvironment {
                     "control_operation_id": format!("fixture-acquisition-{}", now_ms()),
                     "intent": {"kind": "workspace_coding"},
                     "requested_worker_name": "Restore fixture acquisition",
-                    "acceptance": {"kind": "socket_ready"},
+                    "acceptance": {"kind": "run_accepted", "expected_segments": 1},
+                    "initial_submit": [{"kind": "text", "content": input}],
                     "profile": {"kind": "named", "value": profile}
                 })),
             "create acquisition Worker",
@@ -1958,7 +1959,7 @@ mod startup_address_tests {
         let mut environment = synthetic_environment(artifacts.path())?;
         assert!(
             environment
-                .create_acquisition_worker("project:fixture-chat")
+                .create_acquisition_worker("project:fixture-chat", "input")
                 .is_err()
         );
         assert!(

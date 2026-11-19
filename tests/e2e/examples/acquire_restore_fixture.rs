@@ -140,6 +140,27 @@ fn snapshot(env: &WorkerE2eEnvironment, id: &str) -> Result<SessionSnapshot> {
         _ => Err("expected idle full snapshot".into()),
     }
 }
+fn wait_initial_turn(env: &WorkerE2eEnvironment, id: &str) -> Result {
+    let mut socket = connect(env, id)?;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match read_event(&mut socket, deadline)? {
+            Event::Snapshot { session, state, .. }
+                if state.state == WorkerState::Idle && rows(&session)?.len() == 2 =>
+            {
+                return Ok(());
+            }
+            Event::WorkerState { snapshot: state } if state.state == WorkerState::Idle => {
+                if rows(&snapshot(env, id)?)?.len() == 2 {
+                    return Ok(());
+                }
+                return Err("initial run finished without one user/assistant turn".into());
+            }
+            _ => (),
+        }
+    }
+}
+
 fn turn(env: &WorkerE2eEnvironment, id: &str, input: &str) -> Result {
     let mut socket = connect(env, id)?;
     match read_event(&mut socket, Instant::now() + WAIT)? {
@@ -217,7 +238,7 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
     cli_config(&env, &binaries.binary("yoi")?, "validate", &checkout)?;
     cli_config(&env, &binaries.binary("yoi")?, "push", &checkout)?;
     env.start_runtime_with_seed(|_| Ok(()))?;
-    let created = env.create_acquisition_worker(fixture::PROFILE)?;
+    let created = env.create_acquisition_worker(fixture::PROFILE, FIRST)?;
     // Public response only, never the authorized request or its headers.
     write_json(
         &env.artifacts_dir.join("acquisition-create-response.json"),
@@ -228,7 +249,7 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
         .and_then(Value::as_str)
         .ok_or("Worker creation did not return a Worker (not retried)")?
         .to_owned();
-    turn(&env, &id, FIRST)?;
+    wait_initial_turn(&env, &id)?;
     turn(&env, &id, SECOND)?;
     let live = snapshot(&env, &id)?;
     let live_rows = rows(&live)?;
