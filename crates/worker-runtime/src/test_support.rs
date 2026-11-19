@@ -632,9 +632,14 @@ impl StoppedWorkerTemplate {
                 }
                 LogEntry::Invoke { .. } | LogEntry::LlmUsage { .. } | LogEntry::TurnEnd { .. } => {}
                 _ => {
-                    return Err(reject(
-                        "unsupported conversation record or pending operation",
-                    ));
+                    // The discriminator is generated from the typed enum, not
+                    // arbitrary source content. Do not print the record payload.
+                    let value = serde_json::to_value(log)
+                        .map_err(|_| reject("invalid typed Session record"))?;
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "stopped Worker fixture: unsupported conversation record {} at index {index}",
+                        value["kind"].as_str().unwrap_or("unknown"),
+                    )));
                 }
             }
         }
