@@ -56,6 +56,27 @@ process終了ケースはそのAccepted receipt確認後に環境が所有する
 
 これは**commit済みかつterminal receipt保存後**のprocess終了であり、未commit候補やcommit直後・receipt前の終了証明ではない。固定Codex資産へSubmit/Notifyを送らないため、通常入力・Paused admissionの製品E2Eの証明でもない。検証jobはこの明示targetを選択する必要があり、通常suiteだけでは代替しない。
 
+## 固定fixtureの明示的な再取得
+
+`acquire_restore_fixture` exampleは通常テストから呼ばれない、実Codex OAuthの取得入口。明示した認証ディレクトリをRuntime子processだけへ渡し、隔離Server/Runtimeの公開create/input/stopを使って人工会話を2往復取得する。認証providerによるtoken refreshを含め、その認証利用を許可した場合にだけ実行する。認証情報はfixtureや診断へcopyせず、通常restoreテストはこの設定を使わない。
+
+```sh
+# 製品と抽出supportを別invocation/targetに分離する。
+cargo build --locked -p yoi -p yoi-workspace-server -p worker-runtime \
+  --bin yoi --bin yoi-server --bin yoi-runtime --target-dir target/e2e-products
+cargo build -p yoi-e2e --features e2e,fixture-support --example acquire_restore_fixture
+# 取得元を固定するため、tracked sourceはcommitしてcleanにしておく。
+YOI_E2E_BIN="$PWD/target/e2e-products/debug/yoi" \
+YOI_E2E_SERVER_BIN="$PWD/target/e2e-products/debug/yoi-server" \
+YOI_E2E_RUNTIME_BIN="$PWD/target/e2e-products/debug/yoi-runtime" \
+  target/debug/examples/acquire_restore_fixture \
+    --codex-home "$HOME/.codex" \
+    --output tests/e2e/fixtures/worker-codex-v2 \
+    --model codex-oauth/gpt-6.1-sol
+```
+
+出力先は未存在の新versionを指定する。稼働Workspaceを借りず、modelをscripted応答へ置換しない。入力の受付と実行完了を区別し、実WSのIdle観測後に公開snapshotを取得する。Worker停止とRuntime終了後に型付き抽出し、元Session bytes、実WSの会話とoffline projection、asset hash/size、生成元commitを照合する。失敗時は自動再送・既存fixture上書きをせず、harnessが所有processを回収する。候補の公開restore/checkpoint検証と内容確認を終えてから標準fixtureを更新する。
+
 ## Opt-in Runtime checkpoint process試験
 
 上のfeatureless製品4case（target内の既存seed projection試験1件とは別）に加え、`restore-checkpoints`を明示した実Runtimeでdecision前後とactivation後・terminal前のlive windowを試験する。このfeatureはoffline fixture-supportと独立しており、通常RuntimeではCLI入口も環境変数による入口も無い。

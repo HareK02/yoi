@@ -266,6 +266,9 @@ pub struct WorkerE2eEnvironment {
     access_token: Option<String>,
     client: Client,
     binaries: WorkerBinaryProviderInfo,
+    // Explicit acquisition only; ordinary E2E never inherits model credentials.
+    #[cfg(feature = "fixture-support")]
+    acquisition_codex_home: Option<PathBuf>,
     #[cfg(feature = "restore-checkpoints")]
     restore_checkpoint_config: Option<PathBuf>,
 }
@@ -333,6 +336,8 @@ impl WorkerE2eEnvironment {
             access_token: None,
             client,
             binaries,
+            #[cfg(feature = "fixture-support")]
+            acquisition_codex_home: None,
             #[cfg(feature = "restore-checkpoints")]
             restore_checkpoint_config: None,
         };
@@ -373,6 +378,22 @@ impl WorkerE2eEnvironment {
             self.artifacts_dir.join("binary-provider.json"),
             serde_json::to_vec_pretty(&self.binaries)?,
         )?;
+        Ok(())
+    }
+
+    /// Opt into a live model only for explicit fixture acquisition. The caller
+    /// authorizes this credential directory (including provider token refresh).
+    /// It is not copied into the environment or its diagnostic artifacts.
+    #[cfg(feature = "fixture-support")]
+    pub fn use_acquisition_codex_home(&mut self, home: &Path) -> Result<()> {
+        if self.runtime.is_some() {
+            return Err(HarnessError::Protocol("Runtime is already running".into()));
+        }
+        let home = home.canonicalize()?;
+        if !home.join("auth.json").is_file() {
+            return Err(HarnessError::Protocol("Codex auth.json is required".into()));
+        }
+        self.acquisition_codex_home = Some(home);
         Ok(())
     }
 
@@ -669,7 +690,7 @@ impl WorkerE2eEnvironment {
             .ok_or_else(|| HarnessError::Protocol("Runtime identity is not initialized".into()))?;
         let server_url = self.required_server_url()?.to_string();
         let workspace_id = self.required_workspace_id()?.to_string();
-        let mut command = self.isolated_command(&runtime_binary);
+        let mut command = self.runtime_command(&runtime_binary);
         command.args([
             "--bind",
             "127.0.0.1:0",
@@ -918,6 +939,48 @@ impl WorkerE2eEnvironment {
             0,
         )?;
         Ok(evidence)
+    }
+
+    /// Explicit acquisition caller only; never used by ordinary restore tests.
+    #[cfg(feature = "fixture-support")]
+    pub fn create_acquisition_worker(&self, profile: &str) -> Result<Value> {
+        if self.acquisition_codex_home.is_none() {
+            return Err(HarnessError::Protocol(
+                "model acquisition was not enabled".into(),
+            ));
+        }
+        let (server, workspace) = self.backend_target()?;
+        self.request_json(
+            self.client
+                .post(format!(
+                    "{server}/api/w/{workspace}/runtimes/{}/workers",
+                    self.runtime_id
+                ))
+                .timeout(Duration::from_secs(60))
+                .json(&serde_json::json!({
+                    "control_operation_id": format!("fixture-acquisition-{}", now_ms()),
+                    "intent": {"kind": "workspace_coding"},
+                    "requested_worker_name": "Restore fixture acquisition",
+                    "acceptance": {"kind": "socket_ready"},
+                    "profile": {"kind": "named", "value": profile}
+                })),
+            "create acquisition Worker",
+        )
+    }
+
+    #[cfg(feature = "fixture-support")]
+    pub fn send_acquisition_input(&self, worker_id: &str, content: &str) -> Result<Value> {
+        if self.acquisition_codex_home.is_none() {
+            return Err(HarnessError::Protocol(
+                "model acquisition was not enabled".into(),
+            ));
+        }
+        self.request_json(
+            self.client
+                .post(self.worker_url(worker_id, "input")?)
+                .json(&serde_json::json!({"kind": "user", "content": content})),
+            "submit acquisition input",
+        )
     }
 
     pub fn stop_worker(&self, worker_id: &str) -> Result<Value> {
@@ -1307,6 +1370,16 @@ impl WorkerE2eEnvironment {
             .env("TMPDIR", temporary)
             .env("XDG_CACHE_HOME", cache);
         Ok(command)
+    }
+
+    fn runtime_command(&self, binary: &Path) -> Command {
+        #[allow(unused_mut)]
+        let mut command = self.isolated_command(binary);
+        #[cfg(feature = "fixture-support")]
+        if let Some(home) = &self.acquisition_codex_home {
+            command.env("CODEX_HOME", home);
+        }
+        command
     }
 
     fn isolated_command(&self, binary: &Path) -> Command {
@@ -1855,6 +1928,10 @@ mod startup_address_tests {
                 profile: "synthetic".into(),
                 binaries: Vec::new(),
             },
+            #[cfg(feature = "fixture-support")]
+            acquisition_codex_home: None,
+            #[cfg(feature = "restore-checkpoints")]
+            restore_checkpoint_config: None,
             root,
         })
     }
@@ -1871,6 +1948,51 @@ mod startup_address_tests {
 
     fn assert_secret_free(diagnostic: impl std::fmt::Debug) {
         assert!(!format!("{diagnostic:?}").contains("private-test-marker"));
+    }
+
+    #[test]
+    #[cfg(feature = "fixture-support")]
+    fn acquisition_auth_requires_explicit_selection_and_only_reaches_runtime() -> Result<()> {
+        let artifacts = tempfile::tempdir()?;
+        let credentials = tempfile::tempdir()?;
+        let mut environment = synthetic_environment(artifacts.path())?;
+        assert!(
+            environment
+                .create_acquisition_worker("project:fixture-chat")
+                .is_err()
+        );
+        assert!(
+            environment
+                .send_acquisition_input("worker", "input")
+                .is_err()
+        );
+        assert!(
+            environment
+                .use_acquisition_codex_home(credentials.path())
+                .is_err()
+        );
+        let has_codex = |command: &Command| {
+            command
+                .get_envs()
+                .any(|(key, value)| key == "CODEX_HOME" && value.is_some())
+        };
+        assert!(!has_codex(
+            &environment.runtime_command(Path::new("runtime"))
+        ));
+        fs::write(
+            credentials.path().join("auth.json"),
+            "not a real credential",
+        )?;
+        environment.use_acquisition_codex_home(credentials.path())?;
+        assert!(has_codex(
+            &environment.runtime_command(Path::new("runtime"))
+        ));
+        assert!(!has_codex(
+            &environment.isolated_command(Path::new("server"))
+        ));
+        assert!(!environment.home.join(".codex/auth.json").exists());
+        assert_eq!(fs::read_dir(artifacts.path())?.count(), 0);
+        Ok(())
     }
 
     #[test]

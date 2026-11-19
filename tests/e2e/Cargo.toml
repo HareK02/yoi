@@ -58,6 +58,11 @@ name = "worker_environment"
 path = "tests/worker_environment.rs"
 required-features = ["e2e"]
 
+[[example]]
+name = "acquire_restore_fixture"
+path = "examples/acquire_restore_fixture.rs"
+required-features = ["e2e", "fixture-support"]
+
 [[test]]
 name = "worker_restore"
 path = "tests/worker_restore.rs"
