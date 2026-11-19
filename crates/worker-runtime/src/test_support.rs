@@ -630,6 +630,10 @@ impl StoppedWorkerTemplate {
                         return Err(reject("duplicate or invalid entry identity"));
                     }
                 }
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == "worker.protected_inputs.v1"
+                    && *payload == serde_json::json!({"version": 1, "kinds": []}) => {}
                 LogEntry::Invoke { .. } | LogEntry::LlmUsage { .. } | LogEntry::TurnEnd { .. } => {}
                 _ => {
                     // The discriminator is generated from the typed enum, not

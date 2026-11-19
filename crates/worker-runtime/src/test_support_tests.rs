@@ -715,6 +715,53 @@ fn fresh_manifest_and_memory_settings_are_required() {
 }
 
 #[test]
+fn empty_protected_input_checkpoint_preserves_bytes_and_rejects_protected_or_unknown_data() {
+    let (_source, worker, template) = source();
+    let segment = worker.join(format!("session/segments/{}.jsonl", template.segment_id));
+    for (payload, accepted) in [
+        (serde_json::json!({"version": 1, "kinds": []}), true),
+        (serde_json::json!({"version": 2, "kinds": []}), false),
+        (
+            serde_json::json!({"version": 1, "kinds": ["workspace-memory"]}),
+            false,
+        ),
+        (
+            serde_json::json!({"version": 1, "kinds": [], "unknown": 1}),
+            false,
+        ),
+        (
+            serde_json::json!({"version": 1, "kinds": [], "subject_jobs": []}),
+            false,
+        ),
+    ] {
+        let mut bytes = template.segment_jsonl.clone();
+        bytes.extend(
+            serde_json::to_vec(&LogEntry::Extension {
+                ts: 1,
+                domain: "worker.protected_inputs.v1".into(),
+                payload,
+            })
+            .unwrap(),
+        );
+        bytes.push(b'\n');
+        fs::write(&segment, &bytes).unwrap();
+        let extracted = StoppedWorkerTemplate::extract(&worker);
+        assert_eq!(extracted.is_ok(), accepted);
+        if let Ok(extracted) = extracted {
+            let (_target, options) = destination(&extracted);
+            extracted.install(&options, request(), &resolved()).unwrap();
+            let installed = options
+                .root
+                .join(WORKERS_DIR)
+                .join(worker_id().to_string())
+                .join(format!("session/segments/{}.jsonl", template.segment_id));
+            assert_eq!(fs::read(installed).unwrap(), bytes);
+        }
+        assert_eq!(fs::read(&segment).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn settled_checkpoints_preserve_receipts_but_refuse_pending_work() {
     let mut checkpoint = settled_checkpoint();
     assert!(validate_settled_activation(&checkpoint_extension(&checkpoint)).is_ok());
