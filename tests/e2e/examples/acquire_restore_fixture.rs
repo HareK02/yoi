@@ -200,7 +200,9 @@ fn rows(snapshot: &SessionSnapshot) -> Result<Vec<Value>> {
                 role: SessionMessageRole::Assistant,
                 content,
             } => ("assistant", serde_json::to_value(content)?),
-            SessionSnapshotEntryData::RunStats { .. } | SessionSnapshotEntryData::Invoke { .. } => {
+            SessionSnapshotEntryData::RunStats { .. }
+            | SessionSnapshotEntryData::Usage { .. }
+            | SessionSnapshotEntryData::Invoke { .. } => {
                 continue;
             }
             SessionSnapshotEntryData::RunError { message, .. } => {
@@ -344,6 +346,62 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
     eprintln!("Captured and validated {}", output.display());
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one(data: SessionSnapshotEntryData) -> SessionSnapshot {
+        SessionSnapshot {
+            pending_submissions: Default::default(),
+            entries: vec![protocol::SessionSnapshotEntry {
+                entry_id: "entry".into(),
+                timestamp: 1,
+                provenance: protocol::SessionEntryProvenance::LegacyUnknown,
+                derived_from: vec![],
+                use_policy: None,
+                data,
+            }],
+        }
+    }
+
+    #[test]
+    fn conversation_projection_excludes_accounting_but_rejects_failed_or_tool_turns() {
+        for data in [
+            SessionSnapshotEntryData::Usage {
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                output_tokens: 2,
+            },
+            SessionSnapshotEntryData::RunStats {
+                elapsed_ms: 1,
+                requests: 1,
+                upload_tokens: 1,
+                output_tokens: 2,
+            },
+            SessionSnapshotEntryData::Invoke {
+                trigger: protocol::InvokeKind::UserSend,
+            },
+        ] {
+            assert!(rows(&one(data)).unwrap().is_empty());
+        }
+        assert!(
+            rows(&one(SessionSnapshotEntryData::RunError {
+                message: "failed".into(),
+                failure: None
+            }))
+            .is_err()
+        );
+        assert!(
+            rows(&one(SessionSnapshotEntryData::ToolCall {
+                call_id: "call".into(),
+                name: "tool".into(),
+                arguments: "{}".into()
+            }))
+            .is_err()
+        );
+    }
+}
+
 fn main() -> Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 6 || args[0] != "--codex-home" || args[2] != "--output" || args[4] != "--model"
