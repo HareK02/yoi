@@ -1,0 +1,52 @@
+{
+  "model": "codex-oauth/gpt-6.1-sol",
+  "rows": [
+    {
+      "entry_id": "01a1f24f-76e3-7451-a8a7-f714c8f2f99e",
+      "parts": [
+        {
+          "content": "これは隔離した復元テスト用の人工会話です。合言葉は『青い灯台』です。この合言葉を覚えて、一文だけで確認してください。Toolや外部操作は行わないでください。",
+          "kind": "text"
+        }
+      ],
+      "role": "user",
+      "timestamp": 1795066656483
+    },
+    {
+      "entry_id": "01a1f24f-7e88-7a31-84f8-285d30c2ccad",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "合言葉は『青い灯台』ですね、覚えました。"
+        }
+      ],
+      "role": "assistant",
+      "timestamp": 1795066658440
+    },
+    {
+      "entry_id": "01a1f24f-7f01-7f42-b3bd-e02e77a27a54",
+      "parts": [
+        {
+          "content": "先ほど伝えた合言葉だけを答えてください。",
+          "kind": "text"
+        }
+      ],
+      "role": "user",
+      "timestamp": 1795066658562
+    },
+    {
+      "entry_id": "01a1f24f-84c4-71f2-91ed-c2035f2cd3d0",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "青い灯台"
+        }
+      ],
+      "role": "assistant",
+      "timestamp": 1795066660036
+    }
+  ],
+  "session_id": "01a1f24f-76d5-77d3-a28e-0f1e9152b059",
+  "source_revision": "e40316bac9507fc772a8f960fe58da7bb71104bd",
+  "worker_id": "01a1f24f-75bf-7f40-ac34-9239036d9d84"
+}
