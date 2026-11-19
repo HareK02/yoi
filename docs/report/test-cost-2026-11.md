@@ -1,6 +1,6 @@
 # T-871: 全体時間分布とテスト責務の見直し
 
-通常Rustの初回8,039名を計測し、履歴組合せの単体化、実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。通常runnerはwarm build後、399区分を中断なしで完走。Rustは8,045名＝7,999成功＋46既存ignored、欠落・重複0。Web実browser32ファイルと、再生成した固定fixtureによるrestore4件・checkpoint7件も成功した。前回残したChat接続browserとnavigation reviewの失敗は、追加調査で古いtest/fixtureの原因を確定して修正し、各2回成功した。doctest/Web timeoutも同じCargo targetへseed検証buildを重ねたロック競合と切り分けた。原因未確定のまま完了とした判断は撤回しT-871を再開した。最新の訂正・確証は末尾「未確定原因を残した完了判断の撤回と追加検証」に記録する。途中の失敗・未完記録は経緯として保持する。
+通常Rustの初回8,039名を計測し、履歴組合せの単体化、実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。通常runnerはwarm build後、399区分を中断なしで完走。Rustは8,045名＝7,999成功＋46既存ignored、欠落・重複0。Web実browser32ファイルと、再生成した固定fixtureによるrestore4件・checkpoint7件も成功した。前回残したChat接続browserとnavigation reviewの失敗は、追加調査で古いtest/fixtureの原因を確定して修正し、各2回成功した。doctest/Web timeoutも同じCargo targetへseed検証buildを重ねたロック競合と切り分けた。原因未確定のまま完了とした判断を撤回して追加対応し、残る明示browser review全9スクリプト・10実行も成功した。最後のコードcommitは `f4bdcdc01`。最新の照合結果は末尾「明示review全入口と起動内訳の最終照合」に記録する。途中の失敗・未完記録は経緯として保持し、過去の未解決項目を現在の状態と混同しない。
 
 ## 計測条件と範囲
 
@@ -441,3 +441,55 @@ owner locatorだけを修正してreaderの旧期待値で失敗する対照実�
 ### 追加検証の境界
 
 変更は明示browser driver/合成fixtureの3ファイルと本報告だけ。通常Rust/製品コード・固定restore資産は不変なので、通常399区分を再び全実行したとは主張しない。今回の実接続Chat2回、navigation2回、shared fixture回帰、Web unit/doctest対照実行、編集3ファイルのDeno typecheck、diff/命名検査で変更と原因を検証した。以前の全体計測における179.44秒shardの余裕の小ささは実測値として残すが、失敗原因不明と同一扱いにしない。未実行の物理認証器/全platformや起動区間の未細分化は検証・計測範囲の限界であり、観測済み失敗の原因として推測しない。
+
+## 明示review全入口と起動内訳の最終照合
+
+最終コードcommit `f4bdcdc01`、専用 `work/t871-test-cost`。前節までで実行していなかった7本のreview scriptも調査・実行し、現行UI/通信との不整合は修正した。古いfixtureを作業外のブロッカーとして残していない。通常399区分の過去の単一完走に、今回の変更対象回帰を重ねた結果であり、最終HEADで通常399区分をもう一度実行したとは主張しない。
+
+### 明示browser reviewの全入口
+
+既存の製品buildを再利用し、Chromium、各process最大180秒、既存runnerの隔離/子process回収を使用して10実行を直列計測。**全9スクリプト・10実行成功、合計71.47秒、248 captures、失敗/timeout/想定外fault 0**。この時間はbuildを含まない。画像生成と自動assertionの成功であり、全画像の目視承認ではない。実Webに合成HTTP/WSを接続するreviewであり、実Backend接続テストの代用とも数えない。
+
+| スクリプト（`tools/web-ux/browser-tests/`） | 条件 | 秒 | captures |
+|---|---|---:|---:|
+| `configuration_adoption_review.ts` | after | 5.43 | 24 |
+| 同上 | after / catalog-conflict | 4.64 | 12 |
+| `repository_access_failure_review.ts` | after | 2.54 | 12 |
+| `workdir_management_review.ts` | after | 2.28 | 14 |
+| `workdir_stop_cleanup_review.ts` | after | 2.36 | 6 |
+| `subject_creation_review.ts` | after | 8.76 | 54 |
+| `subject_conversation_review.ts` | after | 7.64 | 30 |
+| `subject_body_recovery_review.ts` | after | 2.78 | 12 |
+| `subject_navigation_review.ts` | current | 22.96 | 56 |
+| `chat_ui_review.ts` | after | 12.08 | 28 |
+
+一般の再現入口は `DENO_DIR=<依存を取得済みのcache> deno run --config tools/web-ux/deno.json -A tools/web-ux/browser-tests/<script> web/workspace/build <一意のlabel> after`。configuration conflictは末尾へ`catalog-conflict`を追加。navigationは`after`なし。Chatだけは`chat_ui_review.ts after`で、出力先が固定なので以前のartifactを退避する。最終実行の正確なcommand/隔離条件はローカル `target/t871-review-completion/final-reviews.ts`、機械結果は`review-final-inventory.json`と各`*.result.json/stdout/stderr`に保存した。
+
+Subject create/conversation/recoveryの3本は別途2回、各15表示条件・96 capturesも成功。親でSubWorkerの保存Session・差分・各artifact/hashを照合し、委譲を終了した。createは変更不要。conversation/recoveryは以下を修正した（`23f0d8ceb fix: update remaining Subject review protocol fixtures`）。
+
+- conversationの古いHTTP chat mockを現行のopen/subscribe/send WebSocket応答へ更新。履歴購読・ACK喪失・同一要求のretry・拒否・公開会話のassertionを維持し、現行実行が旧HTTP chat endpointへ流れていないことも確認。
+- recoveryの旧button文言・折畳みcontrols・HTTP会話fixtureを現行へ更新。unknown後のreloadと同一recover要求の再送、実行権限撤回後の操作非表示を維持。廃止された手動Refresh操作の代わりにWorker通知から再GETする現行経路を使い、通知だけで権限を決めず、新規observationとmutationなしをassert。
+- 共有Memory fixtureの空会話WS応答は明示`body-recovery` modeに限定。Memory/Journal回帰3 tests＋10 steps成功（18秒）。navigationとChatも上表で再実行した。
+
+最終実行前のChat起動失敗は他reviewと同じ引数を渡した呼出し誤り（`usage: chat_ui_review.ts before|after`）で、browser未起動。正しい`after`で再実行し成功。製品不具合として扱わず、失敗logも保持した。
+
+### Server起動・health・identity exportの分離
+
+`f4bdcdc01 test: separate server readiness and identity export timings`で既存harnessへ単調時計によるartifactを追加。起動待機・health probe・公開identity取得・cleanupの動作やdeadlineは変更していない。16隔離環境の記録で全cleanup成功を照合した。
+
+| 対象 | 環境数 | spawn→listen 平均（範囲） | health 平均（範囲） | 公開identity export 平均（範囲） |
+|---|---:|---|---|---|
+| seeded Backend | 13 | 6.304秒（6.069–6.505） | 4.265秒（3.708–4.939） | 0.018秒（0.015–0.025） |
+| empty Backend | 3 | 6.894秒（6.567–7.105） | 0.0022秒（0.0020–0.0024） | 対象外 |
+
+以前一括で約9.5–10秒と記録した起動/identity区間は、今回の測定では主にlistenまでとseeded状態のhealth到達に費やされている。公開identity取得は主因ではない。異なるrunの値を直接差し引いて改善量とはしない。さらに内側のDB/config初期化等への寄与率は未測定であり、6秒全てやhealthの4秒を固定sleepと断定しない。正規の起動・公開readiness・実接続保証を落として単体に置き換える変更は採用しない。記録は各E2E artifactの`server-startup-timing.json`/`seeded-identity-timing.json`、この16環境の集計は`target/t871-review-completion/startup-summary.json`。
+
+### 最後の変更対象回帰と最終状態
+
+- E2E harness unit 25成功（1.27秒）。worker environment 2成功（51.38秒）、restore 4＋seed projection 1成功（64.19秒）、checkpoint 7成功（106.82秒）。個別startup計測1成功（19.92秒）はrestoreとの重複であり、distinct件数へ加算しない。
+- TUI panel 2成功（33.67秒）、rewind 1成功（0.52秒）、auth 10成功（194.90秒）、configuration CLI 3成功（49.45秒）。全6明示E2E integration targetを再実行。通常選択の製品22件＋checkpoint選択7件＝製品29件成功で、seed projection 1件とharness unitは別枠。
+- authの最初の1失敗はnative browserの`--cached-only`に対して親が既存Deno cache指定を渡さなかったこと。保存stderrの`@std/path/meta.json` cache missを確認し、既存cacheを明示した全auth/CLI再実行で成功。通信/製品の失敗、物理認証器の成功へ読み替えない。
+- root `cargo check`、Rust format、変更Denoのtypecheck、diff/命名検査成功。各logは`target/t871-review-completion/`。既知のts-rs/unused warningは残るがerrorなし。
+- 通常399区分の完走（Rust7,999成功＋46既存ignored等）、実browser32 files、今回の明示review9 scripts、明示E2E、実接続Chat修正後の成功を別枠で照合した。過去の失敗logは保持し、観測済みの失敗を原因未確定のまま残していない。
+
+残す限界は、通常runner最長179.44秒に対する180秒上限の余裕、物理認証器・実スマホ・全feature/platform組合せの未検証、全画像の目視承認未実施、起動内部のさらなる細分化である。これらを未解決のtest/fixture失敗とは混同しない。push/merge/deploy、`yoi-origin`切替、稼働サービス/DB・`yoi-data`変更はしていない。
