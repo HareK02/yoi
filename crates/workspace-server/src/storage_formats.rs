@@ -86,6 +86,7 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     verify_subject_permission_domain_shape(conn, current)?;
     verify_publication_shape(conn, current)?;
     verify_connection_observation_shape(conn, current)?;
+    verify_worker_lifecycle_shape(conn, current)?;
     let tail = failure_tail(conn, current, &rows)?;
     verify_failure_shape(conn, current, tail)?;
     let journal = tail == FailureTail::Journal || current >= 127;
@@ -372,6 +373,7 @@ impl FailureTail {
         tail.push((134, super::backend_job_finalizing::MIGRATION_NAME));
         tail.push((135, super::subject_release_recording_store::MIGRATION_NAME));
         tail.push((136, super::launch_policy_identity_migration::MIGRATION_NAME));
+        tail.push((137, super::worker_lifecycle_notifications::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -1407,7 +1409,9 @@ mod failure_format_tests {
     use rusqlite::params;
 
     // The registered tail is not a contiguous integer range: it excludes 132.
-    const CURRENT_TAIL: &[i64] = &[124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136];
+    const CURRENT_TAIL: &[i64] = &[
+        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137,
+    ];
 
     fn apply(conn: &Connection, version: i64) -> Result<()> {
         let migration = store::MIGRATIONS
@@ -1486,6 +1490,76 @@ mod failure_format_tests {
                 (table.clone(), rows)
             })
             .collect()
+    }
+
+    #[test]
+    fn lifecycle_migration_preserves_delivery_evidence_rolls_back_and_checks_shape() {
+        let conn = fixture_123(Stage::Converged(121));
+        for version in CURRENT_TAIL.iter().copied().filter(|v| *v < 137) {
+            apply(&conn, version).unwrap();
+        }
+        conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('owner','user','owner','Owner','1','1');
+            INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('w','owner','Workspace','active','1','1');
+            INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit) VALUES('w','ticket','ticket','Retained Ticket','open','task','P2','open',1);
+            INSERT INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,facts_json) VALUES('w','ticket','existing-event','worker','','comment','{}');
+            INSERT INTO notification_decisions(source_sequence,workspace_id,delivery_id,disposition,reason,purpose) SELECT sequence,'w','existing-delivery','deliver','attention','attention' FROM notification_sources WHERE input_event_id='existing-event';
+            INSERT INTO notification_requests VALUES('w','existing-delivery','retained payload','{}');
+            INSERT INTO notification_acknowledgements VALUES('w','existing-delivery','{}');
+            INSERT INTO notification_failures(workspace_id,delivery_id,code) VALUES('w','existing-delivery','acceptance_unknown');
+            CREATE TRIGGER reject_lifecycle_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=137 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+        let violations = conn
+            .prepare("SELECT \"table\",parent FROM pragma_foreign_key_check")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            violations.is_empty(),
+            "fixture foreign keys: {violations:?}"
+        );
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq=1000 WHERE name='notification_sources'",
+            [],
+        )
+        .unwrap();
+        let allocator = || {
+            conn.query_row(
+                "SELECT rowid,seq FROM sqlite_sequence WHERE name='notification_sources'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        let saved_allocator = allocator();
+        let shape = snapshot(&conn).unwrap();
+        let old_columns = columns(&conn);
+        let retained = values(&conn, &old_columns);
+        assert!(apply(&conn, 137).is_err());
+        assert_eq!(snapshot(&conn).unwrap(), shape);
+        assert_eq!(values(&conn, &old_columns), retained);
+        assert_eq!(allocator(), saved_allocator);
+        conn.execute_batch("DROP TRIGGER reject_lifecycle_receipt")
+            .unwrap();
+        apply(&conn, 137).unwrap();
+        let mut data_columns = old_columns;
+        data_columns.remove("__yoi_schema_migrations");
+        let mut data = retained;
+        data.remove("__yoi_schema_migrations");
+        assert_eq!(values(&conn, &data_columns), data);
+        assert_eq!(allocator(), saved_allocator);
+        conn.execute("INSERT INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,facts_json) VALUES('w','ticket','new-event','worker','','comment','{}')",[]).unwrap();
+        assert_eq!(allocator().1, 1001);
+        verify_history(&conn, 137).unwrap();
+        assert!(
+            conn.execute("UPDATE notification_requests SET content='changed'", [])
+                .is_err()
+        );
+        conn.execute_batch("DROP INDEX notification_worker_lifecycle_identity")
+            .unwrap();
+        assert!(verify_history(&conn, 137).is_err());
     }
 
     #[test]
@@ -2527,6 +2601,49 @@ fn verify_subject_permission_domain_shape(conn: &Connection, current: i64) -> Re
         return Err(invalid(
             "Subject permission domain physical schema mismatch",
         ));
+    }
+    Ok(())
+}
+
+fn verify_worker_lifecycle_shape(conn: &Connection, current: i64) -> Result<()> {
+    let shape = snapshot(conn)?;
+    if current < 137 {
+        return if shape.keys().any(|name| {
+            name == "worker_lifecycle_scan_offers"
+                || name == "notification_worker_lifecycle_identity"
+        }) {
+            Err(invalid(
+                "Worker lifecycle schema before its migration receipt",
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    let select = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(name, object)| {
+                object.0 != "trigger"
+                    && (object.1 == "notification_sources"
+                        || object.1 == "worker_lifecycle_scan_offers"
+                        || name == "notification_worker_lifecycle_identity")
+            })
+            .collect()
+    };
+    static EXPECTED: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let expected = EXPECTED
+        .get_or_init(|| {
+            (|| -> Result<Shape> {
+                let reference = reference_base()?;
+                super::worker_lifecycle_notifications::install(&reference)?;
+                Ok(select(snapshot(&reference)?))
+            })()
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(invalid)?;
+    if select(shape) != *expected {
+        return Err(invalid("Worker lifecycle physical schema mismatch"));
     }
     Ok(())
 }

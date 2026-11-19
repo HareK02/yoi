@@ -147,7 +147,15 @@ async fn reservation_fences_ingress_fallback_and_history_drop_recovers_commit_st
             .accept_notification("blocked".into(), "blocked".into())
             .is_err()
     );
-    fallback.notify("child-session".into(), "must not be admitted".into());
+    assert!(
+        fallback
+            .notify(
+                "child-session".into(),
+                "source".into(),
+                "must not be admitted".into()
+            )
+            .is_err()
+    );
     assert!(buffer.is_empty());
     assert!(!pending.has_unfinished_admission());
     assert!(writer.append_entry(extension()).is_err());
@@ -257,7 +265,13 @@ async fn staged_notification_fallback_blocks_release_until_the_actual_turn_finis
     let fallback = durable_parent_notification_target(pending.clone(), buffer);
     let controller = prepared.start().await.unwrap();
     let mut events = controller.handle.subscribe();
-    fallback.notify("child".into(), "durable accepted notification".into());
+    fallback
+        .notify(
+            "child".into(),
+            "source".into(),
+            "durable accepted notification".into(),
+        )
+        .unwrap();
     assert!(reserve(&controller.handle).await.is_err());
     tokio::time::timeout(Duration::from_secs(5), starts.recv())
         .await

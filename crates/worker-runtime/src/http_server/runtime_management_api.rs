@@ -558,6 +558,30 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         }
     }
 
+    async fn worker_activity(
+        &self,
+        request: runtime_api::WorkerActivityRequest,
+    ) -> Result<runtime_api::WorkerActivityResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .worker_activity_scoped(&scope, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = scope;
+            Err(runtime_api::RuntimeApiError::new(
+                400,
+                "worker_activity_unavailable",
+                "Retained Worker activity storage unavailable",
+            ))
+        }
+    }
+
     async fn session_material_catalog(
         &self,
         request: runtime_api::SessionMaterialCatalogRequest,

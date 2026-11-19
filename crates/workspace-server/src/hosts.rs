@@ -1795,6 +1795,12 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Err("committed recording capture is unavailable on this Runtime".into())
     }
 
+    fn worker_activity(
+        &self,
+        _request: runtime_api::WorkerActivityRequest,
+    ) -> Result<runtime_api::WorkerActivityResponse, String> {
+        Err("Worker activity read is unsupported".into())
+    }
     fn session_material_catalog(
         &self,
         _request: runtime_api::SessionMaterialCatalogRequest,
@@ -3162,6 +3168,20 @@ impl RuntimeRegistry {
             })
     }
 
+    pub fn worker_activity(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::WorkerActivityRequest,
+    ) -> Result<runtime_api::WorkerActivityResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .worker_activity(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "worker_activity_failed".into(),
+                message,
+            })
+    }
     pub fn session_material_catalog(
         &self,
         runtime_id: &str,
@@ -4557,6 +4577,18 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .session_recording_capture_scoped(&scope, &request))
     }
 
+    fn worker_activity(
+        &self,
+        request: runtime_api::WorkerActivityRequest,
+    ) -> Result<runtime_api::WorkerActivityResponse, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("Worker activity Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .worker_activity_scoped(&scope, &request)
+            .map_err(|e| e.to_string())
+    }
     fn session_material_catalog(
         &self,
         request: runtime_api::SessionMaterialCatalogRequest,
@@ -7541,6 +7573,17 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         .map_err(|diagnostic| diagnostic.message)
     }
 
+    fn worker_activity(
+        &self,
+        request: runtime_api::WorkerActivityRequest,
+    ) -> Result<runtime_api::WorkerActivityResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.worker_activity(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
     fn session_material_catalog(
         &self,
         request: runtime_api::SessionMaterialCatalogRequest,

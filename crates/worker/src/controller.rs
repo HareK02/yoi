@@ -579,7 +579,7 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
             source,
         } = method
         else {
-            return;
+            return Err(std::io::Error::other("expected tracked child notification"));
         };
         let (source_namespace, provenance) = resolved_input_source(&pending_submissions, &source);
         let source_namespace = receipt_scope.namespace(source_namespace);
@@ -591,10 +591,11 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
         ) {
             Ok(_) => {
                 stage_pending_notifications(&pending_submissions, &notify_buffer);
+                Ok(())
             }
-            Err(error) => {
-                tracing::warn!(%error, "failed to durably accept SubWorker notification");
-            }
+            Err(_) => Err(std::io::Error::other(
+                "SubWorker notification pending persistence failed",
+            )),
         }
     }))
 }
@@ -4885,7 +4886,9 @@ mod tests {
             session_store::LoggedSessionHistoryOrigin::LegacyUnknown
         ));
 
-        target.notify("child-session".into(), "completed".into());
+        target
+            .notify("child-session".into(), "source".into(), "completed".into())
+            .unwrap();
 
         let snapshot = pending.snapshot();
         assert_eq!(snapshot.notification_count, 0);

@@ -95,6 +95,119 @@ fn ids(reader: &SessionPublicMaterialReader) -> Vec<String> {
 }
 
 #[test]
+fn terminal_scan_is_bounded_without_terminals_and_excludes_pause_and_private_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("worker/session");
+    let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+    let session = crate::new_session_id();
+    let segment = crate::new_segment_id();
+    let store = WorkerSessionStore::new_with_retention(&root, retention.clone()).unwrap();
+    let mut records = vec![seed(session, vec![])];
+    records.extend((0..600).map(|_| invoke()));
+    records.push(LogEntry::RunCompleted {
+        entry_id: None,
+        ts: 10,
+        interrupted: true,
+        result: agen::EngineResult::Paused,
+        active_run_turn_count: Some(1),
+    });
+    records.push(LogEntry::RunErrored {
+        entry_id: None,
+        ts: 11,
+        interrupted: true,
+        message: "SECRET provider payload".into(),
+        failure: None,
+    });
+    records.push(LogEntry::RunCompleted {
+        entry_id: None,
+        ts: 12,
+        interrupted: false,
+        result: agen::EngineResult::LimitReached,
+        active_run_turn_count: None,
+    });
+    store.create_segment(session, segment, &records).unwrap();
+    // Runtime traces and temporary publication files are not committed segment logs.
+    std::fs::write(
+        root.join("segments").join(format!("{segment}.trace.jsonl")),
+        "private trace, not a LogEntry\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("segments/.pending.jsonl"), "uncommitted\n").unwrap();
+    let guard = retention.lock_live(session).unwrap();
+    let first = scan_worker_run_terminals_guarded(&root, session, None, &guard).unwrap();
+    assert!(first.facts.is_empty());
+    let cursor = first
+        .next_cursor
+        .expect("non-terminal records still advance a bounded page");
+    let second = scan_worker_run_terminals_guarded(&root, session, Some(&cursor), &guard).unwrap();
+    assert_eq!(second.facts.len(), 2);
+    assert_eq!(second.facts[0].boundary, PublicRunBoundary::Errored);
+    assert_eq!(second.facts[0].occurred_at_ms, 11);
+    assert!(second.next_cursor.is_none());
+    assert!(!serde_json::to_string(&second).unwrap().contains("SECRET"));
+    let replay = scan_worker_run_terminals_guarded(&root, session, Some(&cursor), &guard).unwrap();
+    assert_eq!(replay.facts, second.facts);
+    let bad = RunTerminalCursor {
+        byte_offset: cursor.byte_offset - 1,
+        ..cursor.clone()
+    };
+    assert!(scan_worker_run_terminals_guarded(&root, session, Some(&bad), &guard).is_err());
+    let foreign = RunTerminalCursor {
+        session_id: crate::new_session_id(),
+        ..cursor
+    };
+    assert!(scan_worker_run_terminals_guarded(&root, session, Some(&foreign), &guard).is_err());
+}
+
+#[test]
+fn terminal_scan_keeps_inactive_segment_facts_and_stable_entry_references() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("worker/session");
+    let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+    let session = crate::new_session_id();
+    let segment = crate::new_segment_id();
+    let store = WorkerSessionStore::new_with_retention(&root, retention.clone()).unwrap();
+    store
+        .create_segment(
+            session,
+            segment,
+            &[seed(session, vec![]), invoke(), cancelled()],
+        )
+        .unwrap();
+    let reader = SessionPublicMaterialReader::open_worker_with_retention(
+        &root,
+        segment,
+        Default::default(),
+        retention.clone(),
+    )
+    .unwrap();
+    let old_ref = reader
+        .descriptors()
+        .find(|d| d.origin == PublicMaterialOrigin::HostRunBoundary)
+        .unwrap()
+        .identity
+        .entry_ref
+        .clone();
+    let new_segment = crate::new_segment_id();
+    store
+        .create_segment(
+            session,
+            new_segment,
+            &[seed(session, vec![]), invoke(), cancelled()],
+        )
+        .unwrap();
+    let guard = retention.lock_live(session).unwrap();
+    let page = scan_worker_run_terminals_guarded(&root, session, None, &guard).unwrap();
+    assert_eq!(page.facts.len(), 2);
+    assert!(
+        page.facts
+            .iter()
+            .any(|f| f.segment_id == segment && f.entry_ref == old_ref)
+    );
+    assert_ne!(page.facts[0].entry_ref, page.facts[1].entry_ref);
+}
+
+#[test]
 fn external_erasure_fences_worker_reader_and_publisher_before_physical_delete_finishes() {
     use crate::retention::{SessionDeletionIntent, SessionRetentionStore};
     let temp = tempfile::tempdir().unwrap();

@@ -1080,6 +1080,40 @@ pub struct SessionMaterialPinResponse {
     pub pin_id: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerActivityRequest {
+    pub workspace_id: String,
+    pub worker_id: String,
+    pub run_cursor: Option<session_store::public_material::RunTerminalCursor>,
+    pub stop_after: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerStoppedFact {
+    pub operation_id: String,
+    pub occurred_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum RunTerminalAvailability {
+    Page {
+        page: session_store::public_material::RunTerminalPage,
+    },
+    NotMaterialized,
+    Unavailable {
+        reason: SessionPublicUnavailableReason,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerActivityResponse {
+    pub run: RunTerminalAvailability,
+    pub stops: Vec<WorkerStoppedFact>,
+    pub next_stop: Option<String>,
+}
+
 /// One body-bearing immutable slice. The byte budget includes slice metadata,
 /// but not the enclosing availability enum or the caller's durable Job envelope.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1640,6 +1674,12 @@ pub trait RuntimeApi {
         &self,
         #[body] request: SessionMaterialReadRequest,
     ) -> Result<SessionMaterialReadAvailability, RuntimeApiError>;
+
+    #[post("/v1/session-public/worker-activity", status = 200, error_status = 400)]
+    async fn worker_activity(
+        &self,
+        #[body] request: WorkerActivityRequest,
+    ) -> Result<WorkerActivityResponse, RuntimeApiError>;
 
     #[post("/v1/session-public/search", status = 200, error_status = 400)]
     async fn session_public_search(
@@ -2334,6 +2374,13 @@ mod tests {
             _request: SessionRecordingCaptureRequest,
         ) -> Result<SessionRecordingCaptureAvailability, RuntimeApiError> {
             Err(test_error(501))
+        }
+
+        async fn worker_activity(
+            &self,
+            _request: WorkerActivityRequest,
+        ) -> Result<WorkerActivityResponse, RuntimeApiError> {
+            unimplemented!("test fixture does not read Worker activity")
         }
 
         async fn session_material_catalog(

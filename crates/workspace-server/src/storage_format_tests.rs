@@ -128,7 +128,7 @@ fn saved_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
 
 // Explicit canonical tail: schema 132 has no registered migration. Keep this
 // expectation independent of published_plan and the production migration list.
-fn expected_published_tail() -> [(i64, &'static str); 14] {
+fn expected_published_tail() -> [(i64, &'static str); 15] {
     [
         (122, crate::config_adoption::MIGRATION_NAME),
         (123, super::super::backend_job_upgrade::MIGRATION_NAME),
@@ -156,6 +156,10 @@ fn expected_published_tail() -> [(i64, &'static str); 14] {
             136,
             super::super::launch_policy_identity_migration::MIGRATION_NAME,
         ),
+        (
+            137,
+            super::super::worker_lifecycle_notifications::MIGRATION_NAME,
+        ),
     ]
 }
 
@@ -166,7 +170,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
         assert_eq!(plan.current_schema_version, current);
-        assert_eq!(plan.target_schema_version, 136);
+        assert_eq!(plan.target_schema_version, 137);
         assert_eq!(
             plan.migrations
                 .iter()

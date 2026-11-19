@@ -597,6 +597,9 @@ fn fresh_and_upgraded_current_job_schema_have_same_columns_constraints_and_progr
     let upgraded = Connection::open(path).unwrap();
     store::configure_sqlite(&upgraded).unwrap();
     migrate(&upgraded).unwrap();
+    // Compare current schemas only after the registered tail also upgrades the
+    // shared notification tables; schema130 alone is not the latest contract.
+    store::prepare_connection(&upgraded).unwrap();
     let fresh = Connection::open_in_memory().unwrap();
     store::prepare_connection(&fresh).unwrap();
     fn signature(conn: &Connection) -> Vec<Vec<Value>> {
