@@ -748,8 +748,20 @@ fn build_references() -> Result<References> {
             (1..=family.names().len()).map(move |count| Stage::Published(family, count))
         }))
         .chain((119..=121).map(Stage::Converged));
+    // Each stage must start from the same frozen base. Build that private
+    // reference once, then copy it; never reuse a previously installed stage
+    // or copy any caller's database into the reference.
+    let base_reference = reference_base()?;
     for stage in all {
-        let conn = reference_base()?;
+        let mut conn = Connection::open_in_memory()?;
+        rusqlite::backup::Backup::new(&base_reference, &mut conn)?.run_to_completion(
+            128,
+            std::time::Duration::ZERO,
+            None,
+        )?;
+        // Connection-local settings are not part of a SQLite backup.
+        super::configure_sqlite(&conn)?;
+        conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
         install_reference(&conn, stage)?;
         let shape = snapshot(&conn)?;
         let mut fields = BTreeMap::new();

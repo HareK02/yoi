@@ -6,6 +6,51 @@ use super::*;
 use rusqlite::{backup::Backup, params};
 
 #[test]
+fn copied_reference_stages_match_independent_frozen_schema_construction() {
+    let copied = build_references().unwrap();
+    let stages = std::iter::once(Stage::Base)
+        .chain(FAMILIES.into_iter().flat_map(|family| {
+            (1..=family.names().len()).map(move |count| Stage::Published(family, count))
+        }))
+        .chain((119..=121).map(Stage::Converged));
+    let base = snapshot(&reference_base().unwrap()).unwrap();
+    let mut tables = BTreeSet::new();
+    let mut new_columns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let base_conn = reference_base().unwrap();
+    let mut count = 0;
+    for stage in stages {
+        // Independent construction is the oracle: do not use the copy helper.
+        let conn = reference_base().unwrap();
+        install_reference(&conn, stage).unwrap();
+        let shape = snapshot(&conn).unwrap();
+        assert_eq!(copied.stages[&stage], shape, "stage {stage:?}");
+        for (name, object) in &shape {
+            if base.get(name) != Some(object) {
+                tables.insert(object.1.clone());
+            }
+            if object.0 == "table" {
+                let old: BTreeSet<_> = super::super::table_columns(&base_conn, name)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+                let fields: BTreeSet<_> = super::super::table_columns(&conn, name)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+                new_columns
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(fields.difference(&old).cloned());
+            }
+        }
+        count += 1;
+    }
+    assert_eq!(copied.stages.len(), count);
+    assert_eq!(copied.tables, tables);
+    assert_eq!(copied.new_columns, new_columns);
+}
+
+#[test]
 fn table_declaration_normalization_is_idempotent_after_extension() {
     let connection = Connection::open_in_memory().unwrap();
     connection
