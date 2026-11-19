@@ -992,7 +992,7 @@ impl SqliteWorkspaceAuthority {
             .iter()
             .map(|request| {
                 // Integrated results never require observation of a mutable branch.
-                let observation = if request.state == MergeRequestState::Open {
+                let observation = if request.state.is_open() {
                     request.selector_from.as_deref().map_or_else(
                         || {
                             Err(server_api::MergeRequestRefDiagnostic {
@@ -1924,7 +1924,7 @@ pub(crate) fn merge_request_summary(
     source_observation: std::result::Result<String, server_api::MergeRequestRefDiagnostic>,
 ) -> TicketMergeRequestSummary {
     let (current_subject_ref, source_ref_observation, integration_evidence_error) =
-        if request.state == MergeRequestState::Merged {
+        if request.state.is_completed() {
             (
                 request
                     .merged_result()
@@ -1936,7 +1936,7 @@ pub(crate) fn merge_request_summary(
                     .err()
                     .map(|error| error.code().to_string()),
             )
-        } else if request.state == MergeRequestState::Closed {
+        } else if request.state.is_canceled() {
             (
                 None,
                 server_api::TicketSourceRefObservation::NotRequired {},
@@ -1960,7 +1960,7 @@ pub(crate) fn merge_request_summary(
         MergeRequestThreadEvent::ReviewRequested(review) => Some(review),
         _ => None,
     });
-    let current_review = if request.state == MergeRequestState::Merged {
+    let current_review = if request.state.is_completed() {
         request.integration_approval().ok()
     } else {
         current_subject_ref
@@ -2005,12 +2005,7 @@ pub(crate) fn merge_request_summary(
         }
     }
     .to_string();
-    let state = match request.state {
-        MergeRequestState::Open => "open",
-        MergeRequestState::Merged => "merged",
-        MergeRequestState::Closed => "closed",
-    }
-    .to_string();
+    let state = request.state.clone().into();
 
     TicketMergeRequestSummary {
         merge_request_id: request.merge_request_id.clone(),
@@ -2088,7 +2083,12 @@ fn ticket_evidence_summary(
 ) -> TicketEvidenceSummary {
     let relevant = merge_requests
         .iter()
-        .filter(|request| request.state != "closed")
+        .filter(|request| {
+            !matches!(
+                request.state,
+                server_api::MergeRequestState::Canceled { .. }
+            )
+        })
         .collect::<Vec<_>>();
     let has_merge_request = !relevant.is_empty();
     let has_current_subject_ref = has_merge_request
@@ -3128,7 +3128,13 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             merge_request_id: "mr-1".to_string(),
             repository_id: "main".to_string(),
-            state: MergeRequestState::Open,
+            state: if decision == ReviewDecision::Approve {
+                MergeRequestState::Integration {
+                    started_by: "review-1".into(),
+                }
+            } else {
+                MergeRequestState::Implementation {}
+            },
             selector_from: Some("work/ticket-1".to_string()),
             selector_to: "orchestration".to_string(),
             ticket_ids: vec!["ticket-1".to_string()],
@@ -3208,7 +3214,12 @@ mod tests {
 
     fn merged_request() -> MergeRequest {
         let mut request = reviewed_merge_request(ReviewDecision::Approve, false);
-        request.state = MergeRequestState::Merged;
+        request.state = MergeRequestState::Completed {
+            completion: merge_request::MergeRequestCompletion::Published {
+                started_by: "review-1".into(),
+                merge_event_id: "merge-1".into(),
+            },
+        };
         request
             .thread
             .push(MergeRequestThreadEvent::Merge(merge_request::MergeEvent {
@@ -3466,7 +3477,12 @@ mod tests {
                 .thread
                 .push(MergeRequestThreadEvent::Merge(merge));
         }
-        requests[1].state = MergeRequestState::Merged;
+        requests[1].state = MergeRequestState::Completed {
+            completion: merge_request::MergeRequestCompletion::Published {
+                started_by: "review-1".into(),
+                merge_event_id: "merge-1".into(),
+            },
+        };
         assert!(
             project_evidence(&requests, "ticket-content-2", &observations)
                 .1
@@ -3516,7 +3532,9 @@ mod tests {
         );
         assert!(ticket_evidence_summary(&["docs"], &summaries, true).has_merge_request);
         let mut closed = reviewed_merge_request(ReviewDecision::Approve, false);
-        closed.state = MergeRequestState::Closed;
+        closed.state = MergeRequestState::Canceled {
+            from: merge_request::MergeRequestCancellationOrigin::Legacy {},
+        };
         assert!(
             !project_evidence(&[closed], "ticket-content-1", &[Ok("commit-1".into())])
                 .1

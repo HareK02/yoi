@@ -1,3 +1,8 @@
+#[path = "store/integration.rs"]
+mod integration;
+#[path = "store/lifecycle.rs"]
+mod lifecycle;
+
 use chrono::{TimeZone, Utc};
 use merge_request::*;
 use rusqlite::Connection;
@@ -137,7 +142,23 @@ fn concurrent_open_serializes_the_conflict_snapshot_instead_of_upgrading_read_lo
 }
 
 /// Frozen v12 fixture: counters must never be promoted to content attestations.
+fn freeze_v13_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TRIGGER merge_request_lifecycle_transition;
+        DROP TRIGGER merge_request_lifecycle_evidence_insert;
+        DROP TRIGGER merge_request_lifecycle_evidence_update;
+        ALTER TABLE merge_requests ADD COLUMN old_state TEXT NOT NULL DEFAULT 'open' CHECK(old_state IN ('open','merged','closed'));
+        UPDATE merge_requests SET old_state=CASE json_extract(state,'$.kind') WHEN 'completed' THEN 'merged' WHEN 'canceled' THEN 'closed' ELSE 'open' END;
+        ALTER TABLE merge_requests DROP COLUMN state;
+        ALTER TABLE merge_requests RENAME COLUMN old_state TO state;
+        UPDATE merge_request_schema SET version=13;",
+        )
+        .unwrap();
+}
+
 fn freeze_v12_review_payloads(connection: &Connection) {
+    freeze_v13_schema(connection);
     let rows = {
         let mut statement = connection.prepare(
             "SELECT event_id,payload_json FROM merge_request_thread_events WHERE kind IN ('review_requested','review')",
@@ -303,7 +324,7 @@ fn v12_migration_revokes_old_grants_preserves_integration_and_requires_fresh_con
             .query_row("SELECT version FROM merge_request_schema", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
 }
 
@@ -539,7 +560,7 @@ fn completion_admission_fences_commit_and_receipt_replay_without_duplicate_event
     });
     assert!(matches!(rejected, Err(MergeRequestError::Unauthorized(_))));
     assert_eq!(calls.get(), 2);
-    assert_eq!(store.get("W", "T").unwrap().state, MergeRequestState::Open);
+    assert!(store.get("W", "T").unwrap().state.is_open());
     assert!(
         !store
             .get("W", "T")
@@ -607,7 +628,7 @@ fn integration_preserves_selectors_ticket_state_and_assignment_and_replays_its_m
     assert_eq!(merged.approved_source_ref, "opaque-source-ref");
     let mr = s.get("W", "T").unwrap();
     assert_eq!(mr.selector_from.as_deref(), Some("work/t"));
-    assert_eq!(mr.state, MergeRequestState::Merged);
+    assert!(mr.state.is_completed());
     let current_assignment: bool = Connection::open(d.path().join("db"))
         .unwrap()
         .query_row(
@@ -705,7 +726,7 @@ fn integration_post_failure_rolls_back_and_same_operation_recovers_with_legacy_e
             .contains("injected integration post failure")
     );
     let failed = store.get_by_id("W", "MR").unwrap();
-    assert_eq!(failed.state, MergeRequestState::Open);
+    assert_eq!(failed.state, before.state);
     assert_eq!(failed.thread, before.thread);
     assert!(store.authorize_review_submission("MR", "pending").is_ok());
     assert_eq!(
@@ -724,10 +745,7 @@ fn integration_post_failure_rolls_back_and_same_operation_recovers_with_legacy_e
         .unwrap();
     let merged = store.complete(completion.clone()).unwrap();
     assert_eq!(store.complete(completion).unwrap(), merged);
-    assert_eq!(
-        store.get_by_id("W", "MR").unwrap().state,
-        MergeRequestState::Merged
-    );
+    assert!(store.get_by_id("W", "MR").unwrap().state.is_completed());
     assert!(store.authorize_review_submission("MR", "pending").is_err());
     let posts = connection
         .prepare("SELECT event_ref,body FROM typed_ticket_events WHERE event_index >= 0 ORDER BY event_index")
@@ -878,7 +896,7 @@ fn review_revocation_invalidates_readiness() {
 }
 
 #[test]
-fn fresh_schema_uses_version_13_and_reopens_as_current() {
+fn fresh_schema_reopens_as_current() {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
         "CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,PRIMARY KEY(workspace_id,ticket_id));",
@@ -891,7 +909,7 @@ fn fresh_schema_uses_version_13_and_reopens_as_current() {
             r.get::<_, i64>(0)
         })
         .unwrap(),
-        13
+        14
     );
     merge_request::migrate(&c).unwrap();
 }
@@ -1064,7 +1082,7 @@ fn first_class_list_and_detail_are_workspace_scoped_and_cursor_bounded() {
     Connection::open(dir.path().join("db"))
         .unwrap()
         .execute(
-            "UPDATE merge_requests SET state='closed' WHERE workspace_id='W' AND merge_request_id='MR'",
+            "UPDATE merge_requests SET state=json_object('kind','canceled','from',json_object('kind','implementation')) WHERE workspace_id='W' AND merge_request_id='MR'",
             [],
         )
         .unwrap();
@@ -1112,7 +1130,7 @@ fn first_class_list_and_detail_are_workspace_scoped_and_cursor_bounded() {
         .list(
             "W",
             &MergeRequestListQuery {
-                state: Some(MergeRequestState::Closed),
+                state: Some(MergeRequestStateFilter::Closed),
                 limit: 10,
                 ..Default::default()
             },

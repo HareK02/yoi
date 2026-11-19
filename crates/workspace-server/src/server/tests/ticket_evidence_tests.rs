@@ -66,7 +66,10 @@ async fn integration_preserves_legacy_empty_post_ref_and_exposes_new_ref_with_se
         "evidence-integration"
     );
     let shown = fixture.show().await;
-    assert_eq!(shown.merge_requests[0].state, "merged");
+    assert!(matches!(
+        shown.merge_requests[0].state,
+        server_api::MergeRequestState::Completed { .. }
+    ));
 }
 
 #[tokio::test]
@@ -655,7 +658,11 @@ async fn released_assignment_still_observes_provider_and_reports_real_unavailabi
 
     let shown = fixture.show().await;
     let summary = &shown.merge_requests[0];
-    assert_eq!(summary.state, "open");
+    assert!(matches!(
+        summary.state,
+        server_api::MergeRequestState::Implementation {}
+            | server_api::MergeRequestState::Integration { .. }
+    ));
     assert_eq!(summary.current_subject_ref, None);
     assert_eq!(
         summary.source_ref_observation,
@@ -792,7 +799,11 @@ async fn closing_ticket_with_open_unreviewed_mr_does_not_change_its_proof_or_sta
     let shown = fixture.show().await;
     assert_eq!(shown.state.as_str(), "closed");
     assert!(!shown.evidence.approved_current_subject);
-    assert_eq!(shown.merge_requests[0].state, "open");
+    assert!(matches!(
+        shown.merge_requests[0].state,
+        server_api::MergeRequestState::Implementation {}
+            | server_api::MergeRequestState::Integration { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1306,7 +1317,10 @@ async fn closed_and_reopened_tickets_allow_orchestrator_review_and_integration_w
         assert_eq!(integrated.approval_event_id, approval.event_id);
         let shown = fixture.show().await;
         assert_eq!(shown.state.as_str(), if reopen { "open" } else { "closed" });
-        assert_eq!(shown.merge_requests[0].state, "merged");
+        assert!(matches!(
+            shown.merge_requests[0].state,
+            server_api::MergeRequestState::Completed { .. }
+        ));
         assert!(
             fixture
                 .api

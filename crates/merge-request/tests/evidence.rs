@@ -72,7 +72,12 @@ fn merged_requests() -> Vec<MergeRequest> {
                 workspace_id: "W".into(),
                 merge_request_id: subject.merge_request_id.clone(),
                 repository_id: subject.merge_request_id.clone(),
-                state: MergeRequestState::Merged,
+                state: MergeRequestState::Completed {
+                    completion: MergeRequestCompletion::Published {
+                        started_by: format!("integration-{}", subject.merge_request_id),
+                        merge_event_id: format!("merge-{}", subject.merge_request_id),
+                    },
+                },
                 selector_from: Some("work/source".into()),
                 selector_to: "main".into(),
                 ticket_ids: vec!["T".into()],

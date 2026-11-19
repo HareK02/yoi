@@ -430,7 +430,7 @@ Deno.test("Ticket Browser parser accepts target collections and rejects singular
 const mergeRequestSummary = {
   merge_request_id: "mr-1",
   repository_key: "main",
-  state: "open",
+  state: { kind: "integration", started_by: "approval-1" },
   selector_from: "work/T-1",
   selector_to: "develop",
   updated_at: "2026-10-08T00:00:00Z",
@@ -466,12 +466,12 @@ Deno.test("Merge Request summaries preserve live observation and immutable merge
       },
       {
         ...mergeRequestSummary,
-        state: "merged",
+        state: { kind: "completed", completion: {kind: "legacy", merge_event_id: "merge-1"} },
         source_ref_observation: { status: "not_required" },
       },
       {
         ...mergeRequestSummary,
-        state: "merged",
+        state: { kind: "completed", completion: {kind: "legacy", merge_event_id: "merge-1"} },
         source_ref_observation: { status: "not_required" },
         integration_evidence_error: "approval_event_missing",
         review_status: "none",
@@ -569,7 +569,7 @@ Deno.test("closed Ticket state is preserved when current requirement evidence is
     evidence: { ...fixture.evidence, missing: ["review_after_rescope"] },
     merge_requests: [{
       ...mergeRequestSummary,
-      state: "merged",
+      state: { kind: "completed", completion: {kind: "legacy", merge_event_id: "merge-1"} },
       source_ref_observation: { status: "not_required" },
     }],
   });
@@ -613,8 +613,8 @@ Deno.test("Ticket Browser parser accepts the generated Objective list shape", ()
   assertEquals(parsed.items[0]?.resource_key, "O-1");
 });
 
-Deno.test("Ticket Browser parser validates the canonical Merge Request thread", () => {
-  const parsed = parseMergeRequestDetailResponse({
+function mergeRequestDetailFixture() {
+  return {
     view: "detail",
     summary: {
       review_status: "pending",
@@ -628,7 +628,7 @@ Deno.test("Ticket Browser parser validates the canonical Merge Request thread", 
     workspace_id: "workspace-a",
     merge_request_id: "mr-1",
     repository_key: "main",
-    state: "open",
+    state: {kind: "implementation"},
     selector_from: "work/T-1",
     selector_to: "develop",
     ticket_ids: ["ticket-id"],
@@ -658,7 +658,11 @@ Deno.test("Ticket Browser parser validates the canonical Merge Request thread", 
       observed_at: "2026-09-22T00:00:00Z",
     },
     linked_tickets: [{ ticket_id: "ticket-id", key: "T-1" }],
-  });
+  };
+}
+
+Deno.test("Ticket Browser parser validates the canonical Merge Request thread", () => {
+  const parsed = parseMergeRequestDetailResponse(mergeRequestDetailFixture());
   assertEquals(parsed.thread[0]?.kind, "review_requested");
   assertEquals(parsed.summary.review_status, "pending");
   assertEquals(parsed.summary.latest_event?.event_id, "event-1");
@@ -678,6 +682,129 @@ Deno.test("Ticket Browser parser validates the canonical Merge Request thread", 
       }),
     "unknown field",
   );
+});
+
+// Exercise the shared decoder through the actual list, Ticket and MR read boundaries.
+const lifecycleProjectionParsers = [
+  (fields: Record<string, unknown>) => parseMergeRequestListResponse(
+    mergeRequestListFixture({ ...mergeRequestSummary, ...fields }),
+  ).items[0].summary,
+  (fields: Record<string, unknown>) => parseTicketDetail({
+    ...ticketDetailFixture(), merge_requests: [{ ...mergeRequestSummary, ...fields }],
+  }).merge_requests[0],
+  (fields: Record<string, unknown>) => parseTicketDetail({
+    ...ticketDetailFixture(), merge_request: { ...mergeRequestSummary, ...fields },
+  }).merge_request!,
+  ...["summary", "detail"].map((view) => (fields: Record<string, unknown>) =>
+    parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), view, ...fields })),
+];
+
+Deno.test("MR projections preserve lifecycle variant evidence independently of review", () => {
+  for (const parse of lifecycleProjectionParsers) {
+    for (const state of [
+      {kind: "implementation"},
+      {kind: "integration", started_by: "first-review"},
+      {kind: "completed", completion: {kind: "published", started_by: "first-review", merge_event_id: "merge-1"}},
+      {kind: "completed", completion: {kind: "legacy", merge_event_id: null}},
+      {kind: "completed", completion: {kind: "legacy", merge_event_id: "legacy-merge"}},
+      {kind: "completed", completion: {kind: "legacy"}},
+      {kind: "canceled", from: {kind: "implementation"}},
+      {kind: "canceled", from: {kind: "integration", started_by: "first-review"}},
+      {kind: "canceled", from: {kind: "legacy"}},
+    ]) {
+      const parsed = parse({state});
+      assertEquals(parsed.state, state);
+      assertEquals("phase" in parsed, false);
+      assertEquals("integration_started_by" in parsed, false);
+    }
+  }
+  for (const review_status of ["none", "pending", "request_changes", "approved"]) {
+    const fixture = mergeRequestDetailFixture();
+    const parsed = parseMergeRequestDetailResponse({
+      ...fixture, state: {kind: "integration", started_by: "first-review"},
+      summary: {...fixture.summary, review_status},
+    });
+    assertEquals(parsed.state.kind, "integration");
+    assertEquals(parsed.summary.review_status, review_status);
+    assertEquals(parsed.summary.readiness.ready, false);
+  }
+});
+
+Deno.test("MR projections reject missing and foreign variant payloads rather than inferring phase", () => {
+  for (const parse of lifecycleProjectionParsers) {
+    for (const state of [undefined, null, "open", {kind: "unknown"},
+      {kind: "closed", from: {kind: "implementation"}},
+      {kind: "integration"}, {kind: "integration", started_by: null},
+      {kind: "implementation", started_by: "foreign"},
+      {kind: "integration", started_by: "review", completion: {}},
+      {kind: "completed"}, {kind: "completed", completion: {kind: "published", merge_event_id: "merge"}},
+      {kind: "completed", completion: {kind: "legacy", started_by: "guessed"}},
+      {kind: "canceled"}, {kind: "canceled", from: {kind: "integration"}},
+      ...[null, "published", {}, {kind: "unknown"},
+        {kind: "published", started_by: "review"},
+        {kind: "published", started_by: "review", merge_event_id: null},
+        {kind: "published", started_by: 7, merge_event_id: "merge"},
+        {kind: "legacy", merge_event_id: 7},
+      ].map((completion) => ({kind: "completed", completion})),
+      ...[null, "implementation", {}, {kind: "unknown"},
+        {kind: "integration", started_by: null},
+        {kind: "integration", started_by: 7},
+        {kind: "implementation", started_by: "foreign"},
+        {kind: "legacy", started_by: "foreign"},
+      ].map((from) => ({kind: "canceled", from})),
+    ]) assertThrows(() => parse({state}), ".state");
+    for (const fields of [{phase: "integration"}, {integration_started_by: "review"}]) {
+      assertThrows(() => parse(fields), "unknown field");
+    }
+    assertThrows(() => parse({state: {kind: "integration", started_by: "x".repeat(262_145)}}), "started_by exceeds its length limit");
+  }
+});
+
+Deno.test("MR lifecycle preserves source-specific review and publication evidence", () => {
+  const fixture = mergeRequestDetailFixture();
+  const request = fixture.thread[0];
+  const { requested_by: _, ...reviewBase } = request;
+  const review = {
+    ...reviewBase, kind: "review", event_id: "review-1", sequence: 2,
+    request_event_id: request.event_id, decision: "approve", body: "Reviewed", findings: [],
+  };
+  const publication = {
+    kind: "merge", event_id: "merge-1", sequence: 3, created_at: fixture.updated_at,
+    approval_event_id: review.event_id, approved_source_ref: review.subject_ref,
+    merged_by: request.requested_by, operation_id: "publish-1",
+    resolution: "none", strategy: "fast_forward",
+    target_ref_before: "def456", target_ref_after: review.subject_ref,
+  };
+  const compactReview = {
+    event: { event_id: review.event_id, sequence: review.sequence },
+    request_event_id: request.event_id, subject_ref: review.subject_ref,
+    ticket_content_digest: review.ticket_content_digest, decision: review.decision, findings_count: 0,
+  };
+  const state = {
+    kind: "completed",
+    completion: { kind: "published", started_by: review.event_id, merge_event_id: publication.event_id },
+  };
+  const parsed = parseMergeRequestDetailResponse({
+    ...fixture, state, thread: [request, review, publication],
+    summary: {
+      ...fixture.summary, review_status: "approved", review: compactReview,
+      latest_event: { event_id: publication.event_id, sequence: publication.sequence },
+      thread_event_count: 3,
+    },
+  });
+  assertEquals(parsed.state, state);
+  assertEquals(parsed.summary.review, compactReview);
+  const [parsedRequest, parsedReview, parsedPublication] = parsed.thread;
+  if (parsedRequest.kind !== "review_requested" || parsedReview.kind !== "review" || parsedPublication.kind !== "merge") {
+    throw new Error("Expected source review and publication events");
+  }
+  assertEquals(parsedRequest.subject_ref, request.subject_ref);
+  assertEquals(parsedReview.subject_ref, review.subject_ref);
+  assertEquals(parsedReview.request_event_id, request.event_id);
+  assertEquals(parsedReview.ticket_merge_request_subjects, request.ticket_merge_request_subjects);
+  assertEquals(parsedPublication.approval_event_id, review.event_id);
+  assertEquals(parsedPublication.approved_source_ref, review.subject_ref);
+  assertEquals(parsedPublication.target_ref_after, publication.target_ref_after);
 });
 
 const tags = ["ready", "closed"].map((name) => ({

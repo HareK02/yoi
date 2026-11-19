@@ -670,16 +670,16 @@
         {#if mergeRequests.length > 0}
           {#each mergeRequests as mergeRequest (mergeRequest.merge_request_id)}
             <article class="ticket-control-card">
-              <p><strong>{mergeRequest.repository_key}: {mergeRequest.state}</strong></p>
+              <p><strong>{mergeRequest.repository_key}: {mergeRequest.state.kind}</strong></p>
               <p>
                 From <code>{mergeRequest.selector_from ?? "requires repair"}</code>
                 to <code>{mergeRequest.selector_to}</code>
               </p>
-              <p><strong>{mergeRequest.state === "merged" ? "Immutable integration evidence" : "Live source review"}:</strong> {summarySourceReviewStatus(mergeRequest)}</p>
+              <p><strong>{mergeRequest.state.kind === "completed" ? "Immutable integration evidence" : "Live source review"}:</strong> {summarySourceReviewStatus(mergeRequest)}</p>
               {#if mergeRequest.integration_evidence_error !== null}
                 <p class="workspace-callout is-error"><strong>Integration evidence error:</strong> {mergeRequest.integration_evidence_error}</p>
               {/if}
-              <p><strong>Target integration:</strong> {mergeRequest.state === "merged" ? "recorded" : `awaiting Orchestrator integration into ${mergeRequest.selector_to}`}.</p>
+              <p><strong>Target integration:</strong> {mergeRequest.state.kind === "completed" ? "recorded" : `awaiting Orchestrator integration into ${mergeRequest.selector_to}`}.</p>
               <a
                 class="workspace-secondary-button"
                 href={mergeRequestPagePath(data.workspaceId, mergeRequest.merge_request_id)}

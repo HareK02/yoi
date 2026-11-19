@@ -8704,7 +8704,7 @@ pub enum TicketSourceRefObservation {
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
     pub repository_key: String,
-    pub state: String,
+    pub state: MergeRequestState,
     pub review_status: String,
     pub selector_from: Option<String>,
     pub selector_to: String,
@@ -9441,13 +9441,78 @@ pub struct ObjectiveShowRequest {
     pub event_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MergeRequestState {
-    Open,
-    Merged,
-    Closed,
+    Implementation {},
+    Integration {
+        started_by: String,
+    },
+    Completed {
+        completion: MergeRequestCompletion,
+    },
+    Canceled {
+        from: MergeRequestCancellationOrigin,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MergeRequestCompletion {
+    Published {
+        started_by: String,
+        merge_event_id: String,
+    },
+    Legacy {
+        merge_event_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MergeRequestCancellationOrigin {
+    Implementation {},
+    Integration { started_by: String },
+    Legacy {},
+}
+
+impl From<merge_request::MergeRequestState> for MergeRequestState {
+    fn from(state: merge_request::MergeRequestState) -> Self {
+        use merge_request::{
+            MergeRequestCancellationOrigin as Origin, MergeRequestCompletion as Completion,
+            MergeRequestState as State,
+        };
+        match state {
+            State::Implementation {} => Self::Implementation {},
+            State::Integration { started_by } => Self::Integration { started_by },
+            State::Completed { completion } => Self::Completed {
+                completion: match completion {
+                    Completion::Published {
+                        started_by,
+                        merge_event_id,
+                    } => MergeRequestCompletion::Published {
+                        started_by,
+                        merge_event_id,
+                    },
+                    Completion::Legacy { merge_event_id } => {
+                        MergeRequestCompletion::Legacy { merge_event_id }
+                    }
+                },
+            },
+            State::Canceled { from } => Self::Canceled {
+                from: match from {
+                    Origin::Implementation {} => MergeRequestCancellationOrigin::Implementation {},
+                    Origin::Integration { started_by } => {
+                        MergeRequestCancellationOrigin::Integration { started_by }
+                    }
+                    Origin::Legacy {} => MergeRequestCancellationOrigin::Legacy {},
+                },
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

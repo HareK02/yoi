@@ -25572,7 +25572,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     conn.execute("INSERT INTO typed_ticket_targets(workspace_id,ticket_id,ordinal,repository_key,ref_selector,access)
                         VALUES('case-workspace',?1,0,'main','develop','read_write')", [&id]).unwrap();
                     conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at)
-                        VALUES('case-workspace',?1,'case-repo','merged','work/original','develop','1','2')", [&id]).unwrap();
+                        VALUES('case-workspace',?1,'case-repo',json_object('kind','completed','completion',json_object('kind','legacy','merge_event_id',?1)),'work/original','develop','1','2')", [&id]).unwrap();
                     conn.execute("INSERT INTO merge_request_ticket_relations(workspace_id,merge_request_id,ticket_id,relation_kind,created_at)
                         VALUES('case-workspace',?1,?1,'implements','1')", [&id]).unwrap();
                     let evidence = merge_request::MergeEvent {

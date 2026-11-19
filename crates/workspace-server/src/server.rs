@@ -19968,11 +19968,7 @@ fn merged_result_source_ref(mr: &merge_request::MergeRequest) -> ApiResult<Strin
 fn public_merge_request_state(
     state: merge_request::MergeRequestState,
 ) -> server_api::MergeRequestState {
-    match state {
-        merge_request::MergeRequestState::Open => server_api::MergeRequestState::Open,
-        merge_request::MergeRequestState::Merged => server_api::MergeRequestState::Merged,
-        merge_request::MergeRequestState::Closed => server_api::MergeRequestState::Closed,
-    }
+    state.into()
 }
 
 fn public_merge_request_worker_identity(
@@ -20225,9 +20221,9 @@ async fn scoped_list_merge_requests(
         .state
         .as_deref()
         .map(|state| match state {
-            "open" => Ok(merge_request::MergeRequestState::Open),
-            "merged" => Ok(merge_request::MergeRequestState::Merged),
-            "closed" => Ok(merge_request::MergeRequestState::Closed),
+            "open" => Ok(merge_request::MergeRequestStateFilter::Open),
+            "merged" => Ok(merge_request::MergeRequestStateFilter::Merged),
+            "closed" => Ok(merge_request::MergeRequestStateFilter::Closed),
             _ => Err(settings_bad_request(
                 "invalid_merge_request_state",
                 "state must be one of open, merged, or closed",
@@ -20262,7 +20258,7 @@ async fn scoped_list_merge_requests(
         .into_iter()
         .map(|merge_request| -> ApiResult<MergeRequestListItem> {
             let (current_subject_ref, ref_diagnostics) =
-                if merge_request.state == merge_request::MergeRequestState::Open {
+                if merge_request.state.is_open() {
                     match (
                         merge_request.selector_from.as_deref(),
                         merge_request.ticket_ids.first(),
@@ -20389,7 +20385,7 @@ fn integrated_merge_refs(
     server_api::MergeRequestRefResponse,
     server_api::MergeRequestRefResponse,
 )> {
-    if mr.state != merge_request::MergeRequestState::Merged {
+    if !mr.state.is_completed() {
         return None;
     }
     let result = mr.merged_result().ok();
@@ -20455,7 +20451,7 @@ fn merge_request_status_summary(
         .then_some(source.resolved_ref.as_deref())
         .flatten();
     let review = subject.and_then(|subject| {
-        if mr.state == merge_request::MergeRequestState::Merged {
+        if mr.state.is_completed() {
             mr.integration_approval().ok()
         } else {
             mr.effective_review(subject)
@@ -20700,34 +20696,33 @@ async fn scoped_merge_request_readiness(
             let assignment = api
                 .store
                 .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?;
-            let (current_subject_ref, source_blocker) =
-                if mr.state == merge_request::MergeRequestState::Merged {
-                    (
-                        mr.merged_result()
-                            .ok()
-                            .map(|merge| merge.approved_source_ref.clone()),
-                        None,
-                    )
-                } else {
-                    match (mr.selector_from.as_deref(), assignment) {
-                        (Some(selector), Some(assignment)) => match observe_published_source_ref(
-                            &api,
-                            &workspace_id,
-                            &assignment.worker.runtime_id,
-                            &mr.repository_id,
-                            selector,
-                        ) {
-                            Ok(observation) => (Some(observation.resolved_ref), None),
-                            Err(error) => {
-                                let diagnostic = merge_ref_diagnostic(error);
-                                let blocker = source_ref_readiness_blocker(&diagnostic.code);
-                                (None, Some(blocker.to_string()))
-                            }
-                        },
-                        (Some(_), None) => (None, Some("source_ref_unavailable".to_string())),
-                        (None, _) => (None, None),
-                    }
-                };
+            let (current_subject_ref, source_blocker) = if mr.state.is_completed() {
+                (
+                    mr.merged_result()
+                        .ok()
+                        .map(|merge| merge.approved_source_ref.clone()),
+                    None,
+                )
+            } else {
+                match (mr.selector_from.as_deref(), assignment) {
+                    (Some(selector), Some(assignment)) => match observe_published_source_ref(
+                        &api,
+                        &workspace_id,
+                        &assignment.worker.runtime_id,
+                        &mr.repository_id,
+                        selector,
+                    ) {
+                        Ok(observation) => (Some(observation.resolved_ref), None),
+                        Err(error) => {
+                            let diagnostic = merge_ref_diagnostic(error);
+                            let blocker = source_ref_readiness_blocker(&diagnostic.code);
+                            (None, Some(blocker.to_string()))
+                        }
+                    },
+                    (Some(_), None) => (None, Some("source_ref_unavailable".to_string())),
+                    (None, _) => (None, None),
+                }
+            };
             let mut report = store.readiness(merge_request::ReadinessCheck {
                 merge_request_id,
                 ticket_id,
@@ -20989,9 +20984,12 @@ async fn scoped_register_merge_request_review_capability(
                         "Ticket has no current implementation assignment".into(),
                     )
                 })?;
-            let subject_ref = match mr.state {
-                merge_request::MergeRequestState::Merged => merged_result_source_ref(&mr)?,
-                merge_request::MergeRequestState::Open => {
+            let subject_ref = match &mr.state {
+                merge_request::MergeRequestState::Completed { .. } => {
+                    merged_result_source_ref(&mr)?
+                }
+                merge_request::MergeRequestState::Implementation {}
+                | merge_request::MergeRequestState::Integration { .. } => {
                     let selector = mr.selector_from.as_deref().ok_or_else(|| {
                         Error::InvalidInput("selector_from requires repair".into())
                     })?;
@@ -21011,17 +21009,16 @@ async fn scoped_register_merge_request_review_capability(
                     )?;
                     source_observation.resolved_ref
                 }
-                merge_request::MergeRequestState::Closed => {
+                merge_request::MergeRequestState::Canceled { .. } => {
                     return Err(Error::InvalidInput(
-                        "closed Merge Request is not reviewable".into(),
+                        "canceled Merge Request is not reviewable".into(),
                     )
                     .into());
                 }
             };
             let mut ticket_merge_request_subjects = Vec::new();
             for linked in store.list_for_ticket(&workspace_id, &ticket_id)? {
-                let linked_subject_ref = if linked.state == merge_request::MergeRequestState::Merged
-                {
+                let linked_subject_ref = if linked.state.is_completed() {
                     merged_result_source_ref(&linked)?
                 } else {
                     let linked_selector = linked.selector_from.as_deref().ok_or_else(|| {
@@ -21099,9 +21096,12 @@ async fn scoped_submit_merge_request_review(
                         "Ticket has no current implementation assignment".into(),
                     )
                 })?;
-            let current_subject_ref = match mr.state {
-                merge_request::MergeRequestState::Merged => merged_result_source_ref(&mr)?,
-                merge_request::MergeRequestState::Open => {
+            let current_subject_ref = match &mr.state {
+                merge_request::MergeRequestState::Completed { .. } => {
+                    merged_result_source_ref(&mr)?
+                }
+                merge_request::MergeRequestState::Implementation {}
+                | merge_request::MergeRequestState::Integration { .. } => {
                     let selector = mr.selector_from.as_deref().ok_or_else(|| {
                         Error::InvalidInput("selector_from requires repair".into())
                     })?;
@@ -21114,9 +21114,9 @@ async fn scoped_submit_merge_request_review(
                     )?
                     .resolved_ref
                 }
-                merge_request::MergeRequestState::Closed => {
+                merge_request::MergeRequestState::Canceled { .. } => {
                     return Err(Error::InvalidInput(
-                        "closed Merge Request is not reviewable".into(),
+                        "canceled Merge Request is not reviewable".into(),
                     )
                     .into());
                 }
@@ -70615,7 +70615,7 @@ mod tests {
     fn mr_read_fixture() -> merge_request::MergeRequest {
         serde_json::from_value(json!({
             "workspace_id": TEST_WORKSPACE_ID, "merge_request_id": "mr-read",
-            "repository_id": "repo", "state": "open", "selector_from": "work/read",
+            "repository_id": "repo", "state": {"kind":"integration","started_by":"approval-1"}, "selector_from": "work/read",
             "selector_to": "develop", "ticket_ids": ["ticket"],
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
             "thread": [
@@ -70920,7 +70920,11 @@ mod tests {
         );
         mr.thread.truncate(1);
         assert_eq!(mr_read_summary(&mr).review_status, "pending");
-        mr.state = merge_request::MergeRequestState::Merged;
+        mr.state = merge_request::MergeRequestState::Completed {
+            completion: merge_request::MergeRequestCompletion::Legacy {
+                merge_event_id: None,
+            },
+        };
         assert!(
             mr_read_summary(&mr).review.is_none(),
             "merged state alone is not approval"

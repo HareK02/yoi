@@ -460,7 +460,7 @@ impl SqliteWorkspaceStore {
     ) -> Result<()> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let ids = tx.prepare("SELECT merge_request_id FROM merge_requests WHERE workspace_id=?1 AND repository_id=?2 AND selector_from=?3 AND state='open'")?.query_map(params![workspace,repository,selector],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let ids = tx.prepare("SELECT merge_request_id FROM merge_requests WHERE workspace_id=?1 AND repository_id=?2 AND selector_from=?3 AND json_extract(state,'$.kind') IN ('implementation','integration')")?.query_map(params![workspace,repository,selector],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
             for id in ids {
                 let previous: Option<String> = tx.query_row("SELECT subject_ref FROM merge_request_source_observations WHERE workspace_id=?1 AND merge_request_id=?2 ORDER BY sequence DESC LIMIT 1", params![workspace,id], |r|r.get(0)).optional()?;
                 // New MRs may already have a review before the first observation.

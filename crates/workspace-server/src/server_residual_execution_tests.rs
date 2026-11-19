@@ -210,7 +210,7 @@ fn seed_unrepaired_mr(fixture: &Fixture) {
     // Persist the external unrepaired-selector shape. No active assignment:
     // the real handler must reach its assignment read, then reject without provider dispatch.
     let conn = Connection::open(&fixture.api.config.database_path).unwrap();
-    conn.execute("INSERT INTO merge_requests VALUES (?1,'repair-fixture','fixture-repo','open',NULL,'develop',?2,?2)", rusqlite::params![WORKSPACE, "2026-01-01T00:00:00Z"]).unwrap();
+    conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at) VALUES (?1,'repair-fixture','fixture-repo',json_object('kind','implementation'),NULL,'develop',?2,?2)", rusqlite::params![WORKSPACE, "2026-01-01T00:00:00Z"]).unwrap();
     conn.execute("INSERT INTO merge_request_ticket_relations VALUES (?1,'repair-fixture',?2,'implements',?3)", rusqlite::params![WORKSPACE, ticket.id, "2026-01-01T00:00:00Z"]).unwrap();
 }
 

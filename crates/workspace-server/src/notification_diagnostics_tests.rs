@@ -83,7 +83,7 @@ async fn notification_diagnostics_detects_exact_missing_mr_event_after_earlier_c
     let (_dir, store) = tracking_store_fixture().await;
     tracking_store_assign(&store, "a", "assign-a");
     store.with_conn(|conn| {
-        conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_to,created_at,updated_at) SELECT workspace_id,'mr-diagnostic',repository_id,'open','develop','1','1' FROM repositories WHERE workspace_id='w' LIMIT 1",[])?;
+        conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_to,created_at,updated_at) SELECT workspace_id,'mr-diagnostic',repository_id,json_object('kind','implementation'),'develop','1','1' FROM repositories WHERE workspace_id='w' LIMIT 1",[])?;
         for (event,seq) in [("first",1),("missing",2)] {
             conn.execute("INSERT INTO merge_request_thread_events(workspace_id,merge_request_id,event_id,sequence,kind,payload_json,created_at) VALUES('w','mr-diagnostic',?1,?2,'review','{}','1')",params![event,seq])?;
         }

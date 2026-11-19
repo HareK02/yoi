@@ -26,7 +26,7 @@ function assertEquals(actual: unknown, expected: unknown): void {
 const summary: TicketMergeRequestSummary = {
   merge_request_id: "mr-1",
   repository_key: "main",
-  state: "open",
+  state: { kind: "integration", started_by: "approval-1" },
   selector_from: "work/T-1",
   selector_to: "develop",
   updated_at: "2026-10-08T00:00:00Z",
@@ -56,7 +56,7 @@ Deno.test("merged summary labels approval as immutable persisted evidence withou
   assertEquals(
     summarySourceReviewStatus({
       ...summary,
-      state: "merged",
+      state: { kind: "completed", completion: {kind: "legacy", merge_event_id: "merge-1"} },
       source_ref_observation: { status: "not_required" },
     }),
     "Integration approval recorded for immutable merged source source-1.",
@@ -67,7 +67,7 @@ Deno.test("merged evidence error does not claim a valid integration approval", (
   assertEquals(
     summarySourceReviewStatus({
       ...summary,
-      state: "merged",
+      state: { kind: "completed", completion: {kind: "legacy", merge_event_id: "merge-1"} },
       source_ref_observation: { status: "not_required" },
       integration_evidence_error: "approval_event_missing",
     }),
@@ -103,7 +103,7 @@ Deno.test("closed Ticket can retain immutable approval while current requirement
     },
     merge_requests: [{
       ...summary,
-      state: "merged",
+      state: { kind: "completed", completion: {kind: "legacy", merge_event_id: "merge-1"} },
       source_ref_observation: { status: "not_required" },
     }],
   });
@@ -207,7 +207,7 @@ Deno.test("merged detail uses backend validated immutable evidence even with a p
     linked_tickets: [],
     selector_from: "work/T-1",
     selector_to: "develop",
-    state: "merged",
+    state: {kind: "completed", completion: {kind: "legacy", merge_event_id: "merge-1"}},
     created_at: summary.updated_at,
     updated_at: summary.updated_at,
     source: {

@@ -128,7 +128,7 @@ function detail(
     ticket_ids: ["T-1"],
     selector_from: "work/ticket",
     selector_to: "develop",
-    state: "open",
+    state: {kind: "integration", started_by: "approval-1"},
     created_at: createdAt,
     updated_at: createdAt,
     source: {

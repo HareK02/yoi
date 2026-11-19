@@ -60,7 +60,7 @@
           <div class="ticket-section-heading"><h2>Selectors</h2></div>
           <dl class="ticket-facts">
             <div><dt>Repository</dt><dd>{mergeRequest.repository_key}</dd></div>
-            <div><dt>State</dt><dd>{mergeRequest.state}</dd></div>
+            <div><dt>State</dt><dd>{mergeRequest.state.kind}</dd></div>
             <div><dt>Source selector</dt><dd><code>{mergeRequest.selector_from ?? "requires repair"}</code></dd></div>
             <div><dt>Live source ref</dt><dd>{mergeRequest.source.status}{mergeRequest.source.ref ? ` · ${mergeRequest.source.ref}` : ""}</dd></div>
             {#if mergeRequest.source.diagnostic}
@@ -75,7 +75,7 @@
         <section class="ticket-detail-section">
           <div class="ticket-section-heading"><h2>Review and integration status</h2></div>
           <dl class="ticket-facts">
-            <div><dt>{mergeRequest.state === "merged" ? "Recorded integration approval" : "Live source review freshness"}</dt><dd>{sourceReviewFreshness(mergeRequest)}</dd></div>
+            <div><dt>{mergeRequest.state.kind === "completed" ? "Recorded integration approval" : "Live source review freshness"}</dt><dd>{sourceReviewFreshness(mergeRequest)}</dd></div>
             <div><dt>Target integration</dt><dd>{targetIntegrationStatus(mergeRequest)}</dd></div>
           </dl>
         </section>

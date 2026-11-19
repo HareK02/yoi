@@ -199,7 +199,7 @@ export function dashboardFixture(
           summary: {
             merge_request_id: `internal-merge-${index}`,
             repository_key: "main",
-            state: "open",
+            state: status === "approved" ? {kind: "integration", started_by: "approval-1"} : {kind: "implementation"},
             selector_from: long
               ? "feature/" + "long-branch-".repeat(15)
               : ["fix/queue", "feat/home", "fix/sidebar"][index],

@@ -1,6 +1,9 @@
 import type {
   BrowserTicketState,
   InvalidProjectRecord,
+  MergeRequestState,
+  MergeRequestCompletion,
+  MergeRequestCancellationOrigin,
   MergeRequestDetailResponse,
   MergeRequestLinkedTicketResponse,
   MergeRequestListItem,
@@ -936,6 +939,55 @@ function parseSourceRefObservation(
   throw new TicketBrowserContractError(`${label}.status is invalid`);
 }
 
+function parseMergeRequestCompletion(value: unknown, label: string): MergeRequestCompletion {
+  const item = object(value, label);
+  switch (item.kind) {
+    case "published":
+      exact(item, ["kind", "started_by", "merge_event_id"], label);
+      return { kind: item.kind, started_by: string(item.started_by, `${label}.started_by`), merge_event_id: string(item.merge_event_id, `${label}.merge_event_id`) };
+    case "legacy":
+      exact(item, ["kind", "merge_event_id"], label);
+      return { kind: item.kind, merge_event_id: optionalNullableString(item.merge_event_id, `${label}.merge_event_id`) };
+    default:
+      throw new TicketBrowserContractError(`${label}.kind is invalid`);
+  }
+}
+
+function parseMergeRequestCancellationOrigin(value: unknown, label: string): MergeRequestCancellationOrigin {
+  const item = object(value, label);
+  switch (item.kind) {
+    case "implementation":
+    case "legacy":
+      exact(item, ["kind"], label);
+      return { kind: item.kind };
+    case "integration":
+      exact(item, ["kind", "started_by"], label);
+      return { kind: item.kind, started_by: string(item.started_by, `${label}.started_by`) };
+    default:
+      throw new TicketBrowserContractError(`${label}.kind is invalid`);
+  }
+}
+
+function parseMergeRequestState(value: unknown, label: string): MergeRequestState {
+  const item = object(value, label);
+  switch (item.kind) {
+    case "implementation":
+      exact(item, ["kind"], label);
+      return { kind: item.kind };
+    case "integration":
+      exact(item, ["kind", "started_by"], label);
+      return { kind: item.kind, started_by: string(item.started_by, `${label}.started_by`) };
+    case "completed":
+      exact(item, ["kind", "completion"], label);
+      return { kind: item.kind, completion: parseMergeRequestCompletion(item.completion, `${label}.completion`) };
+    case "canceled":
+      exact(item, ["kind", "from"], label);
+      return { kind: item.kind, from: parseMergeRequestCancellationOrigin(item.from, `${label}.from`) };
+    default:
+      throw new TicketBrowserContractError(`${label}.kind is invalid`);
+  }
+}
+
 function parseTicketMergeRequestSummary(
   value: unknown,
   label: string,
@@ -997,7 +1049,7 @@ function parseTicketMergeRequestSummary(
       `${label}.selector_from`,
     ),
     selector_to: string(item.selector_to, `${label}.selector_to`),
-    state: string(item.state, `${label}.state`),
+    state: parseMergeRequestState(item.state, `${label}.state`),
     updated_at: string(item.updated_at, `${label}.updated_at`),
   };
 }
@@ -1925,10 +1977,7 @@ export function parseMergeRequestDetailResponse(
     "updated_at",
     "workspace_id",
   ], label);
-  const state = string(item.state, `${label}.state`);
-  if (!["open", "merged", "closed"].includes(state)) {
-    throw new TicketBrowserContractError(`${label}.state is invalid`);
-  }
+  const state = parseMergeRequestState(item.state, `${label}.state`);
   const view = string(item.view, `${label}.view`);
   if (view !== "summary" && view !== "detail") {
     throw new TicketBrowserContractError(`${label}.view is invalid`);
@@ -1954,7 +2003,7 @@ export function parseMergeRequestDetailResponse(
     ),
     selector_to: string(item.selector_to, `${label}.selector_to`),
     source: parseMergeRequestRef(item.source, `${label}.source`),
-    state: state as MergeRequestDetailResponse["state"],
+    state,
     target: parseMergeRequestRef(item.target, `${label}.target`),
     thread: array(item.thread, `${label}.thread`, parseMergeRequestThreadEvent),
     ticket_ids: strings(item.ticket_ids, `${label}.ticket_ids`),

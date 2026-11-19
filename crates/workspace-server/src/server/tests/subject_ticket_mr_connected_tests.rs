@@ -359,7 +359,7 @@ impl MrModel {
             );
         };
         assert_eq!(mr["merge_request_id"], mr_id);
-        assert_eq!(mr["state"], "open");
+        assert_eq!(mr["state"], json!({"kind":"implementation"}));
         assert_eq!(mr["source"]["status"], "known", "{mr}");
         assert_eq!(mr["target"]["ref"], input["before"]);
         assert_ne!(mr["source"]["ref"], mr["target"]["ref"]);
@@ -1590,7 +1590,13 @@ impl FullModel {
                 json!({"merge_request_id":mr_id,"after":0,"limit":20}),
             );
         };
-        assert_eq!(final_mr["state"], "merged");
+        assert_eq!(final_mr["state"]["kind"], "completed");
+        assert_eq!(final_mr["state"]["completion"]["kind"], "published");
+        assert_eq!(
+            final_mr["state"]["completion"]["merge_event_id"],
+            completed["event_id"]
+        );
+        assert!(final_mr["state"]["completion"]["started_by"].is_string());
         assert_eq!(event(&final_mr, "merge")["event_id"], completed["event_id"]);
         if success(request, "full-body-done").is_none() {
             return call(

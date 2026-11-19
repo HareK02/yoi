@@ -475,7 +475,7 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
         });
         let mut parent_detail = ticket_result_detail("T-7");
         parent_detail["parent_link"]["ticket_id"] = json!("actualparent");
-        detail["merge_requests"] = json!([{"merge_request_id":"MR-1","repository_key":"main","state":"open","selector_from":"work/source","selector_to":"develop","review_status":"pending","subject_ref":null,"source_ref_observation":{"status":"not_required"}}]);
+        detail["merge_requests"] = json!([{"merge_request_id":"MR-1","repository_key":"main","state":{"kind":"implementation"},"selector_from":"work/source","selector_to":"develop","review_status":"pending","subject_ref":null,"source_ref_observation":{"status":"not_required"}}]);
         let query_item = json!({"resource_key":"T-42","title":"Intent","state":"open","closure_operation_key":null,"current_closure":null,"legacy_handoff":null,"assignment_tracking":[],"tags":[],"matched_fields":[],"linked_objective_keys":["O-3"],"relation_count":1,"blocker_count":0,"unresolved_blocker_count":0,"unresolved_review_count":0,"merge_requests":detail["merge_requests"], "snippet":"/cases/T-999"});
         let mut second_item = query_item.clone();
         second_item["resource_key"] = json!("T-43");
@@ -490,7 +490,7 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
         response(detail),
         response(parent_detail),
         objective_detail_response("objective-observed"),
-        response(json!({"workspace_id":"workspace","merge_request_id":"MR-1","repository_key":"main","state":"open","selector_from":"work/source","selector_to":"develop","ticket_ids":[],"thread":[]})),
+        response(json!({"workspace_id":"workspace","merge_request_id":"MR-1","repository_key":"main","state":{"kind":"implementation"},"selector_from":"work/source","selector_to":"develop","ticket_ids":[],"thread":[]})),
         response(json!({"id":"internal123","resource_key":"T-9","slug":"new","status":"Open"})),
     ]).with_authorizations([
         expected_authorization("ticket.query","workspace",None),

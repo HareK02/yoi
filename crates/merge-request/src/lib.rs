@@ -10,7 +10,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const MAX_BODY_BYTES: usize = 16 * 1024;
 const DOMAIN_TABLES: [&str; 5] = [
     "merge_requests",
@@ -20,31 +20,9 @@ const DOMAIN_TABLES: [&str; 5] = [
     "merge_request_reviewer_child_sessions",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum MergeRequestState {
-    Open,
-    Merged,
-    Closed,
-}
-impl MergeRequestState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Merged => "merged",
-            Self::Closed => "closed",
-        }
-    }
+mod lifecycle;
+pub use lifecycle::*;
 
-    fn parse(v: &str) -> Result<Self, MergeRequestError> {
-        match v {
-            "open" => Ok(Self::Open),
-            "merged" => Ok(Self::Merged),
-            "closed" => Ok(Self::Closed),
-            _ => Err(MergeRequestError::Corrupt(format!("unknown state `{v}`"))),
-        }
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
@@ -220,6 +198,7 @@ impl MergeRequestThreadEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MergeRequest {
     pub workspace_id: String,
     pub merge_request_id: String,
@@ -309,6 +288,14 @@ impl std::fmt::Display for MergeRequestEvidenceError {
 impl std::error::Error for MergeRequestEvidenceError {}
 
 impl MergeRequest {
+    pub fn phase(&self) -> MergeRequestPhase {
+        match self.state {
+            MergeRequestState::Implementation {} => MergeRequestPhase::Implementation,
+            MergeRequestState::Integration { .. } => MergeRequestPhase::Integration,
+            MergeRequestState::Completed { .. } => MergeRequestPhase::Completed,
+            MergeRequestState::Canceled { .. } => MergeRequestPhase::Canceled,
+        }
+    }
     pub fn effective_review(&self, subject: &str) -> Option<&ReviewEvent> {
         self.thread.iter().rev().find_map(|e|match e{MergeRequestThreadEvent::Review(v)if v.subject_ref==subject&&!self.thread.iter().any(|x|matches!(x,MergeRequestThreadEvent::ReviewRevoked(r)if r.review_event_id==v.event_id))=>Some(v),_=>None})
     }
@@ -318,14 +305,24 @@ impl MergeRequest {
     /// Post-integration evidence evaluation uses the pinned source, independent of current branch/provider availability.
     /// Do not infer approval from `merged` state alone; verify evidence with [`Self::integration_approval`].
     pub fn merged_result(&self) -> Result<&MergeEvent, MergeRequestEvidenceError> {
-        if self.state != MergeRequestState::Merged {
-            return Err(MergeRequestEvidenceError::NotMerged);
-        }
+        let merge_event_id = match &self.state {
+            MergeRequestState::Completed {
+                completion: MergeRequestCompletion::Published { merge_event_id, .. },
+            } => merge_event_id,
+            MergeRequestState::Completed {
+                completion: MergeRequestCompletion::Legacy { merge_event_id },
+            } => merge_event_id
+                .as_ref()
+                .ok_or(MergeRequestEvidenceError::MergeResultMissing)?,
+            _ => return Err(MergeRequestEvidenceError::NotMerged),
+        };
         self.thread
             .iter()
             .rev()
             .find_map(|event| match event {
-                MergeRequestThreadEvent::Merge(event) => Some(event),
+                MergeRequestThreadEvent::Merge(event) if &event.event_id == merge_event_id => {
+                    Some(event)
+                }
                 _ => None,
             })
             .ok_or(MergeRequestEvidenceError::MergeResultMissing)
@@ -484,7 +481,7 @@ fn same_source_snapshot(
 
 #[derive(Clone, Debug, Default)]
 pub struct MergeRequestListQuery {
-    pub state: Option<MergeRequestState>,
+    pub state: Option<MergeRequestStateFilter>,
     pub repository_id: Option<String>,
     pub ticket_id: Option<String>,
     pub selector_from: Option<String>,
@@ -722,7 +719,7 @@ impl MergeRequestStore {
         // deferred read-to-write upgrade can fail immediately with SQLITE_BUSY
         // while normal Subject history/Job writers use the same database.
         let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let conflict:bool=t.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 AND mr.repository_id=?3 AND mr.state='open')",params![i.auth.workspace_id,i.ticket_id,i.repository_id],|r|r.get(0))?;
+        let conflict:bool=t.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 AND mr.repository_id=?3 AND json_extract(mr.state,'$.kind') IN ('implementation','integration'))",params![i.auth.workspace_id,i.ticket_id,i.repository_id],|r|r.get(0))?;
         if conflict {
             return Err(MergeRequestError::Conflict(
                 "Ticket already has an open Merge Request for this repository; advance that Merge Request's existing selector_from with a normal non-force push instead of opening a replacement".into(),
@@ -730,7 +727,7 @@ impl MergeRequestStore {
         }
         let now = i.now.to_rfc3339();
         t.execute(
-            "INSERT INTO merge_requests VALUES(?1,?2,?3,'open',?4,?5,?6,?6)",
+            "INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at) VALUES(?1,?2,?3,json_object('kind','implementation'),?4,?5,?6,?6)",
             params![
                 i.auth.workspace_id,
                 i.merge_request_id,
@@ -825,9 +822,7 @@ impl MergeRequestStore {
         }
         let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
         self.current_assignment_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
-        if mr.state == MergeRequestState::Closed
-            || (mr.state == MergeRequestState::Open && mr.selector_from.is_none())
-        {
+        if mr.state.is_canceled() || (mr.state.is_open() && mr.selector_from.is_none()) {
             return Err(MergeRequestError::Conflict(
                 "Merge Request is not reviewable".into(),
             ));
@@ -844,8 +839,8 @@ impl MergeRequestStore {
         let current_mr = load_mr(&t, &i.auth.workspace_id, &i.merge_request_id)?
             .filter(|request| request.ticket_ids.iter().any(|id| id == &i.ticket_id))
             .ok_or(MergeRequestError::NotFound)?;
-        if current_mr.state == MergeRequestState::Closed
-            || (current_mr.state == MergeRequestState::Open && current_mr.selector_from.is_none())
+        if current_mr.state.is_canceled()
+            || (current_mr.state.is_open() && current_mr.selector_from.is_none())
         {
             return Err(MergeRequestError::Conflict(
                 "Merge Request changed before review request".into(),
@@ -918,7 +913,7 @@ impl MergeRequestStore {
                    JOIN merge_requests mr
                      ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
                   WHERE g.capability_token=?1 AND g.merge_request_id=?2
-                    AND g.status='issued' AND mr.state IN('open','merged')",
+                    AND g.status='issued' AND json_extract(mr.state,'$.kind') IN ('implementation','integration','completed')",
                 params![capability_token, merge_request_id],
                 |row| {
                     Ok(ReviewSubmissionAuthorization {
@@ -938,7 +933,7 @@ impl MergeRequestStore {
         i: SubmitMergeRequestReview,
     ) -> Result<ReviewEvent, MergeRequestError> {
         let mut c = self.lock()?;
-        let t = c.transaction()?;
+        let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let g: Option<(String, String, String, String, String, String)> = t
             .query_row(
                 "SELECT g.workspace_id,g.merge_request_id,g.request_event_id,g.subject_ref,
@@ -950,7 +945,7 @@ impl MergeRequestStore {
                      ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
                   WHERE g.capability_token=?1 AND rel.ticket_id=?2
                     AND g.merge_request_id=?3
-                    AND g.status='issued' AND mr.state IN('open','merged')",
+                    AND g.status='issued' AND json_extract(mr.state,'$.kind') IN ('implementation','integration','completed')",
                 params![i.capability_token, i.ticket_id, i.merge_request_id],
                 |r| {
                     Ok((
@@ -1020,6 +1015,20 @@ impl MergeRequestStore {
         };
         insert_event(&t, &ws, &mr, "review", &e, i.now, None)?;
         t.execute("UPDATE merge_request_review_grants SET status='consumed',consumed_at=?2 WHERE capability_token=?1",params![i.capability_token,i.now.to_rfc3339()])?;
+        // Enter once with a valid approval; later revocation retains this history.
+        if e.decision == ReviewDecision::Approve
+            && current_ticket_content_digest(&t, &ws, &i.ticket_id)?.as_deref()
+                == Some(e.ticket_content_digest.as_str())
+            && !e.ticket_content_digest.is_empty()
+            && linked_merge_request_ids(&t, &ws, &i.ticket_id)?
+                == e.ticket_merge_request_subjects
+                    .iter()
+                    .map(|s| s.merge_request_id.clone())
+                    .collect::<Vec<_>>()
+        {
+            t.execute("UPDATE merge_requests SET state=json_object('kind','integration','started_by',?3),updated_at=?4 WHERE workspace_id=?1 AND merge_request_id=?2 AND json_extract(state,'$.kind')='implementation'",
+                params![ws, mr, e.event_id, i.now.to_rfc3339()])?;
+        }
         t.commit()?;
         Ok(e)
     }
@@ -1073,8 +1082,11 @@ impl MergeRequestStore {
             .and_then(|s| mr.effective_review(s))
             .cloned();
         let mut b = vec![];
-        if mr.state != MergeRequestState::Open {
+        if !mr.state.is_open() {
             b.push("Merge Request is not open".into())
+        }
+        if mr.phase() == MergeRequestPhase::Implementation {
+            b.push("integration entry is unconfirmed; a fresh valid review is required".into());
         }
         if mr.selector_from.is_none() {
             b.push("selector_from requires repair".into())
@@ -1147,11 +1159,16 @@ impl MergeRequestStore {
             ));
         }
         self.current_assignment_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
-        if mr.state != MergeRequestState::Open {
+        if !mr.state.is_open() {
             return Err(MergeRequestError::Conflict(
                 "Merge Request is not open".into(),
             ));
         }
+        let MergeRequestState::Integration { .. } = &mr.state else {
+            return Err(MergeRequestError::NotReady(
+                "Merge Request has no confirmed integration entry".into(),
+            ));
+        };
         let review = mr
             .effective_review(&i.current_subject_ref)
             .filter(|review| review.event_id == i.approval_event_id)
@@ -1233,7 +1250,7 @@ impl MergeRequestStore {
                 "operation fingerprint mismatch".into(),
             ));
         }
-        if mr.state != MergeRequestState::Open {
+        if !mr.state.is_open() {
             return Err(MergeRequestError::Conflict(
                 "Merge Request is not open".into(),
             ));
@@ -1251,6 +1268,11 @@ impl MergeRequestStore {
                 "completion assignment changed before commit".into(),
             ));
         }
+        let MergeRequestState::Integration { started_by } = &mr.state else {
+            return Err(MergeRequestError::NotReady(
+                "Merge Request has no confirmed integration entry".into(),
+            ));
+        };
         let review = mr
             .effective_review(&i.current_subject_ref)
             .filter(|review| review.event_id == i.approval_event_id)
@@ -1341,9 +1363,14 @@ impl MergeRequestStore {
             Some(&event.operation_id),
         )?;
         transaction.execute(
-            "UPDATE merge_requests SET state='merged',updated_at=?3
-              WHERE workspace_id=?1 AND merge_request_id=?2 AND state='open'",
-            params![mr.workspace_id, mr.merge_request_id, i.now.to_rfc3339()],
+            "UPDATE merge_requests SET state=?4,updated_at=?3
+              WHERE workspace_id=?1 AND merge_request_id=?2 AND json_extract(state,'$.kind')='integration'",
+            params![mr.workspace_id, mr.merge_request_id, i.now.to_rfc3339(),
+                serde_json::to_string(&MergeRequestState::Completed {
+                    completion: MergeRequestCompletion::Published {
+                        started_by: started_by.clone(), merge_event_id: event.event_id.clone(),
+                    },
+                }).map_err(|e| MergeRequestError::Operation(e.to_string()))?],
         )?;
         ticket_event(&transaction, &mr, &event, &i.auth.assignment_id)?;
         transaction.commit()?;
@@ -1400,7 +1427,7 @@ impl MergeRequestStore {
     }
     pub fn get(&self, ws: &str, ticket: &str) -> Result<MergeRequest, MergeRequestError> {
         let c = self.lock()?;
-        let id:Option<String>=c.query_row("SELECT rel.merge_request_id FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 ORDER BY CASE mr.state WHEN 'open' THEN 0 ELSE 1 END,mr.created_at DESC LIMIT 1",params![ws,ticket],|r|r.get(0)).optional()?;
+        let id:Option<String>=c.query_row("SELECT rel.merge_request_id FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 ORDER BY CASE WHEN json_extract(mr.state,'$.kind') IN ('implementation','integration') THEN 0 ELSE 1 END,mr.created_at DESC LIMIT 1",params![ws,ticket],|r|r.get(0)).optional()?;
         match id {
             Some(id) => load_mr(&c, ws, &id)?.ok_or(MergeRequestError::NotFound),
             None => Err(MergeRequestError::NotFound),
@@ -1469,12 +1496,12 @@ impl MergeRequestStore {
             .as_ref()
             .map(|(updated_at, _)| updated_at.as_str());
         let cursor_id = cursor_position.as_ref().map(|(_, id)| id.as_str());
-        let state = query.state.map(MergeRequestState::as_str);
+        let state = query.state.map(MergeRequestStateFilter::as_str);
         let mut statement = c.prepare(
             "SELECT mr.merge_request_id
              FROM merge_requests mr
              WHERE mr.workspace_id=?1
-               AND (?2 IS NULL OR mr.state=?2)
+               AND (?2 IS NULL OR CASE json_extract(mr.state,'$.kind') WHEN 'implementation' THEN 'open' WHEN 'integration' THEN 'open' WHEN 'completed' THEN 'merged' WHEN 'canceled' THEN 'closed' END=?2)
                AND (?3 IS NULL OR mr.repository_id=?3)
                AND (?4 IS NULL OR mr.selector_from=?4)
                AND (?5 IS NULL OR mr.selector_to=?5)
@@ -1703,7 +1730,7 @@ fn load_mr(c: &Connection, w: &str, m: &str) -> Result<Option<MergeRequest>, Mer
         workspace_id: w.into(),
         merge_request_id: m.into(),
         repository_id: repo,
-        state: MergeRequestState::parse(&state)?,
+        state: json(&state)?,
         selector_from: from,
         selector_to: to,
         ticket_ids: tickets,
@@ -1793,8 +1820,15 @@ fn ticket_event(
 pub fn migrate(c: &Connection) -> Result<(), MergeRequestError> {
     match schema_state(c)? {
         SchemaState::Fresh => fresh(c),
-        SchemaState::Current(SCHEMA_VERSION) => verify(c),
-        SchemaState::Current(12) => migrate_v12_content_attestations(c),
+        SchemaState::Current(SCHEMA_VERSION) => {
+            verify(c)?;
+            verify_lifecycle_schema(c)
+        }
+        SchemaState::Current(13) => migrate_v13_lifecycle(c),
+        SchemaState::Current(12) => {
+            migrate_v12_content_attestations(c)?;
+            migrate_v13_lifecycle(c)
+        }
         SchemaState::Current(v) => Err(MergeRequestError::Operation(format!(
             "unsupported schema {v}"
         ))),
@@ -1863,7 +1897,7 @@ fn migrate_v12_content_attestations(c: &Connection) -> Result<(), MergeRequestEr
     )?;
     transaction.execute(
         "UPDATE merge_request_schema SET version=?1 WHERE singleton=1",
-        params![SCHEMA_VERSION],
+        params![13],
     )?;
     verify(&transaction)?;
     transaction.commit()?;
@@ -1913,6 +1947,8 @@ fn schema_state(c: &Connection) -> Result<SchemaState, MergeRequestError> {
 fn fresh(c: &Connection) -> Result<(), MergeRequestError> {
     let t = c.unchecked_transaction()?;
     tables(&t)?;
+    lifecycle::add_lifecycle_column(&t, "state")?;
+    lifecycle::lifecycle_triggers(&t)?;
     t.execute(
         "INSERT INTO merge_request_schema VALUES(1,?1)",
         params![SCHEMA_VERSION],
@@ -1923,7 +1959,7 @@ fn fresh(c: &Connection) -> Result<(), MergeRequestError> {
 }
 fn tables(t: &Transaction<'_>) -> Result<(), MergeRequestError> {
     t.execute_batch("CREATE TABLE merge_request_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL);")?;
-    t.execute_batch("CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,repository_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('open','merged','closed')),selector_from TEXT,selector_to TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id),FOREIGN KEY(workspace_id,repository_id)REFERENCES repositories(workspace_id,repository_id));CREATE TABLE merge_request_ticket_relations(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL,relation_kind TEXT NOT NULL CHECK(relation_kind='implements'),created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,ticket_id),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE,FOREIGN KEY(workspace_id,ticket_id)REFERENCES typed_tickets(workspace_id,ticket_id)ON DELETE CASCADE);CREATE TABLE merge_request_thread_events(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,event_id TEXT NOT NULL,sequence INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN('review_requested','review','review_revoked','review_cancelled','comment','merge')),payload_json TEXT NOT NULL,operation_id TEXT,created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,event_id),UNIQUE(workspace_id,merge_request_id,sequence),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE);CREATE UNIQUE INDEX merge_request_merge_operations ON merge_request_thread_events(workspace_id,operation_id)WHERE operation_id IS NOT NULL;CREATE TABLE merge_request_review_grants(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,request_event_id TEXT NOT NULL,subject_ref TEXT NOT NULL,reviewer_runtime_id TEXT NOT NULL,reviewer_worker_id TEXT NOT NULL,capability_token TEXT PRIMARY KEY,issued_at TEXT NOT NULL,consumed_at TEXT,revoked_at TEXT,status TEXT NOT NULL CHECK(status IN('issued','consumed','revoked')),FOREIGN KEY(workspace_id,merge_request_id,request_event_id)REFERENCES merge_request_thread_events(workspace_id,merge_request_id,event_id)ON DELETE CASCADE);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT NOT NULL,child_session_id TEXT NOT NULL,parent_runtime_id TEXT NOT NULL,parent_worker_id TEXT NOT NULL,reviewer_profile TEXT NOT NULL,registered_at TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('active','consumed')),PRIMARY KEY(workspace_id,child_session_id));")?;
+    t.execute_batch("CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,repository_id TEXT NOT NULL,selector_from TEXT,selector_to TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id),FOREIGN KEY(workspace_id,repository_id)REFERENCES repositories(workspace_id,repository_id));CREATE TABLE merge_request_ticket_relations(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL,relation_kind TEXT NOT NULL CHECK(relation_kind='implements'),created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,ticket_id),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE,FOREIGN KEY(workspace_id,ticket_id)REFERENCES typed_tickets(workspace_id,ticket_id)ON DELETE CASCADE);CREATE TABLE merge_request_thread_events(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,event_id TEXT NOT NULL,sequence INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN('review_requested','review','review_revoked','review_cancelled','comment','merge')),payload_json TEXT NOT NULL,operation_id TEXT,created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,event_id),UNIQUE(workspace_id,merge_request_id,sequence),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE);CREATE UNIQUE INDEX merge_request_merge_operations ON merge_request_thread_events(workspace_id,operation_id)WHERE operation_id IS NOT NULL;CREATE TABLE merge_request_review_grants(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,request_event_id TEXT NOT NULL,subject_ref TEXT NOT NULL,reviewer_runtime_id TEXT NOT NULL,reviewer_worker_id TEXT NOT NULL,capability_token TEXT PRIMARY KEY,issued_at TEXT NOT NULL,consumed_at TEXT,revoked_at TEXT,status TEXT NOT NULL CHECK(status IN('issued','consumed','revoked')),FOREIGN KEY(workspace_id,merge_request_id,request_event_id)REFERENCES merge_request_thread_events(workspace_id,merge_request_id,event_id)ON DELETE CASCADE);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT NOT NULL,child_session_id TEXT NOT NULL,parent_runtime_id TEXT NOT NULL,parent_worker_id TEXT NOT NULL,reviewer_profile TEXT NOT NULL,registered_at TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('active','consumed')),PRIMARY KEY(workspace_id,child_session_id));")?;
     Ok(())
 }
 fn verify(c: &Connection) -> Result<(), MergeRequestError> {

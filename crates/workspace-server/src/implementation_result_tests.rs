@@ -788,7 +788,7 @@ async fn mr_notification_upgrade_recovers_events_not_comments_and_retains_unknow
     store.with_conn(|conn| {
         let legacy_source = serde_json::json!({"actor":"authenticated-worker:r/worker", "runtime_id":"r", "worker_id":"worker", "agent_key":"workspace-orchestrator", "authentication_binding_id":"tracking-binding"});
         conn.execute("INSERT INTO ticket_assignment_operation_fences VALUES('w','operation-known-implementation','delegation','r','worker','workspace-orchestrator','tracking-binding',?1)",[legacy_source.to_string()])?;
-        conn.execute_batch("INSERT INTO merge_requests VALUES('w','historical-mr','main','open','refs/heads/work','refs/heads/main','3','3');
+        conn.execute_batch("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at) VALUES('w','historical-mr','main',json_object('kind','implementation'),'refs/heads/work','refs/heads/main','3','3');
             INSERT INTO merge_request_ticket_relations VALUES('w','historical-mr','tracking','implements','3');
             INSERT INTO merge_request_thread_events VALUES('w','historical-mr','approved-event',1,'review','{\"subject_ref\":\"source-a\",\"decision\":\"approve\"}',NULL,'3');
             INSERT INTO merge_request_thread_events VALUES('w','historical-mr','old-comment',2,'comment','{\"body\":\"handoff done\"}',NULL,'3');")?;
@@ -971,8 +971,10 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
             ("review_cancelled", None, None, None),
         ];
         store.with_conn(|conn| {
-            conn.execute_batch("INSERT INTO merge_requests VALUES('w','actor-mr','main','open','work','main','3','3');
-                INSERT INTO merge_request_ticket_relations VALUES('w','actor-mr','tracking','implements','3');")?;
+            // The retained Host fixture already uses the current MR component schema.
+            let state = r#"{"kind":"implementation"}"#;
+            conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at) VALUES('w','actor-mr','main',?1,'work','main','3','3')", [state])?;
+            conn.execute_batch("INSERT INTO merge_request_ticket_relations VALUES('w','actor-mr','tracking','implements','3');")?;
             for (index, (kind, field, worker, _)) in events.iter().enumerate() {
                 let mut payload = serde_json::json!({"subject_ref":"source-a"});
                 if let (Some(field), Some(worker)) = (field, worker) {
@@ -1014,9 +1016,9 @@ async fn implementation_result_accepts_only_observations_with_matching_mr_ticket
     let worker = routing_worker_assign(&store, "implementation").worker;
     seed_manual_start_ticket(&store, "unrelated", "open");
     store.with_conn(|conn| {
-        conn.execute_batch("INSERT INTO merge_requests VALUES('w','observed-mr','main','open','work','main','3','3');
+        conn.execute_batch("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at) VALUES('w','observed-mr','main',json_object('kind','implementation'),'work','main','3','3');
             INSERT INTO merge_request_ticket_relations VALUES('w','observed-mr','tracking','implements','3');
-            INSERT INTO merge_requests VALUES('w','other-mr','main','open','other','main','3','3');
+            INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at) VALUES('w','other-mr','main',json_object('kind','implementation'),'other','main','3','3');
             INSERT INTO merge_request_ticket_relations VALUES('w','other-mr','unrelated','implements','3');")?;
         Ok(())
     }).unwrap();

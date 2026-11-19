@@ -52,7 +52,7 @@
             {/if}
           </div>
           <div class="ticket-meta">
-            <span class={`ticket-state state-${mergeRequest.state}`}>{mergeRequest.state}</span>
+            <span class={`ticket-state state-${mergeRequest.state.kind}`}>{mergeRequest.state.kind}</span>
             <time>{prettyDate(mergeRequest.updated_at)}</time>
           </div>
         </a>

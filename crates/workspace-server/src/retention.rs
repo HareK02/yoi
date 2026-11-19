@@ -1857,6 +1857,9 @@ mod tests {
                         assert_eq!(after.last().unwrap()[0], Value::Integer(17));
                         ticket::verify_sqlite_ticket_schema(conn)?;
                     }
+                } else if migrated && table == "merge_request_schema" {
+                    assert_eq!(before, &vec![vec![Value::Integer(1), Value::Integer(13)]]);
+                    assert_eq!(after, vec![vec![Value::Integer(1), Value::Integer(14)]]);
                 } else if migrated
                     && matches!(table.as_str(), "backend_jobs" | "backend_job_attempts")
                 {

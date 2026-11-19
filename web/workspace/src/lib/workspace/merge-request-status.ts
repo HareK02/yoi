@@ -12,7 +12,7 @@ export function sourceReviewFreshness(
   mergeRequest: MergeRequestDetail,
 ): string {
   const source = mergeRequest.source.ref;
-  if (mergeRequest.state === "merged") {
+  if (mergeRequest.state.kind === "completed") {
     if (mergeRequest.source.diagnostic) {
       return `Immutable integration evidence unavailable: ${mergeRequest.source.diagnostic.code}.`;
     }
@@ -62,7 +62,7 @@ export function summarySourceReviewStatus(
   mergeRequest: TicketMergeRequestSummary,
 ): string {
   const source = mergeRequest.current_subject_ref;
-  if (mergeRequest.state === "merged") {
+  if (mergeRequest.state.kind === "completed") {
     if (!source) return "Immutable merged source unavailable.";
     if (
       mergeRequest.integration_evidence_error !== null ||
@@ -96,7 +96,7 @@ export function summarySourceReviewStatus(
 export function targetIntegrationStatus(
   mergeRequest: MergeRequestDetail,
 ): string {
-  if (mergeRequest.state === "merged") {
+  if (mergeRequest.state.kind === "completed") {
     return "Target integration recorded by CompleteMergeRequest.";
   }
   if (!mergeRequest.target.ref) {

@@ -1,6 +1,6 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
-use server_api::TicketSourceRefObservation;
+use server_api::{MergeRequestState, TicketSourceRefObservation};
 
 #[derive(Debug, Serialize)]
 pub(super) struct ModelTicketQueryResponse {
@@ -214,7 +214,7 @@ struct ModelEvidenceEvent {
 struct ModelMergeRequest {
     merge_request_id: String,
     repository_key: String,
-    state: String,
+    state: MergeRequestState,
     selector_from: Option<String>,
     selector_to: String,
     review_status: String,
@@ -709,7 +709,13 @@ fn project_merge_request(value: &Value) -> Result<ModelMergeRequest, String> {
     Ok(ModelMergeRequest {
         merge_request_id: string_field(merge, "merge_request_id")?,
         repository_key: string_field(merge, "repository_key")?,
-        state: string_field(merge, "state")?,
+        state: serde_json::from_value(
+            merge
+                .get("state")
+                .ok_or_else(|| "missing state".to_string())?
+                .clone(),
+        )
+        .map_err(|error| format!("invalid state: {error}"))?,
         selector_from: optional_string(merge, "selector_from")?,
         selector_to: string_field(merge, "selector_to")?,
         review_status: string_field(merge, "review_status")?,
@@ -1248,7 +1254,7 @@ mod tests {
             let merge_request = json!({
                 "merge_request_id": "mr-source",
                 "repository_key": "repository",
-                "state": state,
+                "state": if merged { json!({"kind":"completed","completion":{"kind":"published","started_by":"approval-1","merge_event_id":"merge-1"}}) } else { json!({"kind":"integration","started_by":"approval-1"}) },
                 "selector_from": "source-branch",
                 "selector_to": "main",
                 "review_status": "approved",
@@ -1306,11 +1312,32 @@ mod tests {
     }
 
     #[test]
+    fn merge_request_projection_preserves_lifecycle_without_inferring_review_approval() {
+        let mut input = json!({
+            "merge_request_id": "mr-lifecycle", "repository_key": "main", "state": {"kind":"integration","started_by":"first-approval"},
+            "selector_to": "main", "review_status": "request_changes",
+            "source_ref_observation": {"status": "unavailable", "code": "offline"}
+        });
+        let projected = serde_json::to_value(project_merge_request(&input).unwrap()).unwrap();
+        assert_eq!(projected["state"]["kind"], "integration");
+        assert_eq!(projected["state"]["started_by"], "first-approval");
+        assert_eq!(projected["review_status"], "request_changes");
+        assert!(projected["subject_ref"].is_null());
+        assert!(projected.get("ticket_ids").is_none());
+
+        input["state"] = json!("approved");
+        assert!(project_merge_request(&input).unwrap_err().contains("state"));
+        input.as_object_mut().unwrap().remove("state");
+        assert!(project_merge_request(&input).unwrap_err().contains("state"));
+        input["state"] = json!({"kind":"integration","started_by":"first-approval"});
+    }
+
+    #[test]
     fn merge_request_projection_rejects_missing_or_invalid_source_observation() {
         let merge_request = json!({
             "merge_request_id": "mr-source",
             "repository_key": "repository",
-            "state": "open",
+            "state": {"kind":"implementation"},
             "selector_to": "main",
             "review_status": "none",
             "current_subject_ref": null,
@@ -1611,7 +1638,7 @@ mod tests {
         let post = post_fixture(true, &body);
         let closure = json!({"operation_key":"close", "reason":"completed", "explanation":"closure prose", "references":[], "author":"user", "at":"today"});
         let tracking = json!({"workspace_id":"ws", "ticket_id":"internal", "assignment_id":"assignment", "role":"orchestrator", "principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}, "assigned_by":"user", "assigned_at":"today", "release":null, "current":true, "last_event_id":"handling-event", "updated_at":"today", "migration_diagnostic":null, "tracking":{"status":"waiting", "waiting_reason":"prose", "progress":null, "next_action":"prose", "result":null}});
-        let merge = json!({"merge_request_id":"MR-1", "repository_key":"main", "state":"open", "selector_from":"topic", "selector_to":"main", "review_status":"request_changes", "current_subject_ref":"sha1", "source_ref_observation":{"status":"observed"}, "integration_evidence_error":null, "review_excerpt":"review prose"});
+        let merge = json!({"merge_request_id":"MR-1", "repository_key":"main", "state":{"kind":"integration","started_by":"approval-1"}, "selector_from":"topic", "selector_to":"main", "review_status":"request_changes", "current_subject_ref":"sha1", "source_ref_observation":{"status":"observed"}, "integration_evidence_error":null, "review_excerpt":"review prose"});
         let mut input = json!({
             "parent_link": parent_fixture(),
             "resource_key":"T-848", "title":"Views", "body":body, "body_truncated":false, "initial_post":post,

@@ -5810,6 +5810,97 @@
         ],
         "type": "object"
       },
+      "MergeRequestCancellationOrigin": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "implementation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "integration",
+                "type": "string"
+              },
+              "started_by": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "started_by"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "legacy",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MergeRequestCompletion": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "published",
+                "type": "string"
+              },
+              "merge_event_id": {
+                "type": "string"
+              },
+              "started_by": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "started_by",
+              "merge_event_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "legacy",
+                "type": "string"
+              },
+              "merge_event_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "MergeRequestDetailResponse": {
         "additionalProperties": false,
         "properties": {
@@ -6211,12 +6302,72 @@
         "type": "object"
       },
       "MergeRequestState": {
-        "enum": [
-          "open",
-          "merged",
-          "closed"
-        ],
-        "type": "string"
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "implementation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "integration",
+                "type": "string"
+              },
+              "started_by": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "started_by"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "completion": {
+                "$ref": "#/components/schemas/MergeRequestCompletion"
+              },
+              "kind": {
+                "const": "completed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "completion"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "$ref": "#/components/schemas/MergeRequestCancellationOrigin"
+              },
+              "kind": {
+                "const": "canceled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "from"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "MergeRequestStatusSummary": {
         "additionalProperties": false,
@@ -21348,7 +21499,7 @@
             "$ref": "#/components/schemas/TicketSourceRefObservation"
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/MergeRequestState"
           },
           "updated_at": {
             "type": "string"
@@ -26575,7 +26726,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:90175d2e303b305715d36cb87581f8d3340323fe7219910b92bc090185a787e5"
+    "x-yoi-source-digest": "sha256:9d0a6b8b537fc21fc992c2621395bad1b76c24a1837cfa2efc5e67c48e76e734"
   },
   "openapi": "3.1.0",
   "paths": {

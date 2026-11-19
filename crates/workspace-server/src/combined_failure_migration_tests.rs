@@ -828,6 +828,11 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
         assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
         old_columns.remove("typed_ticket_orchestration_plans");
         old_columns.remove("ticket_schema_migrations");
+        assert_eq!(
+            rows(&conn, "SELECT singleton,version FROM merge_request_schema"),
+            vec![vec![Value::Integer(1), Value::Integer(13)]]
+        );
+        old_columns.remove("merge_request_schema");
         exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
         let retained = values(&conn, &old_columns);
         drop(conn);
@@ -839,6 +844,7 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                 assert_appended_receipts(conn, &old_receipts, &plan);
                 assert_obsolete_job_tables_removed(conn);
+                assert_eq!(rows(conn, "SELECT singleton,version FROM merge_request_schema"), vec![vec![Value::Integer(1),Value::Integer(14)]]);
                 assert_eq!(values(conn, &old_columns), retained, "all old columns and values must remain exact");
                 assert_eq!(failure_signature(conn), expected, "all changed tables, keys and programs match fresh composition");
                 storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
