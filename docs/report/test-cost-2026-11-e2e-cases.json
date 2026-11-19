@@ -1,0 +1,241 @@
+{
+  "base_revision": "a412713c910f85b1ffdc59c3f41a0df040e9323b",
+  "source": "8386f29b3 (source-equivalent pre-commit execution; server rebuilt, unchanged harness/runtime binaries reused)",
+  "conditions": {
+    "test_threads": 1,
+    "top_level_jobs": 1,
+    "build_included": false,
+    "featureless_products": true,
+    "checkpoint_harness": "additional e2e checkpoint build",
+    "auth_includes_ignored": true
+  },
+  "unique_product_cases": 29,
+  "duplicate_product_runs": 4,
+  "seed_projection_runs": 2,
+  "groups": [
+    {
+      "group": "auth",
+      "process_seconds": 85.201314937,
+      "case_results": [
+        {
+          "name": "activation_bad_attestation_stays_pending_and_concurrent_ceremonies_store_only_one_key",
+          "status": "ok",
+          "seconds": 6.121033365
+        },
+        {
+          "name": "activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purpose",
+          "status": "ok",
+          "seconds": 6.701095164
+        },
+        {
+          "name": "activation_issuance_requires_live_admin_and_cookie_origin_not_identity_claims",
+          "status": "ok",
+          "seconds": 5.22425377
+        },
+        {
+          "name": "activation_with_disabled_self_registration_survives_reopen_and_enables_only_passkey_login",
+          "status": "ok",
+          "seconds": 10.048318223
+        },
+        {
+          "name": "browser_sessions::real_backend_browser_cookies_preserve_identity_expiry_return_url_and_explicit_logout",
+          "status": "ok",
+          "seconds": 15.934086021
+        },
+        {
+          "name": "disabled_registration_preserves_existing_login_self_addition_and_workspace_ownership",
+          "status": "ok",
+          "seconds": 6.380245362
+        },
+        {
+          "name": "hosting_policy_rejects_spoofing_inflight_registration_and_survives_restart",
+          "status": "ok",
+          "seconds": 9.691223654
+        },
+        {
+          "name": "legacy_host_bootstrap_is_ordinary_until_explicit_host_selection",
+          "status": "ok",
+          "seconds": 7.006390278
+        },
+        {
+          "name": "native_migration::native_ctap2_legacy_random_handle_residency_exclusion_and_other_authenticator_migration",
+          "status": "ok",
+          "seconds": 10.009042956
+        },
+        {
+          "name": "workspace_catalog_zero_one_multiple_preserves_explicit_selection_and_actor_ownership",
+          "status": "ok",
+          "seconds": 8.071661178
+        }
+      ],
+      "evidence": "target/t871-acceptance/e2e-auth-final-summary.json"
+    },
+    {
+      "group": "cli",
+      "process_seconds": 20.352668406,
+      "case_results": [
+        {
+          "name": "authenticated_nonowner_cannot_read_preview_or_adopt_owner_workspace",
+          "status": "ok",
+          "seconds": 9.067572092
+        },
+        {
+          "name": "cli_help_and_input_errors_are_actionable_without_runtime",
+          "status": "ok",
+          "seconds": 0.060319926
+        },
+        {
+          "name": "source_edit_push_repull_and_no_change_survive_backend_restart",
+          "status": "ok",
+          "seconds": 11.219196727
+        }
+      ],
+      "evidence": "target/t871-acceptance/e2e-cli-final-summary.json"
+    },
+    {
+      "group": "environment",
+      "process_seconds": 20.254488810999998,
+      "case_results": [
+        {
+          "name": "concurrent_environments_are_isolated_and_cleanup_is_local",
+          "status": "ok",
+          "seconds": 13.920116213
+        },
+        {
+          "name": "starts_server_and_runtime_from_empty_storage",
+          "status": "ok",
+          "seconds": 6.3277071320000005
+        }
+      ],
+      "evidence": "target/t871-acceptance/e2e-environment-final-summary.json"
+    },
+    {
+      "group": "restore",
+      "process_seconds": 36.854614528999996,
+      "case_results": [
+        {
+          "name": "committed_response_loss_survives_owned_runtime_process_kill_and_restart",
+          "status": "ok",
+          "seconds": 12.232409922
+        },
+        {
+          "name": "concurrent_fixed_id_restores_keep_sessions_storage_and_cleanup_isolated",
+          "status": "ok",
+          "seconds": 9.232848817
+        },
+        {
+          "name": "lost_http_response_recovers_exact_request_and_rejects_fresh_stale_intent",
+          "status": "ok",
+          "seconds": 8.280735996
+        },
+        {
+          "name": "seed::tests::completed_run_full_snapshot_retains_invoke_and_usage_accounting",
+          "status": "ok",
+          "seconds": 0.000628748
+        },
+        {
+          "name": "supplied_stopped_worker_restores_exact_live_session_and_cleans_up",
+          "status": "ok",
+          "seconds": 7.09463083
+        }
+      ],
+      "evidence": "target/t871-acceptance/e2e-restore-final-summary.json"
+    },
+    {
+      "group": "checkpoint",
+      "process_seconds": 93.052774429,
+      "case_results": [
+        {
+          "name": "checkpoint::acknowledged_checkpoint_explicit_release_resumes_original_operation_and_tears_down",
+          "status": "ok",
+          "seconds": 10.535814504
+        },
+        {
+          "name": "checkpoint::acknowledged_checkpoint_failed_observer_scope_has_bounded_owned_cleanup",
+          "status": "ok",
+          "seconds": 15.047061207
+        },
+        {
+          "name": "checkpoint::acknowledged_checkpoint_peer_disconnect_resumes_original_operation_and_tears_down",
+          "status": "ok",
+          "seconds": 7.205644657
+        },
+        {
+          "name": "checkpoint::acknowledged_committed_preterminal_process_death_reconstructs_same_decision",
+          "status": "ok",
+          "seconds": 7.667327137
+        },
+        {
+          "name": "checkpoint::acknowledged_not_committed_candidate_process_death_recovers_same_request_as_rollback",
+          "status": "ok",
+          "seconds": 7.349622681
+        },
+        {
+          "name": "checkpoint::repair::orphan_pin_activated_process_death_preserves_real_repair_and_committed_decision",
+          "status": "ok",
+          "seconds": 8.298087025
+        },
+        {
+          "name": "checkpoint::repair::orphan_pin_not_committed_process_death_preserves_unrepaired_source",
+          "status": "ok",
+          "seconds": 7.619942489
+        },
+        {
+          "name": "committed_response_loss_survives_owned_runtime_process_kill_and_restart",
+          "status": "ok",
+          "seconds": 7.588035348
+        },
+        {
+          "name": "concurrent_fixed_id_restores_keep_sessions_storage_and_cleanup_isolated",
+          "status": "ok",
+          "seconds": 7.538379773
+        },
+        {
+          "name": "lost_http_response_recovers_exact_request_and_rejects_fresh_stale_intent",
+          "status": "ok",
+          "seconds": 7.146181137
+        },
+        {
+          "name": "seed::tests::completed_run_full_snapshot_retains_invoke_and_usage_accounting",
+          "status": "ok",
+          "seconds": 0.000825707
+        },
+        {
+          "name": "supplied_stopped_worker_restores_exact_live_session_and_cleans_up",
+          "status": "ok",
+          "seconds": 7.040984966
+        }
+      ],
+      "evidence": "target/t871-acceptance/e2e-checkpoint-final-summary.json"
+    },
+    {
+      "group": "panel",
+      "process_seconds": 13.642518671,
+      "case_results": [
+        {
+          "name": "backend_panel_loads_backend_owned_tickets_and_supports_reload_navigation_and_ctrl_c",
+          "status": "ok",
+          "seconds": 7.415918145
+        },
+        {
+          "name": "backend_panel_shell_enter_path_uses_the_same_backend_authority",
+          "status": "ok",
+          "seconds": 6.219834493
+        }
+      ],
+      "evidence": "target/t871-acceptance/e2e-panel-final-summary.json"
+    },
+    {
+      "group": "rewind",
+      "process_seconds": 0.53969131,
+      "case_results": [
+        {
+          "name": "single_pod_rewind_picker_applies_without_escape_and_suppresses_duplicate_enter",
+          "status": "ok",
+          "seconds": 0.534408845
+        }
+      ],
+      "evidence": "target/t871-acceptance/e2e-rewind-final-summary.json"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # T-871: 全体時間分布とテスト責務の見直し
 
-通常Rustの初回8,039名を計測し、履歴組合せの単体化、実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。通常runnerはwarm build後、399区分を中断なしで完走。Rustは8,045名＝7,999成功＋46既存ignored、欠落・重複0。Web実browser32ファイルと、再生成した固定fixtureによるrestore4件・checkpoint7件も成功した。前回残したChat接続browserとnavigation reviewの失敗は、追加調査で古いtest/fixtureの原因を確定して修正し、各2回成功した。doctest/Web timeoutも同じCargo targetへseed検証buildを重ねたロック競合と切り分けた。原因未確定のまま完了とした判断を撤回して追加対応し、残る明示browser review全9スクリプト・10実行も成功した。最後のコードcommitは `f4bdcdc01`。最新の照合結果は末尾「明示review全入口と起動内訳の最終照合」に記録する。途中の失敗・未完記録は経緯として保持し、過去の未解決項目を現在の状態と混同しない。
+通常Rustの初回8,039名を計測し、履歴組合せの単体化、実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。通常runnerの399区分・Rust7,999成功＋46既存ignoredやbrowser全入口の成功は下記の履歴証拠である。**要件再監査で時間内訳と比較条件の不足を確認したため、以前のCompleted判断を撤回してT-871を再開した。** 最新の追加計測・改善・回帰と残る未充足は末尾「要件再監査後の追加計測と改善」に記録する。過去の成功を最新ソースの全件再実行や全要件充足と読み替えない。
 
 ## 計測条件と範囲
 
@@ -241,7 +241,7 @@ Journalは`e8b7edcb3`。新規DBにだけ既存の検証済みpristine schemaを
 | doctest | 9成功・21既存ignored | 221.88秒、内部compile込み。通常runnerの180秒以内という証拠ではない |
 | root cargo check / Rust fmt / diff / 状態契約命名 | 成功 | check122秒、命名635行/未承認0/古い例外0 |
 
-Browserはproduction shellと合成loopback HTTP/WS fixtureの接続であり、実Backend認可やDB/Runtimeの製品E2Eへ読み替えない。review scriptの`subject_navigation_review.ts`と`chat_ui_review.ts`は未実行。画像の目視レビューは行っていない（製品UIの変更なし）。CIでの実行済みを意味しない。
+Browserはproduction shellと合成loopback HTTP/WS fixtureの接続であり、実Backend認可やDB/Runtimeの製品E2Eへ読み替えない。review scriptの`subject_navigation_review.ts`と`chat_ui_review.ts`は未実行。画像の目視レビューは行っていない。なお「製品UIの変更なし」という当初の記載は誤りで、`ff87d6f95`はWorkdir cleanup-planのbounded error読取り・表示を変更している。同commitの`workdir_removal_shell_test.ts`はHTTP 503本文非表示、観測済み503に限るbody cancel、再取得不能時の削除禁止、unknown時の同一要求再送を検証し、その後のWeb/UX実browser回帰およびWorkdir reviewの成功証拠に含まれる。CIでの実行済みを意味しない。
 
 主な再現入口:
 
@@ -493,3 +493,66 @@ Subject create/conversation/recoveryの3本は別途2回、各15表示条件・9
 - 通常399区分の完走（Rust7,999成功＋46既存ignored等）、実browser32 files、今回の明示review9 scripts、明示E2E、実接続Chat修正後の成功を別枠で照合した。過去の失敗logは保持し、観測済みの失敗を原因未確定のまま残していない。
 
 残す限界は、通常runner最長179.44秒に対する180秒上限の余裕、物理認証器・実スマホ・全feature/platform組合せの未検証、全画像の目視承認未実施、起動内部のさらなる細分化である。これらを未解決のtest/fixture失敗とは混同しない。push/merge/deploy、`yoi-origin`切替、稼働サービス/DB・`yoi-data`変更はしていない。
+
+## 要件再監査後の追加計測と改善
+
+上の完了判断は撤回した。起点`a412713c9`、専用`work/t871-test-cost`で追加実施。以下は新しい測定であり、通常399区分の再実行ではない。証拠は`target/t871-acceptance/`（以下この節では相対名で表記）。test binaryを列挙してexact選択、libtest JSON report-time、1 test thread、親の計測は直列、Cargo buildは別invocation。既存runnerのHOME/XDG/データ隔離・process回収を使用し、成功cache・通常timeout・ignoreは変更していない。共有ホストの他作業や子のbrowser調査があるため、専用無負荷機の測定とはしない。
+
+### 移行81経路の比較条件を揃えた再測定
+
+旧81経路の関数を診断用に現行test binaryへ併設し、同じproduction migration・feature/profileで旧構成と新構成を実行した。旧fixtureの廃止済み空テーブルは現行契約に合わせ、診断関数は最終ソースから除去した。旧profile対新profileの比較ではなく、同じprofileでのテスト責務分離の比較である。
+
+| 同一binary内の比較 | 旧81経路 | 新14実DB＋小さい履歴テスト |
+|---|---:|---:|
+| 初回（`migration-legacy-1` / `migration-current-1`）process | 494.84秒 | 83.23秒 |
+| 次の成功比較（`migration-legacy-long-3` / `migration-current-2`）case合計 | 431.68秒 | 80.95秒 |
+
+2組目のbinaryは後述のreference構築改善も含むが、その組の前後は同一binary。新構成の80.95秒は4テスト合計で、併走したreference同値テスト2.60秒は分離した。約83%/81%削減で、元の負荷・profile混在比較を補う。途中`migration-legacy-2`は診断540秒上限で中断しterminal結果なし。これを成功に数えず保持し、旧構成を測るローカル診断だけ上限900秒で再実行した。通常runnerの180秒や採用テストのtimeoutは変更していない。初回の短いfilter誤指定はempty-selectionで実行前に拒否された。
+
+### Journal: 入力の過剰反復を減らす
+
+旧入力のphase測定81.50秒の内訳はfixture4.97、remove/handoff3.16、最初のJob完了11.12、残りJob連鎖62.07秒。最後のcapture/envelope検証0.013秒、range/hash照合0.022秒、同期Drop0.0016秒。Job連鎖が約90%で、scan/clone削減を優先する根拠はなかった。追加診断では8 Jobs（各Session4）、model parse/decode34回の合計0.124秒、応答構築0.0018秒。model decode cacheは費用の主因ではなく、採用しない。
+
+`repeat(28_000)`を`repeat(10_000)`へ。元本文60,000 bytes、canonical JSONの反復部分90,000 bytes、さらにenvelopeでescapeされた反復部分140,000 bytesで、128KiB上限をmetadata抜きでも超える。実測は4 Jobs（各Session2）、最初のcapture約83,360 bytes、envelope131,071 bytes、source90,108 bytesの途中で区切る。最初のJob後の未完責任、両Session/fork/全range/hash/保存checkpoint/実teardownの既存assertは全て残る。追加の同一巨大本文prefixだけを削減した。
+
+- 同profile・単独選択process: 旧81.53/88.85秒 → 候補57.26/47.48秒。初回旧値はphaseのみ、2回目と候補は追加model診断付きで、完全に同一の診断量ではない。2回目の診断実測からmodel処理費用の小ささも確認した。
+- 一時計測を撤去した最終removal moduleは16件成功（325.89秒）、対象case42.37秒。moduleのwarm cache値を単独比較へ混ぜない。
+- 詳細fit境界は既存`subjektiv::journal::tests::snapshot_inputs`のexact/max+1 scalar・巨大metadata・全量再構成・decode拒否が担当する。これはSQLite componentでありDBなしunitとは呼ばない。実Session/fork→archive→HTTP/Job→永続checkpoint/cleanupはそれだけでは検出できないため接続testを残す。
+- 証拠: `journal-phases-1*`、`phase2-journal-before*`、`journal-candidate-{1,2}*`、`journal-final-removal*`、`journal/NOTES.md`。子の保存Session・差分と親の実測を照合済み。
+
+### retained Job: 重複したhistory照合を削減
+
+64の実DDL経路は維持。98.84秒の外側内訳はfixture2.94、seed4.91、初回open65.46、書込み/assert1.08、reopen24.36、reopen assert0.008、cleanup0.080秒。内側の重複を含まない別集計はplan16.83、migration apply48.58、helper末尾の追加history検証24.13秒。内外は包含関係があるので足し合わせない。
+
+schema123のproduction migrationはtransaction commit前にhistoryを検証し、reopenのproduction planも物理schema/receiptを検証する。同じhelper末尾の再照合を除去し、保存値のclose/reopen比較は維持した。新たな負例はupgrade history表を壊してclose/reopenし、planが修復・receipt改変せず拒否することを確認する。
+
+単独旧98.87/95.66秒に対し、候補66.68秒（先行負例によるcacheあり）、最終単独88.65/83.07秒。最終にはreference構築改善も含む。module内では108.79秒まで変動したため66.68秒だけで固定の改善率を主張しない。削除した24.13秒の重複処理は直接計測値だが、wall timeの効果はホスト負荷にも依存する。最終module23件成功、201.45秒。`retained-phases-{1,2}*`、`phase2-retained-after*`、`retained-final-{module,exact-1,exact-2}*`に保持。
+
+### Server起動: 実DB検証を削らずreference構築を共有
+
+featureless dev製品に一時計測を加え、seeded/empty両方を実processで起動した。seededのDB open6.02秒のうちplan5.73、追加history0.209、domain verifier0.035秒。emptyはDB open6.20秒、create0.620、history5.35秒。両方ともreference初期化で共通基礎DBを各stageごとに構築する費用が4.21/4.17秒、stage固有install0.472/0.467、snapshot0.183/0.174、columns0.024/0.026秒だった。
+
+`build_references`のprivateなin-memory基礎DBを一度だけ作り、各stageへSQLite backupで独立copyする。connection-localなPRAGMAは各copyへ設定し直す。全stageのinstall・snapshot・制約照合は従来どおりで、利用者DBのコピー/検証成功cache/保存schema変更はない。`copied_reference_stages_match_independent_frozen_schema_construction`が、各stageを従来どおり独立構築するoracleに対して全Shape・対象tables・new_columnsを一致検証する。既存の壊れた制約/receipt拒否も成功。
+
+同じrestore test binaryとfixture、featureless dev製品のbefore/afterを交互実行したprocess値は14.20→9.81、13.51→9.72秒（平均約29.5%削減）。`startup-paired-{before,after}-{1,2}*`。before製品はmain/APIの一時計測を持ちafterは除去済みなので、少量の診断出力差もある。先行候補では全case16秒の例もあり、短縮を全E2Eへ一律外挿しない。
+
+seededのhealth前処理は、config store/secrets約0.60、schema compose0.062、materialization0.187、worker projection2.009、feature storage/authority0.54、removal recovery0.116、Job/Journal/notification recovery0.047秒。ここは独立接続の検証と実Runtime観測を含み、今回のprivate reference改善とは別である。projection内の通信待機と処理の詳細割合までは切っておらず、2秒を無駄な固定sleepとして削っていない。一次logは`target/e2e-artifacts/worker-484317-1795085591559-0/`と`worker-484597-1795085607169-0/`。一時計測patchは`phase2/instrumented-candidate.patch`に保存し、main/server/storeから撤去した。
+
+### 明示E2E全caseの時間と新たに再現したbrowser失敗
+
+全6 integration target＋checkpointを再実行し、**製品29 distinct cases成功**。全case名・秒数・選択条件をGit管理の`test-cost-2026-11-e2e-cases.json`へ記録した。auth10=85.20秒、CLI3=20.35秒、environment2=20.25秒、restore4＋seed1=36.85秒、panel2=13.64秒、rewind1=0.54秒。checkpoint feature binaryは12件=93.05秒で、checkpoint7以外にrestore4とseed1を再実行した重複を明示している。29へ二重加算しない。
+
+途中のauthはnative browser1件がgeneric errorで失敗。他9件とCLI/environmentの個別時間も保持。子の反復でHTTP200後のPlaywright `Response.json()`失敗をlogin/additionで3回再現した。画面遷移のないadditionでも起きるため「navigationだけが原因」とは断定しない。既存透過proxyの実応答をcloneで観測し、browserの完全な要求本文/path/statusへ一意に照合する方式へ修正した。実応答を変更せず、POST再送・失敗時の成功fallback・認証代用はしない。観測側のstatus/referenceだけを壊す負例2回は期待どおり失敗、復元後5回成功、親の全auth10も成功。長寿命waiterの未処理拒否も捕捉し元promiseの失敗を保持する。
+
+**未確定の事実を残す**: 元genericログは例外分類を保存しておらず、今回再現した本文取得失敗との同一性は遡って証明できない。子の診断版でも1件は未処理waiterが一次例外を隠し、1件は追加した`response.finished()`待ちを含む版で180秒に達した。追加待ちは撤去済みだが、当時の停止点を保存していないので直接原因と断定しない。これらを後の成功で消さず、`native/NOTES.md`、`runs.json`、`validation.json`に全28回（21成功/7失敗、うち意図的負例2）を記録した。保存されなかった例外を推測で復元することはできず、利用者の原因確定要求を全て満たしたとは判断しない。
+
+### 回帰・build・再現入口・未完
+
+- 診断関数撤去後storage format全16件成功（110.23秒）。reference oracle、history/schema破損拒否、rollback/data/reopenの既存接続検証を含む。retained23、Journal removal16の成功と合わせる。最終Server全件や通常399区分は再実行していない。
+- root `cargo check`、`cargo fmt --all -- --check`、Deno typecheck/format（native TS）、`git diff --check`成功。
+- 外側buildは`phase2/*.time`で分離。Server libの追加計測222.45秒、Journal候補154.02秒、clean候補318.71秒、診断関数撤去後128.17秒。dev製品の詳細計測76.56秒、reference候補44.19秒、最終62.39秒。既存cacheあり、cold値ではない。`/usr/bin/time`/`python3`未存在による未開始試行は測定に含めず、Bash time/Denoで実施した。
+- 通常の再現: `cargo test -p yoi-workspace-server --lib store::storage_formats::tests:: -- --test-threads=1`、`store::backend_job_upgrade::tests::`、`server::tests::subjektiv_journal_tests::removal::`。moduleは通常runnerのshardとは別で長時間になる。E2Eは既存各targetを`e2e,fixture-support`で選択し、featureless製品pathを明示する。正確なbinary/args/環境は各`*-selection.json`、計測入口は`run.ts`、比較用sourceは`migration-comparator.rs`/`phase2/comparator-source.rs`。
+
+今回、主要移行の同一binary比較、Journal/retained/Serverの内訳と追加改善、明示E2Eのcase別時間を補完した。一方、過去に採用した変更すべての比較条件を統一した最終台帳（ConnectedChat Client再利用など）はまだ揃っていない。さらに上記の新しいgeneric失敗・診断失敗の証拠不足がある。**T-871はopenを維持し、今回の追加成果をもって再びCompletedとはしない。** 起動の残る観測/復旧コストの詳細化や比較証拠の残件と、物理機器/全platformという元からの範囲限界は区別する。push/merge/deploy、稼働サービス/DB・yoi-data変更なし。
+
+追加コードcommit: `160bddae3 refactor: reuse frozen SQLite bases for schema references`、`dcdb8c94f test: bound journal payloads and remove duplicate history checks`、`8386f29b3 fix: observe native auth responses outside Chromium buffers`。上記検証はcommit前の同一ソースで実施。採用した一時計測の常設化や診断用81経路の復活はしていない。
