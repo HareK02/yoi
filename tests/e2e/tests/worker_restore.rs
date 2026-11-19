@@ -438,6 +438,7 @@ fn stop_and_cleanup(
     }
     assert_single_state(&installed.environment, fixture, "stopped")?;
     phase(&installed.environment, "shutdown-cleanup")?;
+    let artifacts = installed.environment.artifacts_dir.clone();
     let report = installed.environment.cleanup()?;
     if !report.cleanup_success || report.fixture_root_exists_after {
         return Err(failure("environment cleanup failed"));
@@ -445,13 +446,30 @@ fn stop_and_cleanup(
     if !report.report_path.is_file() {
         return Err(failure("cleanup evidence is missing"));
     }
+    record_phase(&artifacts, "cleanup-verified")?;
     Ok(())
 }
 
 fn phase(environment: &WorkerE2eEnvironment, phase: &str) -> Result<()> {
+    record_phase(&environment.artifacts_dir, phase)
+}
+
+fn record_phase(artifacts: &std::path::Path, phase: &str) -> Result<()> {
+    use std::io::Write;
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    // One process-local monotonic clock keeps concurrent environments comparable.
+    // Only stage labels/timing are recorded; no requests or Session payloads.
+    let elapsed_ns = START.get_or_init(Instant::now).elapsed().as_nanos();
+    let record = serde_json::json!({"phase":phase,"elapsed_ns":elapsed_ns});
+    let mut history = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(artifacts.join("restore-phases.jsonl"))?;
+    serde_json::to_writer(&mut history, &record)?;
+    history.write_all(b"\n")?;
     fs::write(
-        environment.artifacts_dir.join("restore-phase.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({"phase":phase}))?,
+        artifacts.join("restore-phase.json"),
+        serde_json::to_vec_pretty(&record)?,
     )?;
     Ok(())
 }
