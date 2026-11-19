@@ -1,5 +1,5 @@
 //! Explicit live-Codex acquisition, never invoked by a test or fixture loader.
-//! Products must be featureless builds from the recorded clean source revision.
+//! Products must be featureless builds from the recorded clean source commit.
 use protocol::{Event, SessionMessageRole, SessionSnapshot, SessionSnapshotEntryData, WorkerState};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -232,7 +232,7 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
     if !model.starts_with("codex-oauth/") {
         return Err("this acquisition requires an explicit Codex OAuth model".into());
     }
-    let revision = git(root, &["rev-parse", "HEAD"])?;
+    let source_commit = git(root, &["rev-parse", "HEAD"])?;
     if !git(root, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
         return Err("commit tracked source before acquisition".into());
     }
@@ -302,7 +302,7 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
     for file in source_files {
         source_hashes.insert(file.clone(), digest(&fs::read(source.join(file))?));
     }
-    if git(root, &["rev-parse", "HEAD"])? != revision
+    if git(root, &["rev-parse", "HEAD"])? != source_commit
         || !git(root, &["status", "--porcelain", "--untracked-files=no"])?.is_empty()
     {
         return Err("source changed during acquisition".into());
@@ -312,7 +312,7 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
     fs::write(output.join("workspace-config.dcdl"), &configuration)?;
     write_json(
         &output.join("expected.json"),
-        &json!({"source_revision":revision,"model":model,"worker_id":id,"session_id":template.session_id().to_string(),"rows":live_rows}),
+        &json!({"source_revision":source_commit,"model":model,"worker_id":id,"session_id":template.session_id().to_string(),"rows":live_rows}),
     )?;
     let mut files = BTreeMap::new();
     for file in [
@@ -326,7 +326,7 @@ fn acquire(codex_home: &Path, output: &Path, model: &str) -> Result {
     write_json(
         &output.join("manifest.json"),
         &json!({
-            "format_version":1,"source_revision":revision,"runtime_schema_version":template_value["runtime_schema_version"],"session_schema_version":session_manifest["schema_version"],
+            "format_version":1,"source_revision":source_commit,"runtime_schema_version":template_value["runtime_schema_version"],"session_schema_version":session_manifest["schema_version"],
             "workspace_id":template.workspace_id(),"runtime_id":template.runtime_id(),"worker_id":id,"session_id":template.session_id().to_string(),"segment_id":template.segment_id().to_string(),"model":model,"state":"stopped",
             "acquisition":"Real isolated Codex OAuth two-turn artificial conversation through featureless Server/Runtime public APIs; live snapshot compared with typed offline extraction. Session bytes unchanged; credentials and execution receipts excluded.",
             "source_file_sha256":source_hashes,"files":files
