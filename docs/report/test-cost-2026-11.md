@@ -1,6 +1,6 @@
 # T-871: 全体時間分布とテスト責務の見直し
 
-通常Rustの初回8,039名を計測し、保存形式の履歴組合せを純粋な判定と実DB接続へ分離した。追加で実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。専用Workdirで8,045名を再照合し、修正targetの再実行を合わせて7,999成功・46既存ignored、欠落・重複0を確認した。Web実browser計32ファイルも成功。ただし単一の最終ソースを通常runnerで一度に完走した記録ではなく、restore/checkpoint用の固定fixture不整合など未解消項目が残る。全体完了とはせず、最新の採否・検証範囲は末尾の継続検証・fixture再生成の節に記録する。
+通常Rustの初回8,039名を計測し、履歴組合せの単体化、実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。最終通常runnerはwarm build後、399区分を中断なしで完走。Rustは8,045名＝7,999成功＋46既存ignored、欠落・重複0。Web実browser32ファイルと、再生成した固定fixtureによるrestore4件・checkpoint7件も成功した。**全ての明示・手動入口が成功したわけではない**。独立したChat接続browserとnavigation reviewの失敗、cold内部buildのtimeout、目視・外部実環境の未検証は末尾「最終照合と独立した残件」にまとめた。途中の失敗・未完記録は経緯として以下に保持し、最新結果で消していない。
 
 ## 計測条件と範囲
 
@@ -283,3 +283,100 @@ fixture-support回帰は15成功・既存1 ignored、実行1.93秒（build別）
 新候補を明示したfeatureless `worker_restore` targetは **1成功（seed projection）・4失敗**、実行45.04秒（事前build別）。2件は直接restore HTTP 403、2件はresponse-loss relayのupstream non-200で停止した。fixture整合性チェックとoffline installは通ったが、復元成功ではない。コード照合では、旧`seed_fixed_worker`はcatalog/reservationだけを作り、現行restoreが`subject_authorization::validate_bound_worker`で要求する実行権限を作っていない。実際のHTTP error bodyは秘密保護のため収集しておらず、認可拒否の具体的reasonとの照合は未実施。5つの隔離環境のcleanup成功・root不存在を確認した。
 
 新候補は保存するが標準fixtureはまだ切替えない。次は新規の隔離seedに現行の正規実行権限を整合させ、認可を迂回せず4 restoreケースと7 checkpointケースを再検証する。checkpoint候補実行、phase別計測、通常runnerの最終単一ソース完走は引き続き未完。T-871全体完了や全E2E成功は主張しない。
+
+## 最終照合と独立した残件
+
+上の阻害記録以後の最終結果。専用`work/t871-test-cost`で実施し、通常runnerの採用ソースは`77ab0dc0f`。その後の`cb1a75821`は取得exampleの内部変数命名と既存保存keyの例外登録、`9bbd796bb`はrestoreテストの単調時計記録だけで、通常runner対象の製品コード・検証条件は変えていない。各変更targetは別途検証した。元の`yoi-origin`、稼働サービス、`yoi-data`は変更せず、push/deployはしていない。
+
+### Restore seed修正・標準fixture採用
+
+`77ab0dc0f`で、隔離bootstrap ownerから現行Profile/permissionを解決し、本番launch policy検証器を通した新規の実行grantとfrozen launch bundleをoffline seedへ保存するよう修正した。元fixtureのgrantの再利用や本番restoreの認可緩和はない。owner不一致、明示empty、binding/digest、revocation、後段失敗時のrollbackを含むseed回帰10件（7.57秒）と、関連authority回帰24件（54.73秒）が成功。harness libは25件（1.24秒）成功。
+
+候補のrestore4件とcheckpoint7件の成功後、標準資産をv2へ切替え、overrideなしでも再実行した。READMEがasset rootにあると安全性検査が拒否したため、説明を隣接`worker-codex-v2.md`へ移動した。許可ファイルの検査は維持し、取得済み4資産のbytes/hash/出自は変更していない。元HTTP403、README拒否、初回compile失敗のログは保存した。
+
+### 通常runnerの一括結果
+
+`deno task test --jobs 8`の単一invocationが**399区分成功・失敗0**で終了した。通常Rust394区分＋doctest/Web/tool5区分。実行1,508.19秒（約25分8秒）、外側warm build8.61秒を別計上。131 binary・8,045選択名と結果数が一致し、7,999成功・46既存ignored、欠落・余剰・重複0。分割再実行の合成ではない。以前のcase別JSON計測とは別の通常runner結果である。
+
+| 通常runnerの非Rust区分 | 結果 | process秒 |
+|---|---|---:|
+| doctest | 9成功・21既存ignored | 38.40 |
+| Web unit | 897成功 | 22.26 |
+| Web component | 870成功 | 7.00 |
+| UX unit | 26成功 | 4.32 |
+| 検証tool | 26成功 | 7.72 |
+
+最長Server shardは179.44秒、続いて178.01/176.55/174.25秒。180秒制限は変更しておらず、**余裕は小さい**。この一回の成功を負荷に依存しない安定完走や60秒目標の達成としない。
+
+先行invocationは外側build322.14秒後、内部compileを含むdoctestとWeb unitが各180秒でtimeoutし、全体も未完だった。その記録は`normal-runner.log`と07-05のrunner directoryへ保持した。warm状態の全体成功で、cold内部build競合の問題が解消したとはしない。外側buildと内部buildの分離は残る改善候補である。
+
+### 明示E2E・browser・手動入口
+
+全6 E2E integration targetを実行。製品3種のfeatureless build、checkpoint Runtime、TUI用buildは別Cargo invocation/targetで分離した。テストは原則process内1 thread、並行隔離ケース内の2環境は並行のまま。認証browser2件は既存ignoredを明示選択し、成功へ数えた。
+
+| 選択target/入口 | 最終結果 | テスト/実行秒（build別） |
+|---|---|---:|
+| worker_restore、featureless | 製品4成功＋seed projection1成功 | 55.55 |
+| worker_restore、checkpoint選択 | 7成功、上記5件はfilter外 | 90.71 |
+| auth_passkeys、ignoredを含む | 10成功 | 220.83 |
+| configuration_cli | 3成功 | 52.82 |
+| worker_environment | 2成功 | 51.21 |
+| panel | 2成功 | 86.40 |
+| rewind | 1成功 | 0.52 |
+| Ticket実API/Web roundtrip | 1成功 | 8.40 |
+| Drive実API/Web adapter | 1成功 | 4.83 |
+| Repository実API/Web receiver | 1成功 | 3.67 |
+| Ticket browse performance | 1成功 | 149.04 |
+| Chat実Backend/browser接続 | **1失敗** | 34.75 |
+| UX browser15file | 49成功＋10 steps | Deno表示2m59s |
+| Web browser17file | 26成功＋317 steps | file別process合計235.78 |
+
+E2Eの製品ケース合計は29成功（seed projection1件は別）。harness lib25件と取得example単体1件も別計上。再生成時のRuntime fixture抽出回帰は15成功・private helper1 ignored。これらは全てを同一invocationへまとめた結果ではない。checkpoint製品のbuildは4m20s、認証targetのbuildは2m42s、取得example回帰のbuildは43.58秒。全体cold build費用や性能比較へ混ぜない。
+
+UX browserはsuite共通buildを一度使用（Viteの二段出力2.10/1.50秒）。Web17fileは既存production buildを再利用した。mock HTTP/WSの32file成功を、実Backend接続Chatの失敗の代替証拠にしない。`chat_ui_review.ts`はlight/dark・390/768/1440pxでdraft保持/復帰まで完走したが、画像の目視承認は行っていない。`subject_navigation_review.ts`は`Operation` comboboxの15秒待ちで失敗した。
+
+通常Rustの46 ignoredを全件列挙したところ、41件は親テストがexact subprocessとして起動するprivate helper、5件は表の実API/Webとbrowse入口だった。helperを環境なしで単独起動して成功を水増ししない。5件の明示選択結果は4成功・Chat1失敗で、通常runnerのignored数とは別の帳簿にした。doctest21 ignoredは既存の非実行例のまま。実モデルの一般的なlive API試験、物理認証器/実スマホ、全feature組合せや全platformの成功は検証範囲に含めていない。実Codexの使用は前節の人工会話fixture取得に限る。
+
+### Restore内部の計測
+
+`restore-phases.jsonl`へprocess-localの単調時計とphase名だけを追加し、要求・Session・credentialのpayloadは出さない。通常restoreの5隔離環境とcheckpointの7環境について、binaryの保存hashと現在bytesの一致、cleanup成功、root不存在を照合した。次の値は同一環境の隣接phase差分。checkpointの一部はRAII/panic回収を検証するため、全phaseを共通stop経路で測れない。
+
+| 準備区間 | 通常5環境の平均秒 | checkpoint7環境の平均秒 |
+|---|---:|---:|
+| fixture copy/verify | 0.056 | 0.044 |
+| offline bootstrap/Profile/Worker seed | 1.343 | 0.791 |
+| seeded Backend起動＋公開identity取得 | 9.946 | 9.492 |
+| Runtime trust初期化 | 0.041 | 0.044 |
+
+seedの初回を含む範囲は通常0.679–3.379秒、checkpoint0.475–2.546秒。通常のrestore→live subscribeは3環境で0.332–0.685秒、snapshot検証は0.036–0.095秒。通常cleanupは5環境で0.063–0.070秒。Backend起動区間が支配的だが、内側のDB open・process readiness・公開identity取得は未分離であり、約10秒全てを単なる固定待機やfixture overheadとは断定しない。実process/公開認可/永続復元がこのE2Eの対象なので、単体fakeへの置換は採用しなかった。各環境時間の和は並行ケースを含むsuite wall timeと異なる。
+
+### 最後に残した独立項目
+
+1. **Chat実Backend/browser接続失敗**：画面には`Conversation history could not be loaded.`、テストは`outcome could not be confirmed` alertを30秒待って失敗。原因が製品・fixture・同期のどれかは未確定。timeout延長、assertion削除、製品parser緩和はせず、独立した問題として修正をスキップした。
+2. **navigation review失敗**：`Operation` comboboxが15秒以内に現れない。現行画面とreview scriptの契約照合は未完。上記32fileの自動suiteとは独立して記録した。
+3. **cold内部buildとshard余裕**：最終一括成功はwarm。coldでのdoctest/Web内部build timeoutは残り、最長shard179.44秒も余裕が小さい。現在のrunner成功を一般的な性能保証にしない。
+4. **非実行範囲と残るコスト**：目視レビュー・実物認証器・一般live API・全feature/platform組合せは未検証。retained Jobの64物理移行とJournalの実Session/Job境界は残す。seed transaction候補は効果がなく復元済み。全setup内部を独立stopwatchで測り切ったわけではなく、特にBackend起動区間は今後の内訳候補である。
+
+利用者の「独立した問題はスキップし最後にまとめる」指示に従い、実行可能な選択targetの検証・採用変更・集計をここで完了する。全テストgreenや全費用最小化を意味しない。
+
+### 再現と証拠
+
+通常runner: `target/normal-tests/2026-11-19T07-21-24.395Z-86810a66-ec0e-48cd-a004-ff0b957f75e1/{inventory,summary}.json`と全区分stdout/stderr。`target/t871-completion/aggregate.mjs`がselected名/親summary件数を照合し、`coverage.json`に重複/欠落と上位時間を記録する。初回・最終ログを別保存している。
+
+明示試験: `target/t871-completion/*-tests.log`、`restore-timed.log`、`checkpoint-timed.log`、各実API/Webの`.json/.stdout/.stderr`、`ux-browser.log`、`navigation.log`、`chat-review.log`。phaseは`phase-summary.json`、元環境は`target/e2e-artifacts/worker-201640-*`と`worker-205937-*`。seed/authority回帰・標準採用前後は`target/t871-restore-authority/RESULTS.md`と`artifact-index.json`。既存ログは消していない。これらtarget配下の資料はローカル証拠でありGit管理対象ではない。
+
+```sh
+# 既定devshellのlld、Deno依存とPlaywright Chromiumを事前供給。
+# 共有ライブラリ注入がbrowserと干渉する環境ではenv -u LD_LIBRARY_PATHで実行。
+deno task test --jobs 8
+# tests/e2e/README.mdに従い、製品buildをテストbuildと分離し
+# YOI_E2E_BIN / YOI_E2E_SERVER_BIN / YOI_E2E_RUNTIME_BINを明示する。
+cargo test --locked -p yoi-e2e --features e2e,fixture-support --test worker_restore -- --test-threads=1
+cargo test --locked -p yoi-e2e --features e2e,restore-checkpoints --test worker_restore checkpoint:: -- --test-threads=1
+cargo test --locked -p yoi-e2e --features e2e --test auth_passkeys -- --include-ignored --test-threads=1
+cargo test --locked -p yoi-e2e --features e2e --test configuration_cli --test worker_environment -- --test-threads=1
+# panel/rewindのみTUI用e2e-test buildを供給する。
+cargo test --locked -p yoi-e2e --features e2e --test panel --test rewind -- --test-threads=1
+```
+
+最終root `cargo check`、全Rust format、`git diff --check`、状態契約命名検査は成功。命名検査は639該当行・未承認0・古い例外0。取得exampleの内部変数は`source_commit`へ変更し、既存fixture formatの保存keyだけを出自の説明付きで例外登録した。fixtureの保存bytesは書換えていない。
