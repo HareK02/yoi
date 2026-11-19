@@ -1,5 +1,5 @@
 #!/usr/bin/env -S deno run -A
-/** 実Webと合成HTTPで失敗予約の回復導線を検証・撮影する。実Runtimeの証拠ではない。 */
+/** 実Webと合成HTTP/WebSocketで失敗予約の回復導線を検証・撮影する。実Runtimeの証拠ではない。 */
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join, resolve } from "@std/path";
 import { type Browser, chromium } from "playwright";
@@ -39,11 +39,13 @@ const manifest = {
     diffSha256: Array.from(sourceDigest, (b) => b.toString(16).padStart(2, "0")).join(""),
     runnerSha256: await sha256File(fromFileUrl(import.meta.url)),
   },
-  evidence: "actual-Web-with-synthetic-HTTP-NOT-real-Backend-or-Runtime",
+  evidence: "actual-Web-with-synthetic-HTTP-and-WebSocket-NOT-real-Backend-or-Runtime",
   mode,
   buildRoot,
   buildIndexSha256: await sha256File(join(buildRoot, "index.html")),
   captures,
+  scenarios: [] as unknown[],
+  failures: [] as string[],
   faults,
   status: "running",
   visualVerdict: "unreviewed",
@@ -61,6 +63,7 @@ const owned = await startOwnedProcesses(
       String(port),
       buildRoot,
       "3",
+      "body-recovery",
     ],
     readyUrl: `${base}/health`,
   }],
@@ -76,6 +79,36 @@ try {
       viewport: { width, height: 1000 },
       colorScheme: "light",
       reducedMotion: "reduce",
+    });
+    // Worker notifications only invalidate the observation; the body GET supplies authority.
+    let invalidateBody: (() => void) | undefined;
+    await context.routeWebSocket("**/protocol/ws", (socket) => {
+      const server = socket.connectToServer();
+      server.onMessage((data) => {
+        const frame = JSON.parse(String(data));
+        if (
+          frame.frame === "response" && frame.message.result === "subscribed" &&
+          frame.message.payload.selector.topic === "workspace_workers"
+        ) {
+          const subscriptionId = frame.message.payload.subscription_id;
+          invalidateBody = () =>
+            socket.send(JSON.stringify({
+              protocol_version: 2,
+              frame: "event",
+              message: {
+                event: "event",
+                data: {
+                  subscription_id: subscriptionId,
+                  payload: {
+                    event: "worker_removed",
+                    data: { worker_id: "unrelated-worker", runtime_id: "runtime" },
+                  },
+                },
+              },
+            }));
+        }
+        socket.send(data);
+      });
     });
     const page = await context.newPage();
     page.setDefaultTimeout(15000);
@@ -95,6 +128,8 @@ try {
     let recovered = false;
     let authority = true;
     const requests: unknown[] = [];
+    const observations: unknown[] = [];
+    manifest.scenarios.push({ width, requests, observations });
     const body = () => ({
       workspace_id: "memory-review",
       subject_id: "empty-subject",
@@ -116,7 +151,11 @@ try {
       "**/api/w/memory-review/subjektiv/subjects/empty-subject/body**",
       async (route) => {
         const request = route.request();
-        if (request.method() === "GET") return await route.fulfill({ json: body() });
+        if (request.method() === "GET") {
+          const observation = body();
+          observations.push(observation);
+          return await route.fulfill({ json: observation });
+        }
         assert(request.url().endsWith("/recover"), "recovery must never dispatch start or stop");
         const input = request.postDataJSON();
         requests.push(input);
@@ -133,22 +172,28 @@ try {
         });
       },
     );
-    const conversation = {
-      id: "conversation",
-      subject_id: "empty-subject",
-      participant_account_id: "owner",
-      last_user_message_id: null,
-    };
-    await context.route(
-      "**/api/w/memory-review/chat/conversations**",
-      (route) =>
-        route.fulfill({
-          json: route.request().url().includes("/messages")
-            ? { conversation, messages: [], has_more: false }
-            : conversation,
-        }),
-    );
+    // Historical capture mode used HTTP; keep that bridge isolated from current WS assertions.
+    if (mode === "before") {
+      const conversation = {
+        id: "conversation",
+        subject_id: "empty-subject",
+        participant_account_id: "owner",
+        last_user_message_id: null,
+      };
+      await context.route(
+        "**/api/w/memory-review/chat/conversations**",
+        (route) =>
+          route.fulfill({
+            json: route.request().url().includes("/messages")
+              ? { conversation, messages: [], has_more: false }
+              : conversation,
+          }),
+      );
+    }
     const capture = async (state: string) => {
+      if (mode === "after" && state !== "failure") {
+        await page.locator('section.subject-body[aria-busy="false"]').waitFor();
+      }
       await assertNoPageWideOverflow(page);
       const image = join(output, `${width}-${state}.png`);
       await page.screenshot({ path: image });
@@ -172,33 +217,56 @@ try {
         await capture("retained");
         continue;
       }
-      const recover = page.getByRole("button", { name: "Release failed start reservation" });
+      await page.getByText("Subject controls", { exact: true }).click();
+      const recover = page.getByRole("button", { name: "Recover start", exact: true });
       await recover.waitFor();
       await recover.focus();
       await capture("retained");
       await recover.click();
-      const retry = page.getByRole("button", { name: "Retry same recover request" });
+      const retry = page.getByRole("button", { name: "Retry", exact: true });
       await retry.waitFor();
+      await page.getByText("Could not confirm the operation.", { exact: true }).waitFor();
+      assertEquals(requests.length, 1);
       await capture("unknown");
       await page.reload();
-      await page.getByRole("button", { name: "Retry same recover request" }).click();
-      await page.getByRole("button", { name: "Start conversation body", exact: true }).waitFor();
+      await page.getByText("Subject controls", { exact: true }).click();
+      await page.getByRole("button", { name: "Retry", exact: true }).click();
+      await page.getByRole("button", { name: "Start Subject", exact: true }).waitFor();
       assertEquals(requests.length, 2);
       assertEquals(requests[0], requests[1]);
       await capture("released");
       authority = false;
       recovered = false;
-      await page.getByRole("button", { name: "Refresh body state" }).click();
-      await page.getByText("Body creation failed; reservation retained.", { exact: true })
-        .waitFor();
+      // Preserve the live authority-withdrawal check through the current notification refresh path.
+      assert(invalidateBody, "the live Worker subscription must exist before invalidation");
+      const observationsBeforeInvalidation = observations.length;
+      invalidateBody();
+      await page.getByText("Subject controls are unavailable.", { exact: true }).waitFor();
+      assert(
+        observations.length > observationsBeforeInvalidation,
+        "Worker invalidation must trigger a fresh body observation",
+      );
       assertEquals(await recover.count(), 0);
+      assertEquals(
+        await page.getByRole("region", { name: "Subject controls", exact: true })
+          .getByRole("button").count(),
+        0,
+      );
+      assertEquals(requests.length, 2, "observation refresh must not dispatch another mutation");
       await capture("no-authority");
+    } catch (error) {
+      manifest.failures.push(`${width}: ${error instanceof Error ? error.stack : error}`);
+      await capture("failure").catch(() => {});
+      throw error;
     } finally {
       await context.close();
     }
   }
   assertEquals(faults, []);
   manifest.status = "browser-assertions-passed";
+} catch (error) {
+  manifest.status = "failed";
+  throw error;
 } finally {
   try {
     await browser?.close();

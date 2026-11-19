@@ -21,6 +21,7 @@ if (
 
 // 既存Memory scenarioとpaginationを変えないよう、明示選択時だけ有効にする。
 const navigationMode = Deno.args[3] === "navigation";
+const bodyRecoveryMode = Deno.args[3] === "body-recovery";
 const permissionsMode = Deno.args[3] === "permissions" || navigationMode;
 if (permissionsMode) {
   // 権限の証拠は親から渡された実製品buildを使って採取する。
@@ -684,8 +685,8 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     const { socket, response } = Deno.upgradeWebSocket(request);
     socket.onmessage = (event) => {
       const frame = JSON.parse(String(event.data));
-      // Navigation needs only an empty public conversation, not message delivery or Runtime work.
-      if (navigationMode && frame.frame === "messaging_request") {
+      // These explicit modes need only empty public history, not delivery or Runtime work.
+      if ((navigationMode || bodyRecoveryMode) && frame.frame === "messaging_request") {
         const command = frame.message.command as MessagingCommand;
         const conversation = {
           id: "conversation",
