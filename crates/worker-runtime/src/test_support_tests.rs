@@ -5,6 +5,17 @@ use crate::profile_archive::ProfileSourceGraphSummary;
 use session_store::{LogEntry, Store};
 use sha2::{Digest, Sha256};
 
+#[test]
+fn decode_diagnostic_identifies_type_and_position_without_private_values() {
+    let error = decode::<SessionManifest>(br#"{"private-source-marker":1}"#)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("SessionManifest at 1:"), "{error}");
+    assert!(error.contains("(Data)"), "{error}");
+    assert!(!error.contains("private-source-marker"), "{error}");
+}
+
 const RUNTIME: &str = "fixture-runtime";
 const WORKSPACE: &str = "fixture-workspace";
 const NEW_URL: &str = "http://127.0.0.1:34567";

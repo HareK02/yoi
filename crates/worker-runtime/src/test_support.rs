@@ -88,7 +88,16 @@ fn io<T>(result: std::io::Result<T>) -> Result<T, RuntimeError> {
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, RuntimeError> {
-    serde_json::from_slice(bytes).map_err(|_| reject("invalid typed document"))
+    serde_json::from_slice(bytes).map_err(|error| {
+        // Never include the serde message: it may quote private source values.
+        RuntimeError::InvalidRequest(format!(
+            "stopped Worker fixture: invalid typed document {} at {}:{} ({:?})",
+            std::any::type_name::<T>(),
+            error.line(),
+            error.column(),
+            error.classify(),
+        ))
+    })
 }
 
 fn no_symlink_components(path: &Path) -> Result<(), RuntimeError> {
