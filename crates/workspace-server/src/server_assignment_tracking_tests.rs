@@ -2508,6 +2508,15 @@ async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_
     )
     .await;
     set_test_subject_policy_as_owner(&api, &subject_id, policy.execution, Default::default());
+    // This Worker was issued through a launch policy, not the Subject's direct
+    // delegation lane. Clearing that unrelated lane does not revoke policy use.
+    tracking_response(
+        app.clone(),
+        assignment_request(&api, &identity, worker_id, &ticket, "generic-assign"),
+        StatusCode::OK,
+    ).await;
+    // Removing the actual launch authority must fence even saved receipts.
+    set_test_subject_policy_as_owner(&api, &subject_id, Default::default(), Default::default());
     for request in [
         assignment_request(&api, &identity, worker_id, &ticket, "generic-assign"),
         runtime_source_request(&identity, Some(worker_id), "DELETE", &clear, Vec::new()),

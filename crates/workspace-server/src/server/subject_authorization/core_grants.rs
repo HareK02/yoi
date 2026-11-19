@@ -8,6 +8,9 @@ use server_api::authorization::{
 };
 use server_api::launch_policy::{WorkerLaunchPolicyState, launch_policy_usage_key};
 
+#[path = "policy_continuity.rs"]
+mod policy_continuity;
+
 impl WorkerAuthorityView {
     fn core_grant(&self, worker: &RuntimeWorkerRef) -> ApiResult<Option<CoreWorkerExecutionGrant>> {
         self.config_store
@@ -97,24 +100,24 @@ impl WorkerAuthorityView {
         let CoreWorkerGrantParent::SubjectBody {
             subject_id,
             source_change_id,
-            runtime_id,
-            worker_id,
+            ..
         } = parent
         else {
             return Err(denied(
                 "legacy scoped grant cannot issue a key-only Worker assignment",
             ));
         };
-        let origin = RuntimeWorkerRef::new(runtime_id, worker_id);
-        self.require_core_origin(&origin)?;
-        if self.current_body_subject(&origin)?.as_deref() != Some(subject_id) {
-            return Err(denied("delegation origin lost Subject body ownership"));
+        for policy in self.continuous_subject_policies(subject_id, source_change_id)? {
+            if policy.legacy_constraints.is_some() {
+                return Err(denied(
+                    "legacy scoped authority cannot sustain a key-only Worker assignment",
+                ));
+            }
+            if !current_key_allowed(self, operation, Some(&policy.delegation))? {
+                return Ok(false);
+            }
         }
-        let policy = self.assignment_subject_policy(subject_id)?;
-        if policy.change_id != *source_change_id {
-            return Err(denied("Subject delegation authority was replaced"));
-        }
-        current_key_allowed(self, operation, Some(&policy.delegation))
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -279,36 +282,29 @@ impl WorkerAuthorityView {
                 CoreWorkerGrantParent::SubjectBody {
                     subject_id,
                     source_change_id,
-                    runtime_id,
-                    worker_id,
+                    ..
                 } => {
-                    let origin = RuntimeWorkerRef::new(runtime_id, worker_id);
-                    self.require_core_origin(&origin)?;
-                    if usage.is_none() {
-                        self.assignment_subject_policy(subject_id)?;
-                    }
-                    if self.current_body_subject(&origin)?.as_deref() != Some(subject_id) {
-                        return Err(denied("launch origin lost Subject body ownership"));
-                    }
-                    let source = self
-                        .policy(subject_id)?
-                        .ok_or_else(|| denied("Subject launch authority is unset"))?;
-                    if source.change_id() != source_change_id {
-                        return Err(denied("Subject launch authority was replaced"));
-                    }
-                    for operation in operations.iter().copied() {
-                        if !source.allows(
-                            self,
-                            &ScopedPermission {
-                                operation: operation.into(),
-                                resource: resource.clone(),
-                            },
-                            false,
-                            subject_id,
-                        )? {
+                    for policy in self.continuous_subject_policies(subject_id, source_change_id)? {
+                        if usage.is_none() && policy.legacy_constraints.is_some() {
                             return Err(denied(
-                                "Subject no longer has launch policy use permission",
+                                "legacy scoped authority cannot sustain a key-only Worker assignment",
                             ));
+                        }
+                        let source = CurrentSubjectPolicy::Canonical(policy);
+                        for operation in operations.iter().copied() {
+                            if !source.allows(
+                                self,
+                                &ScopedPermission {
+                                    operation: operation.into(),
+                                    resource: resource.clone(),
+                                },
+                                false,
+                                subject_id,
+                            )? {
+                                return Err(denied(
+                                    "Subject launch permission was revoked after issuance",
+                                ));
+                            }
                         }
                     }
                     return Ok(());
