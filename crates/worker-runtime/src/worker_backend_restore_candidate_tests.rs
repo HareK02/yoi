@@ -386,19 +386,10 @@ mod restore_candidate {
                             },
                         )
                         .await;
-                        let state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
-                        let mut events = handle.subscribe();
-                        handle
-                            .send(Method::Pause {
-                                command: next_internal_command(&state).unwrap(),
-                            })
-                            .await
-                            .unwrap();
-                        receive_matching(&mut events, "seed pause acknowledgement", |event| {
-                            matches!(event, Event::WorkerState { snapshot }
-                                if snapshot.catalog_status() == protocol::WorkerStatus::Paused)
-                        })
-                        .await;
+                        // Keep the seed model hanging while accepting saved inputs.
+                        // Notify resumes a Paused Controller, so pausing here would
+                        // consume the notice (and could start the queued submissions)
+                        // before the restore fixture has shut down.
                         let mut receipts = Vec::new();
                         for id in [FIRST, SECOND] {
                             let receipt = submit(&handle, id).await;
@@ -410,10 +401,10 @@ mod restore_candidate {
                                 }
                             ));
                             receipts.push(serde_json::to_value(receipt).unwrap());
-                            if id == FIRST {
-                                notify_from_source(&handle, notice_source.clone()).await;
-                            }
                         }
+                        // Accept the notice last, so the saved checkpoint is the
+                        // pending receipt before any later activation checkpoint.
+                        notify_from_source(&handle, notice_source.clone()).await;
                         assert_eq!(pending(&handle).await.submissions.len(), 2);
                         shutdown_profile_controller(seed.0.take().unwrap()).await;
                         receipts

@@ -1398,5 +1398,161 @@ fn open_noatime(path: &Path) -> io::Result<File> {
 #[path = "public_material/tests.rs"]
 mod tests;
 
+/// A physical log cursor is scoped to a Session, not a mutable active lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunTerminalCursor {
+    pub session_id: SessionId,
+    pub segment_id: SegmentId,
+    pub byte_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTerminalFact {
+    pub session_id: SessionId,
+    pub segment_id: SegmentId,
+    pub entry_ref: String,
+    pub occurred_at_ms: u64,
+    pub boundary: PublicRunBoundary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunTerminalPage {
+    pub facts: Vec<RunTerminalFact>,
+    pub next_cursor: Option<RunTerminalCursor>,
+}
+
+/// Reads committed terminal records without exposing conversation or error bodies.
+/// The caller holds the Session publication/erasure guard. Every round caps directory
+/// entries, physical records, bytes and output, even if no terminal is encountered.
+/// At the end of a sweep callers start a new sweep: an older Segment may receive an
+/// append, and a new Segment need not sort after an already observed one.
+pub fn scan_worker_run_terminals_guarded(
+    root: &Path,
+    session: SessionId,
+    cursor: Option<&RunTerminalCursor>,
+    guard: &crate::retention::SessionRetentionGuard,
+) -> Result<RunTerminalPage, PublicMaterialError> {
+    if guard.session_id() != session {
+        return Err(PublicMaterialError::Inconsistent);
+    }
+    let store =
+        WorkerSessionStore::open_read_only(root).map_err(|_| PublicMaterialError::Unavailable)?;
+    if store
+        .session_id()
+        .map_err(|_| PublicMaterialError::Unavailable)?
+        != Some(session)
+    {
+        return Err(PublicMaterialError::Changed);
+    }
+    if cursor.is_some_and(|c| c.session_id != session) {
+        return Err(PublicMaterialError::InvalidOffset);
+    }
+    let mut segments = Vec::new();
+    for (index, entry) in std::fs::read_dir(root.join("segments"))?.enumerate() {
+        if index >= 512 {
+            return Err(PublicMaterialError::ResourceLimit);
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(PublicMaterialError::Inconsistent)?;
+        if name.ends_with(".trace.jsonl") || name.starts_with('.') {
+            continue;
+        }
+        if name.ends_with(".jsonl") {
+            if !entry.file_type()?.is_file() {
+                return Err(PublicMaterialError::Inconsistent);
+            }
+            let segment = name
+                .strip_suffix(".jsonl")
+                .and_then(|s| s.parse::<SegmentId>().ok())
+                .ok_or(PublicMaterialError::Inconsistent)?;
+            segments.push(segment);
+        }
+    }
+    segments.sort_by_key(|s| s.to_string());
+    let start = match cursor {
+        Some(cursor) => segments
+            .iter()
+            .position(|s| *s == cursor.segment_id)
+            .ok_or(PublicMaterialError::Missing)?,
+        None => 0,
+    };
+    let mut facts = Vec::new();
+    let mut records = 0usize;
+    let mut bytes = 0u64;
+    for segment in segments.into_iter().skip(start) {
+        let mut reader = RecordReader::open(
+            &root.join("segments").join(format!("{segment}.jsonl")),
+            64 * 1024 * 1024,
+        )?;
+        let offset = cursor
+            .filter(|c| c.segment_id == segment)
+            .map_or(0, |c| c.byte_offset);
+        if offset > reader.end {
+            return Err(PublicMaterialError::InvalidOffset);
+        }
+        if offset > 0 {
+            reader.seek(offset - 1)?;
+            let mut previous = [0];
+            reader.reader.read_exact(&mut previous)?;
+            if previous[0] != b'\n' {
+                return Err(PublicMaterialError::InvalidOffset);
+            }
+        }
+        reader.seek(offset)?;
+        while let Some((position, entry)) = reader.next()? {
+            records += 1;
+            bytes += reader.offset - position;
+            let terminal = match run_boundary(&entry) {
+                Some(
+                    boundary @ PublicRunBoundary::Completed {
+                        outcome: PublicRunOutcome::Finished | PublicRunOutcome::LimitReached,
+                        ..
+                    },
+                )
+                | Some(
+                    boundary @ (PublicRunBoundary::Cancelled
+                    | PublicRunBoundary::Errored
+                    | PublicRunBoundary::Abandoned),
+                ) => Some(boundary),
+                _ => None,
+            };
+            if let Some(boundary) = terminal {
+                let occurred_at_ms = match &entry {
+                    LogEntry::RunCompleted { ts, .. }
+                    | LogEntry::RunCancelled { ts, .. }
+                    | LogEntry::RunErrored { ts, .. }
+                    | LogEntry::PausedTurnAbandoned { ts, .. } => *ts,
+                    _ => unreachable!(
+                        "terminal projection only accepts timestamped terminal records"
+                    ),
+                };
+                facts.push(RunTerminalFact {
+                    session_id: session,
+                    segment_id: segment,
+                    entry_ref: boundary_reference(&entry, session, segment, position),
+                    occurred_at_ms,
+                    boundary,
+                });
+            }
+            if facts.len() >= 100 || records >= 512 || bytes >= 4 * 1024 * 1024 {
+                return Ok(RunTerminalPage {
+                    facts,
+                    next_cursor: Some(RunTerminalCursor {
+                        session_id: session,
+                        segment_id: segment,
+                        byte_offset: reader.offset,
+                    }),
+                });
+            }
+        }
+    }
+    Ok(RunTerminalPage {
+        facts,
+        next_cursor: None,
+    })
+}
+
 /// Legacy descriptor-reader facade over the shared committed replay.
 pub type SessionPublicMaterialReader = CommittedPublicReplay;

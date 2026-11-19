@@ -126,7 +126,7 @@ pub(super) fn notification_target(
     fixed_worker_target(api, &input.worker)
 }
 
-fn fixed_worker_target(
+pub(super) fn fixed_worker_target(
     api: &WorkspaceApi,
     recipient: &RuntimeWorkerRef,
 ) -> std::result::Result<TicketWorkerNotificationTarget, NotificationFailureCode> {
@@ -315,6 +315,7 @@ pub(super) fn recover_ticket_notifications(api: &WorkspaceApi) {
         return;
     };
     recover_job_notifications(api);
+    worker_lifecycle_notifications::recover(api);
     dispatch_ticket_worker_notifications(api);
     // Resolve each current assignment independently. A missing body is not an implicit restore.
     let inputs = match api

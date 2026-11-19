@@ -29,6 +29,7 @@ pub enum NotificationEventKind {
     AssignmentChanged,
     Result,
     MergeRequest,
+    WorkerLifecycle,
     Unknown,
 }
 impl NotificationEventKind {
@@ -43,6 +44,7 @@ impl NotificationEventKind {
             "tags" | "tags_set" | "tags_changed" => Self::Tags,
             "release" => Self::Release,
             "assignment_changed" => Self::AssignmentChanged,
+            "worker_lifecycle" => Self::WorkerLifecycle,
             "backend_job_result" => Self::Result,
             "implementation_result" => Self::Result,
             "mr_review_requested"
@@ -661,7 +663,7 @@ fn decision_for_source(
 }
 
 pub(super) fn route_pending(conn: &Connection, workspace: &str) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT s.* FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role!='backend_job' AND d.source_sequence IS NULL ORDER BY s.sequence LIMIT 500")?;
+    let mut stmt = conn.prepare("SELECT s.* FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role NOT IN ('backend_job','worker_lifecycle') AND d.source_sequence IS NULL ORDER BY s.sequence LIMIT 500")?;
     let mut rows = stmt.query([workspace])?;
     while let Some(row) = rows.next()? {
         let source = source_from_row(row)?;

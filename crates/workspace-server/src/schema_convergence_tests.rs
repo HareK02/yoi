@@ -101,7 +101,7 @@ mod schema_convergence {
     }
 
     fn assert_obsolete_jobs_discarded(conn: &Connection) {
-        assert_eq!(current_schema_version(conn).unwrap(), 136);
+        assert_eq!(current_schema_version(conn).unwrap(), 137);
         backend_job_current::verify(conn).unwrap();
         for table in ["backend_jobs", "backend_job_attempts"] {
             assert!(stored_fixture_rows(conn, table).is_empty(), "{table}");
@@ -160,7 +160,7 @@ mod schema_convergence {
                 let schema = schema_rows(&conn);
                 let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
                 assert_eq!(plan.current_schema_version, 103);
-                assert_eq!(plan.target_schema_version, 136);
+                assert_eq!(plan.target_schema_version, 137);
                 assert_eq!(
                     plan.migrations,
                     expected_retained_migration_chain()
@@ -175,6 +175,7 @@ mod schema_convergence {
                                 (134, backend_job_finalizing::MIGRATION_NAME),
                                 (135, subject_release_recording_store::MIGRATION_NAME),
                                 (136, launch_policy_identity_migration::MIGRATION_NAME),
+                                (137, worker_lifecycle_notifications::MIGRATION_NAME),
                             ]
                             .into_iter()
                             .map(|(version, name)| {
@@ -200,7 +201,7 @@ mod schema_convergence {
                     assert_obsolete_jobs_discarded(conn);
                     assert_current_job_constraints(conn);
                     fresh.with_conn(|c| {
-                        assert_eq!(current_schema_version(c)?, 136);
+                        assert_eq!(current_schema_version(c)?, 137);
                         backend_job_current::verify(c)
                     })?;
                     let mut expected = history.clone();

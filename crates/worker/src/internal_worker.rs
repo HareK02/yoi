@@ -10,7 +10,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use agen::timeline::event::UsageEvent;
+use futures_util::FutureExt;
+
+mod lifecycle;
 use agen::{Engine, EngineError, llm_client::LlmClient};
+pub(crate) use lifecycle::{
+    InternalWorkerLifecycleCallback, InternalWorkerLifecycleEvent, InternalWorkerLifecycleFact,
+};
+use lifecycle::{LifecyclePublisher, latest_terminal_id};
 use manifest::{Scope, WorkerManifest};
 use protocol::{Event, InFlightSnapshot, WorkerStatus};
 use session_store::{LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
@@ -450,8 +457,11 @@ pub(crate) enum InternalWorkerSessionError {
 }
 
 enum InternalWorkerSessionCommand {
-    Run(String),
-    Stop(tokio::sync::oneshot::Sender<()>),
+    Run {
+        input_id: String,
+        input: Option<String>,
+    },
+    Stop(tokio::sync::oneshot::Sender<Result<(), InternalWorkerSessionError>>),
 }
 
 /// Parent-owned handle for a long-lived Internal Worker session.
@@ -472,6 +482,7 @@ pub(crate) struct InternalWorkerSessionSnapshot {
 #[derive(Clone)]
 pub(crate) struct InternalWorkerSessionHandle {
     command_tx: tokio::sync::mpsc::Sender<InternalWorkerSessionCommand>,
+    stop_lock: Arc<tokio::sync::Mutex<()>>,
     status: Arc<std::sync::atomic::AtomicU8>,
     store: EphemeralSessionStore,
     session_id: SessionId,
@@ -587,6 +598,7 @@ impl InternalWorkerSessionHandle {
         &self,
         input: impl Into<String>,
     ) -> Result<(), InternalWorkerSessionError> {
+        let _command_guard = self.stop_lock.lock().await;
         self.status
             .compare_exchange(
                 InternalWorkerSessionStatus::Idle.encode(),
@@ -609,7 +621,10 @@ impl InternalWorkerSessionHandle {
         *self.last_outcome.lock().unwrap() = None;
         if self
             .command_tx
-            .send(InternalWorkerSessionCommand::Run(input.into()))
+            .send(InternalWorkerSessionCommand::Run {
+                input_id: protocol::new_submission_request_id(),
+                input: Some(input.into()),
+            })
             .await
             .is_err()
         {
@@ -672,24 +687,42 @@ impl InternalWorkerSessionHandle {
         if self.fail_stop.load(std::sync::atomic::Ordering::Acquire) {
             return Err(InternalWorkerSessionError::Unavailable);
         }
-        let prior = self.status.swap(
-            InternalWorkerSessionStatus::Stopping.encode(),
+        let _guard = self.stop_lock.lock().await;
+        let prior = self.status.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| match InternalWorkerSessionStatus::decode(current) {
+                InternalWorkerSessionStatus::Stopped | InternalWorkerSessionStatus::Failed => None,
+                _ => Some(InternalWorkerSessionStatus::Stopping.encode()),
+            },
         );
-        if matches!(
-            InternalWorkerSessionStatus::decode(prior),
-            InternalWorkerSessionStatus::Stopped | InternalWorkerSessionStatus::Failed
-        ) {
-            return Ok(());
+        if let Err(current) = prior {
+            return if InternalWorkerSessionStatus::decode(current)
+                == InternalWorkerSessionStatus::Stopped
+            {
+                Ok(())
+            } else {
+                Err(InternalWorkerSessionError::Unavailable)
+            };
         }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        self.command_tx
+        if self
+            .command_tx
             .send(InternalWorkerSessionCommand::Stop(done_tx))
             .await
-            .map_err(|_| InternalWorkerSessionError::Unavailable)?;
-        done_rx
-            .await
-            .map_err(|_| InternalWorkerSessionError::Unavailable)
+            .is_err()
+        {
+            return if self.status() == InternalWorkerSessionStatus::Stopped {
+                Ok(())
+            } else {
+                Err(InternalWorkerSessionError::Unavailable)
+            };
+        }
+        match done_rx.await {
+            Ok(result) => result,
+            Err(_) if self.status() == InternalWorkerSessionStatus::Stopped => Ok(()),
+            Err(_) => Err(InternalWorkerSessionError::Unavailable),
+        }
     }
 }
 
@@ -928,7 +961,7 @@ pub(crate) async fn prepare_internal_worker_session(
     store: EphemeralSessionStore,
     visibility: InternalWorkerVisibility,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
-    on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
+    on_lifecycle: Option<InternalWorkerLifecycleCallback>,
     command_event_broker: Option<workdir::WorkdirToolBrokerRouter>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
     let (event_tx, _event_rx) = broadcast::channel(256);
@@ -980,6 +1013,7 @@ pub(crate) async fn prepare_internal_worker_session(
     let last_outcome = Arc::new(Mutex::new(None));
     let handle = InternalWorkerSessionHandle {
         command_tx,
+        stop_lock: Arc::new(tokio::sync::Mutex::new(())),
         status: status.clone(),
         store,
         session_id,
@@ -998,82 +1032,152 @@ pub(crate) async fn prepare_internal_worker_session(
     };
 
     tokio::spawn(async move {
+        let lifecycle = LifecyclePublisher {
+            session_id: session_id.to_string(),
+            writer: worker.log_writer_handle(),
+            callback: on_lifecycle,
+        };
         let mut stop_done = None;
-        'actor: while let Some(command) = command_rx.recv().await {
-            match command {
-                InternalWorkerSessionCommand::Run(input) => {
-                    actor_in_flight.clear();
-                    let (turn_status, error, outcome) = {
-                        let cancel_sender = worker.engine_mut().cancel_sender();
-                        let mut run = std::pin::pin!(worker.run_text(&input));
-                        loop {
-                            tokio::select! {
-                                result = &mut run => {
-                                    break classify_internal_turn_result(result);
+        let mut active_input_id = None;
+        // Panic is lost execution, not a successful Run or confirmed Stop. Do not
+        // expose payloads or leave waiters with a permanently Running projection.
+        let execution = std::panic::AssertUnwindSafe(async {
+            let mut stop_reason = "command_channel_closed";
+            let notifications = worker.notify_buffer_handle();
+            loop {
+                let command = tokio::select! {
+                    biased;
+                    command = command_rx.recv() => match command {
+                        Some(command) => command,
+                        None => break,
+                    },
+                    _ = notifications.notified(), if status.load(std::sync::atomic::Ordering::Acquire) == InternalWorkerSessionStatus::Idle.encode() => {
+                        if notifications.is_empty() || status.compare_exchange(
+                            InternalWorkerSessionStatus::Idle.encode(),
+                            InternalWorkerSessionStatus::Running.encode(),
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        ).is_err() { continue; }
+                        InternalWorkerSessionCommand::Run {
+                            input_id: protocol::new_submission_request_id(),
+                            input: None,
+                        }
+                    }
+                };
+                match command {
+                    InternalWorkerSessionCommand::Run { input_id, input } => {
+                        active_input_id = Some(input_id.clone());
+                        *last_outcome.lock().unwrap() = None;
+                        *last_error.lock().unwrap() = None;
+                        actor_in_flight.clear();
+                        let prior_terminal = latest_terminal_id(&worker.sink());
+                        let mut stop_requested = false;
+                        let (turn_status, error, outcome) = {
+                            let cancel_sender = worker.engine_mut().cancel_sender();
+                            let mut run = std::pin::pin!(async {
+                                match input {
+                                    Some(input) => worker.run_text(input).await,
+                                    None => worker.run_for_notification(protocol::InvokeKind::Notify).await,
                                 }
-                                command = command_rx.recv() => {
-                                    match command {
-                                        Some(InternalWorkerSessionCommand::Stop(done)) => {
-                                            let _ = cancel_sender.send(()).await;
-                                            let _ = (&mut run).await;
-                                            stop_done = Some(done);
-                                            break 'actor;
+                            });
+                            loop {
+                                tokio::select! {
+                                    result = &mut run => break classify_internal_turn_result(result),
+                                    command = command_rx.recv() => {
+                                        match command {
+                                            Some(InternalWorkerSessionCommand::Stop(done)) => {
+                                                stop_done = Some(done);
+                                                stop_reason = "stop_requested";
+                                            }
+                                            Some(InternalWorkerSessionCommand::Run { .. }) => continue,
+                                            None => { stop_reason = "command_channel_closed"; }
                                         }
-                                        Some(InternalWorkerSessionCommand::Run(_)) => {
-                                            // `send` reserves Running atomically, so a second Run cannot be enqueued.
-                                        }
-                                        None => {
-                                            let _ = cancel_sender.send(()).await;
-                                            let _ = (&mut run).await;
-                                            break 'actor;
-                                        }
+                                        stop_requested = true;
+                                        let _ = cancel_sender.send(()).await;
+                                        break classify_internal_turn_result((&mut run).await);
                                     }
                                 }
                             }
+                        };
+                        publish_internal_context_usage(
+                            &actor_greeting,
+                            &event_tx,
+                            Some(worker.total_tokens().tokens),
+                            protocol::ContextTokenSource::Estimated,
+                        );
+                        actor_in_flight.clear();
+                        *last_outcome.lock().unwrap() = Some(outcome.clone());
+                        if let Some(message) = error {
+                            *last_error.lock().unwrap() = Some(message.clone());
+                            let _ = event_tx.send(Event::Error {
+                                code: protocol::ErrorCode::Internal,
+                                message,
+                            });
                         }
-                    };
-                    publish_internal_context_usage(
-                        &actor_greeting,
-                        &event_tx,
-                        Some(worker.total_tokens().tokens),
-                        protocol::ContextTokenSource::Estimated,
-                    );
-                    actor_in_flight.clear();
-                    *last_outcome.lock().unwrap() = Some(outcome);
-                    status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
-                    if let Some(message) = error {
-                        *last_error.lock().unwrap() = Some(message.clone());
-                        let _ = event_tx.send(Event::Error {
-                            code: protocol::ErrorCode::Internal,
-                            message,
-                        });
+                        let terminal = latest_terminal_id(&worker.sink())
+                            .filter(|id| Some(id) != prior_terminal.as_ref());
+                        lifecycle.run_ended(&input_id, &outcome, terminal);
+                        if !matches!(outcome, InternalWorkerTurnOutcome::Completed(WorkerRunResult::Paused)) {
+                            active_input_id = None;
+                        }
+                        if stop_requested || matches!(turn_status, InternalWorkerSessionStatus::Stopped | InternalWorkerSessionStatus::Failed) {
+                            if !stop_requested { stop_reason = "run_terminal"; }
+                            break;
+                        }
+                        let current = status.compare_exchange(
+                            InternalWorkerSessionStatus::Running.encode(), turn_status.encode(),
+                            std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire,
+                        ).map(|_| turn_status).unwrap_or_else(InternalWorkerSessionStatus::decode);
+                        send_internal_worker_state(&event_tx, current);
+                        state_changed.notify_waiters();
                     }
-                    send_internal_worker_state(&event_tx, turn_status);
-                    if let Some(callback) = &on_turn_end {
-                        callback(turn_status);
+                    InternalWorkerSessionCommand::Stop(done) => {
+                        stop_done = Some(done);
+                        stop_reason = "stop_requested";
+                        break;
                     }
-                    state_changed.notify_waiters();
-                }
-                InternalWorkerSessionCommand::Stop(done) => {
-                    stop_done = Some(done);
-                    break;
                 }
             }
+            status.store(InternalWorkerSessionStatus::Stopping.encode(), std::sync::atomic::Ordering::Release);
+            // Pause is not terminal. Stopping it supplies no completed result for
+            // the still-open logical Run.
+            if let Some(input_id) = active_input_id.take() {
+                lifecycle.publish(Some(&input_id), InternalWorkerLifecycleFact::ExecutionUnknown, None);
+            }
+            let stopped = worker.stop_feature_runtime_report("internal Worker session stopped").await.is_ok();
+            actor_in_flight.clear();
+            if stopped {
+                lifecycle.publish(None, InternalWorkerLifecycleFact::Stopped { reason: stop_reason }, None);
+                status.store(InternalWorkerSessionStatus::Stopped.encode(), std::sync::atomic::Ordering::Release);
+                send_internal_worker_state(&event_tx, InternalWorkerSessionStatus::Stopped);
+                let _ = event_tx.send(Event::Shutdown);
+            } else {
+                lifecycle.publish(None, InternalWorkerLifecycleFact::StopUnconfirmed, None);
+                status.store(InternalWorkerSessionStatus::Failed.encode(), std::sync::atomic::Ordering::Release);
+                *last_error.lock().unwrap() = Some("internal Worker cleanup was not confirmed".into());
+            }
+            if let Some(done) = stop_done.take() {
+                let _ = done.send(if stopped { Ok(()) } else { Err(InternalWorkerSessionError::Unavailable) });
+            }
+        }).catch_unwind().await;
+        if execution.is_err() {
+            lifecycle.publish(
+                active_input_id.as_deref(),
+                InternalWorkerLifecycleFact::ExecutionUnknown,
+                None,
+            );
+            status.store(
+                InternalWorkerSessionStatus::Failed.encode(),
+                std::sync::atomic::Ordering::Release,
+            );
+            *last_error.lock().unwrap() = Some(
+                "internal Worker actor panicked; execution and cleanup are unconfirmed".into(),
+            );
+            if let Some(done) = stop_done {
+                let _ = done.send(Err(InternalWorkerSessionError::Unavailable));
+            }
         }
-        worker
-            .stop_feature_runtime("internal Worker session stopped")
-            .await;
-        actor_in_flight.clear();
-        status.store(
-            InternalWorkerSessionStatus::Stopped.encode(),
-            std::sync::atomic::Ordering::Release,
-        );
-        send_internal_worker_state(&event_tx, InternalWorkerSessionStatus::Stopped);
-        let _ = event_tx.send(Event::Shutdown);
         state_changed.notify_waiters();
-        if let Some(done) = stop_done {
-            let _ = done.send(());
-        }
     });
 
     Ok(handle)
@@ -1084,14 +1188,14 @@ pub(crate) async fn spawn_prepared_internal_worker_session(
     worker: Worker<Box<dyn LlmClient>, EphemeralSessionStore>,
     store: EphemeralSessionStore,
     input: String,
-    on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
+    on_lifecycle: Option<InternalWorkerLifecycleCallback>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
     let handle = prepare_internal_worker_session(
         worker,
         store,
         InternalWorkerVisibility::ServicePrivate,
         None,
-        on_turn_end,
+        on_lifecycle,
         None,
     )
     .await?;
@@ -1105,12 +1209,19 @@ pub(crate) async fn spawn_prepared_internal_worker_session(
 /// Worker while avoiding a second public persistence/catalog policy for helper executions.
 #[derive(Clone, Default)]
 pub(crate) struct EphemeralSessionStore {
+    #[cfg(test)]
+    fail_next_append: Arc<Mutex<Option<fn(&LogEntry) -> bool>>>,
     entries: Arc<Mutex<HashMap<(SessionId, SegmentId), Vec<LogEntry>>>>,
     traces: Arc<Mutex<HashMap<(SessionId, SegmentId), Vec<TraceEntry>>>>,
     worker_metadata: Arc<Mutex<HashMap<String, session_store::WorkerMetadata>>>,
 }
 
 impl EphemeralSessionStore {
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_matching(&self, predicate: fn(&LogEntry) -> bool) {
+        *self.fail_next_append.lock().unwrap() = Some(predicate);
+    }
+
     fn entries_count(&self, session_id: SessionId, segment_id: SegmentId) -> usize {
         self.entries
             .lock()
@@ -1127,6 +1238,16 @@ impl Store for EphemeralSessionStore {
         segment_id: SegmentId,
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
+        #[cfg(test)]
+        {
+            let mut failure = self.fail_next_append.lock().unwrap();
+            if failure.is_some_and(|predicate| predicate(entry)) {
+                *failure = None;
+                return Err(StoreError::Io(std::io::Error::other(
+                    "injected ephemeral append failure",
+                )));
+            }
+        }
         self.entries
             .lock()
             .expect("ephemeral session store mutex poisoned")
@@ -1316,7 +1437,7 @@ pub(crate) fn test_internal_worker_session_with_greeting(
         while let Some(command) = command_rx.recv().await {
             if let InternalWorkerSessionCommand::Stop(done_tx) = command {
                 let _ = command_event_tx.send(Event::Shutdown);
-                let _ = done_tx.send(());
+                let _ = done_tx.send(Ok(()));
                 break;
             }
         }
@@ -1325,6 +1446,7 @@ pub(crate) fn test_internal_worker_session_with_greeting(
     spawn_internal_log_event_bridge(sink.clone(), event_tx.clone());
     let handle = InternalWorkerSessionHandle {
         command_tx,
+        stop_lock: Arc::new(tokio::sync::Mutex::new(())),
         status: Arc::new(std::sync::atomic::AtomicU8::new(
             InternalWorkerSessionStatus::Idle.encode(),
         )),
@@ -1347,6 +1469,8 @@ pub(crate) fn test_internal_worker_session_with_greeting(
 
 #[cfg(test)]
 mod tests {
+    mod lifecycle;
+
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

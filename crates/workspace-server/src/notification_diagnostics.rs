@@ -19,6 +19,14 @@ pub(super) fn source_resource(
         return Ok(None);
     }
     store.with_conn(|conn| {
+        let lifecycle: Option<(String, String)> = conn.query_row(
+            "SELECT json_extract(facts_json,'$.child.runtime_id'),json_extract(facts_json,'$.child.worker_id') FROM notification_sources WHERE workspace_id=?1 AND input_event_id=?2 AND role='worker_lifecycle'",
+            params![workspace,source_event_id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        if let Some((runtime_id, worker_id)) = lifecycle {
+            let resource = PermissionResource::Worker { runtime_id, worker_id };
+            return Ok(resource.validate().is_ok().then_some(resource));
+        }
         // Read selectors only, not facts_json, requests, rendered content or Job
         // results. Legacy arbitrary delivery IDs are retained as input_event_id;
         // neither their spelling nor a caller's Job filter establishes ownership.
