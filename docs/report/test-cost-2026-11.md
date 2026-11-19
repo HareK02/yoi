@@ -1,6 +1,6 @@
 # T-871: 全体時間分布とテスト責務の見直し
 
-通常Rustの初回8,039名を計測し、保存形式の履歴組合せを純粋な判定と実DB接続へ分離した。追加で実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。専用Workdirで8,045名を再照合し、修正targetの再実行を合わせて7,999成功・46既存ignored、欠落・重複0を確認した。Web実browser計32ファイルも成功。ただし単一の最終ソースを通常runnerで一度に完走した記録ではなく、restore/checkpoint用の固定fixture不整合など未解消項目が残る。全体完了とはせず、最新の採否・検証範囲は末尾「専用Workdirでの継続検証」に記録する。
+通常Rustの初回8,039名を計測し、保存形式の履歴組合せを純粋な判定と実DB接続へ分離した。追加で実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。専用Workdirで8,045名を再照合し、修正targetの再実行を合わせて7,999成功・46既存ignored、欠落・重複0を確認した。Web実browser計32ファイルも成功。ただし単一の最終ソースを通常runnerで一度に完走した記録ではなく、restore/checkpoint用の固定fixture不整合など未解消項目が残る。全体完了とはせず、最新の採否・検証範囲は末尾の継続検証・fixture再生成の節に記録する。
 
 ## 計測条件と範囲
 
@@ -266,3 +266,20 @@ cargo test --workspace --exclude yoi-e2e --doc --no-fail-fast
 - 明示E2Eの内部phase計測、残るignored/live APIとmanual review入口、通常runnerによる単一最終ソースでの完走は未完。doctestは新cloneの内部compile込みで180秒を超えた点も別に扱う。
 
 今回の証拠は専用Workdir `target/t871-final/`（build結果、inventory/tasks、各case JSON/stdout/stderr、coverage、候補比較、最終Journal97件照合、Web/UX/check/fmt/docログ）と `target/t871-browser/`（全入口inventory、file別command・時間・結果、初回/最終ログ）。`measure.ts` / `resume.ts` / `aggregate.ts` / `journal-final.ts` / `journal-split.ts` / `verify.ts`は計測・照合手順を保持する。最初の失敗・中断・不採用候補も残す。T-871はopenのままで、push/deploy・元環境の変更はない。
+
+## 現行ソースからのfixture再生成と次の阻害
+
+ユーザーの再生成指示を受け、通常テストからは実行されない明示取得exampleを追加した。`e40316bac9507fc772a8f960fe58da7bb71104bd`のclean tracked sourceを生成元として、featureless製品3種を`target/e2e-products`へ別Cargo invocationでbuildし、隔離Server/Runtime・実Codex OAuth (`codex-oauth/gpt-6.1-sol`) の人工会話2往復から`tests/e2e/fixtures/worker-codex-v2`を取得した。上の「生成していない」はこの再生成以前の状況である。
+
+生成は公開APIのWorker作成・入力・停止と実WS snapshotを用い、停止・shutdown後に型付きoffline抽出した。live/offlineの会話4行、元Session bytes/hash、生成元commit、asset size/hashを照合。会話内容、system promptが公開定型文のみであること、Workdirが空であることも確認した。取得元Runtime/Server shutdownとroot cleanupは全て成功。稼働Workspaceや保存DBは使用せず、認証情報・元Worker metadata・実行grantをfixtureへ保存していない。認証は取得processだけに明示し、restore testへは渡していない。
+
+取得過程では公開createのRunAccepted契約、usageと会話行の分離、失敗runの検出に追従した。さらに抽出器が現行writerを拒否する2点を修正した:
+
+- Workdir公開定型句の`authorization`を秘密値と誤検出。完全一致する既知の1文だけを検査上除外し、他の同語・Bearer/token/URL/host path等の拒否は維持する。Session bytesは一切書換えない。
+- `worker.protected_inputs.v1`の空checkpointを未対応として拒否。`{"version":1,"kinds":[]}`だけを受け入れ、保護対象あり・未知field・未知versionは拒否する。抽出・installのbytes保持を検証した。
+
+fixture-support回帰は15成功・既存1 ignored、実行1.93秒（build別）。診断には型・位置・typed record kindだけを出し、private payloadやserdeの値引用を出さない。再生成失敗ログも`target/t871-acquisition/acquire-{1..8}.*`に残し、成功は`acquire-9.*`。秘密値は記録しない。
+
+新候補を明示したfeatureless `worker_restore` targetは **1成功（seed projection）・4失敗**、実行45.04秒（事前build別）。2件は直接restore HTTP 403、2件はresponse-loss relayのupstream non-200で停止した。fixture整合性チェックとoffline installは通ったが、復元成功ではない。コード照合では、旧`seed_fixed_worker`はcatalog/reservationだけを作り、現行restoreが`subject_authorization::validate_bound_worker`で要求する実行権限を作っていない。実際のHTTP error bodyは秘密保護のため収集しておらず、認可拒否の具体的reasonとの照合は未実施。5つの隔離環境のcleanup成功・root不存在を確認した。
+
+新候補は保存するが標準fixtureはまだ切替えない。次は新規の隔離seedに現行の正規実行権限を整合させ、認可を迂回せず4 restoreケースと7 checkpointケースを再検証する。checkpoint候補実行、phase別計測、通常runnerの最終単一ソース完走は引き続き未完。T-871全体完了や全E2E成功は主張しない。
