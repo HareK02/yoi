@@ -1,6 +1,6 @@
 # T-871: 全体時間分布とテスト責務の見直し
 
-通常Rustの初回8,039名を計測し、保存形式の履歴組合せを純粋な判定と実DB接続へ分離した。追加で実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。第二弾時点の8,045名の結果は全inventoryと照合済み。第三弾でcleanupを約91%短縮し、E2Eのcompile障害を修正して実製品processの計測も進めた。ただしJournal再openの不安定な失敗、browserの契約不整合、外部供給fixtureを必要とする未実行部分が残るため、全体成功・全体最適化完了とはしない。
+通常Rustの初回8,039名を計測し、保存形式の履歴組合せを純粋な判定と実DB接続へ分離した。追加で実SQLite Busyの待機、未使用のWasmコンパイル、移行dry-runの反復、Job cleanupの過大fixtureを削減した。専用Workdirで8,045名を再照合し、修正targetの再実行を合わせて7,999成功・46既存ignored、欠落・重複0を確認した。Web実browser計32ファイルも成功。ただし単一の最終ソースを通常runnerで一度に完走した記録ではなく、restore/checkpoint用の固定fixture不整合など未解消項目が残る。全体完了とはせず、最新の採否・検証範囲は末尾「専用Workdirでの継続検証」に記録する。
 
 ## 計測条件と範囲
 
@@ -47,7 +47,7 @@
 
 本番のreceipt識別、122/123のprefix照合、tail照合、残りのplan構築をprivateな純粋関数へ分離した。通常のDB受入れは引き続き物理schema・dataを検査し、その後にplanを作る。保存schema、migration SQL、履歴名は変更していない。
 
-81通りの履歴はDBなしで識別・途中のtail・残りのplanを検証する。欠落、重複、改名、混在、順序不正の負例を追加した。実SQLiteの移行・保存値保持・close/reopenは14種類全ての物理schemaで維持する。元receiptのversion/nameだけでなく `applied_at` も保持を確認する。
+81通りの履歴はDBなしで識別・途中のtail・残りのplanを検証する。欠落、重複、改名、混在、順序不正の負例を追加した。実SQLiteの移行・保存値保持・close/reopenは14種類全ての物理schemaで維持する。元receiptのversion/nameだけでなく `applied_at` も保持を確認する。これは81入力全てを本番の物理検査・SQL移行へ通したことと同値ではない。論理判定と物理接続の責務を分離し、代表以外の履歴と物理移行の相互作用を総当たりする保証は縮小している。
 
 独立した読み取りレビューで、全代表をbaseline113にすると曖昧なbaseline114から非先頭のshapeを選んだ後の移行が未検証になると指摘された。Removal/1とJobs/1はbaseline114から移行する代表に変更した。名前付き履歴の保持は残る代表が担当する。全81経路の結合を復活させずに、この接続固有の故障を検出する。
 
@@ -195,3 +195,74 @@ feature限定store fixtureは9/9成功（5.79秒）。最初に公開re-export�
 全体の残存失敗と未計測部分を解消する前にT-871を完了とはしない。push/deploy・稼働service/DB変更は実施していない。
 
 主要証拠はTicket T-871とWorkdirの`target/t871-parent/`、`target/t871-busy/`、`target/t871-runtime/`に保持。移行の故障検出対応表は`target/t871-migration/optimized-handoff.md`。target配下は再利用可能なローカル調査資料であり、製品の正本や恒久APIではない。
+
+## 専用Workdirでの継続検証
+
+旧Workdirの上記ログはそのまま保持し、継続作業は専用Workdir `001a1f18c4e8c000003`（alias `t871`）、branch `work/t871-test-cost`へ分離した。今回の開始HEADは`24690e2bf`、採用コード最終HEADは`eb9bae58f`。`yoi-origin`への書込み・切替・build・稼働サービス操作はしていない。
+
+### 通常Rustの再照合と残った環境依存
+
+専用cloneはtargetなしで開始。通常workspace test buildは486秒で成功し、実行時間とは別記した。Rust 1.95.0 / Deno 2.7.14 / Linux 24論理CPU。Wasm compile用に既定devshellのlld 21.1.8をPATHへ追加した。通常runnerと同じCargo選択・列挙・隔離・process回収を再利用し、JSON report-timeは実行processだけで有効化した。8 top-level並列、Server/Worker/Runtimeはprocess内1 thread。
+
+- 131 binary / 8,045名 / 394区分。既存`17f2747a7`のServer 16件/区分が適用され、Server lib147区分＋binary1区分は全成功、最長148.47秒。今回の採用区分に180秒timeoutはない。
+- 外側Toolが600秒で停止したため、完了JSONのない区分だけを最大24区分のbatchで再実行した。最初の未完ログは残し、完了結果をexact binary/test名で照合した。単一invocationのwall timeや通常runner全体の成功とは呼ばない。
+- 初回照合は7,997成功・46 ignored・2失敗。両失敗は長い専用checkout配下でcleanup testのUnix socket bindが`SUN_LEN`を超えたもの。
+- `a449bac5d`でLinux test fixtureだけ、所有parent directoryのFDを経由した短い`/proc/self/fd/...`名でbindする。実socketは従来と同じWorkdir内に作られ、FIFO/socketの置換検出・非open/nonconnect・unlink・再試行のassertionを維持。process cwdや製品cleanupは変えない。
+- 修正後Runtime lib690件は267.60秒で全成功。前回`24690e2bf`のsnapshot境界caseも成功。Runtime libだけを新結果へ置換した照合は**7,999成功・46既存ignored、欠落・余剰・重複0**。元の2失敗ログは消していない。
+
+### 追加最適化候補の採否
+
+どちらも同じ通常workspace test profile、単独process・1 test threadで前後各2回。専用の無負荷機ではない。buildは別invocationであり表の時間に含めない。
+
+| 候補 | 変更前 process秒 | 候補 process秒 | 採否 |
+|---|---:|---:|---|
+| retained Job seed書込みを1 transactionへ | 93.50 / 87.01 | 97.86 / 86.31 | 明確な改善なし。不採用、コードを復元 |
+| Journal fresh API初期化に既存PreparedFixtureを使用 | 82.80 / 81.10 | 79.48 / 79.69 | 採用。平均81.95→79.58秒、約2.9%の小幅短縮 |
+
+retained Jobの64経路はそのまま残した。物理DDL・raw content capture・receipt・retirement・reopenが対象で、履歴の識別表だけとみなせない。既にversion別の空DB templateがあり、ゼロからのfixture構築を重複実装する案も採用しない。今回のseed transaction候補のパッチと測定ログはローカル証拠として残す。
+
+Journalは`e8b7edcb3`。新規DBにだけ既存の検証済みpristine schemaを独立copyし、追加接続の重複schema検査を省く。既存DBのrestartはStartup経路のまま。native Host ownership fence、実SQLite、署名付きHTTP、Runtime、Session、Job cleanupを残す。UTF-8入力、48KiB capture境界、128KiB envelope上限、多Session/fork/Job数、全range/hash assertionは削減していない。単体のdecodeだけではこの接続と永続効果を検証できない。
+
+採用候補の最終build後、Journal全97名を照合して全成功、欠落・重複0。最初の独自診断グループ（名前順8件）は1区分が180秒を超え、94件のterminal結果に留まった。その8名全てを4名ずつへ分け、103.94/114.67秒で成功した。最初のtimeoutは保持しており、これは通常runnerの分散配置147区分とは異なる診断グループである。全体の8,045名照合はJournal追加変更前、97件の再検証は追加変更後である。
+
+### Browserの共有buildと最終検証
+
+`tools/web-ux/browser-tests/run.ts`はsuite開始時に一度buildし、各caseは独立HTTP/browser状態を所有する。`eb9bae58f`ではSubject deletionの独自buildも既存`productionBuild` helperへ接続した。明示build未供給の単独実行では従来どおりbuildし、供給時も`index.html`を検査する。test成功をcacheしない。
+
+調査Subworker用に一時追加したartifact出力先override/helperは採用せず、元の出力先へ戻してから全32fileを再実行した。製品parser・fixture応答・selector・assertionを緩めていない。
+
+| 最終選択 | 結果 | 時間・境界 |
+|---|---|---|
+| UX browser15file | 49成功＋10 steps | build4.59秒、Deno test表示3m29s。実Chromium |
+| Web明示browser17file | 26成功＋317 steps | file別process合計239.42秒、既存build再利用、追加buildなし |
+| Web unit | 897成功 | Deno表示7秒、内部schema生成/buildとは別 |
+| Web component | 870成功 | Vitest10.60秒。実Chromiumとは別 |
+| UX unit / 検証tool | 26成功 / 26成功 | 既存の通常入口 |
+| doctest | 9成功・21既存ignored | 221.88秒、内部compile込み。通常runnerの180秒以内という証拠ではない |
+| root cargo check / Rust fmt / diff / 状態契約命名 | 成功 | check122秒、命名635行/未承認0/古い例外0 |
+
+Browserはproduction shellと合成loopback HTTP/WS fixtureの接続であり、実Backend認可やDB/Runtimeの製品E2Eへ読み替えない。review scriptの`subject_navigation_review.ts`と`chat_ui_review.ts`は未実行。画像の目視レビューは行っていない（製品UIの変更なし）。CIでの実行済みを意味しない。
+
+主な再現入口:
+
+```sh
+cargo test --workspace --exclude yoi-e2e --no-run --message-format=json
+cargo test -p worker-runtime --lib -- --test-threads=1
+cargo test -p yoi-workspace-server --lib server::tests::subjektiv_journal_tests:: -- --test-threads=1
+# 上のmodule全件を一processへ集めると時間が長い。今回の診断はexact名で分割。
+(cd tools/web-ux && env -u LD_LIBRARY_PATH deno task test:browser)
+(cd web/workspace && env -u LD_LIBRARY_PATH deno task test)
+(cd web/workspace && env -u LD_LIBRARY_PATH deno task test:component)
+cargo test --workspace --exclude yoi-e2e --doc --no-fail-fast
+```
+
+### restore/checkpointの具体的な阻害と残件
+
+固定資産`tests/e2e/fixtures/worker-codex-v1`は存在する。「環境変数未設定でfixtureがない」だけではない。manifestの生成元`1639be98411921308238b3a6a6e75c784c045156`に対して、現行`resources`と`crates/builtin-source`は異なり、`job.dcdl`等の参照を現在の資源へ黙って置き換えることを検証器が拒否している。Git差分を確認した。
+
+- 適合する固定fixtureの供給・更新が必要。古いSessionの生成元commitだけの書換え、hashの再計算による出自の偽装、検証skipは行わない。
+- 既存Sessionを保持したfrozen-reference形式を追加するなら、別途形式と参照閉包の完全性・実際の評価入力を設計/検証する必要がある。今回の速度改善としてガードを削らない。
+- restore通常4件とcheckpoint7件は、この制約を解消した最終実行が未完。以前の部分E2E結果、seed projection成功、通常Rust全名照合では代替しない。実credential・稼働データ・外部モデルを借りてfixtureを生成していない。
+- 明示E2Eの内部phase計測、残るignored/live APIとmanual review入口、通常runnerによる単一最終ソースでの完走は未完。doctestは新cloneの内部compile込みで180秒を超えた点も別に扱う。
+
+今回の証拠は専用Workdir `target/t871-final/`（build結果、inventory/tasks、各case JSON/stdout/stderr、coverage、候補比較、最終Journal97件照合、Web/UX/check/fmt/docログ）と `target/t871-browser/`（全入口inventory、file別command・時間・結果、初回/最終ログ）。`measure.ts` / `resume.ts` / `aggregate.ts` / `journal-final.ts` / `journal-split.ts` / `verify.ts`は計測・照合手順を保持する。最初の失敗・中断・不採用候補も残す。T-871はopenのままで、push/deploy・元環境の変更はない。
