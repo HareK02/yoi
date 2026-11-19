@@ -87,7 +87,7 @@ impl Fixture {
                 }
             })
             .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker-codex-v1")
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker-codex-v2")
             });
         Self::load_from(root)
     }

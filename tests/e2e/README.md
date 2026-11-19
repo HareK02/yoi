@@ -48,7 +48,7 @@ YOI_E2E_RESTORE_FIXTURE=target/fixture-candidate-v1 \
   cargo test -p yoi-e2e --features e2e,fixture-support --test worker_restore
 ```
 
-標準資産は`tests/e2e/fixtures/worker-codex-v1`の`manifest.json`・`worker-template.json`・`expected.json`・`workspace-config.dcdl`。manifestの各asset hash/size、schemaと固定ID、生成元commit、modelを検証する。Workspace configのimport参照を黙って最新へ置換せず、Gitで生成元commitに対する`resources`と`crates/builtin-source`の一致を確認する（Git履歴がない場合も失敗）。移植したSessionの正規公開projectionを供給された会話行と照合し、その全snapshotを実executionのWebSocketと比較する。欠落fixture・hash不一致・未実行は成功扱いしない。
+標準資産は`tests/e2e/fixtures/worker-codex-v2`の`manifest.json`・`worker-template.json`・`expected.json`・`workspace-config.dcdl`。manifestの各asset hash/size、schemaと固定ID、生成元commit、modelを検証する。Workspace configのimport参照を黙って最新へ置換せず、Gitで生成元commitに対する`resources`と`crates/builtin-source`の一致を確認する（Git履歴がない場合も失敗）。移植したSessionの正規公開projectionを供給された会話行と照合し、その全snapshotを実executionのWebSocketと比較する。欠落fixture・hash不一致・未実行は成功扱いしない。
 
 応答喪失ケースは同じ`WorkerE2eEnvironment`内の単発loopback relayで公開restore要求をそのまま転送し、完全なupstream応答を受け取った後に呼出元へ0byteで切断する。呼出元のtransport失敗とrelay側のAccepted観測は別の事実として記録する。回収は元のrequest ID・観測tokenをそのまま使い、fresh intentへの古いtokenはHTTP409を要求する。
 

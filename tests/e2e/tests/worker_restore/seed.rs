@@ -344,7 +344,7 @@ fn bootstrap(
             request_fingerprint: "restore-e2e-bootstrap".into(),
             workspace: WorkspaceRecord {
                 workspace_id: fixture.manifest.workspace_id.clone(),
-                owner_account_id: account_id,
+                owner_account_id: account_id.clone(),
                 display_name: "Restore E2E".into(),
                 state: "active".into(),
                 created_at: now.clone(),
@@ -379,6 +379,9 @@ fn bootstrap(
 
     let schema = support(
         WorkspaceConfigSchemaRegistry::default()
+            .with_provider(Arc::new(
+                yoi_workspace_server::policy_config::PermissionConfigSchemaProvider,
+            ))
             .with_provider(Arc::new(ProfileConfigSchemaProvider))
             .with_provider(Arc::new(
                 yoi_workspace_server::prompt_settings::PromptConfigSchemaProvider,
@@ -474,6 +477,7 @@ fn bootstrap(
         &store,
         FixedWorkerSeed {
             workspace_id: &fixture.manifest.workspace_id,
+            owner_account_id: account_id,
             runtime_id: &fixture.manifest.runtime_id,
             worker_id: support(fixture.manifest.worker_id.parse())?,
             allocation_key: "restore-e2e-worker",
