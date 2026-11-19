@@ -1,5 +1,5 @@
-import { productionBuild } from "./production_build.ts";
 /// <reference lib="dom" />
+import { productionBuild } from "./production_build.ts";
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
 import { chromium } from "playwright";
