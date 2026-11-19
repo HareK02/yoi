@@ -88,21 +88,25 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
           await page.goto("http://127.0.0.1:15379/?fixture=admin-on");
           await page.getByRole("heading", { name: "Yoi", exact: true })
             .waitFor();
-          if (
-            await page.getByRole("button", {
-              name: "Show sidebar",
-              exact: true,
-            }).isVisible()
-          ) {
-            await page.getByRole("button", {
-              name: "Show sidebar",
-              exact: true,
-            }).click();
-          }
-          const nav = page.getByRole("navigation", { name: "Your account" });
+          // Account navigation belongs to main, not the sidebar. Opening the
+          // mobile sidebar makes main inert and correctly prevents its focus.
+          const nav = page.getByRole("main").getByRole("navigation", {
+            name: "Your account",
+          });
           await nav.getByRole("link", { name: "Hosting settings", exact: true })
             .waitFor();
-          await nav.getByRole("link", { name: "Account", exact: true }).focus();
+          const account = nav.getByRole("link", {
+            name: "Account",
+            exact: true,
+          });
+          await account.focus();
+          assertEquals(
+            await account.evaluate((element) =>
+              element === document.activeElement
+            ),
+            true,
+            `${theme}/${width}: Account must receive focus before Tab`,
+          );
           await page.keyboard.press("Tab");
           assertEquals(
             await page.locator(":focus").innerText(),
@@ -283,8 +287,23 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
               ],
             ]
           ) {
+            // Loading UI precedes the async session/access checks. Wait until
+            // the intended pending request starts before changing the fixture
+            // cookie on the next navigation; otherwise it can see that persona.
+            const pendingPath = mode === "admin-loading"
+              ? "/api/hosting/settings"
+              : mode === "account-loading"
+              ? "/api/auth/registration-policy"
+              : null;
+            const pendingRequest = pendingPath
+              ? page.waitForRequest((request) =>
+                request.method() === "GET" &&
+                new URL(request.url()).pathname === pendingPath
+              )
+              : null;
             await page.goto(`http://127.0.0.1:15379${path}?fixture=${mode}`);
             await page.locator(ready).waitFor();
+            if (pendingRequest) await pendingRequest;
             await noOverflow(page);
           }
           // 遷移でidentity/settingsの読み取りや遅延font取得がbrowserに取消されることはある。

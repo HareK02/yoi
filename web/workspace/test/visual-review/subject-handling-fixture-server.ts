@@ -16,22 +16,30 @@ const subject = (id: string, state = "active") => ({
   updated_at: "2026-01-01T00:00:00Z",
   current_worker: null,
 });
-function project(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(project);
+function project(value: unknown, legacy: boolean): unknown {
+  if (Array.isArray(value)) return value.map((item) => project(item, legacy));
   if (value && typeof value === "object") {
     const item = value as Record<string, unknown>;
     if (
-      item.kind === "workspace_agent" &&
-      item.agent_key === "workspace-orchestrator"
-    ) return { kind: "subject", subject_id: "subject-a" };
+      (item.kind === "subject" && item.subject_id === "subject-fixture") ||
+      (item.kind === "workspace_agent" &&
+        item.agent_key === "workspace-orchestrator")
+    ) {
+      // Own both personas explicitly, independent of the shared fixture's
+      // current principal. Historical assets also require the legacy shape.
+      return legacy
+        ? { kind: "workspace_agent", agent_key: "workspace-orchestrator" }
+        : { kind: "subject", subject_id: "subject-a" };
+    }
     return Object.fromEntries(
-      Object.entries(item).map(([key, value]) => [key, project(value)]),
+      Object.entries(item).map(([key, value]) => [key, project(value, legacy)]),
     );
   }
   return value;
 }
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
+  const legacy = baseline || url.pathname.includes("tickets-legacy");
   if (
     url.pathname.endsWith("/protocol/ws") &&
     request.headers.get("upgrade") === "websocket"
@@ -128,7 +136,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         ].map((key) => [key, item[key]]),
       )
     );
-    return Response.json(baseline ? data : project(data));
+    return Response.json(project(data, legacy));
   }
   const response = await fetch(new URL(url.pathname + url.search, upstream), {
     method: request.method,
@@ -144,11 +152,10 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     return Response.json(value);
   }
   if (
-    !baseline && !url.pathname.includes("tickets-legacy") &&
     /(?:\/api\/w|\/workspaces)\/[^/]+\/tickets/.test(url.pathname) &&
     response.headers.get("content-type")?.includes("application/json")
   ) {
-    return Response.json(project(await response.json()), {
+    return Response.json(project(await response.json(), legacy), {
       status: response.status,
     });
   }
