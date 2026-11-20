@@ -412,6 +412,7 @@ impl TicketFeatureConfigPartial {
 #[serde(default, deny_unknown_fields)]
 #[derive(config_schema_derive::ConfigSchema)]
 pub struct MergeRequestFeatureConfigPartial {
+    pub query: Option<bool>,
     pub show: Option<bool>,
     pub open: Option<bool>,
     pub review: Option<bool>,
@@ -422,6 +423,7 @@ pub struct MergeRequestFeatureConfigPartial {
 impl MergeRequestFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
+            query: other.query.or(self.query),
             show: other.show.or(self.show),
             open: other.open.or(self.open),
             review: other.review.or(self.review),
@@ -660,6 +662,7 @@ impl From<TicketFeatureConfig> for TicketFeatureConfigPartial {
 impl From<MergeRequestFeatureConfigPartial> for MergeRequestFeatureConfig {
     fn from(value: MergeRequestFeatureConfigPartial) -> Self {
         Self {
+            query: value.query.unwrap_or_default(),
             show: value.show.unwrap_or_default(),
             open: value.open.unwrap_or_default(),
             review: value.review.unwrap_or_default(),
@@ -672,6 +675,7 @@ impl From<MergeRequestFeatureConfigPartial> for MergeRequestFeatureConfig {
 impl From<MergeRequestFeatureConfig> for MergeRequestFeatureConfigPartial {
     fn from(value: MergeRequestFeatureConfig) -> Self {
         Self {
+            query: Some(value.query),
             show: Some(value.show),
             open: Some(value.open),
             review: Some(value.review),
@@ -2823,6 +2827,11 @@ enabled = true
         let set_only: MergeRequestFeatureConfig = toml::from_str("worker_set = true").unwrap();
         assert!(set_only.worker_set && set_only.any());
         assert!(!set_only.show);
+        let query_only: MergeRequestFeatureConfig = toml::from_str("query = true").unwrap();
+        assert!(query_only.query && query_only.any());
+        assert!(!query_only.show);
+        let partial = MergeRequestFeatureConfigPartial::from(query_only);
+        assert_eq!(MergeRequestFeatureConfig::from(partial), query_only);
     }
 
     #[test]

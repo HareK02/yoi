@@ -92,6 +92,21 @@ pub(super) fn value(
     let mut tickets = BTreeSet::new();
     let mut merge_requests = BTreeSet::new();
     match kind {
+        Kind::Query => {
+            if let Some(items) = data.get("items").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(id) = item
+                        .pointer("/summary/merge_request_id")
+                        .and_then(Value::as_str)
+                    {
+                        merge_requests.insert(id.into());
+                    }
+                    if let Some(ids) = item.get("ticket_ids").and_then(Value::as_array) {
+                        tickets.extend(ids.iter().filter_map(Value::as_str).map(str::to_string));
+                    }
+                }
+            }
+        }
         Kind::Open | Kind::Show => {
             if let Some(ids) = data.get("ticket_ids").and_then(Value::as_array) {
                 tickets.extend(ids.iter().filter_map(Value::as_str).map(str::to_string));
@@ -121,7 +136,7 @@ pub(super) fn value(
         Kind::WorkerSet | Kind::Comment => {}
     }
     json_to_wip(&json!({
-        "entry": format!("{collection}/{subject}"),
+        "entry": if kind == Kind::Query { collection.to_owned() } else { format!("{collection}/{subject}") },
         "data": data,
         "links": {
             "tickets": tickets.iter().map(|id| reference(id, ticket_root, ticket_reference(id))).collect::<Vec<_>>(),

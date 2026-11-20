@@ -14,7 +14,7 @@ import "./base.dcdl" // {
         worker = { enabled = true; direct_spawn = false; };
         workspace_worker_discovery = { enabled = true; };
         manage_workdir = { enabled = true; };
-        merge_request = { show = true; worker_set = true; comment = true; };
+        merge_request = { query = true; show = true; worker_set = true; comment = true; };
         ticket = { enabled = true; authoring = true; thread = true; };
     };
 }

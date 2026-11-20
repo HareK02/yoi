@@ -492,6 +492,8 @@ fn same_source_snapshot(
 
 #[derive(Clone, Debug, Default)]
 pub struct MergeRequestListQuery {
+    pub phase: Option<MergeRequestPhase>,
+    pub assigned_worker: Option<WorkerIdentity>,
     pub state: Option<MergeRequestStateFilter>,
     pub repository_id: Option<String>,
     pub ticket_id: Option<String>,
@@ -1516,7 +1518,36 @@ impl MergeRequestStore {
     ) -> Result<MergeRequestListPage, MergeRequestError> {
         let c = self.lock()?;
         let limit = query.limit.clamp(1, 100);
+        let state = query.state.map(MergeRequestStateFilter::as_str);
+        let phase = query.phase.map(|phase| match phase {
+            MergeRequestPhase::Implementation => "implementation",
+            MergeRequestPhase::Integration => "integration",
+            MergeRequestPhase::Completed => "completed",
+            MergeRequestPhase::Canceled => "canceled",
+        });
+        let target = query
+            .selector_to
+            .as_deref()
+            .map(|target| target.strip_prefix("refs/heads/").unwrap_or(target));
+        let filters = serde_json::json!([
+            state,
+            phase,
+            query.repository_id,
+            query.selector_from,
+            target,
+            query.ticket_id,
+            query.assigned_worker
+        ]);
         let cursor_position = match query.cursor.as_deref() {
+            Some(cursor) if cursor.starts_with("mr-page:") => {
+                let (workspace, saved_filters, updated, id): (String, serde_json::Value, String, String) = serde_json::from_str(&cursor[8..])
+                    .map_err(|_| MergeRequestError::Validation("invalid merge request cursor".into()))?;
+                if workspace != workspace_id || saved_filters != filters || updated.is_empty() || id.is_empty() {
+                    return Err(MergeRequestError::Validation("merge request cursor does not match Workspace/filters".into()));
+                }
+                Some((updated, id))
+            }
+            // Compatibility for callers retaining an older ID cursor; new pages freeze the position.
             Some(cursor) => Some(
                 c.query_row(
                     "SELECT updated_at,merge_request_id FROM merge_requests WHERE workspace_id=?1 AND merge_request_id=?2",
@@ -1532,15 +1563,14 @@ impl MergeRequestStore {
             .as_ref()
             .map(|(updated_at, _)| updated_at.as_str());
         let cursor_id = cursor_position.as_ref().map(|(_, id)| id.as_str());
-        let state = query.state.map(MergeRequestStateFilter::as_str);
         let mut statement = c.prepare(
-            "SELECT mr.merge_request_id
+            "SELECT mr.merge_request_id,mr.updated_at
              FROM merge_requests mr
              WHERE mr.workspace_id=?1
                AND (?2 IS NULL OR CASE json_extract(mr.state,'$.kind') WHEN 'implementation' THEN 'open' WHEN 'integration' THEN 'open' WHEN 'completed' THEN 'merged' WHEN 'canceled' THEN 'closed' END=?2)
                AND (?3 IS NULL OR mr.repository_id=?3)
                AND (?4 IS NULL OR mr.selector_from=?4)
-               AND (?5 IS NULL OR mr.selector_to=?5)
+               AND (?5 IS NULL OR CASE WHEN substr(mr.selector_to,1,11)='refs/heads/' THEN substr(mr.selector_to,12) ELSE mr.selector_to END=?5)
                AND (?6 IS NULL OR EXISTS (
                     SELECT 1 FROM merge_request_ticket_relations relation
                     WHERE relation.workspace_id=mr.workspace_id
@@ -1548,6 +1578,16 @@ impl MergeRequestStore {
                       AND relation.ticket_id=?6
                ))
                AND (?7 IS NULL OR mr.updated_at<?7 OR (mr.updated_at=?7 AND mr.merge_request_id>?8))
+               AND (?10 IS NULL OR json_extract(mr.state,'$.kind')=?10)
+               AND (?11 IS NULL OR EXISTS (
+                    SELECT 1 FROM merge_request_thread_events assignment
+                    WHERE assignment.workspace_id=mr.workspace_id AND assignment.merge_request_id=mr.merge_request_id
+                      AND assignment.kind='worker_assigned'
+                      AND assignment.sequence=(SELECT MAX(latest.sequence) FROM merge_request_thread_events latest
+                          WHERE latest.workspace_id=mr.workspace_id AND latest.merge_request_id=mr.merge_request_id AND latest.kind='worker_assigned')
+                      AND json_extract(assignment.payload_json,'$.worker.runtime_id')=?11
+                      AND json_extract(assignment.payload_json,'$.worker.worker_id')=?12
+               ))
              ORDER BY mr.updated_at DESC,mr.merge_request_id ASC
              LIMIT ?9",
         )?;
@@ -1557,21 +1597,36 @@ impl MergeRequestStore {
                 state,
                 query.repository_id.as_deref(),
                 query.selector_from.as_deref(),
-                query.selector_to.as_deref(),
+                target,
                 query.ticket_id.as_deref(),
                 cursor_updated_at,
                 cursor_id,
                 (limit + 1) as i64,
+                phase,
+                query
+                    .assigned_worker
+                    .as_ref()
+                    .map(|w| w.runtime_id.as_str()),
+                query.assigned_worker.as_ref().map(|w| w.worker_id.as_str()),
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?;
         let mut ids = rows.collect::<Result<Vec<_>, _>>()?;
         let has_more = ids.len() > limit;
         ids.truncate(limit);
-        let next_cursor = has_more.then(|| ids.last().cloned()).flatten();
+        let next_cursor = if has_more {
+            ids.last().map(|(id, updated)| {
+                format!(
+                    "mr-page:{}",
+                    serde_json::json!([workspace_id, filters, updated, id])
+                )
+            })
+        } else {
+            None
+        };
         let items = ids
             .iter()
-            .map(|id| load_mr(&c, workspace_id, id)?.ok_or(MergeRequestError::NotFound))
+            .map(|(id, _)| load_mr(&c, workspace_id, id)?.ok_or(MergeRequestError::NotFound))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(MergeRequestListPage { items, next_cursor })
     }

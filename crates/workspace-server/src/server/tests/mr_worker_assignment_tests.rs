@@ -269,3 +269,170 @@ async fn mr_worker_http_assignment_requires_permission_and_preserves_cas_history
         observed
     );
 }
+
+#[tokio::test]
+async fn mr_query_http_checks_collection_and_item_permissions_and_authenticated_self() {
+    let f = Fixture::new().await;
+    let repository_id = f
+        .api
+        .store
+        .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+        .unwrap()
+        .unwrap()
+        .repository_id;
+    let ticket = browser_ticket_backend(&f.api)
+        .unwrap()
+        .create(NewTicket::new("query target"))
+        .unwrap()
+        .id;
+    let initial = Arc::new(InitialMrAuthority(
+        merge_request::CurrentAssignment {
+            assignment_id: "initial-query".into(),
+            ticket_id: ticket.clone(),
+            runtime_id: f.source.runtime_id.clone(),
+            worker_id: f.source.worker_id.clone(),
+        },
+        repository_id.clone(),
+    ));
+    let store = merge_request::MergeRequestStore::open(
+        &f.api.config.database_path,
+        initial.clone(),
+        initial,
+    )
+    .unwrap();
+    store
+        .open_merge_request(merge_request::OpenMergeRequest {
+            merge_request_id: "query-mr".into(),
+            ticket_id: ticket.clone(),
+            repository_id: repository_id.clone(),
+            selector_from: "work/query".into(),
+            selector_to: "refs/heads/develop".into(),
+            summary: String::new(),
+            auth: merge_request::MergeRequestAuth {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                repository_id,
+                runtime_id: f.source.runtime_id.clone(),
+                worker_id: f.source.worker_id.clone(),
+                assignment_id: "initial-query".into(),
+            },
+            now: Utc::now(),
+        })
+        .unwrap();
+    let path = format!(
+        "/api/w/{TEST_WORKSPACE_ID}/merge-requests?repository_key=test-repository&selector_to=develop&phase=implementation&assigned_to_self=true&limit=1"
+    );
+    let send = |path: &str| {
+        runtime_source_request(&f.identity, Some(&f.source.worker_id), "GET", path, vec![])
+    };
+    let query_permission = ScopedPermission {
+        operation: "merge_request.query".into(),
+        resource: PermissionResource::Workspace {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        },
+    };
+    let read_permission = ScopedPermission {
+        operation: "merge_request.read".into(),
+        resource: PermissionResource::MergeRequest {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            merge_request_id: "query-mr".into(),
+        },
+    };
+    f.seed_saved_policy(vec![read_permission.clone()], vec![]);
+    let (status, _) = response(&f.api, send(&path)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "item read is not collection query"
+    );
+    f.seed_saved_policy(vec![query_permission.clone()], vec![]);
+    let (status, denied) = response(&f.api, send(&path)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "query is not item read: {denied}"
+    );
+    assert!(denied.get("items").is_none());
+    f.seed_saved_policy(vec![query_permission, read_permission], vec![]);
+    let (status, result) = response(&f.api, send(&path)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["items"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["items"][0]["summary"]["merge_request_id"],
+        "query-mr"
+    );
+    assert!(result["next_cursor"].is_null());
+    for (suffix, expected) in [
+        ("&phase=bogus", StatusCode::BAD_REQUEST),
+        ("&limit=0", StatusCode::BAD_REQUEST),
+    ] {
+        // Invalid values are tested without duplicate query keys.
+        let invalid = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests?{}", &suffix[1..]);
+        let (status, _) = response(&f.api, send(&invalid)).await;
+        assert!(
+            status == expected || status == StatusCode::UNPROCESSABLE_ENTITY,
+            "{invalid}: {status}"
+        );
+    }
+    let (status, empty) = response(
+        &f.api,
+        send(&path.replace("phase=implementation", "phase=integration")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert!(empty["items"].as_array().unwrap().is_empty());
+    // Self is authenticated, never selected by query arguments or historical Ticket assignment.
+    let current = store
+        .current_worker(TEST_WORKSPACE_ID, "query-mr")
+        .unwrap()
+        .unwrap();
+    store
+        .set_worker(
+            merge_request::SetMergeRequestWorker {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                merge_request_id: "query-mr".into(),
+                operation_id: "query-release".into(),
+                expected_operation_id: Some(current.operation_id),
+                worker: None,
+                assigned_by: merge_request::WorkerIdentity {
+                    runtime_id: f.source.runtime_id.clone(),
+                    worker_id: f.source.worker_id.clone(),
+                },
+                now: Utc::now(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    let (status, empty) = response(&f.api, send(&path)).await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert!(empty["items"].as_array().unwrap().is_empty());
+    let (status, all) = response(
+        &f.api,
+        send(&path.replace("assigned_to_self=true", "assigned_to_self=false")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["items"].as_array().unwrap().len(), 1);
+    let (status, _) = response(
+        &f.api,
+        Request::builder().uri(&path).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "anonymous query is not a Worker identity"
+    );
+    let (status, _) = response(&f.api, human_request(&f.owner, "GET", &path, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "browser has no Runtime Worker self"
+    );
+    f.seed_saved_policy(vec![], vec![]);
+    let (status, _) = response(&f.api, send(&path)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "revocation is checked even on an empty filtered page"
+    );
+}

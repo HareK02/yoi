@@ -73,7 +73,8 @@ fn workflow_instruction() -> FeatureInstructionDeclaration {
     .expect("static Merge Request workflow instruction declaration is valid")
 }
 
-const ALL_KINDS: [Kind; 5] = [
+const ALL_KINDS: [Kind; 6] = [
+    Kind::Query,
     Kind::Show,
     Kind::Open,
     Kind::Review,
@@ -83,6 +84,7 @@ const ALL_KINDS: [Kind; 5] = [
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
+    Query,
     Show,
     Open,
     Review,
@@ -164,6 +166,7 @@ struct ReviewFindingInput {
 impl Kind {
     fn enabled(self, config: MergeRequestFeatureConfig) -> bool {
         match self {
+            Self::Query => config.query,
             Self::Show => config.show,
             Self::Open => config.open,
             Self::Review => config.review,
@@ -174,6 +177,7 @@ impl Kind {
 
     fn name(self) -> &'static str {
         match self {
+            Self::Query => "QueryMergeRequest",
             Self::Show => "ShowMergeRequest",
             Self::Open => "OpenMergeRequest",
             Self::Review => "ReviewMergeRequest",
@@ -183,6 +187,7 @@ impl Kind {
     }
     fn schema(self) -> serde_json::Value {
         match self {
+            Self::Query => json!(schemars::schema_for!(server_api::MergeRequestListQuery)),
             Self::Show => json!(schemars::schema_for!(ShowMergeRequestInput)),
             Self::WorkerSet => json!(schemars::schema_for!(SetMergeRequestWorkerInput)),
             Self::Comment => json!(schemars::schema_for!(CommentMergeRequestInput)),
@@ -365,7 +370,7 @@ fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
             surface: NativeMergeRequestSurface::Item,
             identity_field: Some("merge_request_id"),
         },
-        Kind::Open => NativeMergeRequestOperation {
+        Kind::Query | Kind::Open => NativeMergeRequestOperation {
             surface: NativeMergeRequestSurface::Collection,
             identity_field: None,
         },
@@ -446,7 +451,7 @@ pub fn mount_workspace_http_merge_request_wip(
 
     let collection_descriptor = merge_request_descriptor(
         &collection_tools,
-        "Open Merge Requests through existing scoped authority",
+        "Query and open Merge Requests through existing scoped authority",
         "Open links a Ticket Entry to a repository {key, source, target}. Collection and route-bound item objects separate creation from subject operations. Inspect v2 contracts; v1 flattened inputs are not accepted. Ticket conclusion is independent.",
     )?;
     registry.mount(WipProjection {
@@ -528,6 +533,15 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
             .ok_or_else(merge_request_operation_not_found)?;
         let namespaces = context.result_namespaces.clone();
         let response = execute_native_merge_request_tool(tool, arguments, None, context).await?;
+        if tool.kind == Kind::Query {
+            return Ok(WipOperationOutput::native(result::value(
+                tool.kind,
+                response,
+                "",
+                &self.collection_route,
+                namespaces.root("ticket"),
+            )?));
+        }
         let reference = merge_request_reference(&response)
             .filter(|reference| is_merge_request_route_reference(reference))
             .ok_or_else(|| {
@@ -848,6 +862,9 @@ fn merge_request_operation_not_found() -> WipOperationError {
 
 pub fn description(n: &str) -> Option<&'static str> {
     match n {
+        "QueryMergeRequest" => Some(
+            "Query a bounded MR collection page by repository_key, selector_to (branch shorthand or refs/heads/...), exact phase, legacy state, linked ticket_ref and source selector. phase=integration includes stale reviews, conflicts and waiting MRs, not only currently approved candidates. assigned_to_self=true matches the authenticated current MR Worker, not the Ticket assigned Subject or historical owners. Omitted/false means no assignment filter. Continue with next_cursor and unchanged filters; null next_cursor ends the listing. Query permission does not grant individual MR reads. Use ShowMergeRequest on selected results before acting. Does not assign, publish, approve, or establish execution order.",
+        ),
         "ShowMergeRequest" => Some(
             "Read an authoritative compact MR summary by default: source/target observations, full-evidence review status/readiness and stable event references, worker_assignment (operation_id and worker), and saved publications, without review bodies/history. Both summary and detail include worker_assignment and publications. worker_assignment=null means never assigned; worker=null in a retained assignment is a release that retains its operation_id. Ownership is not resource authority, Worker liveness, or Ticket assignment. Resume implementation or integration from the saved MR phase, current worker, source, review and publication reasons rather than a prior Session or Flow state. Publication outcomes are evidence only; this read never sends or retries publication. Pending/unknown outcomes are not failure; yield without polling and reconcile before source mutation or a new push. Use view=detail with bounded after/limit for exact reviews/findings and history; continue with event_page.next_after. Status is never inferred from a history page. Summary is not approval or integration authority.",
         ),
@@ -1600,3 +1617,6 @@ mod tests {
         assert_eq!(client.authorizations.lock().unwrap().len(), 2);
     }
 }
+
+#[cfg(test)]
+mod query_tests;

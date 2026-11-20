@@ -7,6 +7,16 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
     namespace: "merge_request",
     operations: &[
         BuiltinPermissionOperation {
+            key: "merge_request.query",
+            description: "Query MR phases, repository/target and current self-assignment; selected MR read permissions remain separate.",
+            sets: &[
+                "implementer",
+                "companion",
+                "work-coordination",
+                "work-execution",
+            ],
+        },
+        BuiltinPermissionOperation {
             key: "merge_request.open",
             description: "Open or reuse a repository-scoped Merge Request for this Ticket.",
             sets: &["implementer", "companion", "work-execution"],

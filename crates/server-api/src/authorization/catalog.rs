@@ -149,6 +149,11 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
         K::Workspace,
         &[
             (
+                "merge_request.query",
+                "Query Merge Requests",
+                "Query the Workspace MR collection; each returned MR separately requires read permission.",
+            ),
+            (
                 "ticket.create",
                 "Create Tickets",
                 "Create open Tickets in this Workspace; no read or edit rights to existing Tickets are implied.",

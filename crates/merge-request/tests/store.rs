@@ -8,6 +8,8 @@ mod lifecycle;
 mod ownership;
 #[path = "store/publication.rs"]
 mod publication;
+#[path = "store/query.rs"]
+mod query;
 
 use chrono::{TimeZone, Utc};
 use merge_request::*;
@@ -1147,7 +1149,13 @@ fn first_class_list_and_detail_are_workspace_scoped_and_cursor_bounded() {
         )
         .unwrap();
     assert_eq!(first.items[0].merge_request_id, "MR-2");
-    assert_eq!(first.next_cursor.as_deref(), Some("MR-2"));
+    assert!(
+        first
+            .next_cursor
+            .as_deref()
+            .unwrap()
+            .starts_with("mr-page:")
+    );
 
     let second = store
         .list(

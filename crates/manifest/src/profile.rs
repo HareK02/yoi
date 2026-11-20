@@ -1697,7 +1697,7 @@ mod tests {
     #[test]
     fn each_remaining_merge_request_operation_requires_workspace_authority() {
         let tmp = TempDir::new().unwrap();
-        for flag in ["show", "open", "review", "worker_set", "comment"] {
+        for flag in ["query", "show", "open", "review", "worker_set", "comment"] {
             let mut artifact =
                 serde_json::json!({"worker":{"mode":"tools"},"feature":{"merge_request":{}}});
             artifact["feature"]["merge_request"][flag] = serde_json::json!(true);
@@ -1875,6 +1875,7 @@ mod tests {
         assert!(feature.ticket.thread);
         assert!(!feature.ticket.intake);
         assert!(feature.ticket.workflow);
+        assert!(feature.merge_request.query);
         assert!(feature.merge_request.show);
         assert!(!feature.merge_request.open);
         assert!(!feature.merge_request.review);
@@ -1957,6 +1958,7 @@ mod tests {
         assert!(feature.worker.enabled);
         assert!(feature.worker.direct_spawn);
         assert!(feature.manage_workdir.enabled);
+        assert!(feature.merge_request.query);
         assert!(feature.merge_request.show);
         assert!(!feature.merge_request.open);
         assert!(!feature.merge_request.review);

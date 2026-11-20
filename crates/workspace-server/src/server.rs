@@ -12968,12 +12968,18 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn merge_request_list(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         query: server_api::MergeRequestListQuery,
     ) -> std::result::Result<server_api::MergeRequestListResponse, server_api::RepositoryApiError>
     {
+        let headers = contract_request_headers(&context)?;
+        let source = authenticated_ticket_worker_source(&headers, &context)
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?;
         let Json(response) = scoped_list_merge_requests(
             State(self.workspace_api()?.clone()),
+            source,
             AxumPath(workspace_id),
             Query(query),
         )
@@ -20415,6 +20421,7 @@ fn public_merge_request(
 
 async fn scoped_list_merge_requests(
     State(api): State<WorkspaceApi>,
+    source: Option<WorkerMutationSource>,
     AxumPath(workspace_id): AxumPath<String>,
     Query(query): Query<server_api::MergeRequestListQuery>,
 ) -> ApiResult<Json<MergeRequestListResponse>> {
@@ -20422,6 +20429,25 @@ async fn scoped_list_merge_requests(
 
     let workspace_id = parse_workspace_id(&workspace_id)?;
     require_workspace_access(&workspace_id, &api)?;
+    if query.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+        return Err(settings_bad_request("invalid_merge_request_limit", "limit must be between 1 and 100"));
+    }
+    if let Some(source) = &source {
+        subject_authorization::authorize_scope(&api, source, &server_api::authorization::OperationAuthorizationRequest {
+            operation: "merge_request.query".into(),
+            resource: server_api::authorization::PermissionResource::Workspace { workspace_id: workspace_id.clone() },
+        })?.ok_or_else(|| ApiError::from(Error::WorkspacePermissionDenied("MR query is not granted".into())))?;
+    }
+    let assigned_worker = if query.assigned_to_self == Some(true) {
+        let source = source.as_ref().ok_or_else(|| settings_bad_request("worker_source_required", "assigned_to_self requires an authenticated Runtime Worker"))?;
+        Some(merge_request::WorkerIdentity { runtime_id: source.runtime_id.clone(), worker_id: source.worker_id.clone() })
+    } else { None };
+    let phase = query.phase.map(|phase| match phase {
+        server_api::MergeRequestPhaseFilter::Implementation => merge_request::MergeRequestPhase::Implementation,
+        server_api::MergeRequestPhaseFilter::Integration => merge_request::MergeRequestPhase::Integration,
+        server_api::MergeRequestPhaseFilter::Completed => merge_request::MergeRequestPhase::Completed,
+        server_api::MergeRequestPhaseFilter::Canceled => merge_request::MergeRequestPhase::Canceled,
+    });
     let ticket_id = query
         .ticket_ref
         .as_deref()
@@ -20454,6 +20480,8 @@ async fn scoped_list_merge_requests(
     let page = store.list(
         &workspace_id,
         &merge_request::MergeRequestListQuery {
+            phase,
+            assigned_worker,
             state,
             repository_id,
             ticket_id,
@@ -20463,6 +20491,11 @@ async fn scoped_list_merge_requests(
             limit: query.limit.unwrap_or(50),
         },
     )?;
+    if let Some(source) = &source {
+        for mr in &page.items {
+            require_mr_operation(&api, source, &mr.merge_request_id, "merge_request.read")?;
+        }
+    }
     let items = page
         .items
         .into_iter()
@@ -71009,7 +71042,8 @@ mod tests {
     #[tokio::test]
     async fn merge_request_reads_use_first_class_workspace_resources() {
         let dir = tempfile::tempdir().unwrap();
-        let app = build_inner_router(test_api(dir.path()).await);
+        let app = build_inner_router(test_api(dir.path()).await)
+            .layer(Extension(test_browser_request_actor()));
 
         let collection = app
             .clone()

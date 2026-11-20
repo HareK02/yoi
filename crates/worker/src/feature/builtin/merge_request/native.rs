@@ -85,6 +85,45 @@ fn nullable(ty: Shape) -> Shape {
 
 pub(super) fn contract(kind: Kind) -> Contract {
     let (name, summary, parameters) = match kind {
+        Kind::Query => (
+            "query",
+            "Query the MR collection by repository/target and saved phase (integration includes stale/re-review/conflict cases). assigned_to_self selects the authenticated current MR Worker, not the Ticket Subject. Follow next_cursor with unchanged filters. Each MR read requires separate authority; use item.read before acting. No assignment, publication, or execution order is created.",
+            vec![
+                field("repository_key", false, Shape::String),
+                field("selector_to", false, Shape::String),
+                field("selector_from", false, Shape::String),
+                renamed(
+                    "ticket",
+                    false,
+                    Shape::Reference(ReferenceKind::Ticket),
+                    "ticket_ref",
+                ),
+                field(
+                    "phase",
+                    false,
+                    Shape::Enum(vec![
+                        "implementation",
+                        "integration",
+                        "completed",
+                        "canceled",
+                    ]),
+                ),
+                field(
+                    "state",
+                    false,
+                    Shape::Enum(vec!["open", "merged", "closed"]),
+                ),
+                field("assigned_to_self", false, Shape::Boolean),
+                flattened(
+                    "page",
+                    false,
+                    vec![
+                        field("cursor", false, nullable(Shape::String)),
+                        field("limit", false, nullable(Shape::Integer)),
+                    ],
+                ),
+            ],
+        ),
         Kind::Open => (
             "open",
             "Open or reuse a Ticket-linked repository candidate. ticket is an Entry in the current Ticket collection; repository.source/target are selectors, not asserted commit evidence. Backend validates linkage and authority.",

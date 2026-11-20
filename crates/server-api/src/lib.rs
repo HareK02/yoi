@@ -3968,6 +3968,7 @@ pub trait ServerApi {
     #[get("/api/w/{workspace_id}/merge-requests", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_list(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: MergeRequestListQuery,
     ) -> Result<MergeRequestListResponse, RepositoryApiError>;
@@ -9758,14 +9759,28 @@ pub struct PublicMergeRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeRequestListQuery {
+    /// Exact saved lifecycle phase, independent of review freshness.
+    pub phase: Option<MergeRequestPhaseFilter>,
+    /// Match the authenticated caller's current MR Worker, not the Ticket Subject.
+    /// Requires a Runtime Worker source; omitted/false does not filter assignment.
+    pub assigned_to_self: Option<bool>,
     pub state: Option<String>,
     pub repository_key: Option<String>,
     pub ticket_ref: Option<String>,
     pub selector_from: Option<String>,
     pub selector_to: Option<String>,
     pub cursor: Option<String>,
-    #[schemars(range(min = 0, max = 1000))]
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeRequestPhaseFilter {
+    Implementation,
+    Integration,
+    Completed,
+    Canceled,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

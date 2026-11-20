@@ -18,6 +18,7 @@ import "./base.dcdl" // {
         flow = { enabled = true; };
         ticket = { enabled = true; thread = true; };
         merge_request = {
+            query = true;
             show = true;
             comment = true;
             open = true;

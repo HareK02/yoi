@@ -6109,6 +6109,13 @@
       "MergeRequestListQuery": {
         "additionalProperties": false,
         "properties": {
+          "assigned_to_self": {
+            "description": "Match the authenticated caller's current MR Worker, not the Ticket Subject.\nRequires a Runtime Worker source; omitted/false does not filter assignment.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "cursor": {
             "type": [
               "string",
@@ -6117,12 +6124,23 @@
           },
           "limit": {
             "format": "uint",
-            "maximum": 1000,
-            "minimum": 0,
+            "maximum": 100,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
             ]
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeRequestPhaseFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact saved lifecycle phase, independent of review freshness."
           },
           "repository_key": {
             "type": [
@@ -6177,6 +6195,15 @@
           "items"
         ],
         "type": "object"
+      },
+      "MergeRequestPhaseFilter": {
+        "enum": [
+          "implementation",
+          "integration",
+          "completed",
+          "canceled"
+        ],
+        "type": "string"
       },
       "MergeRequestPublication": {
         "properties": {
@@ -27133,7 +27160,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:38baac1fc3311e6c524ad13332c3f3a9c52d3ce9249bc216b0b8a1c0d57a1278"
+    "x-yoi-source-digest": "sha256:8c02ac49ad97aab8d6368fde823b2442efd18b99a29d2687e55412b90f579d39"
   },
   "openapi": "3.1.0",
   "paths": {
