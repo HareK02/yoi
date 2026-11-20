@@ -415,8 +415,6 @@ pub struct MergeRequestFeatureConfigPartial {
     pub show: Option<bool>,
     pub open: Option<bool>,
     pub review: Option<bool>,
-    pub readiness_check: Option<bool>,
-    pub complete: Option<bool>,
     pub worker_set: Option<bool>,
     pub comment: Option<bool>,
 }
@@ -427,8 +425,6 @@ impl MergeRequestFeatureConfigPartial {
             show: other.show.or(self.show),
             open: other.open.or(self.open),
             review: other.review.or(self.review),
-            readiness_check: other.readiness_check.or(self.readiness_check),
-            complete: other.complete.or(self.complete),
             worker_set: other.worker_set.or(self.worker_set),
             comment: other.comment.or(self.comment),
         }
@@ -667,8 +663,6 @@ impl From<MergeRequestFeatureConfigPartial> for MergeRequestFeatureConfig {
             show: value.show.unwrap_or_default(),
             open: value.open.unwrap_or_default(),
             review: value.review.unwrap_or_default(),
-            readiness_check: value.readiness_check.unwrap_or_default(),
-            complete: value.complete.unwrap_or_default(),
             worker_set: value.worker_set.unwrap_or_default(),
             comment: value.comment.unwrap_or_default(),
         }
@@ -681,8 +675,6 @@ impl From<MergeRequestFeatureConfig> for MergeRequestFeatureConfigPartial {
             show: Some(value.show),
             open: Some(value.open),
             review: Some(value.review),
-            readiness_check: Some(value.readiness_check),
-            complete: Some(value.complete),
             worker_set: Some(value.worker_set),
             comment: Some(value.comment),
         }
@@ -2657,8 +2649,6 @@ workflow = false
 show = true
 open = false
 review = true
-readiness_check = false
-complete = false
 
 [feature.orchestration]
 enabled = false
@@ -2732,8 +2722,6 @@ workflow = false
 show = true
 open = false
 review = true
-readiness_check = false
-complete = false
 
 [feature.orchestration]
 enabled = false
@@ -2749,7 +2737,6 @@ workflow = true
 [feature.merge_request]
 open = true
 review = false
-readiness_check = true
 
 [feature.orchestration]
 enabled = true
@@ -2808,8 +2795,6 @@ enabled = true
                 show: true,
                 open: true,
                 review: false,
-                readiness_check: true,
-                complete: false,
                 ..Default::default()
             }
         );
@@ -2842,7 +2827,13 @@ enabled = true
 
     #[test]
     fn merge_request_removed_operation_flags_are_rejected() {
-        for flag in ["worker_query", "publications", "publish"] {
+        for flag in [
+            "worker_query",
+            "publications",
+            "publish",
+            "complete",
+            "readiness_check",
+        ] {
             let input = format!("{flag} = true");
             assert!(toml::from_str::<MergeRequestFeatureConfigPartial>(&input).is_err());
             assert!(toml::from_str::<MergeRequestFeatureConfig>(&input).is_err());

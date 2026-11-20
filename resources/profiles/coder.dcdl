@@ -22,8 +22,6 @@ import "./base.dcdl" // {
             comment = true;
             open = true;
             review = false;
-            readiness_check = false;
-            complete = false;
         };
     };
 }

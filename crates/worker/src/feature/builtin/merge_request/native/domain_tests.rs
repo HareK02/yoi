@@ -39,20 +39,20 @@ async fn native_backend_conflict_is_a_domain_rejection_not_a_type_rejection_or_r
         crate::worker::WorkspaceResponse {
             content_type: None,
             status: 409,
-            body: "approval snapshot is stale".into(),
+            body: "Worker ownership is stale".into(),
         },
     ]));
     let tool = native_merge_request_tools(
         client.clone(),
         MergeRequestFeatureConfig {
-            complete: true,
+            worker_set: true,
             ..Default::default()
         },
     )
     .unwrap()
     .remove(0);
     let input = arguments(
-        json!({"operation_id":"op-1","integration":{"approval_event_id":"approval-1","target":{"before":"before","after":"after"},"strategy":"merge","resolution":"clean"}}),
+        json!({"operation_id":"op-1","expected_operation_id":{"$case":"null"},"worker":{"$case":"null"}}),
     );
     let rejected = execute_native_merge_request_tool(
         &tool,
@@ -66,7 +66,7 @@ async fn native_backend_conflict_is_a_domain_rejection_not_a_type_rejection_or_r
     )
     .await;
     assert!(
-        matches!(rejected, Err(WipOperationError::Protocol(ProtocolError { code:ProtocolErrorCode::InvalidArguments, message })) if message.contains("HTTP 409") && message.contains("approval snapshot is stale"))
+        matches!(rejected, Err(WipOperationError::Protocol(ProtocolError { code:ProtocolErrorCode::InvalidArguments, message })) if message.contains("HTTP 409") && message.contains("Worker ownership is stale"))
     );
     assert_eq!(client.requests.lock().unwrap().len(), 1);
     assert_eq!(client.authorizations.lock().unwrap().len(), 1);

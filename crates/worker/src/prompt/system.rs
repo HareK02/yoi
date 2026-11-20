@@ -472,34 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn mr_completion_registration_and_schema_follow_feature_config() {
-        let without_mr_tools = ticket_workflow_tools(MergeRequestFeatureConfig::default());
-        assert!(
-            !without_mr_tools
-                .iter()
-                .any(|meta| meta.name == "CompleteMergeRequest")
-        );
-        let tools = ticket_workflow_tools(MergeRequestFeatureConfig {
-            show: true,
-            readiness_check: true,
-            complete: true,
-            ..Default::default()
-        });
-        assert!(!tools.iter().any(|meta| meta.name == "ReviewMergeRequest"));
-        let complete = tools
-            .iter()
-            .find(|meta| meta.name == "CompleteMergeRequest")
-            .unwrap();
-        assert!(
-            complete.input_schema["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|field| field == "approval_event_id")
-        );
-    }
-
-    #[test]
     fn ticket_workflow_publishes_tracking_without_retired_operations() {
         let tools = ticket_workflow_tools(MergeRequestFeatureConfig::default());
         assert!(
@@ -542,7 +514,7 @@ mod tests {
         );
         assert!(!tools.iter().any(|meta| matches!(
             meta.name.as_str(),
-            "OpenMergeRequest" | "ReviewMergeRequest" | "CompleteMergeRequest"
+            "OpenMergeRequest" | "ReviewMergeRequest"
         )));
         for (name, input) in [
             (

@@ -8298,9 +8298,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::merge_request_open(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::merge_request_readiness(
-            service.clone(),
-        ))
         .merge(server_api::server_api_axum::merge_request_thread(
             service.clone(),
         ))
@@ -8321,9 +8318,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::merge_request_worker_set(
-            service.clone(),
-        ))
-        .merge(server_api::server_api_axum::merge_request_complete(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::ticket_case_update(
@@ -13021,23 +13015,6 @@ impl server_api::ServerApi for ServerApiContractService {
         Ok(response)
     }
 
-    async fn merge_request_readiness(
-        &self,
-        workspace_id: String,
-        id: String,
-    ) -> std::result::Result<
-        server_api::MergeRequestReadinessResponse,
-        server_api::RepositoryApiError,
-    > {
-        let Json(response) = scoped_merge_request_readiness(
-            State(self.workspace_api()?.clone()),
-            AxumPath((workspace_id, id)),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
-    }
-
     async fn merge_request_thread(
         &self,
         workspace_id: String,
@@ -13258,25 +13235,6 @@ impl server_api::ServerApi for ServerApiContractService {
             })
             .await
             .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn merge_request_complete(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        id: String,
-        request: server_api::CompleteMergeRequestRequest,
-    ) -> std::result::Result<server_api::MergeEvent, server_api::RepositoryApiError> {
-        let Json(response) = scoped_complete_merge_request(
-            State(self.workspace_api()?.clone()),
-            current_worker_contract_headers(&context)?,
-            context,
-            AxumPath((workspace_id, id)),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
     }
 
     async fn notification_diagnostics(
@@ -20080,7 +20038,7 @@ fn require_completed_target_observation(
     }
     if observed == target_ref_before {
         return Err(Error::InvalidInput(
-            "target selector is still at target_ref_before; Orchestrator must integrate the approved source into the current target and verify the resulting target ref before CompleteMergeRequest (target-only movement does not invalidate approval for an unchanged source)".into(),
+            "target selector is still at target_ref_before; exact-source publication evidence is required before recording completion (target-only movement does not invalidate approval for an unchanged source)".into(),
         )
         .into());
     }
@@ -20944,78 +20902,6 @@ async fn scoped_show_merge_request(
         .await
 }
 
-async fn scoped_merge_request_readiness(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
-) -> ApiResult<Json<server_api::MergeRequestReadinessResponse>> {
-    api.host_executors
-        .host()?
-        .run(move || {
-            let workspace_id = parse_workspace_id(&workspace_id)?;
-            let store = merge_request_store(&api, &workspace_id)?;
-            let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
-            let ticket_id = merge_request_ticket_id(&mr)?;
-            let assignment = store
-                .current_worker(&workspace_id, &merge_request_id)?
-                .and_then(|assignment| assignment.worker);
-            let (current_subject_ref, source_blocker) = if mr.state.is_completed() {
-                (
-                    mr.merged_result()
-                        .ok()
-                        .map(|merge| merge.approved_source_ref.clone()),
-                    None,
-                )
-            } else {
-                match (mr.selector_from.as_deref(), assignment) {
-                    (Some(selector), Some(assignment)) => match observe_published_source_ref(
-                        &api,
-                        &workspace_id,
-                        &assignment.runtime_id,
-                        &mr.repository_id,
-                        selector,
-                    ) {
-                        Ok(observation) => (Some(observation.resolved_ref), None),
-                        Err(error) => {
-                            let diagnostic = merge_ref_diagnostic(error);
-                            let blocker = source_ref_readiness_blocker(&diagnostic.code);
-                            (None, Some(blocker.to_string()))
-                        }
-                    },
-                    (Some(_), None) => (None, Some("source_ref_unavailable".to_string())),
-                    (None, _) => (None, None),
-                }
-            };
-            let mut report = store.readiness(merge_request::ReadinessCheck {
-                merge_request_id,
-                ticket_id,
-                current_subject_ref,
-                auth: merge_request::MergeRequestAuth {
-                    workspace_id,
-                    repository_id: mr.repository_id,
-                    runtime_id: String::new(),
-                    worker_id: String::new(),
-                    assignment_id: String::new(),
-                },
-            })?;
-            if let Some(blocker) = source_blocker {
-                report
-                    .blockers
-                    .retain(|current| current != "selector_unresolved");
-                if !report.blockers.contains(&blocker) {
-                    report.blockers.push(blocker);
-                }
-                report.ready = false;
-            }
-            Ok(Json(server_api::MergeRequestReadinessResponse {
-                ready: report.ready,
-                blockers: report.blockers,
-                subject_ref: report.subject_ref,
-                review: report.review.map(public_review_event),
-            }))
-        })
-        .await
-}
-
 async fn scoped_open_merge_request(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
@@ -21422,57 +21308,6 @@ async fn scoped_revoke_merge_request_review(
                 now: Utc::now(),
             })?;
             Ok(Json(public_review_revoked_event(event)))
-        })
-        .await
-}
-
-async fn scoped_complete_merge_request(
-    State(api): State<WorkspaceApi>,
-    headers: HeaderMap,
-    context: server_api::ServerRequestContext,
-    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
-    Json(input): Json<server_api::CompleteMergeRequestRequest>,
-) -> ApiResult<Json<server_api::MergeEvent>> {
-    api.host_executors
-        .host()?
-        .run(move || {
-            let workspace_id = parse_workspace_id(&workspace_id)?;
-            require_workspace_access(&workspace_id, &api)?;
-            let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
-            require_mr_operation(&api, &source, &merge_request_id, "merge_request.complete")?;
-            if context.runtime_source.is_none() {
-                return Err(Error::WorkspacePermissionDenied(
-                    "MR completion requires a signed Runtime source".into(),
-                )
-                .into());
-            }
-            let store = merge_request_store(&api, &workspace_id)?;
-            let saved = store
-                .publication(&workspace_id, &input.operation_id)?
-                .filter(|p| p.binding.merge_request_id == merge_request_id)
-                .ok_or_else(|| {
-                    merge_request::MergeRequestError::NotReady(
-                        "completion requires saved publication evidence; ref strings are not proof"
-                            .into(),
-                    )
-                })?;
-            if saved.binding.approval_event_id != input.approval_event_id
-                || saved.binding.target_before != input.target_ref_before
-                || saved.binding.source != input.target_ref_after
-                || input.strategy != server_api::MergeStrategy::FastForward
-                || input.resolution != server_api::ConflictResolution::None
-            {
-                return Err(merge_request::MergeRequestError::Conflict(
-                    "completion does not match its publication operation".into(),
-                )
-                .into());
-            }
-            mr_publication::reconcile(&api, saved)?;
-            store
-                .complete_publication(&workspace_id, &input.operation_id, Utc::now())
-                .map(public_merge_event)
-                .map(Json)
-                .map_err(Into::into)
         })
         .await
 }
@@ -45156,10 +44991,9 @@ mod tests {
             );
             assert!(!handler.contains("repository_reader()"));
         }
-        let completion = handler_source(source, "scoped_complete_merge_request");
-        assert!(completion.contains("store") && completion.contains(".publication("));
-        assert!(completion.contains("mr_publication::reconcile("));
-        assert!(!completion.contains("observe_published_merge_ref("));
+        let publication = include_str!("server/mr_publication.rs");
+        assert!(publication.contains(".complete_publication("));
+        assert!(publication.contains(".repository_publication_receipt("));
         let submit = handler_source(source, "scoped_submit_merge_request_review");
         assert!(
             submit
@@ -47626,7 +47460,7 @@ mod tests {
         assert!(matches!(
             not_pushed.error,
             Error::InvalidInput(ref message)
-                if message.contains("Orchestrator must integrate the approved source into the current target")
+                if message.contains("exact-source publication evidence is required before recording completion")
                     && message.contains("target-only movement does not invalidate approval")
         ));
 

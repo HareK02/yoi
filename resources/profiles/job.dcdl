@@ -26,6 +26,6 @@ feature = {
     manage_workdir = { enabled = false; };
     workspace_config = { enabled = false; };
     ticket = { enabled = false; authoring = false; thread = false; intake = false; workflow = false; };
-    merge_request = { show = false; open = false; review = false; readiness_check = false; complete = false; };
+    merge_request = { show = false; open = false; review = false; };
     orchestration = { enabled = false; };
 };

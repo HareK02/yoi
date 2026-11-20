@@ -598,7 +598,6 @@ impl_openapi_schema!(
     BrowserQueueTicketRequest,
     CancelTicketImplementationRequest,
     ClearTicketRoleAssignmentQuery,
-    CompleteMergeRequestRequest,
     CreateTicketRecordRequest,
     CreateTicketRelationRequest,
     DefaultIntakeReadyBodyRequest,
@@ -3975,12 +3974,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: OpenMergeRequestRequest,
     ) -> Result<PublicMergeRequest, RepositoryApiError>;
-    #[get("/api/w/{workspace_id}/merge-requests/{id}/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
-    async fn merge_request_readiness(
-        &self,
-        #[path] workspace_id: String,
-        #[path] id: String,
-    ) -> Result<MergeRequestReadinessResponse, RepositoryApiError>;
     #[get("/api/w/{workspace_id}/merge-requests/{id}/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_thread(
         &self,
@@ -4042,14 +4035,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CommentMergeRequestRequest,
     ) -> Result<MergeRequestCommentEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/merge-requests/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
-    async fn merge_request_complete(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: CompleteMergeRequestRequest,
-    ) -> Result<MergeEvent, RepositoryApiError>;
     #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/case", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_case_update(
         &self,
@@ -9959,17 +9944,6 @@ pub struct SubmitMergeRequestReviewRequest {
     pub findings: Vec<ReviewFinding>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CompleteMergeRequestRequest {
-    pub operation_id: String,
-    pub approval_event_id: String,
-    pub target_ref_before: String,
-    pub target_ref_after: String,
-    pub strategy: MergeStrategy,
-    pub resolution: ConflictResolution,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeManagementApiError {
@@ -13669,12 +13643,14 @@ mod tests {
                 .iter()
                 .filter(|operation| operation.operation_id.starts_with("merge_request_"))
                 .count(),
-            13
+            11
         );
         for removed in [
             "merge_request_worker_get",
             "merge_request_publications",
             "merge_request_publish",
+            "merge_request_readiness",
+            "merge_request_complete",
         ] {
             assert!(
                 !operations
@@ -13695,9 +13671,9 @@ mod tests {
                 "/api/w/{workspace_id}/tickets/relations/search",
             ),
             (
-                "merge_request_complete",
-                HttpMethod::Post,
-                "/api/w/{workspace_id}/merge-requests/{id}/complete",
+                "merge_request_show",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/merge-requests/{merge_request_id}",
             ),
             (
                 "objective_ticket_unlink",
@@ -16015,7 +15991,6 @@ mod openapi_artifact_tests {
             "current_worker_workdir_attach",
             "current_worker_workdir_detach",
             "current_worker_workdir_operation",
-            "merge_request_complete",
             "merge_request_worker_set",
             "merge_request_comment",
             "merge_request_open",

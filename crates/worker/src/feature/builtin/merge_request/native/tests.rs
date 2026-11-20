@@ -27,8 +27,6 @@ fn all_config() -> MergeRequestFeatureConfig {
         show: true,
         open: true,
         review: true,
-        readiness_check: true,
-        complete: true,
         worker_set: true,
         comment: true,
     }
@@ -62,17 +60,36 @@ async fn inspect_interface(runtime: &WipRuntime, path: &str) -> String {
 async fn removed_tools_and_native_operations_are_not_available() {
     let client = Arc::new(RecordingWorkspaceClient::new(vec![]));
     let definitions = enabled_merge_request_definitions(client.clone(), all_config());
-    assert_eq!(definitions.len(), 7);
+    assert_eq!(definitions.len(), 5);
     let names: Vec<_> = definitions
         .iter()
         .map(|definition| definition().0.name)
         .collect();
+    assert_eq!(
+        names,
+        [
+            "ShowMergeRequest",
+            "OpenMergeRequest",
+            "ReviewMergeRequest",
+            "SetMergeRequestWorker",
+            "CommentMergeRequest"
+        ]
+    );
     let native_tools = native_merge_request_tools(client.clone(), all_config()).unwrap();
+    assert_eq!(
+        native_tools
+            .iter()
+            .map(|tool| tool.contract.name)
+            .collect::<Vec<_>>(),
+        ["read", "open", "review", "worker_set", "comment"]
+    );
     let native = runtime(client.clone());
     for (tool, operation) in [
         ("QueryMergeRequestWorker", "worker_query"),
         ("PublishMergeRequest", "publish"),
         ("QueryMergeRequestPublications", "publications"),
+        ("CompleteMergeRequest", "complete"),
+        ("CheckMergeRequestReadiness", "readiness"),
     ] {
         assert!(!names.iter().any(|name| name == tool));
         assert!(description(tool).is_none());
@@ -159,7 +176,7 @@ fn native_contract_exposes_records_enums_nullable_and_entry_without_tool_schema(
 }
 
 #[test]
-fn native_mapping_groups_repository_and_exact_integration_observations() {
+fn native_mapping_groups_repository_selectors() {
     let opened = convert(
         &contract(Kind::Open),
         &arguments(json!({
@@ -174,13 +191,6 @@ fn native_mapping_groups_repository_and_exact_integration_observations() {
     );
     assert!(
         matches!(command(Kind::Open, opened).unwrap_or_else(|_| panic!("valid native command was rejected")), command::Command::Open { ticket, summary, .. } if ticket == "T-797" && summary.is_empty())
-    );
-    let complete = convert(&contract(Kind::Complete), &arguments(json!({
-        "operation_id":"op-1", "integration":{"approval_event_id":"approval-1", "target":{"before":"before","after":"after"}, "strategy":"merge","resolution":"conflicts_resolved"}
-    })), &roots()).unwrap_or_else(|_| panic!("valid native fixture was rejected"));
-    assert_eq!(
-        complete,
-        json!({"operation_id":"op-1","approval_event_id":"approval-1","target_ref_before":"before","target_ref_after":"after","strategy":"merge","resolution":"conflicts_resolved"})
     );
 }
 
@@ -254,12 +264,10 @@ fn native_references_use_the_allocated_namespace_and_reject_identity_spoofing() 
 }
 
 #[tokio::test]
-async fn inspect_then_invoke_native_open_read_readiness_and_complete_reaches_shared_domain() {
+async fn inspect_then_invoke_native_open_and_read_reaches_shared_domain() {
     let client = Arc::new(RecordingWorkspaceClient::new(vec![
         response(json!({"merge_request_id":"MR-1"})),
         response(json!({"merge_request_id":"MR-1","thread":[]})),
-        response(json!({"merge_request_id":"MR-1","ready":true})),
-        response(json!({"merge_request_id":"MR-1","event_id":"integrated-1"})),
     ]));
     let runtime = runtime(client.clone());
     let collection = inspect_interface(&runtime, "/changes").await;
@@ -268,21 +276,13 @@ async fn inspect_then_invoke_native_open_read_readiness_and_complete_reaches_sha
     runtime.invoke("/changes".into(), crate::wip::root_reference(MERGE_REQUEST_COLLECTION_INTERFACE), "open".into(),
         json!({"ticket":"/cases/T-797","repository":{"key":"main","source":"work","target":"develop"}}), ToolExecutionContext::direct()).await.unwrap();
     let item = inspect_interface(&runtime, "/changes/MR-1").await;
-    assert!(item.contains("operation readiness("));
-    assert!(item.contains("integration:"));
+    assert!(item.contains("operation read("));
     assert!(item.contains("findings?:"));
     assert!(!item.contains("merge_request_id:"));
-    for (operation, input) in [
-        (
-            "read",
-            json!({"page":{"after":{"$case":"value","value":7},"limit":{"$case":"value","value":25}}}),
-        ),
-        ("readiness", json!({})),
-        (
-            "complete",
-            json!({"operation_id":"op-1","integration":{"approval_event_id":"approval-1","target":{"before":"before","after":"after"},"strategy":"fast_forward","resolution":"clean"}}),
-        ),
-    ] {
+    for (operation, input) in [(
+        "read",
+        json!({"page":{"after":{"$case":"value","value":7},"limit":{"$case":"value","value":25}}}),
+    )] {
         // Read observations update the object's content validator. Explicitly refresh between
         // independent operations; Invoke must not retry a dispatched validator rejection.
         runtime.inspect("/changes/MR-1".into(), true).await.unwrap();
@@ -298,16 +298,11 @@ async fn inspect_then_invoke_native_open_read_readiness_and_complete_reaches_sha
             .unwrap();
     }
     let requests = client.requests.lock().unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].path, "/api/w/ws/tickets/T-797/merge-request");
     assert_eq!(
         requests[1].path,
         "/api/w/ws/merge-requests/MR-1?view=detail&after=7&limit=25"
-    );
-    assert_eq!(requests[2].path, "/api/w/ws/merge-requests/MR-1/readiness");
-    assert_eq!(
-        serde_json::from_str::<Value>(requests[3].body.as_deref().unwrap()).unwrap(),
-        json!({"operation_id":"op-1","approval_event_id":"approval-1","target_ref_before":"before","target_ref_after":"after","strategy":"fast_forward","resolution":"clean"})
     );
     assert_eq!(
         client
@@ -317,12 +312,7 @@ async fn inspect_then_invoke_native_open_read_readiness_and_complete_reaches_sha
             .iter()
             .map(|a| a.operation.as_str())
             .collect::<Vec<_>>(),
-        [
-            "merge_request.open",
-            "merge_request.read",
-            "merge_request.readiness",
-            "merge_request.complete"
-        ]
+        ["merge_request.open", "merge_request.read"]
     );
 }
 
@@ -341,15 +331,6 @@ async fn native_contract_and_command_rejections_precede_authorization_and_dispat
         ),
         ("read", json!({"after":7})),
         ("read", json!({"merge_request_id":"MR-2"})),
-        ("check_readiness", json!({})),
-        (
-            "complete",
-            json!({"operation_id":"op","integration":{"approval_event_id":"approval","target":{"before":"before"},"strategy":"merge","resolution":"clean"}}),
-        ),
-        (
-            "complete",
-            json!({"operation_id":"op","integration":{"approval_event_id":"approval","target":{"before":"before","after":"after"},"strategy":"squash","resolution":"clean"}}),
-        ),
     ] {
         assert!(
             runtime

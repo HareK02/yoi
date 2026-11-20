@@ -109,7 +109,9 @@ Deno.test("Merge Request UI separates source review freshness from target integr
     "source ref mismatch is not explained",
   );
   assert(
-    statusProjection.includes("CompleteMergeRequest"),
-    "target integration authority is not named",
+    statusProjection.includes("retained completion evidence") &&
+      statusProjection.includes("Backend publication and completion proceed automatically"),
+    "target integration must describe evidence-bound automatic completion",
   );
+  assert(!statusProjection.includes("CompleteMergeRequest"), "removed tool must not be advertised");
 });

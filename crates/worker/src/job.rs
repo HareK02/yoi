@@ -505,14 +505,7 @@ fn validate_profile_with_grant(
             "feature.ticket",
             ticket.enabled || ticket.authoring || ticket.thread || ticket.intake || ticket.workflow,
         ),
-        (
-            "feature.merge_request",
-            merge_request.show
-                || merge_request.open
-                || merge_request.review
-                || merge_request.readiness_check
-                || merge_request.complete,
-        ),
+        ("feature.merge_request", merge_request.any()),
         ("feature.orchestration", orchestration.enabled),
         // The default WIP-only catalog is inert in Tools mode, not a tool requirement.
         (

@@ -203,8 +203,24 @@ async fn mr_worker_http_assignment_requires_permission_and_preserves_cas_history
     assert_eq!(status, StatusCode::OK, "{shown}");
     assert_eq!(shown["publications"], json!([]));
     assert_eq!(shown["worker_assignment"], restored);
-    // Dedicated reads and publication dispatch no longer exist. PUT /worker remains.
+    assert_eq!(shown["summary"]["readiness"]["ready"], false);
+    assert!(shown["summary"]["readiness"]["blockers"].is_array());
+    // Dedicated reads, publication dispatch and completion no longer exist. PUT /worker remains.
     for (method, removed_path) in [
+        (
+            "GET",
+            format!(
+                "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/readiness",
+                mr.merge_request_id
+            ),
+        ),
+        (
+            "POST",
+            format!(
+                "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/complete",
+                mr.merge_request_id
+            ),
+        ),
         ("GET", path.clone()),
         (
             "GET",

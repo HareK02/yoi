@@ -30,8 +30,6 @@ import "./base.dcdl" // {
             show = false;
             open = false;
             review = false;
-            readiness_check = false;
-            complete = false;
         };
         orchestration = { enabled = false; };
     };

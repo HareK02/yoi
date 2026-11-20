@@ -97,10 +97,10 @@ export function targetIntegrationStatus(
   mergeRequest: MergeRequestDetail,
 ): string {
   if (mergeRequest.state.kind === "completed") {
-    return "Target integration recorded by CompleteMergeRequest.";
+    return "Target integration recorded in retained completion evidence.";
   }
   if (!mergeRequest.target.ref) {
     return "Target integration unavailable: selector_to is unresolved.";
   }
-  return `Target integration awaits Orchestrator action at ${mergeRequest.target.ref}. Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.`;
+  return `Target integration at ${mergeRequest.target.ref} is not yet recorded as complete. Backend publication and completion proceed automatically when approval and publication conditions are satisfied. Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.`;
 }

@@ -174,8 +174,6 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
         "TicketImplementationResultQuery",
         "NotificationDiagnostics",
         "ShowMergeRequest",
-        "CheckMergeRequestReadiness",
-        "CompleteMergeRequest",
         "WorkdirList",
         "WorkdirCreate",
         "WorkdirDelete",

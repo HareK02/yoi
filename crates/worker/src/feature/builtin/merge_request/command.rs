@@ -25,9 +25,6 @@ pub(super) enum Command {
         expected_owner_operation_id: String,
         body: String,
     },
-    Readiness {
-        merge_request_id: String,
-    },
     Open {
         ticket: String,
         repository_key: String,
@@ -35,15 +32,6 @@ pub(super) enum Command {
         selector_to: String,
         #[serde(default)]
         summary: String,
-    },
-    Complete {
-        merge_request_id: String,
-        operation_id: String,
-        approval_event_id: String,
-        target_ref_before: String,
-        target_ref_after: String,
-        strategy: MergeStrategyInput,
-        resolution: MergeResolutionInput,
     },
     Review {
         decision: ReviewDecisionInput,
@@ -83,12 +71,6 @@ impl Command {
                     body: v.body,
                 }
             }
-            Kind::Readiness => {
-                let v: MergeRequestInput = parse(input)?;
-                Self::Readiness {
-                    merge_request_id: v.merge_request_id,
-                }
-            }
             Kind::Open => {
                 let v: OpenMergeRequestInput = parse(input)?;
                 Self::Open {
@@ -97,18 +79,6 @@ impl Command {
                     selector_from: v.selector_from,
                     selector_to: v.selector_to,
                     summary: v.summary,
-                }
-            }
-            Kind::Complete => {
-                let v: CompleteMergeRequestInput = parse(input)?;
-                Self::Complete {
-                    merge_request_id: v.merge_request_id,
-                    operation_id: v.operation_id,
-                    approval_event_id: v.approval_event_id,
-                    target_ref_before: v.target_ref_before,
-                    target_ref_after: v.target_ref_after,
-                    strategy: v.strategy,
-                    resolution: v.resolution,
                 }
             }
             Kind::Review => {
@@ -127,9 +97,7 @@ impl Command {
             Self::Read { .. } => Kind::Show,
             Self::WorkerSet { .. } => Kind::WorkerSet,
             Self::Comment { .. } => Kind::Comment,
-            Self::Readiness { .. } => Kind::Readiness,
             Self::Open { .. } => Kind::Open,
-            Self::Complete { .. } => Kind::Complete,
             Self::Review { .. } => Kind::Review,
         }
     }
@@ -251,24 +219,6 @@ pub(super) fn execute_value(
                 ),
             )
         }
-        Command::Readiness { merge_request_id } => {
-            nonempty_named("merge_request_id", &merge_request_id)?;
-            executor.authorize(
-                "merge_request.readiness",
-                PermissionResource::MergeRequest {
-                    workspace_id: ws.into(),
-                    merge_request_id: merge_request_id.clone(),
-                },
-            )?;
-            (
-                WorkspaceRequestMethod::Get,
-                format!(
-                    "/api/w/{ws}/merge-requests/{}/readiness",
-                    encode_path_segment(&merge_request_id)
-                ),
-                None,
-            )
-        }
         Command::Open {
             ticket,
             repository_key,
@@ -292,34 +242,6 @@ pub(super) fn execute_value(
                 ),
                 Some(
                     json!({"repository_key":repository_key,"selector_from":selector_from,"selector_to":selector_to,"summary":summary}),
-                ),
-            )
-        }
-        Command::Complete {
-            merge_request_id,
-            operation_id,
-            approval_event_id,
-            target_ref_before,
-            target_ref_after,
-            strategy,
-            resolution,
-        } => {
-            nonempty_named("merge_request_id", &merge_request_id)?;
-            executor.authorize(
-                "merge_request.complete",
-                PermissionResource::MergeRequest {
-                    workspace_id: ws.into(),
-                    merge_request_id: merge_request_id.clone(),
-                },
-            )?;
-            (
-                WorkspaceRequestMethod::Post,
-                format!(
-                    "/api/w/{ws}/merge-requests/{}/complete",
-                    encode_path_segment(&merge_request_id)
-                ),
-                Some(
-                    json!({"operation_id":operation_id,"approval_event_id":approval_event_id,"target_ref_before":target_ref_before,"target_ref_after":target_ref_after,"strategy":match strategy{MergeStrategyInput::FastForward=>"fast_forward",MergeStrategyInput::Merge=>"merge"},"resolution":match resolution{MergeResolutionInput::None=>"none",MergeResolutionInput::Clean=>"clean",MergeResolutionInput::ConflictsResolved=>"conflicts_resolved"}}),
                 ),
             )
         }

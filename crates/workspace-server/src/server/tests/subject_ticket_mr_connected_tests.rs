@@ -1,6 +1,6 @@
 //! Normal Server library tests for ordinary Subject MR coordination. The signed
 //! Backend/Runtime, canonical policy/body/Profile/Flow, Workdirs/Git/provider,
-//! independent builtin Reviewer and formal review/completion endpoints are real.
+//! independent builtin Reviewer, formal review endpoint and automatic completion are real.
 //! Only explicitly injected model decisions (including Flow verification) are
 //! scripted; this is not live-model or real Host integration evidence. Runtime
 //! directories must be isolated as required by the shared connected harness.
@@ -269,15 +269,14 @@ impl MrModel {
         for forbidden in ["Read", "Write", "Bash", "SubWorkerSpawn"] {
             assert!(!request.tools.iter().any(|tool| tool.name == forbidden));
         }
-        for name in [
-            "ShowMergeRequest",
-            "CheckMergeRequestReadiness",
-            "CompleteMergeRequest",
-        ] {
-            assert!(
-                request.tools.iter().any(|tool| tool.name == name),
-                "normal body must expose {name}; visibility is not a grant"
-            );
+        assert!(
+            request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ShowMergeRequest")
+        );
+        for removed in ["CheckMergeRequestReadiness", "CompleteMergeRequest"] {
+            assert!(!request.tools.iter().any(|tool| tool.name == removed));
         }
         let ticket = input["ticket"].as_str().unwrap();
         let Some(requirements) = success(request, "mr-body-requirements") else {
@@ -370,14 +369,7 @@ impl MrModel {
                 .iter()
                 .all(|event| event["kind"] != "review" && event["kind"] != "merge")
         );
-        let Some(readiness) = success(request, "mr-body-readiness") else {
-            return call(
-                request,
-                "mr-body-readiness",
-                "CheckMergeRequestReadiness",
-                json!({"merge_request_id":mr_id}),
-            );
-        };
+        let readiness = &mr["summary"]["readiness"];
         assert_eq!(
             readiness["ready"], false,
             "unreviewed candidate cannot be adopted: {readiness}"
@@ -644,154 +636,27 @@ async fn ordinary_subject_explicit_coder_review_publishes_mr_and_preserves_unrev
     let original_body = source;
     let published = evaluation["source"].as_str().unwrap();
 
-    // Pre-evidence refusal ordering only: deliberately nonexistent approval and
-    // unchanged target. A missing domain fence would fall through to HTTP400
-    // target-evidence rejection, which is NOT accepted as authorization success.
-    // The full scenario below provides the valid-evidence contrast. Do not call
-    // this deliberately unreviewed control a completed review/integration case.
+    // A caller cannot force completion of an unreviewed MR: the public route is gone.
     let complete_path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr_id}/complete");
-    let completion = |key: &str| {
-        json!({"operation_id":key,
-        "approval_event_id":"deliberately-absent-independent-verdict",
-        "target_ref_before":before,"target_ref_after":published,
-        "strategy":"fast_forward","resolution":"none"})
-    };
-    let (status, other) = h.human(reqwest::Method::POST,
-        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"), json!({
-            "operation_id":"mr-connected-other-subject","role":"other MR Subject","behavior_md":""})).await;
-    assert_eq!(status, StatusCode::CREATED, "{other}");
-    let other = other["id"].as_str().unwrap();
-    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, other, FULL_EXECUTION, "{}")
-        .await;
-    let other_body = ok(&h, "POST",
-        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{other}/body/start"),
-        json!({"request_id":"mr-connected-other-start","expected_current":null,"expected_observation_token":null})).await;
-    assert_eq!(other_body["disposition"], "accepted", "{other_body}");
-    let other_worker = RuntimeWorkerRef::new(
-        CONNECTED_RUNTIME,
-        other_body["body"]["current"]["worker_id"].as_str().unwrap(),
-    );
-    let completion_permission = json!({"operation":"merge_request.complete", "resource":{
-        "kind":"merge_request","workspace_id":TEST_WORKSPACE_ID,"merge_request_id":mr_id}});
-    let (status, granted) = connected_authorization_post(
-        &h.backend_url,
-        &h.identity,
-        &other_worker,
-        &authorization_path(),
-        &completion_permission,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "positive operation-key control for the OTHER current Subject: {granted}"
-    );
-    let (status, error) = connected_authorization_post(
-        &h.backend_url,
-        &h.identity,
-        &other_worker,
-        &complete_path,
-        &completion("mr-connected-other-must-not-complete"),
-    )
-    .await;
-    assert!(
-        matches!(status, StatusCode::FORBIDDEN | StatusCode::CONFLICT),
-        "another key-authorized current Subject must fail ownership BEFORE target/approval validation: {status} {error}"
-    );
-
-    let background = h
-        .api
-        .store
-        .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
-        .unwrap()
-        .unwrap()
-        .worker;
-    let (status, error) = connected_authorization_post(
-        &h.backend_url,
-        &h.identity,
-        &background,
-        &complete_path,
-        &completion("mr-connected-background-must-not-complete"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "frozen child has no complete operation: {error}"
-    );
-
-    // Assign through the normal owner endpoint with its observed current row.
-    // The old Subject still has complete in canonical policy; current assignment
-    // ownership must be checked independently of that unchanged operation key.
-    let rows = h
-        .api
-        .store
-        .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket)
-        .unwrap();
-    let current = serde_json::to_value(&rows[0]).unwrap();
-    let changed = ok(&h, "PUT", &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
-        json!({"operation_id":"mr-connected-reassign","expected_assignment_id":current["assignment_id"],
-            "principal":{"kind":"subject","subject_id":other}})).await;
-    assert_ne!(
-        changed["assignment"]["assignment_id"],
-        current["assignment_id"]
-    );
-    let (status, granted) = connected_authorization_post(
-        &h.backend_url,
-        &h.identity,
-        &original_body,
-        &authorization_path(),
-        &completion_permission,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "reassignment does not silently remove the former Subject's operation key: {granted}"
-    );
     let (status, error) = connected_authorization_post(
         &h.backend_url,
         &h.identity,
         &original_body,
         &complete_path,
-        &completion("mr-connected-former-subject-must-not-complete"),
+        &json!({"operation_id":"fabricated-completion","approval_event_id":"absent",
+            "target_ref_before":before,"target_ref_after":published,
+            "strategy":"fast_forward","resolution":"none"}),
     )
     .await;
     assert!(
-        matches!(status, StatusCode::FORBIDDEN | StatusCode::CONFLICT),
-        "former Subject's operation key cannot substitute for the current assignment: {status} {error}"
+        matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "removed completion route: {status} {error}"
     );
-
-    // Even the NEW assignee/current body must recheck canonical key exclusion.
-    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, other,
-        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#, "{}").await;
-    let (status, error) = connected_authorization_post(
-        &h.backend_url,
-        &h.identity,
-        &other_worker,
-        &complete_path,
-        &completion("mr-connected-revoked-must-not-complete"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "current assignee's excluded operation cannot record completion: {error}"
-    );
-    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, other, "{}", "{}").await;
-    let (status, error) = connected_authorization_post(
-        &h.backend_url,
-        &h.identity,
-        &other_worker,
-        &complete_path,
-        &completion("mr-connected-empty-must-not-complete"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "explicit empty does not restore default: {error}"
-    );
+    // Nor does a Backend advance invent approval or move the target.
+    mr_publication::advance(&h.api, mr_id).unwrap();
     let after = merge_request_store(&h.api, TEST_WORKSPACE_ID)
         .unwrap()
         .get_by_id(TEST_WORKSPACE_ID, mr_id)
@@ -892,11 +757,6 @@ fn assert_approved(mr: &Value, requirements: &Value) {
         review["reviewer"]["worker_id"], requested["requested_by"]["worker_id"],
         "an actual registered child, not the implementing parent, submitted the verdict"
     );
-}
-fn completion_input(mr: &Value, before: &Value) -> Value {
-    json!({"merge_request_id":mr["merge_request_id"],"operation_id":"full-r2-exact-completion",
-        "approval_event_id":event(mr,"review")["event_id"],"target_ref_before":before,
-        "target_ref_after":mr["source"]["ref"],"strategy":"fast_forward","resolution":"none"})
 }
 fn result_id_from_notification(request: &agen::llm_client::Request) -> Option<String> {
     let incoming = text(request);
@@ -1491,51 +1351,6 @@ async fn temp_workdir(h: &ConnectedWorkerHarness, key: &str) -> (String, PathBuf
         .to_owned();
     (id, root)
 }
-fn permission_for_complete(mr: &str) -> Value {
-    json!({"operation":"merge_request.complete","resource":{
-        "kind":"merge_request","workspace_id":TEST_WORKSPACE_ID,"merge_request_id":mr}})
-}
-async fn completion_denied(
-    h: &ConnectedWorkerHarness,
-    worker: &RuntimeWorkerRef,
-    wire: &Value,
-    key: &str,
-    expect_key: bool,
-) {
-    let mr = wire["merge_request_id"].as_str().unwrap();
-    if expect_key {
-        let (status, value) = connected_authorization_post(
-            &h.backend_url,
-            &h.identity,
-            worker,
-            &authorization_path(),
-            &permission_for_complete(mr),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{key}: operation is granted independently of Subject ownership: {value}"
-        );
-    }
-    let mut body = wire.clone();
-    body.as_object_mut().unwrap().remove("merge_request_id");
-    body["operation_id"] = json!(key);
-    let (status, error) = connected_authorization_post(
-        &h.backend_url,
-        &h.identity,
-        worker,
-        &format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr}/complete"),
-        &body,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "{key}: publication evidence must not substitute for operation authority: {error}"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn ordinary_subject_independent_approval_automatically_publishes_and_completion_requires_evidence()
  {
@@ -1628,7 +1443,7 @@ async fn full_mr_scenario(replace_body: bool) {
     let (subject, body) =
         normal_subject(&h, "full-r2-owner", FULL_EXECUTION, FULL_DELEGATION).await;
     let (other,other_body) = normal_subject(&h,"full-r2-other",
-        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,"{}").await;
+        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.read"]; }]; }"#,"{}").await;
     let owner_worker = RuntimeWorkerRef::new(
         CONNECTED_RUNTIME,
         body["current"]["worker_id"].as_str().unwrap(),
@@ -1759,47 +1574,53 @@ async fn full_mr_scenario(replace_body: bool) {
     assert_eq!(git(h._dir.path(), &["rev-parse", "HEAD"]), before);
     assert!(git(&coder_root, &["status", "--porcelain"]).is_empty());
     body_idle_now(&h, &owner_worker).await;
-    let mut completion = completion_input(&ready["mr"], &json!(before));
-    completion["operation_id"] = json!(publication.binding.operation_id);
-    let path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr_id}/complete");
-    let mut wire = completion.clone();
-    wire.as_object_mut().unwrap().remove("merge_request_id");
-    // An authorized unrelated Subject can reconcile the same saved fact; Ticket
-    // ownership and current body identity are not publication evidence.
-    let recorder = replacement.as_ref().unwrap_or(&other_worker);
+    // Recovery is Backend-owned; no model completion operation or Subject stamp remains.
     for _ in 0..2 {
-        let (status, value) =
-            connected_authorization_post(&h.backend_url, &h.identity, recorder, &path, &wire).await;
-        assert_eq!(status, StatusCode::OK, "saved receipt replay: {value}");
-        assert_eq!(value["event_id"], merges[0].event_id);
+        let recovered = mr_publication::reconcile(&h.api, publication.clone()).unwrap();
+        assert_eq!(recovered, *publication);
     }
-    let mut fabricated = wire.clone();
-    fabricated["operation_id"] = json!("not-a-publication");
-    let (status, error) =
-        connected_authorization_post(&h.backend_url, &h.identity, recorder, &path, &fabricated)
-            .await;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "ref strings cannot establish publication: {error}"
+    assert!(
+        mr_store
+            .complete_publication(TEST_WORKSPACE_ID, "not-a-publication", Utc::now())
+            .is_err()
     );
-    completion_denied(
-        &h,
-        &coder,
-        &completion,
-        "background-without-completion",
-        false,
-    )
-    .await;
-    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject,
-        r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#, FULL_DELEGATION).await;
-    completion_denied(&h, &owner_worker, &completion, "revoked-operation", false).await;
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr_id}/complete");
+    let recorder = replacement.as_ref().unwrap_or(&other_worker);
+    for worker in [&owner_worker, &coder, recorder] {
+        let (status, error) = connected_authorization_post(
+            &h.backend_url,
+            &h.identity,
+            worker,
+            &path,
+            &json!({"operation_id":publication.binding.operation_id,
+                "approval_event_id":publication.binding.approval_event_id,
+                "target_ref_before":before,"target_ref_after":source,
+                "strategy":"fast_forward","resolution":"none"}),
+        )
+        .await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "no completion route even with valid evidence: {status} {error}"
+        );
+    }
     super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject, "{}", "{}").await;
-    completion_denied(&h, &owner_worker, &completion, "empty-policy", false).await;
+    assert_eq!(
+        mr_publication::reconcile(&h.api, publication.clone()).unwrap(),
+        *publication
+    );
     if replace_body {
-        let (status, error) =
-            connected_authorization_post(&h.backend_url, &h.identity, &other_worker, &path, &wire)
-                .await;
+        let (status, error) = connected_authorization_post(
+            &h.backend_url,
+            &h.identity,
+            &other_worker,
+            &authorization_path(),
+            &json!({"operation":"merge_request.read","resource":{
+                "kind":"merge_request","workspace_id":TEST_WORKSPACE_ID,"merge_request_id":mr_id}}),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
