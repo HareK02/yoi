@@ -34,6 +34,7 @@ mod external_grant_failure;
 mod external_operation_audit;
 mod grant_cleanup;
 mod launch_policy_registry;
+mod mr_publication;
 mod service_authority;
 mod session_registration;
 mod subject_authorization;
@@ -2203,6 +2204,7 @@ pub struct WorkspaceApi {
     orchestrator_attention:
         Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<Mutex<OrchestratorAttentionState>>>>>,
     notification_delivery_lifecycle: Arc<notification_delivery::NotificationDeliveryLifecycle>,
+    mr_publication_wake: Arc<tokio::sync::Notify>,
     backend_job_drain_requests: Arc<AtomicU64>,
     backend_job_recovery: Arc<backend_job_recovery::RecoveryOwners>,
     journal_lifecycle: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -5137,6 +5139,7 @@ impl WorkspaceApi {
             companion,
             orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
             notification_delivery_lifecycle: Arc::new(Default::default()),
+            mr_publication_wake: Arc::new(tokio::sync::Notify::new()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
             #[cfg(not(test))]
@@ -8312,6 +8315,21 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::merge_request_review_revoke(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_comment(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_publications(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_publish(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_worker_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_worker_set(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::merge_request_complete(
@@ -13131,6 +13149,211 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map_err(ApiError::into_repository_api_error)?;
         Ok(response)
+    }
+
+    async fn merge_request_worker_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<server_api::MergeRequestWorkerResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        let headers = contract_request_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?
+            .run(move || {
+                require_workspace_access(&workspace_id, &api)?;
+                if let Some(source) =
+                    optional_worker_mutation_source(&api, &workspace_id, &headers)?
+                {
+                    require_mr_operation(&api, &source, &id, "merge_request.read")?;
+                }
+                let assignment = merge_request_store(&api, &workspace_id)?
+                    .current_worker(&workspace_id, &id)?
+                    .map(public_mr_worker_assignment);
+                Ok(server_api::MergeRequestWorkerResponse { assignment })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn merge_request_worker_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::SetMergeRequestWorkerRequest,
+    ) -> std::result::Result<
+        server_api::MergeRequestWorkerAssignedEvent,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        let headers = current_worker_contract_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?
+            .run(move || {
+                require_workspace_access(&workspace_id, &api)?;
+                let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+                require_mr_operation(&api, &source, &id, "merge_request.assign")?;
+                if let Some(target) = &request.worker {
+                    let worker = api
+                        .runtime
+                        .worker(&RuntimeWorkerRef::new(
+                            &target.runtime_id,
+                            &target.worker_id,
+                        ))
+                        .map_err(|error| error.into_error())?;
+                    if worker.workspace.workspace_id.as_deref() != Some(workspace_id.as_str()) {
+                        return Err(Error::WorkspacePermissionDenied(
+                            "MR Worker belongs to another Workspace".into(),
+                        )
+                        .into());
+                    }
+                }
+                let store = merge_request_store(&api, &workspace_id)?;
+                let event = store.set_worker_with_admission(
+                    merge_request::SetMergeRequestWorker {
+                        workspace_id: workspace_id.clone(),
+                        merge_request_id: id.clone(),
+                        operation_id: request.operation_id,
+                        expected_operation_id: request.expected_operation_id,
+                        worker: request.worker.map(|worker| merge_request::WorkerIdentity {
+                            runtime_id: worker.runtime_id,
+                            worker_id: worker.worker_id,
+                        }),
+                        assigned_by: merge_request::WorkerIdentity {
+                            runtime_id: source.runtime_id.clone(),
+                            worker_id: source.worker_id.clone(),
+                        },
+                        now: Utc::now(),
+                    },
+                    |_| {
+                        require_mr_operation(&api, &source, &id, "merge_request.assign").map_err(
+                            |error| {
+                                merge_request::MergeRequestError::Unauthorized(
+                                    error.error.to_string(),
+                                )
+                            },
+                        )
+                    },
+                )?;
+                Ok(public_mr_worker_assignment(event))
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn merge_request_comment(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::CommentMergeRequestRequest,
+    ) -> std::result::Result<server_api::MergeRequestCommentEvent, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        let headers = current_worker_contract_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(|e| ApiError::from(e).into_repository_api_error())?
+            .run(move || {
+                require_workspace_access(&workspace_id, &api)?;
+                let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+                require_mr_operation(&api, &source, &id, "merge_request.comment")?;
+                let store = merge_request_store(&api, &workspace_id)?;
+                let mr = store.get_by_id(&workspace_id, &id)?;
+                let auth = merge_request::MergeRequestAuth {
+                    workspace_id,
+                    repository_id: mr.repository_id,
+                    runtime_id: source.runtime_id.clone(),
+                    worker_id: source.worker_id.clone(),
+                    assignment_id: request.expected_owner_operation_id,
+                };
+                let event = store.comment(
+                    &auth,
+                    &id,
+                    &request.operation_id,
+                    &request.body,
+                    Utc::now(),
+                    |_| {
+                        require_mr_operation(&api, &source, &id, "merge_request.comment").map_err(
+                            |e| merge_request::MergeRequestError::Unauthorized(e.error.to_string()),
+                        )
+                    },
+                )?;
+                let server_api::MergeRequestThreadEvent::Comment(event) =
+                    public_merge_request_thread_event(
+                        merge_request::MergeRequestThreadEvent::Comment(event),
+                    )
+                else {
+                    unreachable!()
+                };
+                Ok(event)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn merge_request_publications(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<
+        server_api::MergeRequestPublicationsResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        let headers = contract_request_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(|e| ApiError::from(e).into_repository_api_error())?
+            .run(move || {
+                require_workspace_access(&workspace_id, &api)?;
+                if let Some(source) =
+                    optional_worker_mutation_source(&api, &workspace_id, &headers)?
+                {
+                    require_mr_operation(&api, &source, &id, "merge_request.read")?;
+                }
+                let store = merge_request_store(&api, &workspace_id)?;
+                store.get_by_id(&workspace_id, &id)?;
+                Ok(server_api::MergeRequestPublicationsResponse {
+                    publications: store
+                        .publications(&workspace_id, &id)?
+                        .into_iter()
+                        .map(mr_publication::public)
+                        .collect(),
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn merge_request_publish(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::PublishMergeRequestRequest,
+    ) -> std::result::Result<server_api::MergeRequestPublication, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        let headers = current_worker_contract_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(|e| ApiError::from(e).into_repository_api_error())?
+            .run(move || {
+                require_workspace_access(&workspace_id, &api)?;
+                let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+                require_mr_operation(&api, &source, &id, "merge_request.publish")?;
+                mr_publication::publish(&api, &id, request, Some(&source))
+                    .map(mr_publication::public)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn merge_request_complete(
@@ -19599,22 +19822,30 @@ impl TicketSourceCommitResolver for RuntimeTicketSourceCommitResolver {
     fn resolve_source_commit(
         &self,
         ticket_id: &str,
+        merge_request_id: &str,
         repository_id: &str,
         selector: &str,
     ) -> std::result::Result<String, MergeRequestRefDiagnostic> {
-        let assignment = self
-            .api
-            .store
-            .get_current_ticket_worker_assignment(self.api.workspace_id(), ticket_id)
-            .map_err(|error| merge_ref_diagnostic(error.into()))?
-            .ok_or_else(|| MergeRequestRefDiagnostic {
-                code: "source_ref_runtime_unavailable".into(),
-                message: "No current Coder Runtime is available to observe the source ref".into(),
-            })?;
+        let store = merge_request_store(&self.api, self.api.workspace_id())
+            .map_err(merge_ref_diagnostic)?;
+        let mr = store
+            .get_by_id(self.api.workspace_id(), merge_request_id)
+            .map_err(|error| merge_ref_diagnostic(error.into()))?;
+        if !mr.ticket_ids.iter().any(|id| id == ticket_id)
+            || mr.repository_id != repository_id
+            || mr.selector_from.as_deref() != Some(selector)
+        {
+            return Err(MergeRequestRefDiagnostic {
+                code: "source_ref_mr_mismatch".into(),
+                message: "The requested source does not match the addressed MR".into(),
+            });
+        }
+        let (_, worker) = current_mr_worker(&store, self.api.workspace_id(), &mr.merge_request_id)
+            .map_err(merge_ref_diagnostic)?;
         observe_published_source_ref(
             &self.api,
             self.api.workspace_id(),
-            &assignment.worker.runtime_id,
+            &worker.runtime_id,
             repository_id,
             selector,
         )
@@ -19803,9 +20034,25 @@ fn require_assigned_workdir_source(
     selector: &str,
     resolved_ref: &str,
 ) -> ApiResult<()> {
+    require_worker_workdir_source(
+        api,
+        &assignment.worker,
+        repository_id,
+        selector,
+        resolved_ref,
+    )
+}
+
+fn require_worker_workdir_source(
+    api: &WorkspaceApi,
+    worker_ref: &RuntimeWorkerRef,
+    repository_id: &str,
+    selector: &str,
+    resolved_ref: &str,
+) -> ApiResult<()> {
     let worker = api
         .runtime
-        .worker(&assignment.worker)
+        .worker(worker_ref)
         .map_err(|error| error.into_error())?;
     if worker.workdir_attachments.is_empty() {
         return Err(
@@ -19821,7 +20068,7 @@ fn require_assigned_workdir_source(
         let Some(workdir) = api
             .runtime
             .working_directory(
-                &assignment.worker.runtime_id,
+                &worker_ref.runtime_id,
                 &attachment.working_directory.summary.working_directory_id,
             )
             .map_err(|error| error.into_error())?
@@ -19843,7 +20090,7 @@ fn require_assigned_workdir_source(
         }
     });
     Err(Error::RuntimeOperationFailed {
-        runtime_id: assignment.worker.runtime_id.clone(),
+        runtime_id: worker_ref.runtime_id.clone(),
         code: diagnostic.code,
         message: diagnostic.message,
     }
@@ -20157,6 +20404,64 @@ fn internal_conflict_resolution(
     }
 }
 
+fn current_mr_worker(
+    store: &merge_request::MergeRequestStore,
+    workspace_id: &str,
+    merge_request_id: &str,
+) -> ApiResult<(merge_request::WorkerAssignedEvent, RuntimeWorkerRef)> {
+    let assignment = store
+        .current_worker(workspace_id, merge_request_id)?
+        .ok_or_else(|| {
+            merge_request::MergeRequestError::NotReady(
+                "MR has no current Worker; assign explicitly".into(),
+            )
+        })?;
+    let worker = assignment.worker.as_ref().ok_or_else(|| {
+        merge_request::MergeRequestError::NotReady("MR Worker assignment was released".into())
+    })?;
+    let worker = RuntimeWorkerRef::new(&worker.runtime_id, &worker.worker_id);
+    Ok((assignment, worker))
+}
+
+fn require_mr_operation(
+    api: &WorkspaceApi,
+    source: &WorkerMutationSource,
+    merge_request_id: &str,
+    operation: &str,
+) -> ApiResult<()> {
+    subject_authorization::authorize_scope(
+        api,
+        source,
+        &server_api::authorization::OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::MergeRequest {
+                workspace_id: api.workspace_id().into(),
+                merge_request_id: merge_request_id.into(),
+            },
+        },
+    )?
+    .ok_or_else(|| {
+        ApiError::from(Error::WorkspacePermissionDenied(
+            "MR operation is not granted".into(),
+        ))
+    })?;
+    Ok(())
+}
+
+fn public_mr_worker_assignment(
+    event: merge_request::WorkerAssignedEvent,
+) -> server_api::MergeRequestWorkerAssignedEvent {
+    server_api::MergeRequestWorkerAssignedEvent {
+        event_id: event.event_id,
+        sequence: event.sequence,
+        operation_id: event.operation_id,
+        previous_operation_id: event.previous_operation_id,
+        worker: event.worker.map(public_merge_request_worker_identity),
+        assigned_by: public_merge_request_worker_identity(event.assigned_by),
+        created_at: event.created_at.to_rfc3339(),
+    }
+}
+
 fn public_merge_request_thread_event(
     event: merge_request::MergeRequestThreadEvent,
 ) -> server_api::MergeRequestThreadEvent {
@@ -20198,12 +20503,17 @@ fn public_merge_request_thread_event(
         }
         merge_request::MergeRequestThreadEvent::Comment(event) => {
             server_api::MergeRequestThreadEvent::Comment(server_api::MergeRequestCommentEvent {
+                operation_id: event.operation_id,
+                owner_operation_id: event.owner_operation_id,
                 event_id: event.event_id,
                 sequence: event.sequence,
                 body: event.body,
                 author: public_merge_request_worker_identity(event.author),
                 created_at: event.created_at.to_rfc3339(),
             })
+        }
+        merge_request::MergeRequestThreadEvent::WorkerAssigned(event) => {
+            server_api::MergeRequestThreadEvent::WorkerAssigned(public_mr_worker_assignment(event))
         }
         merge_request::MergeRequestThreadEvent::Merge(event) => {
             server_api::MergeRequestThreadEvent::Merge(public_merge_event(event))
@@ -20299,14 +20609,14 @@ async fn scoped_list_merge_requests(
                         merge_request.selector_from.as_deref(),
                         merge_request.ticket_ids.first(),
                     ) {
-                        (Some(selector), Some(ticket_id)) => match api
-                            .store
-                            .get_current_ticket_worker_assignment(&workspace_id, ticket_id)?
+                        (Some(selector), Some(_ticket_id)) => match store
+                            .current_worker(&workspace_id, &merge_request.merge_request_id)?
+                            .and_then(|assignment| assignment.worker)
                         {
                             Some(assignment) => match observe_published_source_ref(
                                 &api,
                                 &workspace_id,
-                                &assignment.worker.runtime_id,
+                                &assignment.runtime_id,
                                 &merge_request.repository_id,
                                 selector,
                             ) {
@@ -20468,6 +20778,7 @@ fn merge_request_event_reference(
         Event::ReviewRevoked(event) => &event.event_id,
         Event::ReviewCancelled(event) => &event.event_id,
         Event::Comment(event) => &event.event_id,
+        Event::WorkerAssigned(event) => &event.event_id,
         Event::Merge(event) => &event.event_id,
     };
     server_api::MergeRequestEventReference {
@@ -20610,9 +20921,9 @@ async fn scoped_show_merge_request(
                     "Merge Request has no linked Ticket".into(),
                 ))
             })?;
-            let assignment = api
-                .store
-                .get_current_ticket_worker_assignment(&workspace_id, ticket_id)?;
+            let assignment = store
+                .current_worker(&workspace_id, &merge_request_id)?
+                .and_then(|assignment| assignment.worker);
             let (source, target) = if let Some(refs) = integrated_refs {
                 refs
             } else {
@@ -20621,7 +20932,7 @@ async fn scoped_show_merge_request(
                         match observe_published_source_ref(
                             &api,
                             &workspace_id,
-                            &assignment.worker.runtime_id,
+                            &assignment.runtime_id,
                             &mr.repository_id,
                             selector,
                         ) {
@@ -20644,7 +20955,7 @@ async fn scoped_show_merge_request(
                     Some(assignment) => match observe_published_merge_ref(
                         &api,
                         &workspace_id,
-                        &assignment.worker.runtime_id,
+                        &assignment.runtime_id,
                         &mr.repository_id,
                         &mr.selector_to,
                     ) {
@@ -20729,9 +21040,9 @@ async fn scoped_merge_request_readiness(
             let store = merge_request_store(&api, &workspace_id)?;
             let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
             let ticket_id = merge_request_ticket_id(&mr)?;
-            let assignment = api
-                .store
-                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?;
+            let assignment = store
+                .current_worker(&workspace_id, &merge_request_id)?
+                .and_then(|assignment| assignment.worker);
             let (current_subject_ref, source_blocker) = if mr.state.is_completed() {
                 (
                     mr.merged_result()
@@ -20744,7 +21055,7 @@ async fn scoped_merge_request_readiness(
                     (Some(selector), Some(assignment)) => match observe_published_source_ref(
                         &api,
                         &workspace_id,
-                        &assignment.worker.runtime_id,
+                        &assignment.runtime_id,
                         &mr.repository_id,
                         selector,
                     ) {
@@ -20928,18 +21239,11 @@ async fn scoped_repair_merge_request_selector(
             let store = merge_request_store(&api, &workspace_id)?;
             let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
             let ticket_id = merge_request_ticket_id(&mr)?;
-            let assignment = api
-                .store
-                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
-                .ok_or_else(|| {
-                    Error::TicketAssignmentConflict(
-                        "Ticket has no current implementation assignment".into(),
-                    )
-                })?;
+            let (_, worker) = current_mr_worker(&store, &workspace_id, &merge_request_id)?;
             let resolved_subject_ref = observe_published_source_ref(
                 &api,
                 &workspace_id,
-                &assignment.worker.runtime_id,
+                &worker.runtime_id,
                 &mr.repository_id,
                 &input.selector_from,
             )?
@@ -21012,14 +21316,7 @@ async fn scoped_register_merge_request_review_capability(
                 )
                 .into());
             }
-            let assignment = api
-                .store
-                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
-                .ok_or_else(|| {
-                    Error::TicketAssignmentConflict(
-                        "Ticket has no current implementation assignment".into(),
-                    )
-                })?;
+            let (assignment, worker) = current_mr_worker(&store, &workspace_id, &merge_request_id)?;
             let subject_ref = match &mr.state {
                 merge_request::MergeRequestState::Completed { .. } => {
                     merged_result_source_ref(&mr)?
@@ -21032,13 +21329,13 @@ async fn scoped_register_merge_request_review_capability(
                     let source_observation = observe_published_source_ref(
                         &api,
                         &workspace_id,
-                        &assignment.worker.runtime_id,
+                        &worker.runtime_id,
                         &mr.repository_id,
                         selector,
                     )?;
-                    require_assigned_workdir_source(
+                    require_worker_workdir_source(
                         &api,
-                        &assignment,
+                        &worker,
                         &mr.repository_id,
                         selector,
                         &source_observation.resolved_ref,
@@ -21063,10 +21360,12 @@ async fn scoped_register_merge_request_review_capability(
                             linked.merge_request_id
                         ))
                     })?;
+                    let (_, linked_worker) =
+                        current_mr_worker(&store, &workspace_id, &linked.merge_request_id)?;
                     observe_published_source_ref(
                         &api,
                         &workspace_id,
-                        &assignment.worker.runtime_id,
+                        &linked_worker.runtime_id,
                         &linked.repository_id,
                         linked_selector,
                     )?
@@ -21091,7 +21390,7 @@ async fn scoped_register_merge_request_review_capability(
                     repository_id: mr.repository_id,
                     runtime_id: source.runtime_id,
                     worker_id: source.worker_id,
-                    assignment_id: assignment.assignment_id,
+                    assignment_id: assignment.operation_id,
                 },
                 now: Utc::now(),
             })?;
@@ -21124,14 +21423,7 @@ async fn scoped_submit_merge_request_review(
             }
             let ticket_id = review_authorization.ticket_id;
             let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
-            let assignment = api
-                .store
-                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
-                .ok_or_else(|| {
-                    Error::TicketAssignmentConflict(
-                        "Ticket has no current implementation assignment".into(),
-                    )
-                })?;
+            let (_, worker) = current_mr_worker(&store, &workspace_id, &merge_request_id)?;
             let current_subject_ref = match &mr.state {
                 merge_request::MergeRequestState::Completed { .. } => {
                     merged_result_source_ref(&mr)?
@@ -21144,7 +21436,7 @@ async fn scoped_submit_merge_request_review(
                     observe_published_source_ref(
                         &api,
                         &workspace_id,
-                        &assignment.worker.runtime_id,
+                        &worker.runtime_id,
                         &mr.repository_id,
                         selector,
                     )?
@@ -21173,6 +21465,9 @@ async fn scoped_submit_merge_request_review(
                 findings,
                 now: Utc::now(),
             })?;
+            if event.decision == merge_request::ReviewDecision::Approve {
+                api.mr_publication_wake.notify_one();
+            }
             Ok(Json(public_review_event(event)))
         })
         .await
@@ -21196,14 +21491,7 @@ async fn scoped_revoke_merge_request_review(
             let store = merge_request_store(&api, &workspace_id)?;
             let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
             let ticket_id = merge_request_ticket_id(&mr)?;
-            let assignment = api
-                .store
-                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
-                .ok_or_else(|| {
-                    Error::TicketAssignmentConflict(
-                        "Ticket has no current implementation assignment".into(),
-                    )
-                })?;
+            let (assignment, _) = current_mr_worker(&store, &workspace_id, &merge_request_id)?;
             let event = store.revoke_review(merge_request::RevokeMergeRequestReview {
                 merge_request_id,
                 ticket_id,
@@ -21214,7 +21502,7 @@ async fn scoped_revoke_merge_request_review(
                     repository_id: mr.repository_id,
                     runtime_id: source.runtime_id,
                     worker_id: source.worker_id,
-                    assignment_id: assignment.assignment_id,
+                    assignment_id: assignment.operation_id,
                 },
                 now: Utc::now(),
             })?;
@@ -21236,97 +21524,40 @@ async fn scoped_complete_merge_request(
             let workspace_id = parse_workspace_id(&workspace_id)?;
             require_workspace_access(&workspace_id, &api)?;
             let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
-            require_merge_request_completion_grant(&api, &source, &merge_request_id)?;
-            let store = merge_request_store(&api, &workspace_id)?;
-            let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
-            let ticket_id = merge_request_ticket_id(&mr)?;
-            let request_source = context.runtime_source.as_ref().ok_or_else(|| {
-                Error::WorkspacePermissionDenied(
+            require_mr_operation(&api, &source, &merge_request_id, "merge_request.complete")?;
+            if context.runtime_source.is_none() {
+                return Err(Error::WorkspacePermissionDenied(
                     "MR completion requires a signed Runtime source".into(),
                 )
-            })?;
-            let admission =
-                subject_authorization::merge_completion_subject(&api, &source, &ticket_id)?;
-            if let Some(existing) = recorded_merge_completion(&mr.thread, &input.operation_id) {
-                let replay = merge_request::CompleteMergeRequest {
-                    merge_request_id,
-                    ticket_id,
-                    operation_id: input.operation_id,
-                    approval_event_id: input.approval_event_id,
-                    current_subject_ref: existing.approved_source_ref.clone(),
-                    target_ref_before: input.target_ref_before,
-                    target_ref_after: input.target_ref_after,
-                    strategy: internal_merge_strategy(input.strategy),
-                    resolution: internal_conflict_resolution(input.resolution),
-                    auth: merge_request::MergeRequestAuth {
-                        workspace_id,
-                        repository_id: mr.repository_id.clone(),
-                        runtime_id: source.runtime_id,
-                        worker_id: source.worker_id,
-                        assignment_id: String::new(),
-                    },
-                    now: Utc::now(),
-                };
-                return admission
-                    .complete(&api, request_source, &store, replay)
-                    .map(public_merge_event)
-                    .map(Json);
+                .into());
             }
-            let assignment = api
-                .store
-                .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+            let store = merge_request_store(&api, &workspace_id)?;
+            let saved = store
+                .publication(&workspace_id, &input.operation_id)?
+                .filter(|p| p.binding.merge_request_id == merge_request_id)
                 .ok_or_else(|| {
-                    Error::TicketAssignmentConflict(
-                        "Ticket has no current implementation assignment".into(),
+                    merge_request::MergeRequestError::NotReady(
+                        "completion requires saved publication evidence; ref strings are not proof"
+                            .into(),
                     )
                 })?;
-            let selector = mr
-                .selector_from
-                .as_deref()
-                .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-            let current_source_ref = observe_published_source_ref(
-                &api,
-                &workspace_id,
-                &assignment.worker.runtime_id,
-                &mr.repository_id,
-                selector,
-            )?
-            .resolved_ref;
-            let observed_target = observe_published_merge_ref(
-                &api,
-                &workspace_id,
-                &assignment.worker.runtime_id,
-                &mr.repository_id,
-                &mr.selector_to,
-            )?;
-            require_completed_target_observation(
-                &observed_target.resolved_ref,
-                &input.target_ref_before,
-                &input.target_ref_after,
-            )?;
-            let completion = merge_request::CompleteMergeRequest {
-                merge_request_id,
-                ticket_id,
-                operation_id: input.operation_id,
-                approval_event_id: input.approval_event_id,
-                current_subject_ref: current_source_ref,
-                target_ref_before: input.target_ref_before.clone(),
-                target_ref_after: input.target_ref_after.clone(),
-                strategy: internal_merge_strategy(input.strategy),
-                resolution: internal_conflict_resolution(input.resolution),
-                auth: merge_request::MergeRequestAuth {
-                    workspace_id,
-                    repository_id: mr.repository_id.clone(),
-                    runtime_id: source.runtime_id,
-                    worker_id: source.worker_id,
-                    assignment_id: assignment.assignment_id,
-                },
-                now: Utc::now(),
-            };
-            admission
-                .complete(&api, request_source, &store, completion)
+            if saved.binding.approval_event_id != input.approval_event_id
+                || saved.binding.target_before != input.target_ref_before
+                || saved.binding.source != input.target_ref_after
+                || input.strategy != server_api::MergeStrategy::FastForward
+                || input.resolution != server_api::ConflictResolution::None
+            {
+                return Err(merge_request::MergeRequestError::Conflict(
+                    "completion does not match its publication operation".into(),
+                )
+                .into());
+            }
+            mr_publication::reconcile(&api, saved)?;
+            store
+                .complete_publication(&workspace_id, &input.operation_id, Utc::now())
                 .map(public_merge_event)
                 .map(Json)
+                .map_err(Into::into)
         })
         .await
 }
@@ -23857,6 +24088,13 @@ async fn execute_workdir_session_operation(
 }
 
 async fn run_orchestrator_turn_end_hook(api: WorkspaceApi) {
+    tokio::join!(
+        run_notification_recovery_hook(api.clone()),
+        mr_publication::recovery_loop(api)
+    );
+}
+
+async fn run_notification_recovery_hook(api: WorkspaceApi) {
     // Fixed, bounded recovery independent of unrelated Ticket updates. A missed
     // tick is skipped rather than accumulated; rounds do not overlap on this owner.
     let mut recovery = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -44995,7 +45233,6 @@ mod tests {
             "scoped_repair_merge_request_selector",
             "scoped_register_merge_request_review_capability",
             "scoped_submit_merge_request_review",
-            "scoped_complete_merge_request",
         ] {
             let handler = handler_source(source, handler);
             assert!(
@@ -45004,6 +45241,10 @@ mod tests {
             );
             assert!(!handler.contains("repository_reader()"));
         }
+        let completion = handler_source(source, "scoped_complete_merge_request");
+        assert!(completion.contains("store") && completion.contains(".publication("));
+        assert!(completion.contains("mr_publication::reconcile("));
+        assert!(!completion.contains("observe_published_merge_ref("));
         let submit = handler_source(source, "scoped_submit_merge_request_review");
         assert!(
             submit

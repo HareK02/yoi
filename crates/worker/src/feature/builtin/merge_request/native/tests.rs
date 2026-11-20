@@ -29,6 +29,11 @@ fn all_config() -> MergeRequestFeatureConfig {
         review: true,
         readiness_check: true,
         complete: true,
+        worker_query: true,
+        worker_set: true,
+        publications: true,
+        publish: true,
+        comment: true,
     }
 }
 

@@ -6574,6 +6574,109 @@ where
         materializer.authorize_repository_access(request)
     }
 
+    fn reject_repository_publication(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+        reason: &str,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.working_directory_materializer
+            .as_ref()
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::rejected(
+                    "repository_publication_unsupported",
+                    "Repository materializer unavailable",
+                )
+            })?
+            .reject_repository_publication(request, reason)
+    }
+
+    fn repository_publication_receipt(
+        &self,
+        binding: &crate::catalog::RepositoryPublicationBinding,
+    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
+    {
+        self.working_directory_materializer
+            .as_ref()
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::rejected(
+                    "repository_publication_unsupported",
+                    "Repository materializer unavailable",
+                )
+            })?
+            .repository_publication_receipt(binding)
+    }
+
+    fn reconcile_repository_publication(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.working_directory_materializer
+            .as_ref()
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::rejected(
+                    "repository_publication_unsupported",
+                    "Repository materializer unavailable",
+                )
+            })?
+            .reconcile_repository_publication(request)
+    }
+
+    fn publish_repository_source(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        let denied = |message| {
+            WorkingDirectoryDiagnostic::rejected("repository_publication_unavailable", message)
+        };
+        let materializer = self
+            .working_directory_materializer
+            .as_ref()
+            .ok_or_else(|| denied("Repository materializer unavailable".to_string()))?;
+        if let Some(saved) = materializer.repository_publication_receipt(&request.binding)? {
+            return Ok(saved);
+        }
+        let worker = WorkerRef::try_from(&request.binding.worker)
+            .map_err(|_| denied("Publication Worker identity invalid".to_string()))?;
+        let lock = self.worker_lock(&worker).map_err(denied)?;
+        let _operation = lock
+            .try_lock()
+            .map_err(|_| denied("Worker backend operation busy".to_string()))?;
+        let execution = self
+            .workers
+            .lock()
+            .map_err(|_| denied("Worker registry unavailable".to_string()))?
+            .get(&worker)
+            .cloned()
+            .ok_or_else(|| denied("Publication Worker is not live".to_string()))?;
+        if execution.workspace_id.as_deref() != Some(request.binding.workspace_id.as_str())
+            || execution.shutdown_requested.load(Ordering::Acquire)
+            || execution.handle.protocol_is_closed()
+            || !execution.workdir_attachments.iter().any(|a| {
+                a.alias == request.binding.alias
+                    && a.working_directory.summary.working_directory_id
+                        == request.binding.working_directory_id
+            })
+        {
+            return Err(denied(
+                "Publication live Worker or attachment mismatch".to_string(),
+            ));
+        }
+        let handle = execution.handle.clone();
+        let alias = request.binding.alias.clone();
+        let _exclusive = self
+            .run_joined_on_adapter_runtime(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    handle.reserve_workdir_publication(&alias),
+                )
+                .await
+                .map_err(|_| "Workdir exclusion observation timed out".to_string())?
+                .map_err(|_| "Workdir has conflicting operations or commands".to_string())
+            })
+            .map_err(denied)?;
+        materializer.publish_repository_source(request)
+    }
+
     fn observe_repository_ref(
         &self,
         request: &RepositoryRefObservationRequest,
@@ -15426,6 +15529,8 @@ mod tests {
             .send_input(&detail.worker_ref, WorkerInput::user("continue"))
             .unwrap();
     }
+
+    include!("worker_backend/publication_tests.rs");
 
     #[test]
     fn stopping_and_deleting_worker_preserves_bound_working_directory() {

@@ -59,6 +59,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "memory_staging_records",
     "memory_staging_resolutions",
     "merge_request_source_observations",
+    "merge_request_publications",
     "ticket_implementation_results",
     "ticket_implementation_delegations",
     "merge_request_review_grants",
@@ -553,6 +554,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ("notification_job_targets", "notification_job_targets_no_delete"),
                 ("notification_assignment_targets", "notification_assignment_targets_no_delete"),
                 ("merge_request_source_observations", "mr_source_observations_no_delete"),
+                ("merge_request_publications", "merge_request_publication_no_delete"),
                 ("ticket_implementation_results", "implementation_results_no_delete"),
                 ("ticket_implementation_delegations", "implementation_delegations_no_delete"),
                 ("notification_sources", "notification_sources_no_delete"),
@@ -1071,9 +1073,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_purge_erases_launch_authority_and_job_migration_references_atomically() {
+    fn workspace_purge_erases_launch_authority_and_publication_evidence_atomically() {
         let (store, owner, workspace_id) = setup();
         let tables = [
+            "merge_request_publications",
             "backend_job_reference_migration_jobs",
             "backend_job_reference_migration_targets",
             "core_worker_launch_bindings",
@@ -1085,6 +1088,10 @@ mod tests {
         ];
         store.with_conn(|conn| {
             for workspace in ["workspace-a", "workspace-b"] {
+                conn.execute("INSERT INTO repositories(workspace_id,repository_id,repository_key,kind,provider,uri,created_at,updated_at,source_kind,source_uri,source_fingerprint) VALUES(?1,?1,'main','git','git','file:///main','1','1','file','file:///main','sha256:fixture')", [workspace])?;
+                conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,selector_from,selector_to,state,created_at,updated_at) VALUES(?1,'mr',?1,'source','main','{\"kind\":\"implementation\"}','1','1')", [workspace])?;
+                conn.execute("INSERT INTO merge_request_publications VALUES(?1,'publication','mr',?1,'refs/heads/main','approval',1,'{}')", [workspace])?;
+                assert!(conn.execute("DELETE FROM merge_request_publications WHERE workspace_id=?1", [workspace]).is_err());
                 conn.execute("INSERT INTO worker_launch_policies VALUES(?1,'policy',1,'active','{}','policy-operation')", [workspace])?;
                 conn.execute("INSERT INTO worker_launch_policy_history VALUES(?1,'policy','policy-operation',1,'{}')", [workspace])?;
                 conn.execute("INSERT INTO worker_launch_policy_operations VALUES(?1,'policy-operation','owner','{}','{}')", [workspace])?;

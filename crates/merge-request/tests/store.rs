@@ -1,7 +1,13 @@
+#[path = "store/comments.rs"]
+mod comments;
 #[path = "store/integration.rs"]
 mod integration;
 #[path = "store/lifecycle.rs"]
 mod lifecycle;
+#[path = "store/ownership.rs"]
+mod ownership;
+#[path = "store/publication.rs"]
+mod publication;
 
 use chrono::{TimeZone, Utc};
 use merge_request::*;
@@ -38,6 +44,16 @@ fn auth_repo(repository_id: &str) -> MergeRequestAuth {
     MergeRequestAuth {
         repository_id: repository_id.into(),
         ..auth()
+    }
+}
+fn mr_auth(s: &MergeRequestStore, merge_request_id: &str, repository_id: &str) -> MergeRequestAuth {
+    MergeRequestAuth {
+        assignment_id: s
+            .current_worker("W", merge_request_id)
+            .unwrap()
+            .unwrap()
+            .operation_id,
+        ..auth_repo(repository_id)
     }
 }
 fn content_digest(title: &str) -> String {
@@ -143,6 +159,7 @@ fn concurrent_open_serializes_the_conflict_snapshot_instead_of_upgrading_read_lo
 
 /// Frozen v12 fixture: counters must never be promoted to content attestations.
 fn freeze_v13_schema(connection: &Connection) {
+    ownership::freeze_v14_schema(connection);
     connection
         .execute_batch(
             "DROP TRIGGER merge_request_lifecycle_transition;
@@ -304,6 +321,26 @@ fn v12_migration_revokes_old_grants_preserves_integration_and_requires_fresh_con
         merged,
         "recorded merge replay stays intact"
     );
+    store
+        .set_worker(
+            SetMergeRequestWorker {
+                workspace_id: "W".into(),
+                merge_request_id: "MR".into(),
+                operation_id: "legacy-owner".into(),
+                expected_operation_id: None,
+                worker: Some(WorkerIdentity {
+                    runtime_id: "runtime".into(),
+                    worker_id: "coder".into(),
+                }),
+                assigned_by: WorkerIdentity {
+                    runtime_id: "runtime".into(),
+                    worker_id: "coordinator".into(),
+                },
+                now: at(6),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
     let fresh = approve(&store, "source", "fresh");
     assert_eq!(fresh.ticket_content_digest, content_digest("Title"));
     migrate(&connection).unwrap();
@@ -324,7 +361,7 @@ fn v12_migration_revokes_old_grants_preserves_integration_and_requires_fresh_con
             .query_row("SELECT version FROM merge_request_schema", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        14
+        16
     );
 }
 
@@ -436,7 +473,7 @@ fn request_for(
         subject_ref: subject.into(),
         child_session_id: format!("child-{token}"),
         capability_token: token.into(),
-        auth: auth_repo(repository_id),
+        auth: mr_auth(s, merge_request_id, repository_id),
         now: at(3),
     })
     .unwrap()
@@ -880,7 +917,7 @@ fn review_revocation_invalidates_readiness() {
         ticket_id: "T".into(),
         review_event_id: review.event_id,
         reason: "bad evidence".into(),
-        auth: auth(),
+        auth: mr_auth(&s, "MR", "R"),
         now: at(7),
     })
     .unwrap();
@@ -909,7 +946,7 @@ fn fresh_schema_reopens_as_current() {
             r.get::<_, i64>(0)
         })
         .unwrap(),
-        14
+        16
     );
     merge_request::migrate(&c).unwrap();
 }
@@ -949,7 +986,7 @@ fn authority_reads_full_thread_while_public_pages_remain_bounded() {
     assert_eq!(store.thread_page("W", "T", None, 20).unwrap().len(), 20);
     assert_eq!(
         store.thread_page("W", "T", Some(100), 20).unwrap().len(),
-        11
+        12
     );
 }
 
@@ -1317,7 +1354,7 @@ fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
             subject_ref: "subject".into(),
             child_session_id: "child-fresh".into(),
             capability_token: "token-fresh".into(),
-            auth: auth(),
+            auth: mr_auth(&store, "MR", "R"),
             now: at(7),
         })
         .unwrap();
@@ -1426,7 +1463,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
             subject_ref: "subject".into(),
             child_session_id: "child-post-merge".into(),
             capability_token: "token-post-merge".into(),
-            auth: auth(),
+            auth: mr_auth(&store, "MR", "R"),
             now: at(7),
         })
         .unwrap();
@@ -1497,7 +1534,7 @@ fn review_request_rejects_a_snapshot_that_omits_a_linked_merge_request() {
         subject_ref: "subject-one".into(),
         child_session_id: "child-incomplete".into(),
         capability_token: "token-incomplete".into(),
-        auth: auth(),
+        auth: mr_auth(&store, "MR", "R"),
         now: at(4),
     });
     assert!(matches!(result, Err(MergeRequestError::Conflict(_))));
@@ -1743,7 +1780,7 @@ fn persisted_integration_evidence_rejects_missing_mismatched_revoked_or_late_app
                         ticket_id: "T".into(),
                         review_event_id: review.event_id.clone(),
                         reason: "invalid integration evidence".into(),
-                        auth: auth(),
+                        auth: mr_auth(&store, "MR", "R"),
                         now: at(6),
                     })
                     .unwrap();

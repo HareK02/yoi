@@ -612,6 +612,14 @@ impl_openapi_schema!(
     MergeRequestReadinessResponse,
     MergeRequestThreadQuery,
     MergeRequestThreadResponse,
+    MergeRequestWorkerResponse,
+    MergeRequestWorkerAssignedEvent,
+    SetMergeRequestWorkerRequest,
+    MergeRequestPublicationsResponse,
+    CommentMergeRequestRequest,
+    MergeRequestPublication,
+    MergeRequestPublicationOutcome,
+    PublishMergeRequestRequest,
     ObjectiveCreateRequest,
     ObjectiveDetail,
     ObjectiveEditRequest,
@@ -4021,6 +4029,44 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RevokeMergeRequestReviewRequest,
     ) -> Result<ReviewRevokedEvent, RepositoryApiError>;
+    #[get("/api/w/{workspace_id}/merge-requests/{id}/worker", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn merge_request_worker_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<MergeRequestWorkerResponse, RepositoryApiError>;
+    #[put("/api/w/{workspace_id}/merge-requests/{id}/worker", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn merge_request_worker_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: SetMergeRequestWorkerRequest,
+    ) -> Result<MergeRequestWorkerAssignedEvent, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/comments", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn merge_request_comment(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CommentMergeRequestRequest,
+    ) -> Result<MergeRequestCommentEvent, RepositoryApiError>;
+    #[get("/api/w/{workspace_id}/merge-requests/{id}/publications", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn merge_request_publications(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<MergeRequestPublicationsResponse, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/publications", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn merge_request_publish(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: PublishMergeRequestRequest,
+    ) -> Result<MergeRequestPublication, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/merge-requests/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_complete(
         &self,
@@ -9611,9 +9657,94 @@ merge_request_event!(ReviewCancelledEvent {
     reason: String,
 });
 merge_request_event!(MergeRequestCommentEvent {
+    operation_id: Option<String>,
+    owner_operation_id: Option<String>,
     body: String,
     author: MergeRequestWorkerIdentity,
 });
+merge_request_event!(MergeRequestWorkerAssignedEvent {
+    operation_id: String,
+    previous_operation_id: Option<String>,
+    worker: Option<MergeRequestWorkerIdentity>,
+    assigned_by: MergeRequestWorkerIdentity,
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestWorkerResponse {
+    pub assignment: Option<MergeRequestWorkerAssignedEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MergeRequestPublicationOutcome {
+    Unconfirmed {},
+    NotPublished {
+        reason: String,
+    },
+    Published {
+        target_after: String,
+        observed_at: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct MergeRequestPublication {
+    pub operation_id: String,
+    pub merge_request_id: String,
+    pub approval_event_id: String,
+    pub source_ref: String,
+    pub target_selector: String,
+    pub target_ref_before: String,
+    pub outcome: MergeRequestPublicationOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct MergeRequestPublicationsResponse {
+    pub publications: Vec<MergeRequestPublication>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PublishMergeRequestRequest {
+    pub operation_id: String,
+    pub approval_event_id: String,
+}
+
+fn required_nullable_schema<T: JsonSchema>(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    generator.subschema_for::<Option<T>>()
+}
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SetMergeRequestWorkerRequest {
+    pub operation_id: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    #[schemars(required, schema_with = "required_nullable_schema::<String>")]
+    pub expected_operation_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    #[schemars(
+        required,
+        schema_with = "required_nullable_schema::<MergeRequestWorkerIdentity>"
+    )]
+    pub worker: Option<MergeRequestWorkerIdentity>,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -9652,6 +9783,7 @@ pub enum MergeRequestThreadEvent {
     ReviewRevoked(ReviewRevokedEvent),
     ReviewCancelled(ReviewCancelledEvent),
     Comment(MergeRequestCommentEvent),
+    WorkerAssigned(MergeRequestWorkerAssignedEvent),
     Merge(MergeEvent),
 }
 
@@ -13533,6 +13665,32 @@ mod tests {
     }
 
     #[test]
+    fn mr_worker_assignment_requires_explicit_nullable_observation_and_target() {
+        let input = serde_json::json!({"operation_id":"assign", "expected_operation_id":null, "worker":null});
+        assert!(serde_json::from_value::<SetMergeRequestWorkerRequest>(input.clone()).is_ok());
+        for field in ["expected_operation_id", "worker"] {
+            let mut missing = input.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SetMergeRequestWorkerRequest>(missing).is_err(),
+                "{field}"
+            );
+        }
+        let schema =
+            serde_json::to_value(schemars::schema_for!(SetMergeRequestWorkerRequest)).unwrap();
+        for field in ["expected_operation_id", "worker"] {
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(field))
+            );
+            let property = &schema["properties"][field];
+            assert!(property.to_string().contains("null"), "{field}: {property}");
+        }
+    }
+
+    #[test]
     fn ticket_objective_and_merge_request_operations_are_in_server_api_metadata() {
         let operations = ServerApiMetadata::OPERATIONS;
         assert!(operations.iter().all(|operation| {
@@ -13551,7 +13709,7 @@ mod tests {
                 .iter()
                 .filter(|operation| operation.operation_id.starts_with("merge_request_"))
                 .count(),
-            11
+            16
         );
         for (operation_id, method, path) in [
             (
@@ -15886,6 +16044,9 @@ mod openapi_artifact_tests {
             "current_worker_workdir_detach",
             "current_worker_workdir_operation",
             "merge_request_complete",
+            "merge_request_worker_set",
+            "merge_request_comment",
+            "merge_request_publish",
             "merge_request_open",
             "merge_request_review_capability_register",
             "merge_request_review_revoke",
@@ -16350,4 +16511,13 @@ mod activation_contract_tests {
             "activation-secret"
         );
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CommentMergeRequestRequest {
+    pub operation_id: String,
+    pub expected_owner_operation_id: String,
+    pub body: String,
 }

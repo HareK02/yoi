@@ -195,6 +195,55 @@ pub struct RepositoryRefObservation {
     pub observed_at_epoch_seconds: u64,
 }
 
+/// Fixed publication identity. Credentials are refreshed separately from replay identity.
+/// Saved-receipt lookup takes this binding alone and never acquires Repository access.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPublicationBinding {
+    pub workspace_id: String,
+    pub merge_request_id: String,
+    pub operation_id: String,
+    pub repository_id: String,
+    pub repository_source_fingerprint: String,
+    pub target: String,
+    pub source: String,
+    pub approval_event_id: String,
+    pub owner_operation_id: String,
+    pub worker: crate::identity::RuntimeWorkerRef,
+    pub working_directory_id: String,
+    pub connection_id: String,
+    pub alias: workdir::WorkdirAttachmentAlias,
+    pub target_before: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPublicationRequest {
+    pub binding: RepositoryPublicationBinding,
+    pub repository: WorkingDirectoryRepository,
+    pub materialization: RepositoryMaterializationContext,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RepositoryPublicationOutcome {
+    Unknown {},
+    NotPublished {
+        reason: String,
+    },
+    Published {
+        target_after: String,
+        observed_at_epoch_seconds: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPublicationReceipt {
+    pub binding: RepositoryPublicationBinding,
+    pub outcome: RepositoryPublicationOutcome,
+}
+
 /// Workspace-authoritative alias-to-Workdir mapping. This carries no claim that
 /// the Worker Runtime materialized or can bind the referenced Workdir locally.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

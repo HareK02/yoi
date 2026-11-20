@@ -202,6 +202,7 @@ pub trait TicketSourceCommitResolver: Send + Sync {
     fn resolve_source_commit(
         &self,
         ticket_id: &str,
+        merge_request_id: &str,
         repository_id: &str,
         selector: &str,
     ) -> std::result::Result<String, server_api::MergeRequestRefDiagnostic>;
@@ -213,6 +214,7 @@ impl TicketSourceCommitResolver for UnresolvedTicketSourceCommitResolver {
     fn resolve_source_commit(
         &self,
         _ticket_id: &str,
+        _merge_request_id: &str,
         _repository_id: &str,
         _selector: &str,
     ) -> std::result::Result<String, server_api::MergeRequestRefDiagnostic> {
@@ -1003,6 +1005,7 @@ impl SqliteWorkspaceAuthority {
                         |selector| {
                             self.source_commit_resolver.resolve_source_commit(
                                 id,
+                                &request.merge_request_id,
                                 &request.repository_id,
                                 selector,
                             )

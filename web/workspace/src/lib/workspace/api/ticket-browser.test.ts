@@ -1058,3 +1058,21 @@ Deno.test("Subject assignment projection preserves identity and legacy audit wit
     );
   }
 });
+
+Deno.test("MR comment decoder retains replay and owner evidence without classifying integration", () => {
+  for (const operation of [null, "comment-operation"]) {
+    const comment = {
+      kind: "comment", event_id: "comment-event", sequence: 2,
+      author: { runtime_id: "runtime-a", worker_id: "worker-a" },
+      created_at: "2026-09-22T00:00:00Z", body: "Conflict resolved.\nTests passed.",
+      operation_id: operation, owner_operation_id: operation === null ? null : "owner-operation",
+    };
+    const parsed = parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), thread: [comment] });
+    const event = parsed.thread[0];
+    if (event.kind !== "comment") throw new Error("expected comment");
+    assertEquals(event.operation_id, operation);
+    assertEquals(event.owner_operation_id, comment.owner_operation_id);
+    assertEquals(event.body, comment.body);
+    assertThrows(() => parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), thread: [{ ...comment, operation_id: 7 }] }), "operation_id");
+  }
+});

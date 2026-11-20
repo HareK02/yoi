@@ -19,6 +19,10 @@ import "./base.dcdl" // {
         ticket = { enabled = true; thread = true; };
         merge_request = {
             show = true;
+            worker_query = true;
+            publications = true;
+            publish = true;
+            comment = true;
             open = true;
             review = false;
             readiness_check = false;

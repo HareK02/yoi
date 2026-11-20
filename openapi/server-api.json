@@ -6159,6 +6159,110 @@
         ],
         "type": "object"
       },
+      "MergeRequestPublication": {
+        "properties": {
+          "approval_event_id": {
+            "type": "string"
+          },
+          "merge_request_id": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/MergeRequestPublicationOutcome"
+          },
+          "source_ref": {
+            "type": "string"
+          },
+          "target_ref_before": {
+            "type": "string"
+          },
+          "target_selector": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "merge_request_id",
+          "approval_event_id",
+          "source_ref",
+          "target_selector",
+          "target_ref_before",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "MergeRequestPublicationOutcome": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unconfirmed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "not_published",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "published",
+                "type": "string"
+              },
+              "observed_at": {
+                "type": "string"
+              },
+              "target_after": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "target_after",
+              "observed_at"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MergeRequestPublicationsResponse": {
+        "properties": {
+          "publications": {
+            "items": {
+              "$ref": "#/components/schemas/MergeRequestPublication"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "publications"
+        ],
+        "type": "object"
+      },
       "MergeRequestReadView": {
         "enum": [
           "summary",
@@ -6643,6 +6747,18 @@
                 "const": "comment",
                 "type": "string"
               },
+              "operation_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "owner_operation_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "sequence": {
                 "format": "uint64",
                 "maximum": 9007199254740991,
@@ -6656,6 +6772,58 @@
               "sequence",
               "body",
               "author",
+              "created_at"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "assigned_by": {
+                "$ref": "#/components/schemas/MergeRequestWorkerIdentity"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "event_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "worker_assigned",
+                "type": "string"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "previous_operation_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sequence": {
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "worker": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/MergeRequestWorkerIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "event_id",
+              "sequence",
+              "operation_id",
+              "assigned_by",
               "created_at"
             ],
             "type": "object"
@@ -6757,6 +6925,53 @@
         },
         "type": "object"
       },
+      "MergeRequestWorkerAssignedEvent": {
+        "additionalProperties": false,
+        "properties": {
+          "assigned_by": {
+            "$ref": "#/components/schemas/MergeRequestWorkerIdentity"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "previous_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sequence": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "worker": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeRequestWorkerIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "event_id",
+          "sequence",
+          "operation_id",
+          "assigned_by",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "MergeRequestWorkerIdentity": {
         "additionalProperties": false,
         "properties": {
@@ -6771,6 +6986,22 @@
           "runtime_id",
           "worker_id"
         ],
+        "type": "object"
+      },
+      "MergeRequestWorkerResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeRequestWorkerAssignedEvent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
         "type": "object"
       },
       "MergeStrategy": {
@@ -26726,7 +26957,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:9d0a6b8b537fc21fc992c2621395bad1b76c24a1837cfa2efc5e67c48e76e734"
+    "x-yoi-source-digest": "sha256:18775ebbf4297b1556323a2a721dd8f71ac75ecfbff8ed4b45c232b530b9e20f"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -36401,6 +36632,103 @@
         ]
       }
     },
+    "/api/w/{workspace_id}/merge-requests/{id}/publications": {
+      "get": {
+        "operationId": "merge_request_publications",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeRequestPublicationsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/api/w/{workspace_id}/merge-requests/{id}/readiness": {
       "get": {
         "operationId": "merge_request_readiness",
@@ -36663,6 +36991,103 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Array_of_MergeRequestThreadEvent"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/merge-requests/{id}/worker": {
+      "get": {
+        "operationId": "merge_request_worker_get",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeRequestWorkerResponse"
                 }
               }
             },

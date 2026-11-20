@@ -122,6 +122,49 @@ pub(super) fn contract(kind: Kind) -> Contract {
                 ),
             ],
         ),
+        Kind::WorkerQuery => (
+            "worker_query",
+            "Read this route-bound MR's single Worker assignment. assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. This observation grants no authority and does not report Worker liveness or Ticket assignment.",
+            vec![],
+        ),
+        Kind::WorkerSet => (
+            "worker_set",
+            "Set, replace, or release this MR's Worker using the queried operation_id as expected_operation_id. Both expected_operation_id and worker are required null/value unions; null expectation means never assigned, null worker releases ownership. Preserve operation_id and full input for exact retry; reconcile conflict or unknown outcome without automatic retry or a new key. Ownership changes no Ticket assignment, authority, lifecycle, phase, approval, or publication.",
+            vec![
+                field("operation_id", true, Shape::String),
+                field("expected_operation_id", true, nullable(Shape::String)),
+                field(
+                    "worker",
+                    true,
+                    nullable(Shape::Record(vec![
+                        field("runtime_id", true, Shape::String),
+                        field("worker_id", true, Shape::String),
+                    ])),
+                ),
+            ],
+        ),
+        Kind::Comment => (
+            "comment",
+            "Append an owner-fenced Markdown thread comment. Use the observed assignment operation_id and retain the same full input for exact replay. A comment is not approval, authority or publication evidence.",
+            vec![
+                field("operation_id", true, Shape::String),
+                field("expected_owner_operation_id", true, Shape::String),
+                field("body", true, Shape::String),
+            ],
+        ),
+        Kind::Publications => (
+            "publications",
+            "Read saved publication operations and outcomes. This does not send, retry, or conclude work.",
+            vec![],
+        ),
+        Kind::Publish => (
+            "publish",
+            "Publish the exact approved source through the current MR Worker Workdir. Preserve operation_id and approval_event_id for exact replay; a saved operation only reconciles, never redispatches. Unknown is not failure. No Subject stamp or Ticket conclusion.",
+            vec![
+                field("operation_id", true, Shape::String),
+                field("approval_event_id", true, Shape::String),
+            ],
+        ),
         Kind::Readiness => (
             "readiness",
             "Check current review and exact-source integration eligibility for this MR; no integration or Ticket conclusion is performed.",
@@ -129,7 +172,7 @@ pub(super) fn contract(kind: Kind) -> Contract {
         ),
         Kind::Review => (
             "review",
-            "Record an injected Reviewer's decision on this exact MR. decision is required. Omit body/findings for empty defaults; finding severity/body are required, optional code/path/line use null/value unions, and a present line is 0..4294967295. Backend validates candidate freshness; model inputs never carry a capability.",
+            "Record an injected Reviewer's decision on this exact MR. decision is required. Omit body/findings for empty defaults; finding severity/body are required, optional code/path/line use null/value unions, and a present line is 0..4294967295. Backend validates candidate freshness; approve triggers automatic publication when current permissions and target conditions permit. Model inputs never carry a capability.",
             vec![
                 field(
                     "decision",
@@ -156,7 +199,7 @@ pub(super) fn contract(kind: Kind) -> Contract {
         ),
         Kind::Complete => (
             "complete",
-            "Record an already-applied exact-source integration using an observed approval event and target before/after refs. All integration fields are required. operation_id is the stable replay key; Backend rechecks exact approval/target observations and integration authority. No Git operation, automatic retry, or Ticket closure occurs.",
+            "Reconcile completion from the saved provider-confirmed publication operation. All integration fields must match that operation. operation_id is the stable replay key; Backend rechecks current approval and requirements without a Subject stamp. No new Git operation, automatic retry, or Ticket closure occurs.",
             vec![
                 field("operation_id", true, Shape::String),
                 flattened(
@@ -243,3 +286,9 @@ mod tests;
 
 #[cfg(test)]
 mod domain_tests;
+
+#[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
+mod publication_tests;

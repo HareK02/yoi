@@ -14,6 +14,28 @@ pub(super) enum Command {
         after: Option<u64>,
         limit: Option<usize>,
     },
+    WorkerQuery {
+        merge_request_id: String,
+    },
+    WorkerSet {
+        merge_request_id: String,
+        #[serde(flatten)]
+        request: server_api::SetMergeRequestWorkerRequest,
+    },
+    Comment {
+        merge_request_id: String,
+        operation_id: String,
+        expected_owner_operation_id: String,
+        body: String,
+    },
+    Publications {
+        merge_request_id: String,
+    },
+    Publish {
+        merge_request_id: String,
+        operation_id: String,
+        approval_event_id: String,
+    },
     Readiness {
         merge_request_id: String,
     },
@@ -54,6 +76,42 @@ impl Command {
                     view: v.view,
                     after: v.after,
                     limit: v.limit,
+                }
+            }
+            Kind::WorkerQuery => {
+                let v: MergeRequestInput = parse(input)?;
+                Self::WorkerQuery {
+                    merge_request_id: v.merge_request_id,
+                }
+            }
+            Kind::WorkerSet => {
+                let v: SetMergeRequestWorkerInput = parse(input)?;
+                Self::WorkerSet {
+                    merge_request_id: v.merge_request_id,
+                    request: v.request,
+                }
+            }
+            Kind::Comment => {
+                let v: CommentMergeRequestInput = parse(input)?;
+                Self::Comment {
+                    merge_request_id: v.merge_request_id,
+                    operation_id: v.operation_id,
+                    expected_owner_operation_id: v.expected_owner_operation_id,
+                    body: v.body,
+                }
+            }
+            Kind::Publications => {
+                let v: MergeRequestInput = parse(input)?;
+                Self::Publications {
+                    merge_request_id: v.merge_request_id,
+                }
+            }
+            Kind::Publish => {
+                let v: PublishMergeRequestInput = parse(input)?;
+                Self::Publish {
+                    merge_request_id: v.merge_request_id,
+                    operation_id: v.operation_id,
+                    approval_event_id: v.approval_event_id,
                 }
             }
             Kind::Readiness => {
@@ -98,6 +156,11 @@ impl Command {
     pub(super) fn kind(&self) -> Kind {
         match self {
             Self::Read { .. } => Kind::Show,
+            Self::WorkerQuery { .. } => Kind::WorkerQuery,
+            Self::WorkerSet { .. } => Kind::WorkerSet,
+            Self::Comment { .. } => Kind::Comment,
+            Self::Publications { .. } => Kind::Publications,
+            Self::Publish { .. } => Kind::Publish,
             Self::Readiness { .. } => Kind::Readiness,
             Self::Open { .. } => Kind::Open,
             Self::Complete { .. } => Kind::Complete,
@@ -127,6 +190,10 @@ pub(super) fn execute_value(
     client: Arc<dyn WorkspaceClient>,
     command: Command,
 ) -> Result<Value, ToolError> {
+    let ownership_mutation = matches!(
+        &command,
+        Command::WorkerSet { .. } | Command::Publish { .. } | Command::Comment { .. }
+    );
     let executor = Executor { client };
     let ws = executor.client.workspace_id().ok_or_else(|| {
         ToolError::ExecutionFailed("Merge Request operations require Workspace identity".into())
@@ -158,6 +225,125 @@ pub(super) fn execute_value(
                 ));
             }
             return executor.show_merge_request(ws, &merge_request_id, view, after, limit);
+        }
+        Command::WorkerQuery { merge_request_id } => {
+            nonempty_named("merge_request_id", &merge_request_id)?;
+            executor.authorize(
+                "merge_request.read",
+                PermissionResource::MergeRequest {
+                    workspace_id: ws.into(),
+                    merge_request_id: merge_request_id.clone(),
+                },
+            )?;
+            (
+                WorkspaceRequestMethod::Get,
+                format!(
+                    "/api/w/{ws}/merge-requests/{}/worker",
+                    encode_path_segment(&merge_request_id)
+                ),
+                None,
+            )
+        }
+        Command::WorkerSet {
+            merge_request_id,
+            request,
+        } => {
+            nonempty_named("merge_request_id", &merge_request_id)?;
+            nonempty_named("operation_id", &request.operation_id)?;
+            if let Some(expected) = &request.expected_operation_id {
+                nonempty_named("expected_operation_id", expected)?;
+            }
+            if let Some(worker) = &request.worker {
+                nonempty_named("runtime_id", &worker.runtime_id)?;
+                nonempty_named("worker_id", &worker.worker_id)?;
+            }
+            executor.authorize(
+                "merge_request.assign",
+                PermissionResource::MergeRequest {
+                    workspace_id: ws.into(),
+                    merge_request_id: merge_request_id.clone(),
+                },
+            )?;
+            (
+                WorkspaceRequestMethod::Put,
+                format!(
+                    "/api/w/{ws}/merge-requests/{}/worker",
+                    encode_path_segment(&merge_request_id)
+                ),
+                Some(json!(request)),
+            )
+        }
+        Command::Comment {
+            merge_request_id,
+            operation_id,
+            expected_owner_operation_id,
+            body,
+        } => {
+            nonempty_named("merge_request_id", &merge_request_id)?;
+            nonempty_named("operation_id", &operation_id)?;
+            nonempty_named("expected_owner_operation_id", &expected_owner_operation_id)?;
+            if body.trim().is_empty() {
+                return Err(ToolError::InvalidArgument("body must be nonempty".into()));
+            }
+            executor.authorize(
+                "merge_request.comment",
+                PermissionResource::MergeRequest {
+                    workspace_id: ws.into(),
+                    merge_request_id: merge_request_id.clone(),
+                },
+            )?;
+            (
+                WorkspaceRequestMethod::Post,
+                format!(
+                    "/api/w/{ws}/merge-requests/{}/comments",
+                    encode_path_segment(&merge_request_id)
+                ),
+                Some(
+                    json!({"operation_id":operation_id,"expected_owner_operation_id":expected_owner_operation_id,"body":body}),
+                ),
+            )
+        }
+        Command::Publications { merge_request_id } => {
+            nonempty_named("merge_request_id", &merge_request_id)?;
+            executor.authorize(
+                "merge_request.read",
+                PermissionResource::MergeRequest {
+                    workspace_id: ws.into(),
+                    merge_request_id: merge_request_id.clone(),
+                },
+            )?;
+            (
+                WorkspaceRequestMethod::Get,
+                format!(
+                    "/api/w/{ws}/merge-requests/{}/publications",
+                    encode_path_segment(&merge_request_id)
+                ),
+                None,
+            )
+        }
+        Command::Publish {
+            merge_request_id,
+            operation_id,
+            approval_event_id,
+        } => {
+            nonempty_named("merge_request_id", &merge_request_id)?;
+            nonempty_named("operation_id", &operation_id)?;
+            nonempty_named("approval_event_id", &approval_event_id)?;
+            executor.authorize(
+                "merge_request.publish",
+                PermissionResource::MergeRequest {
+                    workspace_id: ws.into(),
+                    merge_request_id: merge_request_id.clone(),
+                },
+            )?;
+            (
+                WorkspaceRequestMethod::Post,
+                format!(
+                    "/api/w/{ws}/merge-requests/{}/publications",
+                    encode_path_segment(&merge_request_id)
+                ),
+                Some(json!({"operation_id":operation_id,"approval_event_id":approval_event_id})),
+            )
         }
         Command::Readiness { merge_request_id } => {
             nonempty_named("merge_request_id", &merge_request_id)?;
@@ -264,14 +450,34 @@ pub(super) fn execute_value(
         Some(v) => WorkspaceRequest::json(method, path, v.to_string()),
         None => WorkspaceRequest::get(path),
     };
-    let res = executor
-        .client
-        .execute(req)
-        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    let res = executor.client.execute(req).map_err(|error| {
+        if ownership_mutation {
+            ownership_outcome_unknown(&error.to_string())
+        } else {
+            ToolError::ExecutionFailed(error.to_string())
+        }
+    })?;
     if !res.is_success() {
-        return Err(api_error("Merge Request API", &res));
+        let error = api_error("Merge Request API", &res);
+        return Err(if ownership_mutation && res.status >= 500 {
+            ownership_outcome_unknown(&error.to_string())
+        } else {
+            error
+        });
     }
-    response_value(&res.body)
+    response_value(&res.body).map_err(|error| {
+        if ownership_mutation {
+            ownership_outcome_unknown(&error.to_string())
+        } else {
+            error
+        }
+    })
+}
+
+fn ownership_outcome_unknown(detail: &str) -> ToolError {
+    ToolError::ExecutionFailed(format!(
+        "MR mutation outcome is unknown after dispatch: {detail}. Reconcile the saved assignment, comment or publication; any exact retry must retain the original operation_id and full input. Do not automatically retry or mint a new operation_id."
+    ))
 }
 
 struct Executor {

@@ -302,6 +302,14 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
             now: Utc::now(),
         })
         .unwrap();
+    let auth = merge_request::MergeRequestAuth {
+        assignment_id: store
+            .current_worker(TEST_WORKSPACE_ID, "result-mr")
+            .unwrap()
+            .unwrap()
+            .operation_id,
+        ..auth
+    };
     store
         .register_reviewer_child_session(merge_request::RegisterReviewerChildSession {
             workspace_id: TEST_WORKSPACE_ID.into(),
@@ -350,7 +358,7 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(pending["items"].as_array().unwrap().len(), 4);
+    assert_eq!(pending["items"].as_array().unwrap().len(), 6);
     assert!(
         pending["items"]
             .as_array()

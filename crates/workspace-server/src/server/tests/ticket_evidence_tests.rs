@@ -79,6 +79,7 @@ async fn ticket_browse_does_not_observe_sources_but_authoritative_query_and_show
         fn resolve_source_commit(
             &self,
             _ticket: &str,
+            _merge_request_id: &str,
             _repository: &str,
             _selector: &str,
         ) -> std::result::Result<String, MergeRequestRefDiagnostic> {
@@ -229,6 +230,17 @@ impl EvidenceApiFixture {
         }]
     }
 
+    fn review_auth(&self) -> MergeRequestAuth {
+        let mut auth = self.auth.clone();
+        auth.assignment_id = self
+            .store
+            .current_worker(TEST_WORKSPACE_ID, EVIDENCE_MR)
+            .unwrap()
+            .unwrap()
+            .operation_id;
+        auth
+    }
+
     fn approve(&self, token: &str) -> ReviewEvent {
         let child_session_id = format!("evidence-reviewer-{token}");
         self.store
@@ -250,7 +262,7 @@ impl EvidenceApiFixture {
                 subject_ref: EVIDENCE_SOURCE.into(),
                 child_session_id,
                 capability_token: token.into(),
-                auth: self.auth.clone(),
+                auth: self.review_auth(),
                 now: evidence_time(),
             })
             .unwrap();
@@ -486,7 +498,7 @@ async fn closed_merged_remote_ticket_uses_immutable_result_in_show_query_list_an
     assert_eq!(first.merge_request.thread.len(), 1);
     assert!(matches!(
         first.merge_request.thread[0],
-        server_api::MergeRequestThreadEvent::ReviewRequested(_)
+        server_api::MergeRequestThreadEvent::WorkerAssigned(_)
     ));
     let empty = fixture.detail(merge.sequence, 1).await;
     assert!(empty.merge_request.thread.is_empty());
@@ -1271,6 +1283,25 @@ async fn closed_and_reopened_tickets_allow_orchestrator_review_and_integration_w
                 now: evidence_time(),
             })
             .unwrap();
+        let new_owner = merge_request::WorkerIdentity {
+            runtime_id: "orchestrator-runtime".into(),
+            worker_id: "orchestrator".into(),
+        };
+        fixture
+            .store
+            .set_worker(
+                merge_request::SetMergeRequestWorker {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    merge_request_id: EVIDENCE_MR.into(),
+                    operation_id: "transfer-review-owner".into(),
+                    expected_operation_id: Some(fixture.review_auth().assignment_id),
+                    worker: Some(new_owner.clone()),
+                    assigned_by: new_owner,
+                    now: evidence_time(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
         fixture.auth.runtime_id = "orchestrator-runtime".into();
         fixture.auth.worker_id = "orchestrator".into();
         let foreign_child = fixture.store.request_review(RequestMergeRequestReview {
@@ -1281,7 +1312,7 @@ async fn closed_and_reopened_tickets_allow_orchestrator_review_and_integration_w
             subject_ref: EVIDENCE_SOURCE.into(),
             child_session_id: "coder-owned-child".into(),
             capability_token: "foreign-child-token".into(),
-            auth: fixture.auth.clone(),
+            auth: fixture.review_auth(),
             now: evidence_time(),
         });
         assert!(matches!(
@@ -1296,7 +1327,7 @@ async fn closed_and_reopened_tickets_allow_orchestrator_review_and_integration_w
                 ticket_id: fixture.ticket_id.clone(),
                 review_event_id: old.event_id,
                 reason: "Request a fresh independent review".into(),
-                auth: fixture.auth.clone(),
+                auth: fixture.review_auth(),
                 now: evidence_time(),
             })
             .unwrap();
@@ -1339,5 +1370,213 @@ async fn closed_and_reopened_tickets_allow_orchestrator_review_and_integration_w
                 .assignment_id,
             fixture.auth.assignment_id
         );
+    }
+}
+
+// Backend publication-result connection with real MR/Ticket persistence. The
+// trusted Runtime receipt is injected here; provider/Git transport is covered by
+// Runtime's connected publication tests, not claimed by this fixture.
+#[tokio::test]
+async fn publication_receipt_fences_binding_and_records_fact_without_subject_completion_stamp() {
+    use worker_runtime::catalog::{
+        RepositoryPublicationBinding, RepositoryPublicationOutcome, RepositoryPublicationReceipt,
+    };
+    for rescope in [false, true] {
+        let fixture = EvidenceApiFixture::new().await;
+        let approval = fixture.approve("publication-receipt");
+        let auth = fixture.review_auth();
+        let binding = merge_request::PublicationBinding {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            merge_request_id: EVIDENCE_MR.into(),
+            operation_id: "provider-publication".into(),
+            repository_id: auth.repository_id.clone(),
+            repository_source_fingerprint: "fixed-repository".into(),
+            alias: "source".into(),
+            target: "refs/heads/develop".into(),
+            source: EVIDENCE_SOURCE.into(),
+            approval_event_id: approval.event_id.clone(),
+            owner_operation_id: auth.assignment_id.clone(),
+            worker: merge_request::WorkerIdentity {
+                runtime_id: auth.runtime_id.clone(),
+                worker_id: auth.worker_id.clone(),
+            },
+            working_directory_id: "saved-workdir".into(),
+            connection_id: "saved-connection".into(),
+            target_before: "before".into(),
+        };
+        let (saved, acquired) = fixture
+            .store
+            .claim_publication(binding.clone(), evidence_time(), |_| Ok(()))
+            .unwrap();
+        assert!(acquired);
+        let mut receipt = RepositoryPublicationReceipt {
+            binding: RepositoryPublicationBinding {
+                workspace_id: binding.workspace_id.clone(),
+                merge_request_id: binding.merge_request_id.clone(),
+                operation_id: binding.operation_id.clone(),
+                repository_id: binding.repository_id.clone(),
+                repository_source_fingerprint: binding.repository_source_fingerprint.clone(),
+                alias: workdir::WorkdirAttachmentAlias::new(binding.alias.clone()).unwrap(),
+                target: binding.target.clone(),
+                source: binding.source.clone(),
+                approval_event_id: binding.approval_event_id.clone(),
+                owner_operation_id: binding.owner_operation_id.clone(),
+                worker: RuntimeWorkerRef::new(&auth.runtime_id, &auth.worker_id),
+                working_directory_id: binding.working_directory_id.clone(),
+                connection_id: binding.connection_id.clone(),
+                target_before: binding.target_before.clone(),
+            },
+            outcome: RepositoryPublicationOutcome::Published {
+                target_after: EVIDENCE_SOURCE.into(),
+                observed_at_epoch_seconds: 946684800,
+            },
+        };
+        receipt.binding.connection_id = "other-connection".into();
+        assert!(mr_publication::accept_receipt(&fixture.api, &saved, receipt.clone()).is_err());
+        assert_eq!(
+            fixture
+                .store
+                .publication(TEST_WORKSPACE_ID, &binding.operation_id)
+                .unwrap()
+                .unwrap(),
+            saved
+        );
+        receipt.binding.connection_id = binding.connection_id.clone();
+        fixture
+            .store
+            .set_worker(
+                merge_request::SetMergeRequestWorker {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    merge_request_id: EVIDENCE_MR.into(),
+                    operation_id: "owner-after-push".into(),
+                    expected_operation_id: Some(auth.assignment_id),
+                    worker: None,
+                    assigned_by: merge_request::WorkerIdentity {
+                        runtime_id: auth.runtime_id,
+                        worker_id: auth.worker_id,
+                    },
+                    now: evidence_time(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        if rescope {
+            Connection::open(&fixture.api.config.database_path)
+                .unwrap()
+                .execute(
+                    "UPDATE typed_tickets SET title='requirements changed' WHERE ticket_id=?1",
+                    [&fixture.ticket_id],
+                )
+                .unwrap();
+        }
+        assert_ne!(
+            fixture
+                .api
+                .require_configured_workspace_repository(&binding.repository_id)
+                .unwrap()
+                .source_fingerprint,
+            binding.repository_source_fingerprint
+        );
+        let mut unknown = receipt.clone();
+        unknown.outcome = RepositoryPublicationOutcome::Unknown {};
+        fixture
+            .api
+            .runtime
+            .register_or_replace(ReceiptOnlyRuntime(unknown));
+        assert_eq!(
+            mr_publication::reconcile(&fixture.api, saved.clone()).unwrap(),
+            saved
+        );
+        fixture
+            .api
+            .runtime
+            .register_or_replace(ReceiptOnlyRuntime(receipt.clone()));
+        let result = mr_publication::reconcile(&fixture.api, saved.clone()).unwrap();
+        assert!(matches!(
+            result.outcome,
+            merge_request::PublicationOutcome::Published { .. }
+        ));
+        let replay = mr_publication::accept_receipt(&fixture.api, &result, receipt).unwrap();
+        assert_eq!(replay, result);
+        let mr = fixture
+            .store
+            .get_by_id(TEST_WORKSPACE_ID, EVIDENCE_MR)
+            .unwrap();
+        assert_eq!(mr.state.is_completed(), !rescope);
+        assert_eq!(
+            mr.thread
+                .iter()
+                .filter(|e| matches!(e, merge_request::MergeRequestThreadEvent::Merge(_)))
+                .count(),
+            usize::from(!rescope)
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .show(fixture.ticket_id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            ticket::TicketState::Open
+        );
+        // A known publication replay uses the saved result even with no MR owner,
+        // no live Worker, and no usable repository credentials in this fixture.
+        assert_eq!(
+            mr_publication::publish(
+                &fixture.api,
+                EVIDENCE_MR,
+                server_api::PublishMergeRequestRequest {
+                    operation_id: binding.operation_id,
+                    approval_event_id: approval.event_id,
+                },
+                None
+            )
+            .unwrap(),
+            result
+        );
+    }
+}
+
+/// Only the remote Runtime transport is substituted. Every unexpected new-access
+/// method fails, so receipt recovery cannot accidentally acquire fresh authority.
+struct ReceiptOnlyRuntime(worker_runtime::catalog::RepositoryPublicationReceipt);
+impl crate::hosts::WorkspaceWorkerRuntime for ReceiptOnlyRuntime {
+    fn runtime_id(&self) -> &str {
+        &self.0.binding.worker.runtime_id
+    }
+    fn runtime_summary(&self, _: usize) -> crate::hosts::InternalRuntimeSummary {
+        panic!("receipt recovery does not inspect live Runtime state")
+    }
+    fn list_hosts(&self, _: usize) -> crate::hosts::RuntimeList<crate::hosts::InternalHostSummary> {
+        panic!("no live Host query")
+    }
+    fn list_workers(
+        &self,
+        _: usize,
+    ) -> crate::hosts::RuntimeList<crate::hosts::InternalWorkerSummary> {
+        panic!("no live Worker query")
+    }
+    fn worker(&self, _: &str) -> crate::hosts::WorkerLookupResult {
+        panic!("stopped Worker is not required")
+    }
+    fn repository_publication_receipt(
+        &self,
+        binding: worker_runtime::catalog::RepositoryPublicationBinding,
+    ) -> std::result::Result<Option<worker_runtime::catalog::RepositoryPublicationReceipt>, Error>
+    {
+        assert_eq!(binding, self.0.binding);
+        Ok(Some(self.0.clone()))
+    }
+    fn publish_repository_source(
+        &self,
+        _: worker_runtime::catalog::RepositoryPublicationRequest,
+    ) -> std::result::Result<worker_runtime::catalog::RepositoryPublicationReceipt, Error> {
+        panic!("recovery must not publish")
+    }
+    fn reconcile_repository_publication(
+        &self,
+        _: worker_runtime::catalog::RepositoryPublicationRequest,
+    ) -> std::result::Result<worker_runtime::catalog::RepositoryPublicationReceipt, Error> {
+        panic!("terminal receipt needs no new provider access")
     }
 }

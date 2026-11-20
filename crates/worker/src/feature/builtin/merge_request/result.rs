@@ -123,7 +123,12 @@ pub(super) fn value(
             }
         }
         Kind::Review => snapshot_ids(&data, &mut merge_requests),
-        Kind::Complete => {}
+        Kind::Complete
+        | Kind::WorkerQuery
+        | Kind::WorkerSet
+        | Kind::Publications
+        | Kind::Publish
+        | Kind::Comment => {}
     }
     json_to_wip(&json!({
         "entry": format!("{collection}/{subject}"),

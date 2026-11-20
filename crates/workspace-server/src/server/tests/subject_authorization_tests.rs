@@ -250,6 +250,8 @@ fn policy_create_request(
 
 #[path = "core_grant_continuity_tests.rs"]
 mod core_grant_continuity;
+#[path = "mr_worker_assignment_tests.rs"]
+mod mr_worker_assignment_tests;
 
 struct Fixture {
     api: WorkspaceApi,

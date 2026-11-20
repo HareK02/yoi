@@ -2,10 +2,9 @@
 //!
 //! The collection opens a repository candidate linked to a Ticket Entry; an item is one Merge
 //! Request whose identity is exclusively route-bound. Keeping these Objects separate prevents a
-//! read/review/integration from selecting a different subject in arguments. The item Interface owns
-//! independent `read`, `readiness`, `review`, and `complete` actions: reading is not a readiness
-//! judgment, a review attests a source, and completion records an already-applied integration. None
-//! implies another action, Git integration, or Ticket conclusion.
+//! read/review/publication from selecting a different subject in arguments. Review attests a fixed
+//! source; Backend publication independently checks current authority and target eligibility.
+//! Approval wakes automatic publication; this adapter neither runs Git locally nor concludes Tickets.
 //!
 //! Native v2 contracts are defined in the child `native` module, independently of Tool JSON Schema.
 //! Their declarations drive descriptor generation, input validation, and command-field conversion.
@@ -61,7 +60,7 @@ use wip_protocol::{
 
 pub const FEATURE_ID: &str = "merge_request";
 const FEATURE_NAME: &str = "Merge Request tools";
-const FEATURE_DESCRIPTION: &str = "Optional repository MR workflow with trusted review and separate Orchestrator integration authority; not a universal Ticket conclusion gate.";
+const FEATURE_DESCRIPTION: &str = "Optional repository MR workflow with independent review and evidence-bound automatic publication; not a universal Ticket conclusion gate.";
 const FEATURE_INSTRUCTION_ID: &str = "merge_request.workflow";
 pub const FEATURE_PROMPT_REF: &str = "common.merge_request";
 
@@ -74,12 +73,17 @@ fn workflow_instruction() -> FeatureInstructionDeclaration {
     .expect("static Merge Request workflow instruction declaration is valid")
 }
 
-const ALL_KINDS: [Kind; 5] = [
+const ALL_KINDS: [Kind; 10] = [
     Kind::Show,
     Kind::Open,
     Kind::Review,
     Kind::Readiness,
     Kind::Complete,
+    Kind::WorkerQuery,
+    Kind::WorkerSet,
+    Kind::Publications,
+    Kind::Publish,
+    Kind::Comment,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +93,11 @@ enum Kind {
     Open,
     Complete,
     Review,
+    WorkerQuery,
+    WorkerSet,
+    Publications,
+    Publish,
+    Comment,
 }
 #[derive(Clone)]
 struct MergeRequestTool {
@@ -98,6 +107,26 @@ struct MergeRequestTool {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MergeRequestInput {
     merge_request_id: String,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetMergeRequestWorkerInput {
+    merge_request_id: String,
+    #[serde(flatten)]
+    request: server_api::SetMergeRequestWorkerRequest,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CommentMergeRequestInput {
+    merge_request_id: String,
+    operation_id: String,
+    expected_owner_operation_id: String,
+    body: String,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PublishMergeRequestInput {
+    merge_request_id: String,
+    operation_id: String,
+    approval_event_id: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ShowMergeRequestInput {
@@ -183,6 +212,11 @@ impl Kind {
             Self::Review => config.review,
             Self::Readiness => config.readiness_check,
             Self::Complete => config.complete,
+            Self::WorkerQuery => config.worker_query,
+            Self::WorkerSet => config.worker_set,
+            Self::Publications => config.publications,
+            Self::Publish => config.publish,
+            Self::Comment => config.comment,
         }
     }
 
@@ -193,12 +227,22 @@ impl Kind {
             Self::Open => "OpenMergeRequest",
             Self::Complete => "CompleteMergeRequest",
             Self::Review => "ReviewMergeRequest",
+            Self::WorkerQuery => "QueryMergeRequestWorker",
+            Self::WorkerSet => "SetMergeRequestWorker",
+            Self::Publications => "QueryMergeRequestPublications",
+            Self::Publish => "PublishMergeRequest",
+            Self::Comment => "CommentMergeRequest",
         }
     }
     fn schema(self) -> serde_json::Value {
         match self {
             Self::Show => json!(schemars::schema_for!(ShowMergeRequestInput)),
-            Self::Readiness => json!(schemars::schema_for!(MergeRequestInput)),
+            Self::Readiness | Self::WorkerQuery | Self::Publications => {
+                json!(schemars::schema_for!(MergeRequestInput))
+            }
+            Self::WorkerSet => json!(schemars::schema_for!(SetMergeRequestWorkerInput)),
+            Self::Publish => json!(schemars::schema_for!(PublishMergeRequestInput)),
+            Self::Comment => json!(schemars::schema_for!(CommentMergeRequestInput)),
             Self::Open => json!(schemars::schema_for!(OpenMergeRequestInput)),
             Self::Complete => json!(schemars::schema_for!(CompleteMergeRequestInput)),
             Self::Review => json!(schemars::schema_for!(ReviewMergeRequestInput)),
@@ -206,7 +250,15 @@ impl Kind {
     }
 
     fn mutating(self) -> bool {
-        matches!(self, Self::Open | Self::Review | Self::Complete)
+        matches!(
+            self,
+            Self::Open
+                | Self::Review
+                | Self::Complete
+                | Self::WorkerSet
+                | Self::Publish
+                | Self::Comment
+        )
     }
 }
 mod command;
@@ -372,7 +424,12 @@ struct NativeMergeRequestOperation {
 
 fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
     match kind {
-        Kind::Show => NativeMergeRequestOperation {
+        Kind::Show
+        | Kind::WorkerQuery
+        | Kind::WorkerSet
+        | Kind::Publications
+        | Kind::Publish
+        | Kind::Comment => NativeMergeRequestOperation {
             surface: NativeMergeRequestSurface::Item,
             identity_field: Some("merge_request_id"),
         },
@@ -870,6 +927,21 @@ pub fn description(n: &str) -> Option<&'static str> {
         "ShowMergeRequest" => Some(
             "Read an authoritative compact MR summary by default: source/target observations, full-evidence review status/readiness and stable event references, without review bodies/history. Use view=detail with bounded after/limit for exact reviews/findings and history; continue with event_page.next_after. Status is never inferred from a history page. Summary is not approval or integration authority.",
         ),
+        "QueryMergeRequestWorker" => Some(
+            "Read the current single MR Worker assignment and its operation_id for CAS. assignment=null means never assigned; a retained assignment with worker=null is a release and retains its operation_id. Ownership is not resource authority, Worker liveness, or Ticket assignment.",
+        ),
+        "SetMergeRequestWorker" => Some(
+            "Set, replace, or release this MR's Worker after reading QueryMergeRequestWorker. Supply a stable operation_id, required expected_operation_id (explicit null only when never assigned), and required worker {runtime_id,worker_id} or explicit null to release. Exact retries retain the same key and full input. On conflict reread and reconcile; unknown outcomes require reconciliation, never a new key or automatic retry. Does not reassign the Ticket, grant authority, start/stop Workers, change MR phase or approval, or publish code.",
+        ),
+        "CommentMergeRequest" => Some(
+            "Append a Markdown comment to the MR thread as its current Worker. Use the observed Worker assignment operation_id as expected_owner_operation_id and a stable comment operation_id. Replays must retain the same full input; stale-owner writes fail. Record conflicts, questions and resolutions here without manufacturing approval or publication evidence. No state change, Git operation or Ticket conclusion.",
+        ),
+        "QueryMergeRequestPublications" => Some(
+            "Read bounded saved publication operations and immutable outcomes for this MR. Unconfirmed is not failed; this read never sends Git commands or retries publication.",
+        ),
+        "PublishMergeRequest" => Some(
+            "Request normal fast-forward publication of the fixed approved MR source using its current Worker Workdir. Read the current MR and publication operations first. Supply the exact approval_event_id and a stable operation_id; replay of a saved operation only reconciles its result and never sends another push. Unknown outcomes require reconciliation using the same full input, not a new operation key. Backend validates current ownership, permissions, approval, target and exclusion. Approval normally triggers this automatically; no Subject stamp or Ticket closure.",
+        ),
         "CheckMergeRequestReadiness" => Some(
             "Resolve current provider refs and derive readiness from exact-source review evidence; source movement requires fresh review while target-only movement preserves unchanged-source approval.",
         ),
@@ -877,10 +949,10 @@ pub fn description(n: &str) -> Option<&'static str> {
             "Open one repository-scoped Merge Request linked to the Ticket; reuse an existing Merge Request for that repository and advance only its selector_from with a normal non-force push.",
         ),
         "CompleteMergeRequest" => Some(
-            "Record an exact-source MR integration receipt using current trusted exact-source approval and provider evidence. This optional recording workflow describes an already-applied integration; it does not update a branch, select which Coder changes to adopt, conclude a Ticket, or release an assignment. Do not record partial or adapted adoption as full integration of the reviewed source.",
+            "Reconcile completion from a saved provider-confirmed publication operation. operation_id, approval_event_id and target before/after must match that operation exactly. Backend records immutable publication evidence and rechecks current MR requirements and approval; no Subject adoption stamp is required. Never asserts a new external merge, sends Git changes, closes a Ticket or releases an assignment.",
         ),
         "ReviewMergeRequest" => Some(
-            "Submit the injected trusted Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not. The capability authenticates the attempt, not the verdict: independent natural-language judgment and validation remain the Reviewer's responsibility.",
+            "Submit the injected trusted Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not. Approval triggers Backend publication when operation permissions and target conditions allow it, without another Subject stamp or model turn. The capability authenticates the attempt, not the verdict: independent natural-language judgment and validation remain the Reviewer's responsibility.",
         ),
         _ => None,
     }

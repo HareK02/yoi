@@ -66,9 +66,18 @@ pub struct WorkerHandle {
     artifact_store: Arc<dyn Store>,
     session_id: session_store::SessionId,
     pending_activations: Arc<std::sync::Mutex<crate::worker::PendingActivationState>>,
+    workdir_sessions: Arc<workdir::WorkdirSessionRouter>,
 }
 
 impl WorkerHandle {
+    /// Reserve the actual routed sessions, including already-issued tool handles.
+    pub async fn reserve_workdir_publication(
+        &self,
+        alias: &workdir::WorkdirAttachmentAlias,
+    ) -> Result<workdir::ExclusiveWorkdirOperation, workdir::WorkdirError> {
+        self.workdir_sessions.reserve_exclusive(alias).await
+    }
+
     /// Read the existing receipt without resending input or activating a run.
     /// Missing evidence is not proof of rejection and must not authorize replay.
     pub fn reconcile_submission(
@@ -1028,6 +1037,7 @@ impl WorkerController {
             artifact_store,
             session_id,
             pending_activations,
+            workdir_sessions: worker.workdir_sessions(),
         };
 
         let command_events = fs_for_view

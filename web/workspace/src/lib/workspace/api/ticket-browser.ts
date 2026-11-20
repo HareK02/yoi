@@ -1792,12 +1792,26 @@ function parseMergeRequestThreadEvent(
     };
   }
   if (kind === "comment") {
-    exact(item, [...base, "author", "body"], label);
+    exact(item, [...base, "author", "body", "operation_id", "owner_operation_id"], label);
     return {
       ...eventBase,
       kind,
+      operation_id: optionalNullableString(item.operation_id, `${label}.operation_id`),
+      owner_operation_id: optionalNullableString(item.owner_operation_id, `${label}.owner_operation_id`),
       author: parseMergeRequestWorker(item.author, `${label}.author`),
       body: string(item.body, `${label}.body`),
+    };
+  }
+  if (kind === "worker_assigned") {
+    exact(item, [...base, "operation_id", "previous_operation_id", "worker", "assigned_by"], label);
+    return {
+      ...eventBase,
+      kind,
+      operation_id: string(item.operation_id, `${label}.operation_id`),
+      previous_operation_id: item.previous_operation_id === null
+        ? null : string(item.previous_operation_id, `${label}.previous_operation_id`),
+      worker: item.worker === null ? null : parseMergeRequestWorker(item.worker, `${label}.worker`),
+      assigned_by: parseMergeRequestWorker(item.assigned_by, `${label}.assigned_by`),
     };
   }
   if (kind === "merge") {

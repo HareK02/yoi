@@ -118,6 +118,7 @@ struct RoutedSessionState {
     session: WorkdirSessionHandle,
     generation: u64,
     detached: AtomicBool,
+    exclusive: AtomicBool,
     active_operations: AtomicUsize,
     active_commands: Mutex<HashSet<CommandHandle>>,
 }
@@ -129,7 +130,18 @@ impl RoutedSessionState {
                 "Workdir attachment is detached".to_string(),
             ));
         }
+        if self.exclusive.load(Ordering::Acquire) {
+            return Err(WorkdirError::Conflict(
+                "Workdir has an exclusive operation".into(),
+            ));
+        }
         self.active_operations.fetch_add(1, Ordering::AcqRel);
+        if self.exclusive.load(Ordering::Acquire) {
+            self.active_operations.fetch_sub(1, Ordering::AcqRel);
+            return Err(WorkdirError::Conflict(
+                "Workdir has an exclusive operation".into(),
+            ));
+        }
         if self.detached.load(Ordering::Acquire) {
             self.active_operations.fetch_sub(1, Ordering::AcqRel);
             return Err(WorkdirError::Unavailable(
@@ -140,7 +152,9 @@ impl RoutedSessionState {
     }
 
     fn is_busy(&self) -> bool {
-        if self.active_operations.load(Ordering::Acquire) != 0 {
+        if self.exclusive.load(Ordering::Acquire)
+            || self.active_operations.load(Ordering::Acquire) != 0
+        {
             return true;
         }
         self.reconcile_terminal_commands(&self.session.command_snapshot());
@@ -210,6 +224,18 @@ impl RoutedSessionState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(handle);
         }
+    }
+}
+
+/// Temporarily excludes routed reads, writes and commands on one connection.
+/// This grants no filesystem or command authority. Hosts still authorize their
+/// own operation and hold this guard through its actual provider completion.
+#[derive(Debug)]
+pub struct ExclusiveWorkdirOperation(Arc<RoutedSessionState>);
+
+impl Drop for ExclusiveWorkdirOperation {
+    fn drop(&mut self) {
+        self.0.exclusive.store(false, Ordering::Release);
     }
 }
 
@@ -517,6 +543,7 @@ impl WorkdirSessionRouter {
             session,
             generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
             detached: AtomicBool::new(false),
+            exclusive: AtomicBool::new(false),
             active_operations: AtomicUsize::new(0),
             active_commands: Mutex::new(HashSet::new()),
         });
@@ -622,6 +649,38 @@ impl WorkdirSessionRouter {
         Ok(())
     }
 
+    /// Fence every existing routed handle before testing activity. An active
+    /// command or operation makes this a non-waiting conflict. Cancellation
+    /// during the provider status query releases the fence through RAII.
+    pub async fn reserve_exclusive(
+        &self,
+        alias: &WorkdirAttachmentAlias,
+    ) -> Result<ExclusiveWorkdirOperation, WorkdirError> {
+        let state = self
+            .sessions
+            .read()
+            .map_err(|_| WorkdirError::Unavailable("Workdir attachment router is poisoned".into()))?
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| WorkdirError::NotFound(alias.as_str().into()))?;
+        if state
+            .exclusive
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(WorkdirError::Conflict(
+                "Workdir already has an exclusive operation".into(),
+            ));
+        }
+        let guard = ExclusiveWorkdirOperation(state.clone());
+        if state.detached.load(Ordering::Acquire) || state.is_busy_for_detach().await {
+            return Err(WorkdirError::Conflict(
+                "Workdir has active operations, commands or detachment".into(),
+            ));
+        }
+        Ok(guard)
+    }
+
     /// Atomically fence new operations before an external detach transaction begins.
     pub async fn begin_detach(&self, alias: &WorkdirAttachmentAlias) -> Result<(), WorkdirError> {
         let state = self
@@ -638,7 +697,7 @@ impl WorkdirSessionRouter {
                 "Workdir attachment is already detaching".to_string(),
             ));
         }
-        if state.is_busy_for_detach().await {
+        if state.exclusive.load(Ordering::Acquire) || state.is_busy_for_detach().await {
             state.detached.store(false, Ordering::Release);
             return Err(WorkdirError::Conflict(format!(
                 "Workdir attachment `{alias}` has active operations or commands"
@@ -674,7 +733,7 @@ impl WorkdirSessionRouter {
                 "Workdir attachment `{alias}` was not prepared for detach"
             )));
         }
-        if state.is_busy_for_detach().await {
+        if state.exclusive.load(Ordering::Acquire) || state.is_busy_for_detach().await {
             state.detached.store(false, Ordering::Release);
             return Err(WorkdirError::Conflict(format!(
                 "Workdir attachment `{alias}` has active operations or commands"
@@ -923,6 +982,54 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn exclusive_operation_fences_existing_handles_and_detachment_until_drop() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("a"), "contents").unwrap();
+        let router = WorkdirSessionRouter::new();
+        let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+        router.attach(alias.clone(), session("wd", &root)).unwrap();
+        let old = router.resolve(Some("checkout")).unwrap().session;
+        let lease = router.reserve_exclusive(&alias).await.unwrap();
+        assert!(router.reserve_exclusive(&alias).await.is_err());
+        assert!(router.begin_detach(&alias).await.is_err());
+        assert!(
+            old.checkout_observe(crate::WorkdirPath::new("a").unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            old.start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
+                command: "printf forbidden".into(),
+                timeout_secs: 5,
+                cwd: crate::WorkdirPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .is_err()
+        );
+        drop(lease);
+        old.checkout_observe(crate::WorkdirPath::new("a").unwrap())
+            .await
+            .unwrap();
+        let command = old
+            .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
+                command: "sleep 30".into(),
+                timeout_secs: 60,
+                cwd: crate::WorkdirPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(router.reserve_exclusive(&alias).await.is_err());
+        old.cancel_command(command).await.unwrap();
+        let lease = router.reserve_exclusive(&alias).await.unwrap();
+        drop(lease);
+        router.detach(&alias).await.unwrap();
     }
 
     #[tokio::test]

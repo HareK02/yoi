@@ -70,7 +70,7 @@ fn phase_tracks_first_valid_approval_not_current_readiness() {
             ticket_id: "T".into(),
             review_event_id: first.event_id.clone(),
             reason: "recheck".into(),
-            auth: auth(),
+            auth: mr_auth(&store, "MR", "R"),
             now: at(5),
         })
         .unwrap();
@@ -222,7 +222,7 @@ fn migration_preserves_review_bytes_without_inventing_entry_and_rolls_back() {
             ticket_id: "T".into(),
             review_event_id: first.event_id.clone(),
             reason: "later".into(),
-            auth: auth(),
+            auth: mr_auth(&store, "MR", "R"),
             now: at(5),
         })
         .unwrap();
@@ -377,6 +377,12 @@ fn migration_cannot_promote_a_stale_approval_after_requirements_return() {
     );
     assert!(!ready(&store, "source"));
     assert!(store.complete(completion(&old)).is_err());
+    store
+        .set_worker(
+            super::ownership::transfer(&store, "legacy-owner", Some("coder")),
+            |_| Ok(()),
+        )
+        .unwrap();
     let fresh = approve(&store, "source", "fresh");
     assert_eq!(
         store

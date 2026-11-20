@@ -44,6 +44,7 @@ use workdir::WorkdirSessionResource;
 
 mod cleanup;
 mod occupancy;
+mod publication;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use cleanup::tests::fail_once as fail_workdir_cleanup_once;
@@ -303,6 +304,48 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
         &self,
         request: &RepositoryRefObservationRequest,
     ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic>;
+
+    fn reject_repository_publication(
+        &self,
+        _request: &crate::catalog::RepositoryPublicationRequest,
+        _reason: &str,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Publication rejection receipts are unavailable",
+        ))
+    }
+
+    fn repository_publication_receipt(
+        &self,
+        _binding: &crate::catalog::RepositoryPublicationBinding,
+    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
+    {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Publication receipts are unavailable",
+        ))
+    }
+
+    fn publish_repository_source(
+        &self,
+        _request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Repository publication is unavailable",
+        ))
+    }
+
+    fn reconcile_repository_publication(
+        &self,
+        _request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Publication recovery is unavailable",
+        ))
+    }
 
     fn bind_working_directory(
         &self,
@@ -1184,6 +1227,34 @@ impl RuntimeGitMaterializer {
 }
 
 impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
+    fn reject_repository_publication(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+        reason: &str,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.record_unpublished(request, reason)
+    }
+
+    fn repository_publication_receipt(
+        &self,
+        binding: &crate::catalog::RepositoryPublicationBinding,
+    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
+    {
+        self.saved_publication_receipt(binding)
+    }
+    fn publish_repository_source(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.publish_fixed_source(request)
+    }
+    fn reconcile_repository_publication(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.reconcile_fixed_source(request)
+    }
+
     fn materialize(
         &self,
         worker_ref: &WorkerRef,
@@ -2261,6 +2332,23 @@ impl RepositoryCommandAccess {
         repository_id: &str,
         ssh: &RepositorySshMaterializationAccess,
     ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        Self::prepare_fixed_ssh(runtime_root, operation_id, repository_id, ssh, false)
+    }
+
+    fn prepare_fixed_ssh(
+        runtime_root: &Path,
+        operation_id: &str,
+        repository_id: &str,
+        ssh: &RepositorySshMaterializationAccess,
+        publication: bool,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        validate_ssh_materialization_access(ssh)?;
+        if publication && ssh.access != server_api::RepositoryAccessMode::ReadWrite {
+            return Err(WorkingDirectoryDiagnostic::rejected(
+                "repository_publication_access_denied",
+                "Publication requires Repository write access",
+            ));
+        }
         let root = repository_command_access_root(runtime_root, operation_id, repository_id);
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
@@ -2282,7 +2370,12 @@ impl RepositoryCommandAccess {
             .port
             .map(|port| format!("-p {} ", shell_quote(&port.to_string())))
             .unwrap_or_default();
-        let remote_command = format!("git-upload-pack {}", shell_quote(&policy.repository_path));
+        let service = if publication {
+            "git-receive-pack"
+        } else {
+            "git-upload-pack"
+        };
+        let remote_command = format!("{service} {}", shell_quote(&policy.repository_path));
         let script = format!(
             "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = -G ] && exit 0; done\nexec ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout={} -o ConnectionAttempts=1 -o ServerAliveInterval={} -o ServerAliveCountMax={} -o IdentitiesOnly=no -o IdentityFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={} -o ClearAllForwardings=yes -o PermitLocalCommand=no {}-- {} {}\n",
             REPOSITORY_SSH_CONNECT_TIMEOUT_SECONDS,
@@ -2889,6 +2982,10 @@ fn apply_repository_access_policy(
 
 fn validate_repository_limits(repository_root: &Path) -> Result<(), WorkingDirectoryDiagnostic> {
     let report = git_stdout(repository_root, ["count-objects", "-v"])?;
+    validate_repository_limits_report(&report)
+}
+
+fn validate_repository_limits_report(report: &str) -> Result<(), WorkingDirectoryDiagnostic> {
     let mut objects = 0u64;
     let mut kibibytes = 0u64;
     for line in report.lines() {
@@ -3145,6 +3242,38 @@ mod tests {
             secret_resource: repository_resource_handle(),
             known_hosts_entry: crate::catalog::SensitiveString::new("host key secret bytes"),
         }
+    }
+
+    #[test]
+    fn publication_ssh_access_rejects_read_only_and_expired_authority_before_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut access = repository_ssh_access();
+        let error = RepositoryCommandAccess::prepare_fixed_ssh(
+            root.path(),
+            "publication",
+            "repo-main",
+            &access,
+            true,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "repository_publication_access_denied");
+        access.access = server_api::RepositoryAccessMode::ReadWrite;
+        access.expires_at_epoch_seconds = 0;
+        let error = RepositoryCommandAccess::prepare_fixed_ssh(
+            root.path(),
+            "publication",
+            "repo-main",
+            &access,
+            true,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.reason,
+            Some(WorkdirManagementReason::RepositoryAccessExpired)
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]
