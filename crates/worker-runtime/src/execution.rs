@@ -1154,6 +1154,48 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         ))
     }
 
+    fn reject_repository_publication(
+        &self,
+        _request: &crate::catalog::RepositoryPublicationRequest,
+        _reason: &str,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Publication rejection receipts are unavailable",
+        ))
+    }
+
+    fn repository_publication_receipt(
+        &self,
+        _binding: &crate::catalog::RepositoryPublicationBinding,
+    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
+    {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Publication receipts are unavailable",
+        ))
+    }
+
+    fn publish_repository_source(
+        &self,
+        _request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Repository publication is unavailable",
+        ))
+    }
+
+    fn reconcile_repository_publication(
+        &self,
+        _request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "repository_publication_unsupported",
+            "Publication recovery is unavailable",
+        ))
+    }
+
     fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
         Vec::new()
     }
@@ -1522,6 +1564,34 @@ impl WorkerExecutionBackendRef {
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         self.backend
             .authorize_working_directory_repository_access(request)
+    }
+
+    pub(crate) fn reject_repository_publication(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+        reason: &str,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.backend.reject_repository_publication(request, reason)
+    }
+
+    pub(crate) fn repository_publication_receipt(
+        &self,
+        binding: &crate::catalog::RepositoryPublicationBinding,
+    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
+    {
+        self.backend.repository_publication_receipt(binding)
+    }
+    pub(crate) fn publish_repository_source(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.backend.publish_repository_source(request)
+    }
+    pub(crate) fn reconcile_repository_publication(
+        &self,
+        request: &crate::catalog::RepositoryPublicationRequest,
+    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+        self.backend.reconcile_repository_publication(request)
     }
 
     pub(crate) fn observe_repository_ref(

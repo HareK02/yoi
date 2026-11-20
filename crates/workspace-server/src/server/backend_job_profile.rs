@@ -82,11 +82,7 @@ fn validate_backend_job_profile_requirements(
         || f.manage_workdir.enabled
         || f.workspace_config.enabled
         || f.ticket.enabled
-        || f.merge_request.show
-        || f.merge_request.open
-        || f.merge_request.review
-        || f.merge_request.readiness_check
-        || f.merge_request.complete
+        || f.merge_request.any()
         || f.orchestration.enabled
         || !manifest.mcp.stdio_servers.is_empty()
     {

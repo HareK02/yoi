@@ -187,12 +187,7 @@ pub fn validate_profile_execution_target(
     if feature.subjektiv.workspace_settings.is_some() {
         requirements.insert(WorkspaceAuthorityRequirement::Subjektiv);
     }
-    if feature.merge_request.show
-        || feature.merge_request.open
-        || feature.merge_request.review
-        || feature.merge_request.readiness_check
-        || feature.merge_request.complete
-    {
+    if feature.merge_request.any() {
         requirements.insert(WorkspaceAuthorityRequirement::MergeRequest);
     }
     if feature.objective.enabled {
@@ -1392,8 +1387,6 @@ mod tests {
         assert!(!feature.merge_request.show);
         assert!(!feature.merge_request.open);
         assert!(!feature.merge_request.review);
-        assert!(!feature.merge_request.readiness_check);
-        assert!(!feature.merge_request.complete);
         assert!(!feature.orchestration.enabled);
     }
 
@@ -1528,8 +1521,6 @@ mod tests {
         assert!(!feature.merge_request.show);
         assert!(!feature.merge_request.open);
         assert!(!feature.merge_request.review);
-        assert!(!feature.merge_request.readiness_check);
-        assert!(!feature.merge_request.complete);
         assert!(!feature.orchestration.enabled);
         assert_eq!(
             manifest.web.as_ref().and_then(|web| web.enabled),
@@ -1704,6 +1695,34 @@ mod tests {
     }
 
     #[test]
+    fn each_remaining_merge_request_operation_requires_workspace_authority() {
+        let tmp = TempDir::new().unwrap();
+        for flag in ["show", "open", "review", "worker_set", "comment"] {
+            let mut artifact =
+                serde_json::json!({"worker":{"mode":"tools"},"feature":{"merge_request":{}}});
+            artifact["feature"]["merge_request"][flag] = serde_json::json!(true);
+            let resolved = resolve_profile_artifact_value(
+                artifact,
+                ProfileSource::Archive {
+                    archive_id: "mr-test".into(),
+                    source: "test".into(),
+                },
+                tmp.path(),
+                "mr-worker",
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    validate_profile_execution_target(&resolved.manifest, ProfileExecutionTarget::Standalone),
+                    Err(ProfileError::UnsupportedExecutionTarget { requirements, .. })
+                        if requirements.contains(&WorkspaceAuthorityRequirement::MergeRequest)
+                ),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
     fn standalone_rejects_profiles_that_require_workspace_authority() {
         let tmp = TempDir::new().unwrap();
         let error = ProfileResolver::new()
@@ -1859,8 +1878,6 @@ mod tests {
         assert!(feature.merge_request.show);
         assert!(!feature.merge_request.open);
         assert!(!feature.merge_request.review);
-        assert!(feature.merge_request.readiness_check);
-        assert!(feature.merge_request.complete);
         assert!(feature.manage_workdir.enabled);
         assert!(!feature.orchestration.enabled);
         assert_eq!(
@@ -1941,8 +1958,6 @@ mod tests {
         assert!(feature.worker.direct_spawn);
         assert!(feature.manage_workdir.enabled);
         assert!(feature.merge_request.show);
-        assert!(feature.merge_request.readiness_check);
-        assert!(feature.merge_request.complete);
         assert!(!feature.merge_request.open);
         assert!(!feature.merge_request.review);
     }
@@ -2101,8 +2116,6 @@ intake = false
 show = true
 open = false
 review = true
-readiness_check = false
-complete = false
 
 [feature.orchestration]
 enabled = false

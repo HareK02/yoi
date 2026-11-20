@@ -248,6 +248,11 @@ fn policy_create_request(
         "authorization":{"kind":"policy", "policy_id":policy.policy_id, "policy_authorization_key":policy.authorization_key}})
 }
 
+#[path = "core_grant_continuity_tests.rs"]
+mod core_grant_continuity;
+#[path = "mr_worker_assignment_tests.rs"]
+mod mr_worker_assignment_tests;
+
 struct Fixture {
     api: WorkspaceApi,
     identity: Arc<RuntimeIdentityMaterial>,
@@ -3144,15 +3149,11 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
     let current_grant = f.core_grant(&current);
     subject_authorization::revalidate_core_grant(&f.api, &current_grant).unwrap();
     f.release_source_lease();
-    let revoked = subject_authorization::revalidate_core_grant(&f.api, &current_grant).unwrap_err();
-    assert!(
-        matches!(&revoked.error, Error::WorkspacePermissionDenied(_)),
-        "core lineage must reject the released origin: {revoked:?}"
-    );
+    subject_authorization::revalidate_core_grant(&f.api, &current_grant).unwrap();
     assert_eq!(
         f.check(&current, &query_permission()).await.0,
-        StatusCode::FORBIDDEN,
-        "the core grant rejects a released origin as authorization denial, not a lease CAS conflict"
+        StatusCode::OK,
+        "body release does not revoke the Subject's continuous delegation authority"
     );
     assert_eq!(f.core_grant(&current), current_grant);
     assert_eq!(

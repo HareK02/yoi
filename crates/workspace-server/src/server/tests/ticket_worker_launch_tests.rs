@@ -1139,7 +1139,7 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
         .await;
     }
     api.config_store.with_conn(|conn| {
-        assert_eq!(conn.query_row("SELECT count(*) FROM merge_request_thread_events WHERE merge_request_id=?1",[mr],|r|r.get::<_,i64>(0))?,0,"no review event mentions B");
+        assert_eq!(conn.query_row("SELECT count(*) FROM merge_request_thread_events WHERE merge_request_id=?1 AND kind IN ('review_requested','review')",[mr],|r|r.get::<_,i64>(0))?,0,"no review event mentions B");
         let (previous,current):(String,String)=conn.query_row("SELECT previous_subject_ref,subject_ref FROM merge_request_source_observations WHERE merge_request_id=?1 ORDER BY sequence DESC LIMIT 1",[mr],|r|Ok((r.get(0)?,r.get(1)?)))?;
         assert_eq!((previous,current),(source_a.clone(),source_b.clone()));
         assert_eq!(conn.query_row("SELECT count(*) FROM notification_sources WHERE kind='mr_source_changed' AND json_extract(facts_json,'$.merge_request_id')=?1",[mr],|r|r.get::<_,i64>(0))?,2,"one source per logical recipient, not per read");

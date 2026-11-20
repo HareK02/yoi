@@ -6983,46 +6983,28 @@ status: 200,
         assert_eq!(review_body["capability_token"], "review-capability-secret");
 
         let orchestrator_client = Arc::new(
-            ScriptedWorkspaceClient::new([
-                crate::worker::WorkspaceResponse {
-                    content_type: None,
-                    status: 200,
-                    body: json!({
+            ScriptedWorkspaceClient::new([crate::worker::WorkspaceResponse {
+                content_type: None,
+                status: 200,
+                body: json!({
+                    "merge_request_id": "MR-1",
+                    "summary": {"readiness": {
                         "ready": true,
                         "blockers": [],
                         "subject_ref": "source-1",
                         "review": {"event_id": "review-1", "decision": "approve"}
-                    })
-                    .to_string(),
-                },
-                crate::worker::WorkspaceResponse {
-                    content_type: None,
-                    status: 200,
-                    body: json!({
-                        "event_id": "merge-1",
-                        "approved_source_ref": "source-1",
-                        "target_ref_before": "target-1",
-                        "target_ref_after": "result-1"
-                    })
-                    .to_string(),
-                },
-            ])
-            .with_authorizations([
-                expected_authorization(
-                    "merge_request.readiness",
-                    "merge_request",
-                    Some(("merge_request_id", "MR-1")),
-                ),
-                expected_authorization(
-                    "merge_request.complete",
-                    "merge_request",
-                    Some(("merge_request_id", "MR-1")),
-                ),
-            ]),
+                    }}
+                })
+                .to_string(),
+            }])
+            .with_authorizations([expected_authorization(
+                "merge_request.read",
+                "merge_request",
+                Some(("merge_request_id", "MR-1")),
+            )]),
         );
         let orchestrator_config = MergeRequestFeatureConfig {
-            readiness_check: true,
-            complete: true,
+            show: true,
             ..Default::default()
         };
         let mut orchestrator_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
@@ -7058,24 +7040,8 @@ status: 200,
             .call(
                 item.clone(),
                 crate::wip::root_reference("yoi.merge-request/item/v2"),
-                "readiness".into(),
+                "read".into(),
                 json!({}),
-                ToolExecutionContext::direct(),
-            )
-            .await
-            .unwrap();
-        orchestrator.tree(item.clone(), 0, true).await.unwrap();
-        orchestrator
-            .call(
-                item.clone(),
-                crate::wip::root_reference("yoi.merge-request/item/v2"),
-                "complete".into(),
-                json!({
-                    "operation_id": "merge-op-1",
-                    "integration": {"approval_event_id": "review-1",
-                    "target": {"before": "target-1", "after": "result-1"},
-                    "strategy": "fast_forward", "resolution": "clean"}
-                }),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -7104,20 +7070,11 @@ status: 200,
         );
         orchestrator_client.assert_authorizations_consumed();
         let orchestrator_requests = orchestrator_client.requests();
-        assert_eq!(orchestrator_requests.len(), 2);
+        assert_eq!(orchestrator_requests.len(), 1);
         assert_eq!(
             orchestrator_requests[0].path,
-            "/api/w/workspace/merge-requests/MR-1/readiness"
+            "/api/w/workspace/merge-requests/MR-1?view=summary"
         );
-        assert_eq!(
-            orchestrator_requests[1].path,
-            "/api/w/workspace/merge-requests/MR-1/complete"
-        );
-        let completion_body: Json =
-            serde_json::from_str(orchestrator_requests[1].body.as_deref().unwrap()).unwrap();
-        assert_eq!(completion_body["approval_event_id"], "review-1");
-        assert_eq!(completion_body["target_ref_before"], "target-1");
-        assert_eq!(completion_body["target_ref_after"], "result-1");
     }
 
     #[tokio::test]

@@ -174,6 +174,7 @@ const WORK_COORDINATION_KEYS: &[&str] = &[
     "repository.read",
     "merge_request.read",
     "merge_request.readiness",
+    "merge_request.assign",
     "merge_request.complete",
     "ticket.create",
     "ticket.query",
@@ -228,6 +229,8 @@ const WORK_EXECUTION_KEYS: &[&str] = &[
     "merge_request.read",
     "merge_request.readiness",
     "merge_request.review",
+    "merge_request.comment",
+    "merge_request.publish",
 ];
 
 fn assert_exact_policy(

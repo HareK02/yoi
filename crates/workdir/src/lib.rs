@@ -46,8 +46,8 @@ pub use local::{
 };
 pub use operation::*;
 pub use router::{
-    ResolvedWorkdirSession, RoutedWorkdirSession, WorkdirAttachmentAlias, WorkdirRouteError,
-    WorkdirRouteErrorCode, WorkdirSessionRouter,
+    ExclusiveWorkdirOperation, ResolvedWorkdirSession, RoutedWorkdirSession,
+    WorkdirAttachmentAlias, WorkdirRouteError, WorkdirRouteErrorCode, WorkdirSessionRouter,
 };
 pub use scope::{
     ReadOnlyWorkdirSession, WorkdirScopeAuthorizationRequest, WorkdirScopeLease,

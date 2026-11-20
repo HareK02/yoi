@@ -3,8 +3,10 @@
 //! Backend/provider contracts. Subject bodies with no assignment deny by default.
 //!
 //! Bindings here are execution grants, not another Worker registry. Current body
-//! ownership remains the singleton store. Replacing a permission assignment fences
-//! all children issued from it; restoring a Worker cannot refresh that assignment.
+//! ownership remains the singleton store. Legacy scoped grants are fenced by policy
+//! replacement; core grants require uninterrupted authority across saved policy changes.
+//! Body succession alone does not revoke a core grant, and restore cannot refresh a
+//! revoked grant or expand its issuance ceiling.
 //! Checks refuse new effects; they do not undo effects already committed. Trusted
 //! Features must call the operation boundary themselves, including alternate surfaces.
 //!

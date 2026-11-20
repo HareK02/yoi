@@ -1792,12 +1792,26 @@ function parseMergeRequestThreadEvent(
     };
   }
   if (kind === "comment") {
-    exact(item, [...base, "author", "body"], label);
+    exact(item, [...base, "author", "body", "operation_id", "owner_operation_id"], label);
     return {
       ...eventBase,
       kind,
+      operation_id: optionalNullableString(item.operation_id, `${label}.operation_id`),
+      owner_operation_id: optionalNullableString(item.owner_operation_id, `${label}.owner_operation_id`),
       author: parseMergeRequestWorker(item.author, `${label}.author`),
       body: string(item.body, `${label}.body`),
+    };
+  }
+  if (kind === "worker_assigned") {
+    exact(item, [...base, "operation_id", "previous_operation_id", "worker", "assigned_by"], label);
+    return {
+      ...eventBase,
+      kind,
+      operation_id: string(item.operation_id, `${label}.operation_id`),
+      previous_operation_id: item.previous_operation_id === null
+        ? null : string(item.previous_operation_id, `${label}.previous_operation_id`),
+      worker: item.worker === null ? null : parseMergeRequestWorker(item.worker, `${label}.worker`),
+      assigned_by: parseMergeRequestWorker(item.assigned_by, `${label}.assigned_by`),
     };
   }
   if (kind === "merge") {
@@ -1954,6 +1968,61 @@ function parseMergeRequestEventPage(
   };
 }
 
+function parseMergeRequestAssignment(
+  value: unknown,
+  label: string,
+): MergeRequestDetailResponse["worker_assignment"] {
+  if (value === null) return null;
+  const item = object(value, label);
+  exact(item, ["event_id", "sequence", "operation_id", "previous_operation_id", "worker", "assigned_by", "created_at"], label);
+  return {
+    event_id: string(item.event_id, `${label}.event_id`),
+    sequence: integer(item.sequence, `${label}.sequence`, 0),
+    operation_id: string(item.operation_id, `${label}.operation_id`),
+    previous_operation_id: item.previous_operation_id === null
+      ? null : string(item.previous_operation_id, `${label}.previous_operation_id`),
+    worker: item.worker === null ? null : parseMergeRequestWorker(item.worker, `${label}.worker`),
+    assigned_by: parseMergeRequestWorker(item.assigned_by, `${label}.assigned_by`),
+    created_at: string(item.created_at, `${label}.created_at`),
+  };
+}
+
+function parseMergeRequestPublication(
+  value: unknown,
+  label: string,
+): MergeRequestDetailResponse["publications"][number] {
+  const item = object(value, label);
+  exact(item, ["operation_id", "merge_request_id", "approval_event_id", "source_ref", "target_selector", "target_ref_before", "outcome"], label);
+  const result = object(item.outcome, `${label}.outcome`);
+  const kind = string(result.kind, `${label}.outcome.kind`);
+  let outcome: MergeRequestDetailResponse["publications"][number]["outcome"];
+  if (kind === "unconfirmed") {
+    exact(result, ["kind"], `${label}.outcome`);
+    outcome = { kind };
+  } else if (kind === "not_published") {
+    exact(result, ["kind", "reason"], `${label}.outcome`);
+    outcome = { kind, reason: string(result.reason, `${label}.outcome.reason`) };
+  } else if (kind === "published") {
+    exact(result, ["kind", "target_after", "observed_at"], `${label}.outcome`);
+    outcome = {
+      kind,
+      target_after: string(result.target_after, `${label}.outcome.target_after`),
+      observed_at: string(result.observed_at, `${label}.outcome.observed_at`),
+    };
+  } else {
+    throw new TicketBrowserContractError(`${label}.outcome.kind is invalid`);
+  }
+  return {
+    operation_id: string(item.operation_id, `${label}.operation_id`),
+    merge_request_id: string(item.merge_request_id, `${label}.merge_request_id`),
+    approval_event_id: string(item.approval_event_id, `${label}.approval_event_id`),
+    source_ref: string(item.source_ref, `${label}.source_ref`),
+    target_selector: string(item.target_selector, `${label}.target_selector`),
+    target_ref_before: string(item.target_ref_before, `${label}.target_ref_before`),
+    outcome,
+  };
+}
+
 export function parseMergeRequestDetailResponse(
   value: unknown,
 ): MergeRequestDetailResponse {
@@ -1973,6 +2042,8 @@ export function parseMergeRequestDetailResponse(
     "summary",
     "view",
     "event_page",
+    "worker_assignment",
+    "publications",
     "ticket_ids",
     "updated_at",
     "workspace_id",
@@ -1986,6 +2057,8 @@ export function parseMergeRequestDetailResponse(
     view,
     summary: parseMergeRequestStatusSummary(item.summary, `${label}.summary`),
     event_page: parseMergeRequestEventPage(item.event_page, `${label}.event_page`),
+    worker_assignment: parseMergeRequestAssignment(item.worker_assignment, `${label}.worker_assignment`),
+    publications: array(item.publications, `${label}.publications`, parseMergeRequestPublication),
     created_at: string(item.created_at, `${label}.created_at`),
     linked_tickets: array(
       item.linked_tickets,

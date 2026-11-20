@@ -16,9 +16,11 @@ fn notification_registration_covers_public_mr_event_kinds() {
         let kind = variant["properties"]["kind"]["const"]
             .as_str()
             .expect("MR event kind discriminator");
-        if kind == "comment" {
+        if matches!(kind, "comment" | "worker_assigned") {
+            // Communication and ownership history are not review results or
+            // handoffs. Ownership does not imply adoption, progress or completion.
             continue;
-        } // Explicit communication is not a review result/handoff.
+        }
         assert_ne!(
             NotificationEventKind::from_source(&format!("mr_{kind}")),
             NotificationEventKind::Unknown,

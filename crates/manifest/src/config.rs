@@ -415,8 +415,8 @@ pub struct MergeRequestFeatureConfigPartial {
     pub show: Option<bool>,
     pub open: Option<bool>,
     pub review: Option<bool>,
-    pub readiness_check: Option<bool>,
-    pub complete: Option<bool>,
+    pub worker_set: Option<bool>,
+    pub comment: Option<bool>,
 }
 
 impl MergeRequestFeatureConfigPartial {
@@ -425,8 +425,8 @@ impl MergeRequestFeatureConfigPartial {
             show: other.show.or(self.show),
             open: other.open.or(self.open),
             review: other.review.or(self.review),
-            readiness_check: other.readiness_check.or(self.readiness_check),
-            complete: other.complete.or(self.complete),
+            worker_set: other.worker_set.or(self.worker_set),
+            comment: other.comment.or(self.comment),
         }
     }
 }
@@ -663,8 +663,8 @@ impl From<MergeRequestFeatureConfigPartial> for MergeRequestFeatureConfig {
             show: value.show.unwrap_or_default(),
             open: value.open.unwrap_or_default(),
             review: value.review.unwrap_or_default(),
-            readiness_check: value.readiness_check.unwrap_or_default(),
-            complete: value.complete.unwrap_or_default(),
+            worker_set: value.worker_set.unwrap_or_default(),
+            comment: value.comment.unwrap_or_default(),
         }
     }
 }
@@ -675,8 +675,8 @@ impl From<MergeRequestFeatureConfig> for MergeRequestFeatureConfigPartial {
             show: Some(value.show),
             open: Some(value.open),
             review: Some(value.review),
-            readiness_check: Some(value.readiness_check),
-            complete: Some(value.complete),
+            worker_set: Some(value.worker_set),
+            comment: Some(value.comment),
         }
     }
 }
@@ -2649,8 +2649,6 @@ workflow = false
 show = true
 open = false
 review = true
-readiness_check = false
-complete = false
 
 [feature.orchestration]
 enabled = false
@@ -2724,8 +2722,6 @@ workflow = false
 show = true
 open = false
 review = true
-readiness_check = false
-complete = false
 
 [feature.orchestration]
 enabled = false
@@ -2741,7 +2737,6 @@ workflow = true
 [feature.merge_request]
 open = true
 review = false
-readiness_check = true
 
 [feature.orchestration]
 enabled = true
@@ -2800,14 +2795,49 @@ enabled = true
                 show: true,
                 open: true,
                 review: false,
-                readiness_check: true,
-                complete: false,
+                ..Default::default()
             }
         );
         assert!(manifest.feature.orchestration.enabled);
         assert!(manifest.feature.objective.enabled);
         assert!(manifest.feature.web.enabled);
         assert!(!manifest.feature.sub_worker.enabled);
+    }
+
+    #[test]
+    fn merge_request_show_and_worker_set_flags_default_off_merge_and_roundtrip_independently() {
+        let empty: MergeRequestFeatureConfigPartial = toml::from_str("").unwrap();
+        let defaults = MergeRequestFeatureConfig::from(empty);
+        assert!(!defaults.show && !defaults.worker_set && !defaults.any());
+        let base: MergeRequestFeatureConfigPartial =
+            toml::from_str("show = true\nworker_set = true").unwrap();
+        let upper: MergeRequestFeatureConfigPartial = toml::from_str("worker_set = false").unwrap();
+        let resolved = MergeRequestFeatureConfig::from(base.merge(upper));
+        assert!(resolved.show);
+        assert!(!resolved.worker_set);
+        assert!(resolved.any());
+        let serialized =
+            toml::to_string(&MergeRequestFeatureConfigPartial::from(resolved)).unwrap();
+        let reparsed: MergeRequestFeatureConfigPartial = toml::from_str(&serialized).unwrap();
+        assert_eq!(MergeRequestFeatureConfig::from(reparsed), resolved);
+        let set_only: MergeRequestFeatureConfig = toml::from_str("worker_set = true").unwrap();
+        assert!(set_only.worker_set && set_only.any());
+        assert!(!set_only.show);
+    }
+
+    #[test]
+    fn merge_request_removed_operation_flags_are_rejected() {
+        for flag in [
+            "worker_query",
+            "publications",
+            "publish",
+            "complete",
+            "readiness_check",
+        ] {
+            let input = format!("{flag} = true");
+            assert!(toml::from_str::<MergeRequestFeatureConfigPartial>(&input).is_err());
+            assert!(toml::from_str::<MergeRequestFeatureConfig>(&input).is_err());
+        }
     }
 
     #[test]

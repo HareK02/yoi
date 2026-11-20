@@ -12215,8 +12215,6 @@ instruction = "saved"
 show = true
 open = false
 review = true
-readiness_check = false
-complete = false
 
 [[scope.allow]]
 target = "/snapshot/workspace"
@@ -12244,8 +12242,6 @@ instruction = "current"
 show = true
 open = true
 review = true
-readiness_check = true
-complete = true
 
 [[scope.allow]]
 target = "/current/workspace"

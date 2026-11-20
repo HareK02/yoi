@@ -117,13 +117,8 @@ pub(super) fn value(
                 }
             }
         }
-        Kind::Readiness => {
-            if let Some(review) = data.get("review").filter(|review| !review.is_null()) {
-                snapshot_ids(review, &mut merge_requests);
-            }
-        }
         Kind::Review => snapshot_ids(&data, &mut merge_requests),
-        Kind::Complete => {}
+        Kind::WorkerSet | Kind::Comment => {}
     }
     json_to_wip(&json!({
         "entry": format!("{collection}/{subject}"),

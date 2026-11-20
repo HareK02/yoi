@@ -75,6 +75,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod publication;
 mod workdir_attachments;
 mod workdir_session;
 pub(crate) use workdir_attachments::WorkdirAttachmentsGuard;

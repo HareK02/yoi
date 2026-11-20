@@ -551,14 +551,14 @@ pub struct MergeRequestFeatureConfig {
     #[serde(default)]
     pub review: bool,
     #[serde(default)]
-    pub readiness_check: bool,
+    pub worker_set: bool,
     #[serde(default)]
-    pub complete: bool,
+    pub comment: bool,
 }
 
 impl MergeRequestFeatureConfig {
     pub fn any(self) -> bool {
-        self.show || self.open || self.review || self.readiness_check || self.complete
+        self.show || self.open || self.review || self.worker_set || self.comment
     }
 }
 

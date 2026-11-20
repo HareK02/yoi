@@ -1,8 +1,8 @@
 //! Native v2 input contracts and their domain-command adapter.
 //!
-//! v1 exposed flattened Tool-shaped fields and `check_readiness`. v2 deliberately has no aliases:
-//! consumers must Inspect the current Object and then its Interface again, use Ticket Entries,
-//! group repository/page/integration records, and invoke `readiness`. Tool mode is unchanged.
+//! Consumers must Inspect the current Object and then its Interface again, use Ticket Entries,
+//! and group repository/page records. Read exposes summary readiness; Backend owns automatic
+//! publication and evidence-bound completion. Tool mode has its own input contracts.
 //!
 //! Examples below show Invoke's JSON binding, not Tool JSON. Read the allocated Ticket collection
 //! root from the Entry parameter's Inspect documentation (it need not be `/tickets`). This input
@@ -13,13 +13,9 @@
 //!   repository: {key: "main", source: "work/T-797", target: "develop"}})
 //! item.read({page: {after: {$case: "value", value: 7},
 //!   limit: {$case: "value", value: 25}}})
-//! item.readiness({})
 //! item.review({decision: "request_changes", findings: [
 //!   {severity: "major", path: {$case: "value", value: "src/main.rs"},
 //!    line: {$case: "value", value: 12}, code: {$case: "null"}, body: "Explain the defect"}]})
-//! item.complete({operation_id: "integration-1", integration: {
-//!   approval_event_id: "approved-1", target: {before: "target-1", after: "result-1"},
-//!   strategy: "fast_forward", resolution: "clean"}})
 //! ```
 //!
 //! Optional fields may be omitted; only Nullable shapes accept explicit null, represented as
@@ -27,8 +23,7 @@
 //! Plain JSON null is not accepted. Omitted summary/body/findings use domain defaults. Backend
 //! remains authoritative for candidate freshness, exact approval, target observations, and business
 //! eligibility. Page bounds and finding line integer ranges are checked before authorization and
-//! dispatch, separately from native type validation. Complete records integration; it never applies
-//! Git changes. Unknown dispatched outcomes are not retried.
+//! dispatch, separately from native type validation. Unknown dispatched outcomes are not retried.
 
 use super::*;
 pub(super) use crate::feature::builtin::native_contract::Contract;
@@ -109,7 +104,7 @@ pub(super) fn contract(kind: Kind) -> Contract {
         ),
         Kind::Show => (
             "read",
-            "Read this route-bound MR. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
+            "Read this route-bound MR. Summary and detail include worker_assignment (operation_id and worker) and saved publications. worker_assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. Ownership is not authority, Worker liveness or Ticket assignment. This read never sends or retries publication. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
             vec![
                 field("view", false, Shape::Enum(vec!["summary", "detail"])),
                 flattened(
@@ -122,14 +117,34 @@ pub(super) fn contract(kind: Kind) -> Contract {
                 ),
             ],
         ),
-        Kind::Readiness => (
-            "readiness",
-            "Check current review and exact-source integration eligibility for this MR; no integration or Ticket conclusion is performed.",
-            vec![],
+        Kind::WorkerSet => (
+            "worker_set",
+            "Set, replace, or release this MR's Worker after read with view=summary, using worker_assignment.operation_id as expected_operation_id. Both expected_operation_id and worker are required null/value unions; null expectation means never assigned, null worker releases ownership. Preserve operation_id and full input for exact retry; reconcile conflict or unknown outcome without automatic retry or a new key. Ownership changes no Ticket assignment, authority, lifecycle, phase, approval, or publication.",
+            vec![
+                field("operation_id", true, Shape::String),
+                field("expected_operation_id", true, nullable(Shape::String)),
+                field(
+                    "worker",
+                    true,
+                    nullable(Shape::Record(vec![
+                        field("runtime_id", true, Shape::String),
+                        field("worker_id", true, Shape::String),
+                    ])),
+                ),
+            ],
+        ),
+        Kind::Comment => (
+            "comment",
+            "Append an owner-fenced Markdown thread comment. Use the observed assignment operation_id and retain the same full input for exact replay. A comment is not approval, authority or publication evidence.",
+            vec![
+                field("operation_id", true, Shape::String),
+                field("expected_owner_operation_id", true, Shape::String),
+                field("body", true, Shape::String),
+            ],
         ),
         Kind::Review => (
             "review",
-            "Record an injected Reviewer's decision on this exact MR. decision is required. Omit body/findings for empty defaults; finding severity/body are required, optional code/path/line use null/value unions, and a present line is 0..4294967295. Backend validates candidate freshness; model inputs never carry a capability.",
+            "Record an injected Reviewer's decision on this exact MR. decision is required. Omit body/findings for empty defaults; finding severity/body are required, optional code/path/line use null/value unions, and a present line is 0..4294967295. Backend validates candidate freshness; approve triggers automatic publication when current permissions and target conditions permit. Model inputs never carry a capability.",
             vec![
                 field(
                     "decision",
@@ -151,34 +166,6 @@ pub(super) fn contract(kind: Kind) -> Contract {
                         field("line", false, nullable(Shape::Integer)),
                         field("body", true, Shape::String),
                     ]))),
-                ),
-            ],
-        ),
-        Kind::Complete => (
-            "complete",
-            "Record an already-applied exact-source integration using an observed approval event and target before/after refs. All integration fields are required. operation_id is the stable replay key; Backend rechecks exact approval/target observations and integration authority. No Git operation, automatic retry, or Ticket closure occurs.",
-            vec![
-                field("operation_id", true, Shape::String),
-                flattened(
-                    "integration",
-                    true,
-                    vec![
-                        field("approval_event_id", true, Shape::String),
-                        flattened(
-                            "target",
-                            true,
-                            vec![
-                                renamed("before", true, Shape::String, "target_ref_before"),
-                                renamed("after", true, Shape::String, "target_ref_after"),
-                            ],
-                        ),
-                        field("strategy", true, Shape::Enum(vec!["fast_forward", "merge"])),
-                        field(
-                            "resolution",
-                            true,
-                            Shape::Enum(vec!["none", "clean", "conflicts_resolved"]),
-                        ),
-                    ],
                 ),
             ],
         ),
@@ -243,3 +230,9 @@ mod tests;
 
 #[cfg(test)]
 mod domain_tests;
+
+#[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
+mod publication_tests;

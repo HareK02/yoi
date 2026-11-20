@@ -21,6 +21,39 @@ pub const BACKEND_RESOURCE_FETCH_PERMISSION: &str = "workspace:resource-fetch";
 const RUNTIME_REQUEST_SOURCE_PROOF_PREFIX: &str = "yoi-runtime-request-v1";
 const RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX: &str = "yoi-runtime-request-v1.";
 
+/// Publication capabilities name one saved operation, not arbitrary Repository access.
+/// The signed method, path and complete body additionally fence changes to its binding.
+pub fn repository_publication_request_permission(
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+) -> Result<Option<String>, RuntimeAuthError> {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let action = match (method, path) {
+        ("POST", runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH) => "publish",
+        ("POST", runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE) => "reconcile",
+        ("POST", runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT) => "receipt",
+        _ => return Ok(None),
+    };
+    let binding = if action == "receipt" {
+        serde_json::from_slice::<crate::catalog::RepositoryPublicationBinding>(body)?
+    } else {
+        serde_json::from_slice::<crate::catalog::RepositoryPublicationRequest>(body)?.binding
+    };
+    let operation_id = &binding.operation_id;
+    if operation_id.is_empty()
+        || operation_id.trim() != operation_id
+        || operation_id.chars().any(char::is_control)
+    {
+        return Err(RuntimeAuthError::InvalidClaim("operation_id"));
+    }
+    // Hash only to fit the bounded capability operation field; equality remains exact.
+    Ok(Some(format!(
+        "repository-publications:{action}:{}",
+        request_body_digest(operation_id.as_bytes())
+    )))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeAuthError {
     #[error("invalid Ed25519 public key format")]

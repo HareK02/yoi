@@ -1,7 +1,10 @@
 # merge-request
 
-Handles SQLite Merge Request records, review evidence, and integration results.
-Does not observe Repository sources, execute Git integration, or decide Ticket completion.
+Handles SQLite Merge Request records, MR-local Worker ownership, review evidence,
+and integration results. Ownership is independent of lifecycle and approval;
+transfers fence delayed writers without invalidating retained review evidence.
+Does not grant Worker/resource permissions, observe Repository sources, execute
+Git integration, or decide Ticket completion.
 
 ## Main entry points
 

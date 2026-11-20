@@ -29,7 +29,7 @@ MCPはT-787の移行対象外とする暫定例外であり、既存の `mcp` �
 新規Subjectの初期割当は、直接実行の`execution`に会話・保持contextの`conversation`と作業調整の`work-coordination`、委譲上限の`delegation`に実装・調査・レビューの`work-execution`への参照を保存する。これらはSubject専用の権限ではなく、各Featureが自身の操作だけを寄与する共有セットである。Subjectは初期割当方針を選ぶが、他Featureの操作一覧を所有しない。
 
 - 直接実行と委譲上限を分離し、委譲で発行した操作キーの上限を固定する。Ticket・Workdir等の選択はdomain・実行context・providerの既存条件として扱い、新しい対象決定・限定機構（ASL）はここでは導入しない。保存済み旧grantの対象制約の保持とは区別する。Reviewerへの再委譲も発行済みの操作上限内とする。セットの解決は担当・現在本体・control grant・CAS・独立承認・retention等のdomain条件を免除しない。
-- 本体の発言/Memory/Journal identity、担当変更・handling判断、案件終了、MR統合記録、権限管理を委譲しない。Subject本体にfilesystem/Bash、MRの作成・レビュー、設定管理権限を初期付与しない。
+- 本体の発言/Memory/Journal identity、担当変更・handling判断、案件終了、権限管理を委譲しない。MR公開結果の記録はSubjectの採用判断とは分離し、保存済み操作と確認済み証拠に基づく。Subject本体にfilesystem/Bash、MRの作成・レビュー、設定管理権限を初期付与しない。
 - ProfileのFeatureとTool許可は利用面の構成であり、セット参照や対象grantの代わりではない。長時間の実装・検証・Git操作は背景Workerへ渡す。
 
 既存の共有セット保持主体は現行寄与の変更を反映する。一方、既存の未設定・空・除外・失効policyやID限定の旧制約を、新規作成defaultで置換しない。個体別の現在権限はSubject domainが所有し、共有設定sourceの編集で付与・失効・再作成しない。権限参照は現行の `feature_sets_v2` のみを受け付ける。起動時の一時移行、旧参照の読取り変換、旧設定フィールドの互換aliasは設けない。共有設定保存とSubject個別権限管理は移行済みマーカーに依存しない。特に以前の空の`delegation`へ新しい参照を自動追加しない。既存主体の割当変更は専用の認可済み権限管理操作として行い、既存委譲の失効への影響も確認する。起動・restore・migration・作成要求の再送は初期割当の再実行ではない。

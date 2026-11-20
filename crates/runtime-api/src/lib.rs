@@ -1916,6 +1916,12 @@ pub const RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS: &str =
     "/v1/working-directories/repository-access";
 pub const RUNTIME_ROUTE_SSH_PROBE: &str = "/v1/repositories/ssh/probe";
 pub const RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE: &str = "/v1/repository-refs/observe";
+pub const RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH: &str =
+    "/v1/repository-publications/publish";
+pub const RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE: &str =
+    "/v1/repository-publications/reconcile";
+pub const RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT: &str =
+    "/v1/repository-publications/receipt";
 pub const RUNTIME_ROUTE_WORKDIR_SESSIONS: &str =
     "/v1/working-directories/{working_directory_id}/sessions";
 pub const RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS: &str =
@@ -1977,6 +1983,21 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
         method: "POST",
         path: RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE,
         reason: "Repository observation transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH,
+        reason: "Repository publication transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE,
+        reason: "Repository publication recovery transport",
+    },
+    RemainingRuntimeRoute {
+        method: "POST",
+        path: RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT,
+        reason: "Saved Repository publication receipt transport",
     },
     RemainingRuntimeRoute {
         method: "POST",
@@ -2962,7 +2983,11 @@ mod tests {
 
     #[test]
     fn remaining_route_inventory_does_not_overlap_contract() {
-        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 19);
+        let unique = REMAINING_RUNTIME_ROUTES
+            .iter()
+            .map(|route| (route.method, route.path))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), REMAINING_RUNTIME_ROUTES.len());
         for remaining in REMAINING_RUNTIME_ROUTES {
             assert!(!RuntimeApiMetadata::OPERATIONS.iter().any(|operation| {
                 format!("{:?}", operation.method).eq_ignore_ascii_case(remaining.method)

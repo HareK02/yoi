@@ -46,7 +46,8 @@ use workdir::{
 use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
-    ProfileSourceArchiveSource, RepositoryRefObservation, RepositoryRefObservationRequest,
+    ProfileSourceArchiveSource, RepositoryPublicationBinding, RepositoryPublicationReceipt,
+    RepositoryPublicationRequest, RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
     WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
     WorkingDirectoryAttachmentStatus, WorkingDirectoryRepositoryAccessRequest,
@@ -1430,6 +1431,39 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn publish_repository_source(
+        &self,
+        _request: RepositoryPublicationRequest,
+    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+        Err(Error::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "repository_publication_provider_unavailable".to_string(),
+            message: "Runtime does not support Repository publication publish".to_string(),
+        })
+    }
+
+    fn reconcile_repository_publication(
+        &self,
+        _request: RepositoryPublicationRequest,
+    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+        Err(Error::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "repository_publication_provider_unavailable".to_string(),
+            message: "Runtime does not support Repository publication reconcile".to_string(),
+        })
+    }
+
+    fn repository_publication_receipt(
+        &self,
+        _binding: RepositoryPublicationBinding,
+    ) -> std::result::Result<Option<RepositoryPublicationReceipt>, Error> {
+        Err(Error::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "repository_publication_provider_unavailable".to_string(),
+            message: "Runtime does not support saved Repository publication receipts".to_string(),
+        })
+    }
+
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
         RuntimeList::new(Vec::new(), Vec::new())
     }
@@ -2482,6 +2516,81 @@ impl RuntimeRegistry {
             })
     }
 
+    pub fn publish_repository_source(
+        &self,
+        runtime_id: &str,
+        request: RepositoryPublicationRequest,
+    ) -> Result<RepositoryPublicationReceipt, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .publish_repository_source(request)
+            .map_err(|error| match error {
+                Error::RuntimeOperationFailed { code, message, .. } => {
+                    RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code,
+                        message,
+                    }
+                }
+                other => RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "repository_publication_provider_unavailable".to_string(),
+                    message: other.to_string(),
+                },
+            })
+    }
+
+    pub fn reconcile_repository_publication(
+        &self,
+        runtime_id: &str,
+        request: RepositoryPublicationRequest,
+    ) -> Result<RepositoryPublicationReceipt, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .reconcile_repository_publication(request)
+            .map_err(|error| match error {
+                Error::RuntimeOperationFailed { code, message, .. } => {
+                    RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code,
+                        message,
+                    }
+                }
+                other => RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "repository_publication_provider_unavailable".to_string(),
+                    message: other.to_string(),
+                },
+            })
+    }
+
+    pub fn repository_publication_receipt(
+        &self,
+        runtime_id: &str,
+        binding: RepositoryPublicationBinding,
+    ) -> Result<Option<RepositoryPublicationReceipt>, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .repository_publication_receipt(binding)
+            .map_err(|error| match error {
+                Error::RuntimeOperationFailed { code, message, .. } => {
+                    RuntimeRegistryError::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code,
+                        message,
+                    }
+                }
+                other => RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "repository_publication_provider_unavailable".to_string(),
+                    message: other.to_string(),
+                },
+            })
+    }
+
     pub fn list_working_directories(
         &self,
         runtime_id: &str,
@@ -3309,6 +3418,45 @@ impl RuntimeRegistry {
     }
 }
 
+fn validate_repository_publication_binding(
+    binding: &RepositoryPublicationBinding,
+    workspace_id: &str,
+    runtime_id: &str,
+) -> Result<(), Error> {
+    if binding.workspace_id != workspace_id {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.to_string(),
+            code: "repository_publication_workspace_mismatch".to_string(),
+            message: "Repository publication is outside the selected Workspace".to_string(),
+        });
+    }
+    if binding.worker.runtime_id != runtime_id {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.to_string(),
+            code: "repository_publication_runtime_mismatch".to_string(),
+            message: "Repository publication is outside the selected Runtime".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_repository_publication_workspace(
+    request: &RepositoryPublicationRequest,
+    workspace_id: &str,
+    runtime_id: &str,
+) -> Result<(), Error> {
+    if request.binding.workspace_id != workspace_id
+        || request.materialization.workspace_id != workspace_id
+    {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.to_string(),
+            code: "repository_publication_workspace_mismatch".to_string(),
+            message: "Repository publication is outside the selected Workspace".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct EmbeddedWorkerRuntime {
     workspace_id: String,
@@ -3882,6 +4030,75 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 error => Error::RuntimeOperationFailed {
                     runtime_id: self.runtime_id.clone(),
                     code: "repository_ref_provider_unavailable".to_string(),
+                    message: error.to_string(),
+                },
+            })
+    }
+
+    fn publish_repository_source(
+        &self,
+        request: RepositoryPublicationRequest,
+    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+        validate_repository_publication_workspace(&request, &self.workspace_id, &self.runtime_id)?;
+        self.runtime
+            .publish_repository_source(request)
+            .map_err(|error| match error {
+                worker_runtime::error::RuntimeError::WorkingDirectory(diagnostic) => {
+                    Error::RuntimeOperationFailed {
+                        runtime_id: self.runtime_id.clone(),
+                        code: diagnostic.code,
+                        message: diagnostic.message,
+                    }
+                }
+                error => Error::RuntimeOperationFailed {
+                    runtime_id: self.runtime_id.clone(),
+                    code: "repository_publication_provider_unavailable".to_string(),
+                    message: error.to_string(),
+                },
+            })
+    }
+
+    fn reconcile_repository_publication(
+        &self,
+        request: RepositoryPublicationRequest,
+    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+        validate_repository_publication_workspace(&request, &self.workspace_id, &self.runtime_id)?;
+        self.runtime
+            .reconcile_repository_publication(request)
+            .map_err(|error| match error {
+                worker_runtime::error::RuntimeError::WorkingDirectory(diagnostic) => {
+                    Error::RuntimeOperationFailed {
+                        runtime_id: self.runtime_id.clone(),
+                        code: diagnostic.code,
+                        message: diagnostic.message,
+                    }
+                }
+                error => Error::RuntimeOperationFailed {
+                    runtime_id: self.runtime_id.clone(),
+                    code: "repository_publication_provider_unavailable".to_string(),
+                    message: error.to_string(),
+                },
+            })
+    }
+
+    fn repository_publication_receipt(
+        &self,
+        binding: RepositoryPublicationBinding,
+    ) -> std::result::Result<Option<RepositoryPublicationReceipt>, Error> {
+        validate_repository_publication_binding(&binding, &self.workspace_id, &self.runtime_id)?;
+        self.runtime
+            .repository_publication_receipt(binding)
+            .map_err(|error| match error {
+                worker_runtime::error::RuntimeError::WorkingDirectory(diagnostic) => {
+                    Error::RuntimeOperationFailed {
+                        runtime_id: self.runtime_id.clone(),
+                        code: diagnostic.code,
+                        message: diagnostic.message,
+                    }
+                }
+                error => Error::RuntimeOperationFailed {
+                    runtime_id: self.runtime_id.clone(),
+                    code: "repository_publication_provider_unavailable".to_string(),
                     message: error.to_string(),
                 },
             })
@@ -5443,6 +5660,12 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     if path == "/v1/workers" && method == "POST" {
         return "workers:create";
     }
+    if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH && method == "POST" {
+        return "repository-publications:publish";
+    }
+    if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE && method == "POST" {
+        return "repository-publications:reconcile";
+    }
     if (path == "/v1/working-directories/repository-access"
         || path == "/v1/repository-refs/observe"
         || path == SSH_HOST_KEY_PROBE_PATH)
@@ -6007,6 +6230,30 @@ impl RemoteWorkerRuntime {
         })
     }
 
+    fn post_repository_publication(
+        &self,
+        path: &str,
+        request: RepositoryPublicationRequest,
+    ) -> Result<RepositoryPublicationReceipt, Error> {
+        validate_repository_publication_workspace(&request, &self.workspace_id, &self.runtime_id)?;
+        let receipt = self
+            .post_json::<_, RepositoryPublicationReceipt>(path, &request)
+            .map_err(|diagnostic| Error::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })?;
+        if receipt.binding != request.binding {
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "repository_publication_receipt_mismatch".to_string(),
+                message: "Runtime publication receipt does not match the requested binding"
+                    .to_string(),
+            });
+        }
+        Ok(receipt)
+    }
+
     fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T, RuntimeDiagnostic>
     where
         B: Serialize + ?Sized,
@@ -6078,14 +6325,27 @@ impl RemoteWorkerRuntime {
         let runtime_id = self.runtime_id.clone();
         let workspace_id = self.workspace_id.clone();
         let bearer_token = self.bearer_token.clone();
+        let publication_permission =
+            worker_runtime::auth::repository_publication_request_permission(method, path, body)
+                .map_err(|_| {
+                    diagnostic(
+                        "repository_publication_invalid_request",
+                        HostDiagnosticSeverity::Error,
+                        "Repository publication capability requires an exact operation".to_string(),
+                    )
+                })?;
         let capability_token = match &self.workspace_authorization {
-            Some(authorization) => Some(authorization.issue(
-                method,
-                path,
-                workspace_runtime_operation(method, path),
-                worker_id_from_remote_path(path).as_deref(),
-                body,
-            )?),
+            Some(authorization) => Some(
+                authorization.issue(
+                    method,
+                    path,
+                    publication_permission
+                        .as_deref()
+                        .unwrap_or_else(|| workspace_runtime_operation(method, path)),
+                    worker_id_from_remote_path(path).as_deref(),
+                    body,
+                )?,
+            ),
             None => None,
         };
         run_blocking_http(move || {
@@ -6888,6 +7148,55 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 code: diagnostic.code,
                 message: diagnostic.message,
             })
+    }
+
+    fn publish_repository_source(
+        &self,
+        request: RepositoryPublicationRequest,
+    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+        self.post_repository_publication(
+            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH,
+            request,
+        )
+    }
+
+    fn reconcile_repository_publication(
+        &self,
+        request: RepositoryPublicationRequest,
+    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+        self.post_repository_publication(
+            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE,
+            request,
+        )
+    }
+
+    fn repository_publication_receipt(
+        &self,
+        binding: RepositoryPublicationBinding,
+    ) -> std::result::Result<Option<RepositoryPublicationReceipt>, Error> {
+        validate_repository_publication_binding(&binding, &self.workspace_id, &self.runtime_id)?;
+        let receipt = self
+            .post_json::<_, Option<RepositoryPublicationReceipt>>(
+                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT,
+                &binding,
+            )
+            .map_err(|diagnostic| Error::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })?;
+        if receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.binding != binding)
+        {
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "repository_publication_receipt_mismatch".to_string(),
+                message: "Runtime publication receipt does not match the requested binding"
+                    .to_string(),
+            });
+        }
+        Ok(receipt)
     }
 
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
@@ -10555,6 +10864,47 @@ mod tests {
         }
     }
 
+    fn repository_publication_request_fixture() -> RepositoryPublicationRequest {
+        RepositoryPublicationRequest {
+            binding: worker_runtime::catalog::RepositoryPublicationBinding {
+                workspace_id: "workspace-a".into(),
+                merge_request_id: "mr-publication".into(),
+                operation_id: "publication-operation".into(),
+                repository_id: "repository-publication".into(),
+                repository_source_fingerprint: "source-fingerprint".into(),
+                target: "refs/heads/main".into(),
+                source: "a".repeat(40),
+                approval_event_id: "approval-event".into(),
+                owner_operation_id: "owner-operation".into(),
+                worker: worker_runtime::identity::RuntimeWorkerRef::new(
+                    "runtime-test",
+                    EmbeddedWorkerId::now_v7().to_string(),
+                ),
+                working_directory_id: "publication-workdir".into(),
+                connection_id: "publication-connection".into(),
+                alias: workdir::WorkdirAttachmentAlias::new("source").unwrap(),
+                target_before: "b".repeat(40),
+            },
+            repository: worker_runtime::catalog::WorkingDirectoryRepository {
+                id: "repository-publication".into(),
+                provider: "git".into(),
+                source: server_api::RepositorySource {
+                    kind: server_api::RepositorySourceKind::LocalPath,
+                    uri: "/not-accessed/publication.git".into(),
+                },
+                source_fingerprint: "source-fingerprint".into(),
+                selector: None,
+            },
+            materialization: worker_runtime::catalog::RepositoryMaterializationContext {
+                workspace_id: "workspace-a".into(),
+                runtime_id: "runtime-test".into(),
+                operation_id: "publication-operation".into(),
+                config_projection_digest: "config-projection".into(),
+                ssh: None,
+            },
+        }
+    }
+
     #[test]
     fn embedded_runtime_forwards_repository_ref_observation_to_execution_backend() {
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -11819,6 +12169,213 @@ mod tests {
             )
             .unwrap();
         assert_eq!(response.session_id, session_id);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn repository_publication_defaults_fail_closed_through_registry() {
+        let registry = RuntimeRegistry::new(vec![Arc::new(FixtureRuntime::with_worker(
+            "runtime-test",
+            "host-test",
+            "worker-test",
+            "test Worker",
+        ))]);
+        let request = repository_publication_request_fixture();
+        for result in [
+            registry.publish_repository_source("runtime-test", request.clone()),
+            registry.reconcile_repository_publication("runtime-test", request.clone()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
+                    if code == "repository_publication_provider_unavailable"
+            ));
+        }
+        assert!(matches!(
+            registry.repository_publication_receipt("runtime-test", request.binding),
+            Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
+                if code == "repository_publication_provider_unavailable"
+        ));
+    }
+
+    // Registry and remote HTTP serialization are real; only the remote peer is a
+    // fixture. Capability enforcement is exercised by the Runtime router suite.
+    #[test]
+    fn repository_publication_remote_preserves_outcomes_and_rejects_other_binding() {
+        use worker_runtime::catalog::RepositoryPublicationOutcome;
+        let request = repository_publication_request_fixture();
+        for reconcile in [false, true] {
+            let path = if reconcile {
+                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE
+            } else {
+                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH
+            };
+            let receipts = [
+                RepositoryPublicationReceipt {
+                    binding: request.binding.clone(),
+                    outcome: RepositoryPublicationOutcome::Unknown {},
+                },
+                RepositoryPublicationReceipt {
+                    binding: request.binding.clone(),
+                    outcome: RepositoryPublicationOutcome::NotPublished {
+                        reason: "not_ff".into(),
+                    },
+                },
+                RepositoryPublicationReceipt {
+                    binding: request.binding.clone(),
+                    outcome: RepositoryPublicationOutcome::Published {
+                        target_after: request.binding.source.clone(),
+                        observed_at_epoch_seconds: 42,
+                    },
+                },
+            ];
+            let mut mismatched = receipts[2].clone();
+            mismatched.binding.operation_id = "another-publication".into();
+            let responses = receipts
+                .iter()
+                .chain([&mismatched])
+                .map(|receipt| MockResponse {
+                    request_body: Some(serde_json::to_value(&request).unwrap()),
+                    ..mock_response(
+                        "POST",
+                        path,
+                        true,
+                        200,
+                        serde_json::to_string(receipt).unwrap(),
+                    )
+                })
+                .collect();
+            let (base_url, server) = serve_mock_http(responses);
+            let registry = RuntimeRegistry::new(Vec::new());
+            registry.register(
+                RemoteWorkerRuntime::new(
+                    RemoteRuntimeConfig::new(
+                        "runtime-test",
+                        "Publication Runtime",
+                        base_url,
+                        Some("secret-token".into()),
+                    ),
+                    "workspace-a".into(),
+                    "http://127.0.0.1:8787".into(),
+                )
+                .unwrap(),
+            );
+            let call = || {
+                if reconcile {
+                    registry.reconcile_repository_publication("runtime-test", request.clone())
+                } else {
+                    registry.publish_repository_source("runtime-test", request.clone())
+                }
+            };
+            for receipt in receipts {
+                assert_eq!(call().unwrap(), receipt);
+            }
+            assert!(
+                matches!(call(), Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
+                if code == "repository_publication_receipt_mismatch")
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn repository_publication_receipt_remote_preserves_optional_outcomes_and_checks_binding() {
+        use worker_runtime::catalog::RepositoryPublicationOutcome;
+        let binding = repository_publication_request_fixture().binding;
+        let path = runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT;
+        let receipts = vec![
+            None,
+            Some(RepositoryPublicationReceipt {
+                binding: binding.clone(),
+                outcome: RepositoryPublicationOutcome::Unknown {},
+            }),
+            Some(RepositoryPublicationReceipt {
+                binding: binding.clone(),
+                outcome: RepositoryPublicationOutcome::NotPublished {
+                    reason: "not_ff".into(),
+                },
+            }),
+            Some(RepositoryPublicationReceipt {
+                binding: binding.clone(),
+                outcome: RepositoryPublicationOutcome::Published {
+                    target_after: binding.source.clone(),
+                    observed_at_epoch_seconds: 42,
+                },
+            }),
+        ];
+        let mismatched = ["operation", "workspace", "runtime", "connection", "source"]
+            .into_iter()
+            .map(|field| {
+                let mut receipt = receipts[3].clone().unwrap();
+                match field {
+                    "operation" => receipt.binding.operation_id = "other-operation".into(),
+                    "workspace" => receipt.binding.workspace_id = "other-workspace".into(),
+                    "runtime" => receipt.binding.worker.runtime_id = "other-runtime".into(),
+                    "connection" => receipt.binding.connection_id = "other-connection".into(),
+                    "source" => receipt.binding.source = "c".repeat(40),
+                    _ => unreachable!(),
+                }
+                Some(receipt)
+            })
+            .collect::<Vec<_>>();
+        let responses = receipts
+            .iter()
+            .chain(&mismatched)
+            .map(|receipt| MockResponse {
+                request_body: Some(serde_json::to_value(&binding).unwrap()),
+                ..mock_response(
+                    "POST",
+                    path,
+                    true,
+                    200,
+                    serde_json::to_string(receipt).unwrap(),
+                )
+            })
+            .collect();
+        let (base_url, server) = serve_mock_http(responses);
+        let registry = RuntimeRegistry::new(Vec::new());
+        registry.register(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "runtime-test",
+                    "Publication Runtime",
+                    base_url,
+                    Some("secret-token".into()),
+                ),
+                "workspace-a".into(),
+                "http://127.0.0.1:8787".into(),
+            )
+            .unwrap(),
+        );
+        for field in ["workspace", "runtime"] {
+            let mut wrong = binding.clone();
+            let expected = if field == "workspace" {
+                wrong.workspace_id = "other-workspace".into();
+                "repository_publication_workspace_mismatch"
+            } else {
+                wrong.worker.runtime_id = "other-runtime".into();
+                "repository_publication_runtime_mismatch"
+            };
+            assert!(
+                matches!(registry.repository_publication_receipt("runtime-test", wrong),
+                Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. }) if code == expected)
+            );
+        }
+        for receipt in receipts {
+            assert_eq!(
+                registry
+                    .repository_publication_receipt("runtime-test", binding.clone())
+                    .unwrap(),
+                receipt
+            );
+        }
+        for _ in mismatched {
+            assert!(
+                matches!(registry.repository_publication_receipt("runtime-test", binding.clone()),
+                Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
+                    if code == "repository_publication_receipt_mismatch")
+            );
+        }
         server.join().unwrap();
     }
 

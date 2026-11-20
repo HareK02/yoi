@@ -105,17 +105,12 @@ fn explicit_domain_reference_fields_preserve_full_snapshot_evidence_without_recu
             {"id":"unroutable/id"}
         ])
     );
-    for (kind, response) in [
-        (Kind::Readiness, json!({"ready":false, "review":event})),
-        (Kind::Review, event),
-    ] {
-        let result = projected(kind, response.clone(), false);
-        assert_eq!(result["data"], response);
-        assert_eq!(
-            result["links"]["merge_requests"].as_array().unwrap().len(),
-            3
-        );
-    }
+    let result = projected(Kind::Review, event.clone(), false);
+    assert_eq!(result["data"], event);
+    assert_eq!(
+        result["links"]["merge_requests"].as_array().unwrap().len(),
+        3
+    );
 }
 
 #[test]
@@ -166,7 +161,6 @@ fn registry_with_order(
         MergeRequestFeatureConfig {
             show: true,
             open: true,
-            readiness_check: true,
             ..Default::default()
         },
         &mr,
@@ -229,7 +223,9 @@ async fn inspect_open_entry_read_and_linked_ticket_use_published_contract_withou
             response(json!({"merge_request_id":"MR-1", "ticket_ids":["T-1"]})),
             response(page.clone()),
             response(detail),
-            response(json!({"ready":false,"review":null})),
+            response(
+                json!({"merge_request_id":"MR-1","summary":{"readiness":{"ready":false,"review":null}}}),
+            ),
         ]));
         let model = Model::new(registry_with_order(client.clone(), true, ticket_first));
         let runtime = &model.runtime;
@@ -297,12 +293,13 @@ async fn inspect_open_entry_read_and_linked_ticket_use_published_contract_withou
             .inspect(read["entry"].as_str().unwrap().into(), true)
             .await
             .unwrap();
-        let readiness = model.invoke(&item, "readiness", json!({})).await.unwrap();
-        assert_eq!(readiness["entry"], read["entry"]);
-        assert_eq!(
-            readiness["links"],
-            json!({"tickets":[],"merge_requests":[]})
-        );
+        let summary = model
+            .invoke(&item, "read", json!({"view":"summary"}))
+            .await
+            .unwrap();
+        assert_eq!(summary["data"]["summary"]["readiness"]["ready"], false);
+        assert_eq!(summary["entry"], read["entry"]);
+        assert_eq!(summary["links"], json!({"tickets":[],"merge_requests":[]}));
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
         assert_eq!(

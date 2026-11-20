@@ -10,7 +10,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 16;
 const MAX_BODY_BYTES: usize = 16 * 1024;
 const DOMAIN_TABLES: [&str; 5] = [
     "merge_requests",
@@ -22,6 +22,10 @@ const DOMAIN_TABLES: [&str; 5] = [
 
 mod lifecycle;
 pub use lifecycle::*;
+mod ownership;
+pub use ownership::*;
+mod publication;
+pub use publication::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +68,7 @@ pub struct MergeRequestAuth {
     pub repository_id: String,
     pub runtime_id: String,
     pub worker_id: String,
+    /// Ticket assignment for open/legacy Complete; MR Worker operation ID for review actions.
     pub assignment_id: String,
 }
 
@@ -130,6 +135,10 @@ pub struct ReviewCancelledEvent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CommentEvent {
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub owner_operation_id: Option<String>,
     pub event_id: String,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
@@ -174,6 +183,7 @@ pub enum MergeRequestThreadEvent {
     ReviewCancelled(ReviewCancelledEvent),
     Comment(CommentEvent),
     Merge(MergeEvent),
+    WorkerAssigned(WorkerAssignedEvent),
 }
 impl MergeRequestThreadEvent {
     pub fn sequence(&self) -> u64 {
@@ -184,6 +194,7 @@ impl MergeRequestThreadEvent {
             Self::ReviewCancelled(v) => v.sequence,
             Self::Comment(v) => v.sequence,
             Self::Merge(v) => v.sequence,
+            Self::WorkerAssigned(v) => v.sequence,
         }
     }
     fn bound_bodies(&mut self) {
@@ -192,7 +203,7 @@ impl MergeRequestThreadEvent {
             Self::ReviewRevoked(value) => truncate_body(&mut value.reason),
             Self::ReviewCancelled(value) => truncate_body(&mut value.reason),
             Self::Comment(value) => truncate_body(&mut value.body),
-            Self::ReviewRequested(_) | Self::Merge(_) => {}
+            Self::ReviewRequested(_) | Self::Merge(_) | Self::WorkerAssigned(_) => {}
         }
     }
 }
@@ -741,10 +752,30 @@ impl MergeRequestStore {
             "INSERT INTO merge_request_ticket_relations VALUES(?1,?2,?3,'implements',?4)",
             params![i.auth.workspace_id, i.merge_request_id, i.ticket_id, now],
         )?;
+        let owner = WorkerAssignedEvent {
+            event_id: Uuid::now_v7().to_string(),
+            sequence: next_seq(&t, &i.auth.workspace_id, &i.merge_request_id)?,
+            operation_id: Uuid::now_v7().to_string(),
+            previous_operation_id: None,
+            worker: Some(i.auth.actor()),
+            assigned_by: i.auth.actor(),
+            created_at: i.now,
+        };
+        insert_event(
+            &t,
+            &i.auth.workspace_id,
+            &i.merge_request_id,
+            "worker_assigned",
+            &owner,
+            i.now,
+            Some(&owner.operation_id),
+        )?;
         if !i.summary.trim().is_empty() {
             let e = CommentEvent {
+                operation_id: None,
+                owner_operation_id: None,
                 event_id: Uuid::now_v7().to_string(),
-                sequence: 1,
+                sequence: next_seq(&t, &i.auth.workspace_id, &i.merge_request_id)?,
                 body: i.summary,
                 author: WorkerIdentity {
                     runtime_id: i.auth.runtime_id,
@@ -821,14 +852,14 @@ impl MergeRequestStore {
             ));
         }
         let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
-        self.current_assignment_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
+        self.current_worker_auth(&i.auth, &mr)?;
         if mr.state.is_canceled() || (mr.state.is_open() && mr.selector_from.is_none()) {
             return Err(MergeRequestError::Conflict(
                 "Merge Request is not reviewable".into(),
             ));
         }
         let mut c = self.lock()?;
-        let t = c.transaction()?;
+        let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current_digest = current_ticket_content_digest(&t, &i.auth.workspace_id, &i.ticket_id)?
             .ok_or(MergeRequestError::NotFound)?;
         if current_digest != i.ticket_content_digest {
@@ -839,6 +870,7 @@ impl MergeRequestStore {
         let current_mr = load_mr(&t, &i.auth.workspace_id, &i.merge_request_id)?
             .filter(|request| request.ticket_ids.iter().any(|id| id == &i.ticket_id))
             .ok_or(MergeRequestError::NotFound)?;
+        self.current_worker_auth(&i.auth, &current_mr)?;
         if current_mr.state.is_canceled()
             || (current_mr.state.is_open() && current_mr.selector_from.is_none())
         {
@@ -1037,8 +1069,12 @@ impl MergeRequestStore {
         i: RevokeMergeRequestReview,
     ) -> Result<ReviewRevokedEvent, MergeRequestError> {
         bounded_body("revocation reason", &i.reason)?;
-        let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
-        self.current_assignment_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
+        let mut c = self.lock()?;
+        let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mr = load_mr(&t, &i.auth.workspace_id, &i.merge_request_id)?
+            .filter(|mr| mr.ticket_ids.iter().any(|id| id == &i.ticket_id))
+            .ok_or(MergeRequestError::NotFound)?;
+        self.current_worker_auth(&i.auth, &mr)?;
         let r = mr
             .thread
             .iter()
@@ -1048,8 +1084,6 @@ impl MergeRequestStore {
             })
             .ok_or(MergeRequestError::NotFound)?;
         if mr.thread.iter().any(|x|matches!(x,MergeRequestThreadEvent::ReviewRevoked(v)if v.review_event_id==r.event_id)){return Err(MergeRequestError::Conflict("already revoked".into()))}
-        let mut c = self.lock()?;
-        let t = c.transaction()?;
         let e = ReviewRevokedEvent {
             event_id: Uuid::now_v7().to_string(),
             sequence: next_seq(&t, &mr.workspace_id, &mr.merge_request_id)?,
@@ -1406,6 +1440,8 @@ impl MergeRequestStore {
             ));
         }
         let e = CommentEvent {
+            operation_id: None,
+            owner_operation_id: None,
             event_id: Uuid::now_v7().to_string(),
             sequence: next_seq(&t, &mr.workspace_id, &mr.merge_request_id)?,
             body: format!("selector_from repaired: {}", i.reason),
@@ -1762,6 +1798,7 @@ fn load_thread(
                 "review_cancelled" => MergeRequestThreadEvent::ReviewCancelled(json(&j)?),
                 "comment" => MergeRequestThreadEvent::Comment(json(&j)?),
                 "merge" => MergeRequestThreadEvent::Merge(json(&j)?),
+                "worker_assigned" => MergeRequestThreadEvent::WorkerAssigned(json(&j)?),
                 _ => return Err(MergeRequestError::Corrupt(format!("unknown event `{k}`"))),
             };
             event.bound_bodies();
@@ -1822,12 +1859,24 @@ pub fn migrate(c: &Connection) -> Result<(), MergeRequestError> {
         SchemaState::Fresh => fresh(c),
         SchemaState::Current(SCHEMA_VERSION) => {
             verify(c)?;
-            verify_lifecycle_schema(c)
+            verify_lifecycle_schema(c)?;
+            publication::verify(c)
         }
-        SchemaState::Current(13) => migrate_v13_lifecycle(c),
+        SchemaState::Current(15) => publication::migrate(c),
+        SchemaState::Current(14) => {
+            ownership::migrate_v14_worker_ownership(c)?;
+            publication::migrate(c)
+        }
+        SchemaState::Current(13) => {
+            migrate_v13_lifecycle(c)?;
+            ownership::migrate_v14_worker_ownership(c)?;
+            publication::migrate(c)
+        }
         SchemaState::Current(12) => {
             migrate_v12_content_attestations(c)?;
-            migrate_v13_lifecycle(c)
+            migrate_v13_lifecycle(c)?;
+            ownership::migrate_v14_worker_ownership(c)?;
+            publication::migrate(c)
         }
         SchemaState::Current(v) => Err(MergeRequestError::Operation(format!(
             "unsupported schema {v}"
@@ -1947,6 +1996,8 @@ fn schema_state(c: &Connection) -> Result<SchemaState, MergeRequestError> {
 fn fresh(c: &Connection) -> Result<(), MergeRequestError> {
     let t = c.unchecked_transaction()?;
     tables(&t)?;
+    ownership::worker_event_tables(&t)?;
+    publication::tables(&t)?;
     lifecycle::add_lifecycle_column(&t, "state")?;
     lifecycle::lifecycle_triggers(&t)?;
     t.execute(
@@ -1959,7 +2010,7 @@ fn fresh(c: &Connection) -> Result<(), MergeRequestError> {
 }
 fn tables(t: &Transaction<'_>) -> Result<(), MergeRequestError> {
     t.execute_batch("CREATE TABLE merge_request_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL);")?;
-    t.execute_batch("CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,repository_id TEXT NOT NULL,selector_from TEXT,selector_to TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id),FOREIGN KEY(workspace_id,repository_id)REFERENCES repositories(workspace_id,repository_id));CREATE TABLE merge_request_ticket_relations(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL,relation_kind TEXT NOT NULL CHECK(relation_kind='implements'),created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,ticket_id),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE,FOREIGN KEY(workspace_id,ticket_id)REFERENCES typed_tickets(workspace_id,ticket_id)ON DELETE CASCADE);CREATE TABLE merge_request_thread_events(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,event_id TEXT NOT NULL,sequence INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN('review_requested','review','review_revoked','review_cancelled','comment','merge')),payload_json TEXT NOT NULL,operation_id TEXT,created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,event_id),UNIQUE(workspace_id,merge_request_id,sequence),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE);CREATE UNIQUE INDEX merge_request_merge_operations ON merge_request_thread_events(workspace_id,operation_id)WHERE operation_id IS NOT NULL;CREATE TABLE merge_request_review_grants(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,request_event_id TEXT NOT NULL,subject_ref TEXT NOT NULL,reviewer_runtime_id TEXT NOT NULL,reviewer_worker_id TEXT NOT NULL,capability_token TEXT PRIMARY KEY,issued_at TEXT NOT NULL,consumed_at TEXT,revoked_at TEXT,status TEXT NOT NULL CHECK(status IN('issued','consumed','revoked')),FOREIGN KEY(workspace_id,merge_request_id,request_event_id)REFERENCES merge_request_thread_events(workspace_id,merge_request_id,event_id)ON DELETE CASCADE);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT NOT NULL,child_session_id TEXT NOT NULL,parent_runtime_id TEXT NOT NULL,parent_worker_id TEXT NOT NULL,reviewer_profile TEXT NOT NULL,registered_at TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('active','consumed')),PRIMARY KEY(workspace_id,child_session_id));")?;
+    t.execute_batch("CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,repository_id TEXT NOT NULL,selector_from TEXT,selector_to TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id),FOREIGN KEY(workspace_id,repository_id)REFERENCES repositories(workspace_id,repository_id));CREATE TABLE merge_request_ticket_relations(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL,relation_kind TEXT NOT NULL CHECK(relation_kind='implements'),created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,ticket_id),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE,FOREIGN KEY(workspace_id,ticket_id)REFERENCES typed_tickets(workspace_id,ticket_id)ON DELETE CASCADE);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT NOT NULL,child_session_id TEXT NOT NULL,parent_runtime_id TEXT NOT NULL,parent_worker_id TEXT NOT NULL,reviewer_profile TEXT NOT NULL,registered_at TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('active','consumed')),PRIMARY KEY(workspace_id,child_session_id));")?;
     Ok(())
 }
 fn verify(c: &Connection) -> Result<(), MergeRequestError> {
@@ -1989,3 +2040,5 @@ fn fk(c: &Connection) -> Result<(), MergeRequestError> {
     }
     Ok(())
 }
+
+mod comments;

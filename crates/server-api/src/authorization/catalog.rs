@@ -429,6 +429,21 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
                 "Submit a review only with independently bound review capability and current source.",
             ),
             (
+                "merge_request.assign",
+                "Assign MR Worker",
+                "Set the current MR Worker without changing phase, approval or Ticket assignment.",
+            ),
+            (
+                "merge_request.comment",
+                "Comment on MR",
+                "Append a replay-safe current-Worker thread comment without changing approval or publication evidence.",
+            ),
+            (
+                "merge_request.publish",
+                "Publish approved MR source",
+                "Publish only the approved fixed source to this MR target using the current Workdir and durable publication evidence.",
+            ),
+            (
                 "merge_request.complete",
                 "Record MR integration",
                 "Record an already-applied exact-source integration with existing approval and source checks.",

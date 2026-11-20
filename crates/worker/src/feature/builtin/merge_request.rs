@@ -2,10 +2,9 @@
 //!
 //! The collection opens a repository candidate linked to a Ticket Entry; an item is one Merge
 //! Request whose identity is exclusively route-bound. Keeping these Objects separate prevents a
-//! read/review/integration from selecting a different subject in arguments. The item Interface owns
-//! independent `read`, `readiness`, `review`, and `complete` actions: reading is not a readiness
-//! judgment, a review attests a source, and completion records an already-applied integration. None
-//! implies another action, Git integration, or Ticket conclusion.
+//! read/review/publication from selecting a different subject in arguments. Review attests a fixed
+//! source; Backend publication independently checks current authority and target eligibility.
+//! Approval wakes automatic publication; this adapter neither runs Git locally nor concludes Tickets.
 //!
 //! Native v2 contracts are defined in the child `native` module, independently of Tool JSON Schema.
 //! Their declarations drive descriptor generation, input validation, and command-field conversion.
@@ -61,7 +60,7 @@ use wip_protocol::{
 
 pub const FEATURE_ID: &str = "merge_request";
 const FEATURE_NAME: &str = "Merge Request tools";
-const FEATURE_DESCRIPTION: &str = "Optional repository MR workflow with trusted review and separate Orchestrator integration authority; not a universal Ticket conclusion gate.";
+const FEATURE_DESCRIPTION: &str = "Optional repository MR workflow with independent review and evidence-bound automatic publication; not a universal Ticket conclusion gate.";
 const FEATURE_INSTRUCTION_ID: &str = "merge_request.workflow";
 pub const FEATURE_PROMPT_REF: &str = "common.merge_request";
 
@@ -78,17 +77,17 @@ const ALL_KINDS: [Kind; 5] = [
     Kind::Show,
     Kind::Open,
     Kind::Review,
-    Kind::Readiness,
-    Kind::Complete,
+    Kind::WorkerSet,
+    Kind::Comment,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
     Show,
-    Readiness,
     Open,
-    Complete,
     Review,
+    WorkerSet,
+    Comment,
 }
 #[derive(Clone)]
 struct MergeRequestTool {
@@ -96,8 +95,18 @@ struct MergeRequestTool {
     kind: Kind,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct MergeRequestInput {
+#[serde(deny_unknown_fields)]
+struct SetMergeRequestWorkerInput {
     merge_request_id: String,
+    #[serde(flatten)]
+    request: server_api::SetMergeRequestWorkerRequest,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CommentMergeRequestInput {
+    merge_request_id: String,
+    operation_id: String,
+    expected_owner_operation_id: String,
+    body: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ShowMergeRequestInput {
@@ -126,29 +135,6 @@ struct OpenMergeRequestInput {
     selector_to: String,
     #[serde(default)]
     summary: String,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
-struct CompleteMergeRequestInput {
-    merge_request_id: String,
-    operation_id: String,
-    approval_event_id: String,
-    target_ref_before: String,
-    target_ref_after: String,
-    strategy: MergeStrategyInput,
-    resolution: MergeResolutionInput,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum MergeStrategyInput {
-    FastForward,
-    Merge,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum MergeResolutionInput {
-    None,
-    Clean,
-    ConflictsResolved,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReviewMergeRequestInput {
@@ -181,32 +167,35 @@ impl Kind {
             Self::Show => config.show,
             Self::Open => config.open,
             Self::Review => config.review,
-            Self::Readiness => config.readiness_check,
-            Self::Complete => config.complete,
+            Self::WorkerSet => config.worker_set,
+            Self::Comment => config.comment,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
             Self::Show => "ShowMergeRequest",
-            Self::Readiness => "CheckMergeRequestReadiness",
             Self::Open => "OpenMergeRequest",
-            Self::Complete => "CompleteMergeRequest",
             Self::Review => "ReviewMergeRequest",
+            Self::WorkerSet => "SetMergeRequestWorker",
+            Self::Comment => "CommentMergeRequest",
         }
     }
     fn schema(self) -> serde_json::Value {
         match self {
             Self::Show => json!(schemars::schema_for!(ShowMergeRequestInput)),
-            Self::Readiness => json!(schemars::schema_for!(MergeRequestInput)),
+            Self::WorkerSet => json!(schemars::schema_for!(SetMergeRequestWorkerInput)),
+            Self::Comment => json!(schemars::schema_for!(CommentMergeRequestInput)),
             Self::Open => json!(schemars::schema_for!(OpenMergeRequestInput)),
-            Self::Complete => json!(schemars::schema_for!(CompleteMergeRequestInput)),
             Self::Review => json!(schemars::schema_for!(ReviewMergeRequestInput)),
         }
     }
 
     fn mutating(self) -> bool {
-        matches!(self, Self::Open | Self::Review | Self::Complete)
+        matches!(
+            self,
+            Self::Open | Self::Review | Self::WorkerSet | Self::Comment
+        )
     }
 }
 mod command;
@@ -372,7 +361,7 @@ struct NativeMergeRequestOperation {
 
 fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
     match kind {
-        Kind::Show => NativeMergeRequestOperation {
+        Kind::Show | Kind::WorkerSet | Kind::Comment => NativeMergeRequestOperation {
             surface: NativeMergeRequestSurface::Item,
             identity_field: Some("merge_request_id"),
         },
@@ -383,14 +372,6 @@ fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
         Kind::Review => NativeMergeRequestOperation {
             surface: NativeMergeRequestSurface::Item,
             identity_field: None,
-        },
-        Kind::Readiness => NativeMergeRequestOperation {
-            surface: NativeMergeRequestSurface::Item,
-            identity_field: Some("merge_request_id"),
-        },
-        Kind::Complete => NativeMergeRequestOperation {
-            surface: NativeMergeRequestSurface::Item,
-            identity_field: Some("merge_request_id"),
         },
     }
 }
@@ -499,7 +480,7 @@ pub fn mount_workspace_http_merge_request_wip(
     let item_descriptor = merge_request_descriptor(
         &item_tools,
         "Inspect and operate on the Merge Request bound to this object route",
-        "The subject Merge Request identity comes exclusively from the target route. Read uses an optional page record. Review requires the exact injected capability; complete groups approval and target observations in integration. Backend validates business preconditions. No operation retries unknown outcomes.",
+        "The subject Merge Request identity comes exclusively from the target route. Read uses an optional page record. Review requires the exact injected capability. Backend owns automatic publication and evidence-bound completion. Backend validates business preconditions. No operation retries unknown outcomes.",
     )?;
     registry.mount_dynamic(WipDynamicMount {
         collection_route: collection_route.clone(),
@@ -868,19 +849,19 @@ fn merge_request_operation_not_found() -> WipOperationError {
 pub fn description(n: &str) -> Option<&'static str> {
     match n {
         "ShowMergeRequest" => Some(
-            "Read an authoritative compact MR summary by default: source/target observations, full-evidence review status/readiness and stable event references, without review bodies/history. Use view=detail with bounded after/limit for exact reviews/findings and history; continue with event_page.next_after. Status is never inferred from a history page. Summary is not approval or integration authority.",
+            "Read an authoritative compact MR summary by default: source/target observations, full-evidence review status/readiness and stable event references, worker_assignment (operation_id and worker), and saved publications, without review bodies/history. Both summary and detail include worker_assignment and publications. worker_assignment=null means never assigned; worker=null in a retained assignment is a release that retains its operation_id. Ownership is not resource authority, Worker liveness, or Ticket assignment. Publication outcomes are evidence only; this read never sends or retries publication. Use view=detail with bounded after/limit for exact reviews/findings and history; continue with event_page.next_after. Status is never inferred from a history page. Summary is not approval or integration authority.",
         ),
-        "CheckMergeRequestReadiness" => Some(
-            "Resolve current provider refs and derive readiness from exact-source review evidence; source movement requires fresh review while target-only movement preserves unchanged-source approval.",
+        "SetMergeRequestWorker" => Some(
+            "Set, replace, or release this MR's Worker after reading ShowMergeRequest view=summary and its worker_assignment. Use worker_assignment.operation_id as expected_operation_id; worker_assignment=null means never assigned, while worker=null in a retained assignment is a release with a retained operation_id. Supply a stable operation_id, required expected_operation_id (explicit null only when never assigned), and required worker {runtime_id,worker_id} or explicit null to release. Exact retries retain the same key and full input. On conflict reread and reconcile; unknown outcomes require reconciliation, never a new key or automatic retry. Does not reassign the Ticket, grant authority, start/stop Workers, change MR phase or approval, or publish code.",
+        ),
+        "CommentMergeRequest" => Some(
+            "Append a Markdown comment to the MR thread as its current Worker. Use the observed Worker assignment operation_id as expected_owner_operation_id and a stable comment operation_id. Replays must retain the same full input; stale-owner writes fail. Record conflicts, questions and resolutions here without manufacturing approval or publication evidence. No state change, Git operation or Ticket conclusion.",
         ),
         "OpenMergeRequest" => Some(
             "Open one repository-scoped Merge Request linked to the Ticket; reuse an existing Merge Request for that repository and advance only its selector_from with a normal non-force push.",
         ),
-        "CompleteMergeRequest" => Some(
-            "Record an exact-source MR integration receipt using current trusted exact-source approval and provider evidence. This optional recording workflow describes an already-applied integration; it does not update a branch, select which Coder changes to adopt, conclude a Ticket, or release an assignment. Do not record partial or adapted adoption as full integration of the reviewed source.",
-        ),
         "ReviewMergeRequest" => Some(
-            "Submit the injected trusted Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not. The capability authenticates the attempt, not the verdict: independent natural-language judgment and validation remain the Reviewer's responsibility.",
+            "Submit the injected trusted Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not. Approval triggers Backend publication when operation permissions and target conditions allow it, without another Subject stamp or model turn. The capability authenticates the attempt, not the verdict: independent natural-language judgment and validation remain the Reviewer's responsibility.",
         ),
         _ => None,
     }
@@ -966,22 +947,10 @@ mod tests {
 
     #[test]
     fn model_facing_operations_use_only_verb_first_names() {
-        for name in [
-            "ShowMergeRequest",
-            "CheckMergeRequestReadiness",
-            "OpenMergeRequest",
-            "CompleteMergeRequest",
-            "ReviewMergeRequest",
-        ] {
+        for name in ["ShowMergeRequest", "OpenMergeRequest", "ReviewMergeRequest"] {
             assert!(description(name).is_some(), "missing operation {name}");
         }
-        for legacy in [
-            "MergeRequestShow",
-            "MergeRequestReadinessCheck",
-            "MergeRequestOpen",
-            "MergeRequestComplete",
-            "MergeRequestReview",
-        ] {
+        for legacy in ["MergeRequestShow", "MergeRequestOpen", "MergeRequestReview"] {
             assert!(
                 description(legacy).is_none(),
                 "legacy alias {legacy} must not remain registered"
@@ -1165,18 +1134,9 @@ mod tests {
 
         let orchestrator = MergeRequestFeatureConfig {
             show: true,
-            readiness_check: true,
-            complete: true,
             ..Default::default()
         };
-        assert_eq!(
-            tool_names(orchestrator),
-            [
-                "ShowMergeRequest",
-                "CheckMergeRequestReadiness",
-                "CompleteMergeRequest"
-            ]
-        );
+        assert_eq!(tool_names(orchestrator), ["ShowMergeRequest",]);
         assert_eq!(install(coder).1, [FEATURE_PROMPT_REF]);
         let unspecified = install(MergeRequestFeatureConfig::default());
         assert!(unspecified.0.is_empty());
@@ -1199,8 +1159,6 @@ mod tests {
         };
         let orchestrator = MergeRequestFeatureConfig {
             show: true,
-            readiness_check: true,
-            complete: true,
             ..Default::default()
         };
 
@@ -1227,11 +1185,7 @@ mod tests {
         );
         assert_eq!(
             operations(orchestrator),
-            [
-                (NativeMergeRequestSurface::Item, "read"),
-                (NativeMergeRequestSurface::Item, "readiness"),
-                (NativeMergeRequestSurface::Item, "complete"),
-            ]
+            [(NativeMergeRequestSurface::Item, "read"),]
         );
 
         let tools = native_merge_request_tools(client, orchestrator).unwrap();
@@ -1251,20 +1205,6 @@ mod tests {
                 .iter()
                 .all(|parameter| parameter.name != "merge_request_id")
         }));
-        let complete = item
-            .operations
-            .iter()
-            .find(|operation| operation.name == "complete")
-            .unwrap();
-        for required in ["operation_id", "integration"] {
-            assert!(
-                complete
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.name == required),
-                "completion precondition `{required}` disappeared"
-            );
-        }
     }
 
     #[test]
@@ -1525,47 +1465,9 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn completion_forwards_every_integration_precondition_unchanged() {
-        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
-            "event_id": "merge-1",
-            "approved_source_ref": "source-1",
-            "target_ref_before": "target-1",
-            "target_ref_after": "result-1"
-        }))]));
-        let tool = MergeRequestTool {
-            kind: Kind::Complete,
-            client: client.clone(),
-        };
-        tool.execute(
-            r#"{"merge_request_id":"MR-1","operation_id":"op-1","approval_event_id":"approval-1","target_ref_before":"target-1","target_ref_after":"result-1","strategy":"fast_forward","resolution":"clean"}"#,
-            ToolExecutionContext::direct(),
-        )
-        .await
-        .unwrap();
-        let requests = client.requests.lock().expect("request lock");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/api/w/ws/merge-requests/MR-1/complete");
-        let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            body,
-            json!({
-                "operation_id": "op-1",
-                "approval_event_id": "approval-1",
-                "target_ref_before": "target-1",
-                "target_ref_after": "result-1",
-                "strategy": "fast_forward",
-                "resolution": "clean"
-            })
-        );
-    }
-
     #[test]
     fn schemas_hide_content_digest_and_commit_authority() {
-        let schemas = [
-            schemars::schema_for!(OpenMergeRequestInput),
-            schemars::schema_for!(CompleteMergeRequestInput),
-        ];
+        let schemas = [schemars::schema_for!(OpenMergeRequestInput)];
         for s in schemas {
             let j = serde_json::to_string(&s).unwrap();
             for banned in [
@@ -1585,19 +1487,9 @@ mod tests {
         for (kind, input, operation) in [
             (Kind::Show, json!({"merge_request_id":"MR-1"}), "read"),
             (
-                Kind::Readiness,
-                json!({"merge_request_id":"MR-1"}),
-                "readiness",
-            ),
-            (
                 Kind::Open,
                 json!({"ticket":"T-1", "repository_key":"repo", "selector_from":"work", "selector_to":"develop"}),
                 "open",
-            ),
-            (
-                Kind::Complete,
-                json!({"merge_request_id":"MR-1", "operation_id":"complete-1", "approval_event_id":"approved", "target_ref_before":"before", "target_ref_after":"after", "strategy":"fast_forward", "resolution":"none"}),
-                "complete",
             ),
             (Kind::Review, json!({"decision":"approve"}), "review"),
         ] {
