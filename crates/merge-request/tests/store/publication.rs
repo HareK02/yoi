@@ -28,6 +28,159 @@ fn binding(store: &MergeRequestStore) -> PublicationBinding {
         target_before: "before".into(),
     }
 }
+fn prepare_independent_mr(
+    dir: &std::path::Path,
+    ticket: &str,
+    mr: &str,
+    target: &str,
+) -> (MergeRequestStore, PublicationBinding) {
+    let path = dir.join("db");
+    let connection = Connection::open(&path).unwrap();
+    connection.execute("INSERT INTO typed_tickets SELECT workspace_id,?1,workflow_state,workflow_state_explicit,updated_at,title,body FROM typed_tickets WHERE ticket_id='T'", [ticket]).unwrap();
+    connection.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body,event_ref) VALUES('W',?1,-1,'comment','Requirements',?2)", [ticket, &format!("{ticket}:-1")]).unwrap();
+    connection.execute("INSERT INTO ticket_current_worker_assignments SELECT workspace_id,?1,assignment_id,runtime_id,worker_id,updated_at FROM ticket_current_worker_assignments WHERE ticket_id='T'", [ticket]).unwrap();
+    let store = MergeRequestStore::open(
+        path,
+        Arc::new(Assignments(Arc::new(Mutex::new(CurrentAssignment {
+            assignment_id: "A".into(),
+            ticket_id: ticket.into(),
+            runtime_id: "runtime".into(),
+            worker_id: "coder".into(),
+        })))),
+        Arc::new(Repositories),
+    )
+    .unwrap();
+    store
+        .open_merge_request(OpenMergeRequest {
+            merge_request_id: mr.into(),
+            ticket_id: ticket.into(),
+            repository_id: "R".into(),
+            selector_from: format!("work/{mr}"),
+            selector_to: target.into(),
+            summary: String::new(),
+            auth: auth(),
+            now: at(0),
+        })
+        .unwrap();
+    let token = format!("review-{mr}");
+    store
+        .register_reviewer_child_session(RegisterReviewerChildSession {
+            workspace_id: "W".into(),
+            parent_runtime_id: "runtime".into(),
+            parent_worker_id: "coder".into(),
+            child_session_id: token.clone(),
+            reviewer_profile: "builtin:reviewer".into(),
+            now: at(2),
+        })
+        .unwrap();
+    let source = format!("source-{mr}");
+    store
+        .request_review(RequestMergeRequestReview {
+            merge_request_id: mr.into(),
+            ticket_id: ticket.into(),
+            ticket_content_digest: ticket::sqlite_ticket_content_digest(&connection, "W", ticket)
+                .unwrap()
+                .unwrap(),
+            ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
+                merge_request_id: mr.into(),
+                subject_ref: source.clone(),
+            }],
+            subject_ref: source.clone(),
+            child_session_id: token.clone(),
+            capability_token: token.clone(),
+            auth: mr_auth(&store, mr, "R"),
+            now: at(3),
+        })
+        .unwrap();
+    let review = store
+        .submit_review(SubmitMergeRequestReview {
+            merge_request_id: mr.into(),
+            ticket_id: ticket.into(),
+            current_subject_ref: source.clone(),
+            capability_token: token,
+            decision: ReviewDecision::Approve,
+            body: "independent candidate prepared".into(),
+            findings: vec![],
+            now: at(4),
+        })
+        .unwrap();
+    let binding = PublicationBinding {
+        workspace_id: "W".into(),
+        merge_request_id: mr.into(),
+        operation_id: format!("publish-{mr}"),
+        repository_id: "R".into(),
+        repository_source_fingerprint: "fingerprint".into(),
+        alias: "main".into(),
+        target: target.into(),
+        source,
+        approval_event_id: review.event_id,
+        owner_operation_id: store.current_worker("W", mr).unwrap().unwrap().operation_id,
+        worker: WorkerIdentity {
+            runtime_id: "runtime".into(),
+            worker_id: "coder".into(),
+        },
+        working_directory_id: format!("workdir-{mr}"),
+        connection_id: format!("connection-{mr}"),
+        target_before: "before".into(),
+    };
+    (store, binding)
+}
+
+#[test]
+fn independent_preparation_is_not_serialized_but_same_target_publication_is() {
+    let (dir, _) = fixture();
+    let (a, ba) = prepare_independent_mr(dir.path(), "T-a", "MR-a", "refs/heads/develop");
+    let (b, bb) = prepare_independent_mr(dir.path(), "T-b", "MR-b", "refs/heads/develop");
+    let (c, bc) = prepare_independent_mr(dir.path(), "T-c", "MR-c", "refs/heads/release");
+    assert!(matches!(
+        a.get_by_id("W", "MR-a").unwrap().state,
+        MergeRequestState::Integration { .. }
+    ));
+    assert!(matches!(
+        b.get_by_id("W", "MR-b").unwrap().state,
+        MergeRequestState::Integration { .. }
+    ));
+    let barrier = std::sync::Barrier::new(2);
+    let (ra, rb) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            barrier.wait();
+            a.claim_publication(ba.clone(), at(6), |_| Ok(()))
+        });
+        let right = scope.spawn(|| {
+            barrier.wait();
+            b.claim_publication(bb.clone(), at(6), |_| Ok(()))
+        });
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    assert_ne!(
+        ra.is_ok(),
+        rb.is_ok(),
+        "same target admits exactly one operation: {ra:?} {rb:?}"
+    );
+    assert!(
+        c.claim_publication(bc, at(6), |_| Ok(())).unwrap().1,
+        "different target proceeds while the first is unconfirmed"
+    );
+    let (winner, loser) = if ra.is_ok() { (&ba, &bb) } else { (&bb, &ba) };
+    assert!(
+        a.claim_publication(loser.clone(), at(7), |_| Ok(()))
+            .is_err(),
+        "unknown outcome must not release target"
+    );
+    a.record_publication_outcome(
+        winner,
+        PublicationOutcome::NotPublished {
+            reason: "confirmed pre-send failure".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        a.claim_publication(loser.clone(), at(8), |_| Ok(()))
+            .unwrap()
+            .1
+    );
+}
+
 fn published() -> PublicationOutcome {
     PublicationOutcome::Published {
         target_after: "source".into(),

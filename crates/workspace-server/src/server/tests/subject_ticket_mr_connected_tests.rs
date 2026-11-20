@@ -1,9 +1,11 @@
 //! Normal Server library tests for ordinary Subject MR coordination. The signed
 //! Backend/Runtime, canonical policy/body/Profile/Flow, Workdirs/Git/provider,
 //! independent builtin Reviewer, formal review endpoint and automatic completion are real.
-//! Only explicitly injected model decisions (including Flow verification) are
-//! scripted; this is not live-model or real Host integration evidence. Runtime
-//! directories must be isolated as required by the shared connected harness.
+//! By default model decisions (including Flow verification) are scripted, not
+//! live-model or real Host integration evidence. The explicitly ignored live test
+//! delegates Coder, Reviewer and verifier to the configured provider; Subject
+//! setup/result collection remains scripted. Runtime directories must be isolated
+//! as required by the shared connected harness.
 //!
 //! Operation assignments are frozen within the Subject's delegation ceiling;
 //! Ticket ownership, Workdir attachments and trusted Reviewer capabilities remain
@@ -775,6 +777,9 @@ fn result_id_from_notification(request: &agen::llm_client::Request) -> Option<St
 
 #[derive(Clone)]
 struct FullModel {
+    live: Option<Arc<dyn agen::llm_client::LlmClient>>,
+    handoff: bool,
+    scope_decision: bool,
     integrate_target: bool,
     stages: tokio::sync::mpsc::Sender<Value>,
     // Stage notifications schedule negative controls between ordinary body turns.
@@ -807,6 +812,19 @@ impl FullModel {
             .expect("real Flow verifier captures its own current state/transitions");
         let state = input["current_state"].as_str().unwrap();
         let (tool, query, expected, target) = match state {
+            "observe"
+                if input["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("Resume existing MR") =>
+            {
+                (
+                    "ShowMergeRequest",
+                    "\"kind\":\"integration\"",
+                    "worker_assignment",
+                    "integrate",
+                )
+            }
             "observe" => (
                 "ShowTicket",
                 "full R2 normal requirement",
@@ -1136,7 +1154,24 @@ impl FullModel {
             context.contains("optional code recipe"),
             "actual explicit builtin coder-review Flow missing"
         );
-        if success(request, "full-coder-flow-implement").is_none() {
+        if let Some(existing) = input["existing_mr"].as_str() {
+            if success(request, "full-coder-flow-approved").is_none() {
+                if success(request, "full-coder-verdict").is_none() {
+                    return call(
+                        request,
+                        "full-coder-verdict",
+                        "ShowMergeRequest",
+                        json!({"merge_request_id":existing,"view":"detail","limit":50}),
+                    );
+                }
+                return call(
+                    request,
+                    "full-coder-flow-approved",
+                    "RequestFlowTransition",
+                    json!({"reason":"Resume existing MR from saved Integration phase/current worker/source/review; do not redo implementation"}),
+                );
+            }
+        } else if success(request, "full-coder-flow-implement").is_none() {
             return call(
                 request,
                 "full-coder-flow-implement",
@@ -1177,6 +1212,35 @@ impl FullModel {
         if let Some(approved) = success(request, "full-coder-flow-approved") {
             assert_eq!(approved["entered_state"], "integrate", "{approved}");
             let original = success(request, "full-coder-verdict").unwrap();
+            if self.scope_decision {
+                if let Some(receipt) = success(request, "scope-result") {
+                    self.emit_once(
+                        "coder_done",
+                        json!({"stage":"coder_done","receipt":receipt}),
+                    )
+                    .await;
+                    return done();
+                }
+                if success(request, "scope-question").is_some() {
+                    return call(
+                        request,
+                        "scope-result",
+                        "TicketImplementationResult",
+                        json!({"ticket":ticket,"kind":"blocker","body":"Target README conflict changes the adopted scope; Subject decision required. No integration mutation or target push performed.","merge_request":{"merge_request_id":original["merge_request_id"],"subject_ref":original["source"]["ref"]}}),
+                    );
+                }
+                return call(
+                    request,
+                    "scope-question",
+                    "CommentMergeRequest",
+                    json!({"merge_request_id":original["merge_request_id"],"expected_owner_operation_id":original["worker_assignment"]["operation_id"],"operation_id":"scope-question","body":"Scope decision required: target README conflicts with requested source. Preserve both refs until Subject chooses the intended requirement; no silent target/scope change."}),
+                );
+            }
+            if self.handoff && input["existing_mr"].is_null() {
+                self.emit_once("handoff", json!({"stage":"handoff","mr":original}))
+                    .await;
+                return done();
+            }
             if self.integrate_target {
                 if let Some(events) = self.integrated_review(request, ticket, &original) {
                     return events;
@@ -1413,7 +1477,8 @@ impl FullModel {
             &coder,
             &input["spawn"],
             json!([{"kind":"flow","selector":"builtin:coder-review"},
-                {"kind":"text","content":format!("{FULL_CODER}{}",json!({"ticket":ticket}))}]),
+                {"kind":"text","content":format!("{FULL_CODER}{}",json!({"ticket":ticket}))},
+                {"kind":"text","content":format!("Read Ticket {ticket} and implement its requirements in Workdir checkout. The source branch is {FULL_SOURCE}, target {FULL_TARGET}, repository test-repository. Follow the selected coder-review Flow through independent review and saved Backend publication/completion; report the result with TicketImplementationResult. These refs and all resources are isolated test fixtures, not the Host's develop branch. Do not request another Subject approval or manually push target. Do not wait by polling; return if blocked.")}]),
         ) {
             return events;
         }
@@ -1429,7 +1494,14 @@ impl FullModel {
             );
         };
         assert_eq!(saved["ticket_id"], ticket);
-        assert_eq!(saved["request"]["kind"], "result");
+        assert_eq!(
+            saved["request"]["kind"],
+            if self.scope_decision {
+                "blocker"
+            } else {
+                "result"
+            }
+        );
         let mr_id = saved["request"]["merge_request"]["merge_request_id"]
             .as_str()
             .unwrap();
@@ -1447,7 +1519,7 @@ impl FullModel {
             mr["source"]["ref"]
         );
         self.emit_once("body_result", json!({"stage":"body_result", "mr":mr,
-            "coder":{"kind":"runtime_worker","runtime_id":coder["runtime_id"],"worker_id":coder["worker_id"]},
+            "coder":{"kind":"runtime_worker","runtime_id":mr["worker_assignment"]["worker"]["runtime_id"],"worker_id":mr["worker_assignment"]["worker"]["worker_id"]},
             "result_id":result_id,"requirements_digest":requirements["content_digest"]})).await;
         done()
     }
@@ -1462,6 +1534,53 @@ impl agen::llm_client::LlmClient for FullModel {
         request: agen::llm_client::Request,
     ) -> std::result::Result<agen::llm_client::client::ResponseStream, agen::llm_client::ClientError>
     {
+        if let Some(live) = &self.live {
+            // Only ordinary Subject setup/result collection is scripted. The Coder,
+            // actual Reviewer child and actual Flow verifier use the real provider.
+            if marker(&request, FULL_CODER).is_some()
+                || request.tools.iter().any(|t| {
+                    matches!(
+                        t.name.as_str(),
+                        "ReviewMergeRequest" | "FinishFlowVerification"
+                    )
+                })
+            {
+                let role = if request
+                    .tools
+                    .iter()
+                    .any(|t| t.name == "FinishFlowVerification")
+                {
+                    "verifier"
+                } else if marker(&request, FULL_CODER).is_some() {
+                    "coder"
+                } else {
+                    "reviewer"
+                };
+                let results: Vec<_> = request
+                    .items
+                    .iter()
+                    .rev()
+                    .filter_map(|item| match item {
+                        Item::ToolResult {
+                            summary, is_error, ..
+                        } => Some(format!(
+                            "{is_error}:{}",
+                            summary.chars().take(300).collect::<String>()
+                        )),
+                        _ => None,
+                    })
+                    .take(3)
+                    .collect();
+                let calls: Vec<_> = request.items.iter().rev().filter_map(|item| match item {
+                    Item::ToolCall { name, arguments, .. } if matches!(name.as_str(), "ShowTicket" | "ShowMergeRequest" | "SubWorkerSpawn") => {
+                        let parsed: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+                        Some(json!({"tool":name,"id":parsed["id"],"mr":parsed["merge_request_id"],"review":parsed["review"]}))
+                    }, _ => None
+                }).take(2).collect();
+                eprintln!("live role={role} recent_results={results:?} references={calls:?}");
+                return live.stream(request).await;
+            }
+        }
         let events = if request
             .tools
             .iter()
@@ -1662,9 +1781,48 @@ async fn replace_idle_body(h: &ConnectedWorkerHarness, subject: &str) -> Runtime
 }
 
 async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
+    full_mr_run(replace_body, integrate_target, None, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn stopped_coder_continues_on_another_worker_without_replacing_ticket_assignment() {
+    full_mr_run(false, true, None, true, false).await;
+}
+
+// Explicit provider access only; the normal suite never contacts a model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn integration_scope_conflict_returns_question_without_mutation_or_publication() {
+    full_mr_run(false, true, None, false, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "opt-in live Codex OAuth, isolated Git/Backend/Runtime; requires existing authorized provider login"]
+async fn live_coder_reviewer_and_flow_verifier_complete_isolated_mr() {
+    let manifest: manifest::ModelManifest =
+        serde_json::from_value(json!({"ref":"codex-oauth/gpt-6.1-sol"})).unwrap();
+    let live = worker::model_client::build_client(&manifest)
+        .expect("configured real model client; no scripted fallback");
+    full_mr_run(false, false, Some(Arc::from(live)), false, false).await;
+}
+
+async fn full_mr_run(
+    replace_body: bool,
+    integrate_target: bool,
+    live: Option<Arc<dyn agen::llm_client::LlmClient>>,
+    handoff: bool,
+    scope_decision: bool,
+) {
     crate::restore_test_environment::require_restore_test_environment();
+    let is_live = live.is_some();
+    let deadline = if is_live {
+        Duration::from_secs(480)
+    } else {
+        LIMIT
+    };
     let (stages, mut events) = tokio::sync::mpsc::channel(12);
     let h = ConnectedWorkerHarness::start(FullModel {
+        live,
+        handoff,
+        scope_decision,
         integrate_target,
         stages,
         seen: Default::default(),
@@ -1679,7 +1837,7 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
         .unwrap();
     let before = git(h._dir.path(), &["rev-parse", "HEAD"]);
     git(h._dir.path(), &["branch", FULL_TARGET]);
-    let (coder_wd, coder_root) = temp_workdir(&h, "full-r2-coder-workdir").await;
+    let (mut coder_wd, mut coder_root) = temp_workdir(&h, "full-r2-coder-workdir").await;
     let target_before = if integrate_target {
         // Independent target publication after the source base was selected.
         git(&coder_root, &["switch", "-c", "target-fixture"]);
@@ -1727,6 +1885,9 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
     let backend = browser_ticket_backend(&h.api).unwrap();
     let mut ticket = NewTicket::new("Full R2 ordinary Subject isolated reviewed MR adoption");
     ticket.body = "full R2 normal requirement: change README to 'full R2 independently reviewed candidate', commit, validate, publish only the source and use the actual direct builtin Reviewer for a formal exact-source verdict. Approve triggers automatic publication in the Coder temporary clone; no Subject completion stamp is needed. Do not touch the real Host target; keep Ticket conclusion separate.".into();
+    if scope_decision {
+        ticket.body = format!("{} If target README conflicts, the intended scope is unresolved: record the question on the MR and return a blocker to the Subject without resolving it or changing refs.", ticket.body.as_str()).into();
+    }
     set_test_ticket_target(&mut ticket, "test-repository", FULL_TARGET);
     let ticket = backend.create(ticket).unwrap().id;
     let _assignment = ok(&h,"PUT",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),json!({
@@ -1747,7 +1908,7 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
             { namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; },
             { namespace = "bash"; keys = ["bash.execute"]; },
             { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; },
-            { namespace = "merge_request"; keys = ["merge_request.open", "merge_request.read", "merge_request.readiness", "merge_request.review", "merge_request.publish"]; },
+            { namespace = "merge_request"; keys = ["merge_request.open", "merge_request.read", "merge_request.readiness", "merge_request.review", "merge_request.publish", "merge_request.comment"]; },
             { namespace = "worker"; keys = ["worker.list"]; }
         ]; }"#,
     );
@@ -1763,7 +1924,7 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
     // The shared harness serves routers; explicitly own the production background
     // loop here. Dropping the JoinSet aborts it even if an assertion fails.
     let mut publication_tasks = tokio::task::JoinSet::new();
-    if integrate_target || replace_body {
+    if is_live || integrate_target || replace_body {
         publication_tasks.spawn(mr_publication::recovery_loop(h.api.clone()));
     }
     let sent = ok(
@@ -1779,12 +1940,39 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
     .await;
     assert_eq!(sent["delivery"]["state"], "accepted", "{sent}");
     let mut observed = std::collections::BTreeMap::<String, Value>::new();
-    tokio::time::timeout(LIMIT, async {
-        while !["coder_done", "body_result"]
+    tokio::time::timeout(deadline, async {
+        let required = if is_live { vec!["body_result"] } else { vec!["coder_done", "body_result"] };
+        while !required
             .iter()
             .all(|stage| observed.contains_key(*stage))
         {
             let value = events.recv().await.expect("real model stages");
+            if value["stage"] == "handoff" {
+                let mr_id = value["mr"]["merge_request_id"].as_str().unwrap();
+                let old = &value["mr"]["worker_assignment"]["worker"];
+                let old_worker = RuntimeWorkerRef::new(old["runtime_id"].as_str().unwrap(), old["worker_id"].as_str().unwrap());
+                body_idle_now(&h, &old_worker).await;
+                let retained = h.api.store.get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket).unwrap();
+                ok(&h, "POST", &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{}/stop", old_worker.runtime_id, old_worker.worker_id), json!({"reason":"test explicit stopped-Coder handoff"})).await;
+                let (new_wd, new_root) = temp_workdir(&h, "continuation-workdir").await;
+                git(&new_root, &["fetch", "origin", FULL_SOURCE]);
+                git(&new_root, &["switch", "-c", FULL_SOURCE, "FETCH_HEAD"]);
+                let created = ok(&h, "POST", &format!("/api/w/{TEST_WORKSPACE_ID}/workers"), json!({
+                    "runtime_id":CONNECTED_RUNTIME,"display_name":"integration-continuation","feature_connections":{},"profile":"builtin:coder","control_operation_id":"continuation-worker","initial_submit":[],
+                    "workdir_attachments":[{"alias":"checkout","working_directory_id":new_wd}],"authorization":input["spawn"]["authorization"]
+                })).await;
+                let new_worker = json!({"runtime_id":created["runtime_id"],"worker_id":created["worker_id"]});
+                let path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr_id}/worker");
+                let bytes = serde_json::to_vec(&json!({"operation_id":"continuation-owner","expected_operation_id":value["mr"]["worker_assignment"]["operation_id"],"worker":new_worker})).unwrap();
+                let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&h.identity)
+                    .issue(&h.backend_url, TEST_WORKSPACE_ID, Some(&owner_worker.worker_id), worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION, "PUT", &path, &bytes, i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap(), 30).unwrap();
+                let (status, assigned) = response(&h.api, Request::builder().method("PUT").uri(&path).header(CONTENT_TYPE, "application/json").header(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof).body(Body::from(bytes)).unwrap()).await;
+                assert_eq!(status, StatusCode::OK, "{assigned}");
+                assert_eq!(serde_json::to_value(h.api.store.get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket).unwrap()).unwrap(), serde_json::to_value(retained).unwrap());
+                coder_wd = new_wd;
+                coder_root = new_root;
+                ok(&h, "POST", &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{}/input", created["runtime_id"].as_str().unwrap(), created["worker_id"].as_str().unwrap()), json!({"content":"Continue existing MR integration","segments":[{"kind":"flow","selector":"builtin:coder-review"},{"kind":"text","content":format!("{FULL_CODER}{}", json!({"ticket":ticket,"existing_mr":mr_id}))}]})).await;
+            }
             if value["stage"] == "publication_wait" {
                 let mr_id = value["mr"]["merge_request_id"].as_str().unwrap();
                 let worker = &value["mr"]["worker_assignment"]["worker"];
@@ -1809,7 +1997,7 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
     })
     .await
     .expect("independent review and saved result reach the Subject");
-    if !integrate_target && !replace_body {
+    if !is_live && !integrate_target && !replace_body {
         assert!(
             observed.contains_key("publication_wait"),
             "pending publication must yield before explicit resumption"
@@ -1819,6 +2007,36 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
     let mr_id = ready["mr"]["merge_request_id"].as_str().unwrap();
     let source = ready["mr"]["source"]["ref"].as_str().unwrap();
     let mr_store = merge_request_store(&h.api, TEST_WORKSPACE_ID).unwrap();
+    if scope_decision {
+        let mr = mr_store.get_by_id(TEST_WORKSPACE_ID, mr_id).unwrap();
+        assert!(matches!(
+            mr.state,
+            merge_request::MergeRequestState::Integration { .. }
+        ));
+        assert!(mr.thread.iter().any(|e| matches!(e, merge_request::MergeRequestThreadEvent::Comment(c) if c.body.contains("Scope decision required"))));
+        assert!(
+            mr_store
+                .publications(TEST_WORKSPACE_ID, mr_id)
+                .unwrap()
+                .iter()
+                .all(|p| !matches!(
+                    p.outcome,
+                    merge_request::PublicationOutcome::Published { .. }
+                ))
+        );
+        assert_eq!(
+            git(
+                h._dir.path(),
+                &["rev-parse", &format!("refs/heads/{FULL_TARGET}")]
+            ),
+            target_before
+        );
+        assert_eq!(git(&coder_root, &["rev-parse", "HEAD"]), source);
+        assert!(git(&coder_root, &["status", "--porcelain"]).is_empty());
+        publication_tasks.abort_all();
+        while publication_tasks.join_next().await.is_some() {}
+        return;
+    }
     let final_mr = tokio::time::timeout(LIMIT, async {
         let mut interval = tokio::time::interval(Duration::from_millis(50));
         loop {
@@ -1902,6 +2120,7 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
     );
     assert_eq!(git(h._dir.path(), &["rev-parse", "HEAD"]), before);
     assert!(git(&coder_root, &["status", "--porcelain"]).is_empty());
+    body_idle_now(&h, &coder).await;
     body_idle_now(&h, &owner_worker).await;
     // Recovery is Backend-owned; no model completion operation or Subject stamp remains.
     for _ in 0..2 {
@@ -1968,10 +2187,16 @@ async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
         h.api.authority.ticket(&ticket).unwrap().content_digest,
         ready["requirements_digest"].as_str().unwrap()
     );
-    assert_eq!(
-        observed["coder_done"]["receipt"]["result_id"],
-        ready["result_id"]
-    );
+    if !is_live {
+        assert_eq!(
+            observed["coder_done"]["receipt"]["result_id"],
+            ready["result_id"]
+        );
+    } else {
+        eprintln!(
+            "live model=codex-oauth/gpt-6.1-sol; Coder/Reviewer/verifier=live; Subject=scripted; confirmed_publications=1; source={source}"
+        );
+    }
     publication_tasks.abort_all();
     while publication_tasks.join_next().await.is_some() {}
 }
