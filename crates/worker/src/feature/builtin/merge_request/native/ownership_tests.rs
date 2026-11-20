@@ -161,10 +161,10 @@ async fn ownership_tool_and_native_preserve_assign_replace_release_and_exact_ret
 }
 
 #[tokio::test]
-async fn ownership_query_preserves_never_assigned_and_released_observations_without_mutation() {
+async fn show_preserves_never_assigned_and_released_observations_without_mutation() {
     for observation in [
-        json!({"assignment":null}),
-        json!({"assignment":{"operation_id":"release-1","worker":null}}),
+        json!({"worker_assignment":null}),
+        json!({"worker_assignment":{"operation_id":"release-1","worker":null}}),
     ] {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
             response(
@@ -174,7 +174,7 @@ async fn ownership_query_preserves_never_assigned_and_released_observations_with
         ]));
         let tool = MergeRequestTool {
             client: client.clone(),
-            kind: Kind::WorkerQuery,
+            kind: Kind::Show,
         };
         let result = tool
             .execute(
@@ -192,7 +192,7 @@ async fn ownership_query_preserves_never_assigned_and_released_observations_with
             .invoke(
                 "/changes/MR-1".into(),
                 crate::wip::root_reference(MERGE_REQUEST_ITEM_INTERFACE),
-                "worker_query".into(),
+                "read".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
             )
@@ -203,8 +203,14 @@ async fn ownership_query_preserves_never_assigned_and_released_observations_with
         assert_eq!(result["entry"], "/changes/MR-1");
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].path, "/api/w/ws/merge-requests/MR%2F1/worker");
-        assert_eq!(requests[1].path, "/api/w/ws/merge-requests/MR-1/worker");
+        assert_eq!(
+            requests[0].path,
+            "/api/w/ws/merge-requests/MR%2F1?view=summary"
+        );
+        assert_eq!(
+            requests[1].path,
+            "/api/w/ws/merge-requests/MR-1?view=summary"
+        );
         assert!(
             requests
                 .iter()
@@ -269,7 +275,7 @@ async fn native_ownership_rejects_omitted_plain_null_or_spoofed_route_before_aut
             .invoke(
                 "/changes/MR-1".into(),
                 crate::wip::root_reference(MERGE_REQUEST_ITEM_INTERFACE),
-                "worker_query".into(),
+                "read".into(),
                 json!({"merge_request_id":"MR-2"}),
                 ToolExecutionContext::direct()
             )
@@ -302,7 +308,7 @@ fn context() -> WipCallContext {
 
 #[tokio::test]
 async fn ownership_denial_is_before_dispatch_for_both_surfaces_and_both_operations() {
-    for kind in [Kind::WorkerQuery, Kind::WorkerSet] {
+    for kind in [Kind::Show, Kind::WorkerSet] {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![]));
         client
             .auth_denied
@@ -324,7 +330,7 @@ async fn ownership_denial_is_before_dispatch_for_both_surfaces_and_both_operatio
         let native = native_merge_request_tools(
             client.clone(),
             MergeRequestFeatureConfig {
-                worker_query: true,
+                show: true,
                 worker_set: true,
                 ..Default::default()
             },
@@ -432,11 +438,11 @@ fn ownership_flags_publish_independent_tool_and_native_operations_without_grants
     for (config, tool_name, operation) in [
         (
             MergeRequestFeatureConfig {
-                worker_query: true,
+                show: true,
                 ..Default::default()
             },
-            "QueryMergeRequestWorker",
-            "worker_query",
+            "ShowMergeRequest",
+            "read",
         ),
         (
             MergeRequestFeatureConfig {

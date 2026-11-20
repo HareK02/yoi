@@ -615,6 +615,8 @@ Deno.test("Ticket Browser parser accepts the generated Objective list shape", ()
 
 function mergeRequestDetailFixture() {
   return {
+    worker_assignment: null,
+    publications: [],
     view: "detail",
     summary: {
       review_status: "pending",
@@ -660,6 +662,40 @@ function mergeRequestDetailFixture() {
     linked_tickets: [{ ticket_id: "ticket-id", key: "T-1" }],
   };
 }
+
+Deno.test("MR show includes assignment CAS and saved publications without thread history", () => {
+  const worker = { runtime_id: "runtime-a", worker_id: "worker-a" };
+  const assignment = {
+    event_id: "owner-event", sequence: 3, operation_id: "owner-op",
+    previous_operation_id: null, worker, assigned_by: worker,
+    created_at: "2026-09-22T00:00:00Z",
+  };
+  const publication = {
+    operation_id: "publication-op", merge_request_id: "mr-1", approval_event_id: "approval-event",
+    source_ref: "abc123", target_selector: "refs/heads/develop", target_ref_before: "def456",
+    outcome: { kind: "published", target_after: "abc123", observed_at: "2026-09-22T00:00:00Z" },
+  };
+  for (const view of ["summary", "detail"]) {
+    for (const worker_assignment of [null, assignment, { ...assignment, worker: null }]) {
+      for (const outcome of [publication.outcome, { kind: "unconfirmed" }, { kind: "not_published", reason: "target moved" }]) {
+        const input = { ...mergeRequestDetailFixture(), view, thread: [], worker_assignment, publications: [{ ...publication, outcome }] };
+        const parsed = parseMergeRequestDetailResponse(input);
+        assertEquals(parsed.worker_assignment, worker_assignment);
+        assertEquals(parsed.publications, input.publications);
+      }
+    }
+  }
+  for (const fields of [
+    { worker_assignment: undefined },
+    { worker_assignment: { ...assignment, operation_id: 7 } },
+    { worker_assignment: { ...assignment, worker: undefined } },
+    { publications: undefined },
+    { publications: [{ ...publication, outcome: { kind: "invented" } }] },
+    { publications: [{ ...publication, outcome: { kind: "published" } }] },
+  ]) {
+    assertThrows(() => parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), ...fields }), "Merge Request detail");
+  }
+});
 
 Deno.test("Ticket Browser parser validates the canonical Merge Request thread", () => {
   const parsed = parseMergeRequestDetailResponse(mergeRequestDetailFixture());

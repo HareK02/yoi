@@ -8320,15 +8320,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::merge_request_comment(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::merge_request_publications(
-            service.clone(),
-        ))
-        .merge(server_api::server_api_axum::merge_request_publish(
-            service.clone(),
-        ))
-        .merge(server_api::server_api_axum::merge_request_worker_get(
-            service.clone(),
-        ))
         .merge(server_api::server_api_axum::merge_request_worker_set(
             service.clone(),
         ))
@@ -13151,34 +13142,6 @@ impl server_api::ServerApi for ServerApiContractService {
         Ok(response)
     }
 
-    async fn merge_request_worker_get(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        id: String,
-    ) -> std::result::Result<server_api::MergeRequestWorkerResponse, server_api::RepositoryApiError>
-    {
-        let api = self.workspace_api()?.clone();
-        let headers = contract_request_headers(&context)?;
-        api.host_executors
-            .host()
-            .map_err(|error| ApiError::from(error).into_repository_api_error())?
-            .run(move || {
-                require_workspace_access(&workspace_id, &api)?;
-                if let Some(source) =
-                    optional_worker_mutation_source(&api, &workspace_id, &headers)?
-                {
-                    require_mr_operation(&api, &source, &id, "merge_request.read")?;
-                }
-                let assignment = merge_request_store(&api, &workspace_id)?
-                    .current_worker(&workspace_id, &id)?
-                    .map(public_mr_worker_assignment);
-                Ok(server_api::MergeRequestWorkerResponse { assignment })
-            })
-            .await
-            .map_err(ApiError::into_repository_api_error)
-    }
-
     async fn merge_request_worker_set(
         &self,
         context: server_api::ServerRequestContext,
@@ -13292,65 +13255,6 @@ impl server_api::ServerApi for ServerApiContractService {
                     unreachable!()
                 };
                 Ok(event)
-            })
-            .await
-            .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn merge_request_publications(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        id: String,
-    ) -> std::result::Result<
-        server_api::MergeRequestPublicationsResponse,
-        server_api::RepositoryApiError,
-    > {
-        let api = self.workspace_api()?.clone();
-        let headers = contract_request_headers(&context)?;
-        api.host_executors
-            .host()
-            .map_err(|e| ApiError::from(e).into_repository_api_error())?
-            .run(move || {
-                require_workspace_access(&workspace_id, &api)?;
-                if let Some(source) =
-                    optional_worker_mutation_source(&api, &workspace_id, &headers)?
-                {
-                    require_mr_operation(&api, &source, &id, "merge_request.read")?;
-                }
-                let store = merge_request_store(&api, &workspace_id)?;
-                store.get_by_id(&workspace_id, &id)?;
-                Ok(server_api::MergeRequestPublicationsResponse {
-                    publications: store
-                        .publications(&workspace_id, &id)?
-                        .into_iter()
-                        .map(mr_publication::public)
-                        .collect(),
-                })
-            })
-            .await
-            .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn merge_request_publish(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        id: String,
-        request: server_api::PublishMergeRequestRequest,
-    ) -> std::result::Result<server_api::MergeRequestPublication, server_api::RepositoryApiError>
-    {
-        let api = self.workspace_api()?.clone();
-        let headers = current_worker_contract_headers(&context)?;
-        api.host_executors
-            .host()
-            .map_err(|e| ApiError::from(e).into_repository_api_error())?
-            .run(move || {
-                require_workspace_access(&workspace_id, &api)?;
-                let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
-                require_mr_operation(&api, &source, &id, "merge_request.publish")?;
-                mr_publication::publish(&api, &id, request, Some(&source))
-                    .map(mr_publication::public)
             })
             .await
             .map_err(ApiError::into_repository_api_error)
@@ -20921,9 +20825,18 @@ async fn scoped_show_merge_request(
                     "Merge Request has no linked Ticket".into(),
                 ))
             })?;
-            let assignment = store
-                .current_worker(&workspace_id, &merge_request_id)?
-                .and_then(|assignment| assignment.worker);
+            let worker_assignment = mr
+                .current_worker()
+                .cloned()
+                .map(public_mr_worker_assignment);
+            let assignment = worker_assignment
+                .as_ref()
+                .and_then(|assignment| assignment.worker.as_ref());
+            let publications = store
+                .publications(&workspace_id, &merge_request_id)?
+                .into_iter()
+                .map(mr_publication::public)
+                .collect();
             let (source, target) = if let Some(refs) = integrated_refs {
                 refs
             } else {
@@ -21023,6 +20936,8 @@ async fn scoped_show_merge_request(
                 linked_tickets,
                 view: query.view.unwrap_or_default(),
                 summary,
+                worker_assignment,
+                publications,
                 event_page,
             }))
         })

@@ -48,7 +48,7 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         },
         BuiltinPermissionOperation {
             key: "merge_request.publish",
-            description: "Publish the independently approved fixed source to its MR target through durable normal fast-forward publication.",
+            description: "Allow Backend automatic publication of the independently approved fixed source to its MR target through durable normal fast-forward publication; no model-facing publish operation.",
             sets: &["implementer", "work-execution"],
         },
         BuiltinPermissionOperation {

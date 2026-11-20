@@ -612,14 +612,11 @@ impl_openapi_schema!(
     MergeRequestReadinessResponse,
     MergeRequestThreadQuery,
     MergeRequestThreadResponse,
-    MergeRequestWorkerResponse,
     MergeRequestWorkerAssignedEvent,
     SetMergeRequestWorkerRequest,
-    MergeRequestPublicationsResponse,
     CommentMergeRequestRequest,
     MergeRequestPublication,
     MergeRequestPublicationOutcome,
-    PublishMergeRequestRequest,
     ObjectiveCreateRequest,
     ObjectiveDetail,
     ObjectiveEditRequest,
@@ -4029,13 +4026,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RevokeMergeRequestReviewRequest,
     ) -> Result<ReviewRevokedEvent, RepositoryApiError>;
-    #[get("/api/w/{workspace_id}/merge-requests/{id}/worker", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
-    async fn merge_request_worker_get(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-    ) -> Result<MergeRequestWorkerResponse, RepositoryApiError>;
     #[put("/api/w/{workspace_id}/merge-requests/{id}/worker", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_worker_set(
         &self,
@@ -4052,21 +4042,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CommentMergeRequestRequest,
     ) -> Result<MergeRequestCommentEvent, RepositoryApiError>;
-    #[get("/api/w/{workspace_id}/merge-requests/{id}/publications", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
-    async fn merge_request_publications(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-    ) -> Result<MergeRequestPublicationsResponse, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/merge-requests/{id}/publications", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
-    async fn merge_request_publish(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: PublishMergeRequestRequest,
-    ) -> Result<MergeRequestPublication, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/merge-requests/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_complete(
         &self,
@@ -9671,13 +9646,6 @@ merge_request_event!(MergeRequestWorkerAssignedEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MergeRequestWorkerResponse {
-    pub assignment: Option<MergeRequestWorkerAssignedEvent>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MergeRequestPublicationOutcome {
     Unconfirmed {},
@@ -9700,20 +9668,6 @@ pub struct MergeRequestPublication {
     pub target_selector: String,
     pub target_ref_before: String,
     pub outcome: MergeRequestPublicationOutcome,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct MergeRequestPublicationsResponse {
-    pub publications: Vec<MergeRequestPublication>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct PublishMergeRequestRequest {
-    pub operation_id: String,
-    pub approval_event_id: String,
 }
 
 fn required_nullable_schema<T: JsonSchema>(
@@ -9927,6 +9881,12 @@ pub struct MergeRequestDetailResponse {
     pub linked_tickets: Vec<MergeRequestLinkedTicketResponse>,
     pub view: MergeRequestReadView,
     pub summary: MergeRequestStatusSummary,
+    /// Current assignment, including its CAS operation ID, independent of the thread page.
+    /// Null means never assigned; a released assignment retains its operation ID and null Worker.
+    pub worker_assignment: Option<MergeRequestWorkerAssignedEvent>,
+    /// Latest publication operations, newest first, bounded to 100 (not a complete history).
+    /// Reading these saved facts never dispatches or retries publication.
+    pub publications: Vec<MergeRequestPublication>,
     pub event_page: MergeRequestEventPage,
 }
 
@@ -13709,8 +13669,20 @@ mod tests {
                 .iter()
                 .filter(|operation| operation.operation_id.starts_with("merge_request_"))
                 .count(),
-            16
+            13
         );
+        for removed in [
+            "merge_request_worker_get",
+            "merge_request_publications",
+            "merge_request_publish",
+        ] {
+            assert!(
+                !operations
+                    .iter()
+                    .any(|operation| operation.operation_id == removed),
+                "{removed}"
+            );
+        }
         for (operation_id, method, path) in [
             (
                 "ticket_case_update",
@@ -16046,7 +16018,6 @@ mod openapi_artifact_tests {
             "merge_request_complete",
             "merge_request_worker_set",
             "merge_request_comment",
-            "merge_request_publish",
             "merge_request_open",
             "merge_request_review_capability_register",
             "merge_request_review_revoke",

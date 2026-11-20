@@ -432,6 +432,9 @@ async fn mr_summary_route_omits_history_but_keeps_page_external_approval() {
     assert!(page.event_page.has_more);
     assert!(page.event_page.next_after.is_some());
     assert_eq!(page.summary, summary.summary);
+    assert_eq!(page.worker_assignment, summary.worker_assignment);
+    assert!(summary.worker_assignment.is_some());
+    assert_eq!(page.publications, summary.publications);
 }
 
 #[tokio::test]
@@ -1519,17 +1522,31 @@ async fn publication_receipt_fences_binding_and_records_fact_without_subject_com
                 .workflow_state,
             ticket::TicketState::Open
         );
+        let saved_publication = mr_publication::public(result.clone());
+        let shown = get_json(
+            fixture.app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{EVIDENCE_MR}?view=summary"),
+        )
+        .await;
+        assert_eq!(
+            shown["publications"],
+            serde_json::json!([saved_publication])
+        );
+        assert_eq!(
+            shown["worker_assignment"]["operation_id"],
+            "owner-after-push"
+        );
+        assert!(shown["worker_assignment"]["worker"].is_null());
+        let page = fixture.detail(0, 1).await;
+        assert_eq!(page.publications, vec![saved_publication]);
         // A known publication replay uses the saved result even with no MR owner,
         // no live Worker, and no usable repository credentials in this fixture.
         assert_eq!(
             mr_publication::publish(
                 &fixture.api,
                 EVIDENCE_MR,
-                server_api::PublishMergeRequestRequest {
-                    operation_id: binding.operation_id,
-                    approval_event_id: approval.event_id,
-                },
-                None
+                binding.operation_id,
+                approval.event_id
             )
             .unwrap(),
             result

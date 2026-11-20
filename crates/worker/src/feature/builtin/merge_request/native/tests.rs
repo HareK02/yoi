@@ -29,10 +29,7 @@ fn all_config() -> MergeRequestFeatureConfig {
         review: true,
         readiness_check: true,
         complete: true,
-        worker_query: true,
         worker_set: true,
-        publications: true,
-        publish: true,
         comment: true,
     }
 }
@@ -59,6 +56,53 @@ async fn inspect_interface(runtime: &WipRuntime, path: &str) -> String {
         .unwrap();
     let interface: Value = serde_json::from_str(interface.content.as_deref().unwrap()).unwrap();
     interface["interface_signature"].as_str().unwrap().into()
+}
+
+#[tokio::test]
+async fn removed_tools_and_native_operations_are_not_available() {
+    let client = Arc::new(RecordingWorkspaceClient::new(vec![]));
+    let definitions = enabled_merge_request_definitions(client.clone(), all_config());
+    assert_eq!(definitions.len(), 7);
+    let names: Vec<_> = definitions
+        .iter()
+        .map(|definition| definition().0.name)
+        .collect();
+    let native_tools = native_merge_request_tools(client.clone(), all_config()).unwrap();
+    let native = runtime(client.clone());
+    for (tool, operation) in [
+        ("QueryMergeRequestWorker", "worker_query"),
+        ("PublishMergeRequest", "publish"),
+        ("QueryMergeRequestPublications", "publications"),
+    ] {
+        assert!(!names.iter().any(|name| name == tool));
+        assert!(description(tool).is_none());
+        assert!(
+            !native_tools
+                .iter()
+                .any(|tool| tool.contract.name == operation)
+        );
+        assert!(serde_json::from_value::<command::Command>(json!({"command":operation})).is_err());
+        assert!(
+            native
+                .invoke(
+                    "/changes/MR-1".into(),
+                    crate::wip::root_reference(MERGE_REQUEST_ITEM_INTERFACE),
+                    operation.into(),
+                    json!({}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert!(client.authorizations.lock().unwrap().is_empty());
+    assert!(client.requests.lock().unwrap().is_empty());
+    assert!(
+        permission_declaration::DECLARATION
+            .operations
+            .iter()
+            .any(|operation| operation.key == "merge_request.publish")
+    );
 }
 
 #[test]

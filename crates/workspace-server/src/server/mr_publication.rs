@@ -246,19 +246,19 @@ pub(super) fn reconcile(api: &WorkspaceApi, saved: Publication) -> ApiResult<Pub
 pub(super) fn publish(
     api: &WorkspaceApi,
     mr_id: &str,
-    input: server_api::PublishMergeRequestRequest,
-    caller: Option<&RuntimeWorkerRef>,
+    operation_id: String,
+    approval_event_id: String,
 ) -> ApiResult<Publication> {
-    if input.operation_id.trim().is_empty() || input.operation_id.len() > 200 {
+    if operation_id.trim().is_empty() || operation_id.len() > 200 {
         return Err(Error::InvalidInput(
             "publication operation_id must be nonempty and at most 200 bytes".into(),
         )
         .into());
     }
     let store = merge_request_store(api, api.workspace_id())?;
-    if let Some(saved) = store.publication(api.workspace_id(), &input.operation_id)? {
+    if let Some(saved) = store.publication(api.workspace_id(), &operation_id)? {
         if saved.binding.merge_request_id != mr_id
-            || saved.binding.approval_event_id != input.approval_event_id
+            || saved.binding.approval_event_id != approval_event_id
         {
             return Err(merge_request::MergeRequestError::Conflict(
                 "publication request fingerprint mismatch".into(),
@@ -269,19 +269,13 @@ pub(super) fn publish(
     }
     let mr = store.get_by_id(api.workspace_id(), mr_id)?;
     let (owner, worker) = current_mr_worker(&store, api.workspace_id(), mr_id)?;
-    if caller.is_some_and(|caller| caller != &worker) {
-        return Err(Error::WorkspacePermissionDenied(
-            "only the current MR Worker can request new publication".into(),
-        )
-        .into());
-    }
     require_mr_operation(api, &worker, mr_id, "merge_request.publish")?;
     let approval = mr
         .thread
         .iter()
         .find_map(|event| match event {
             merge_request::MergeRequestThreadEvent::Review(review)
-                if review.event_id == input.approval_event_id =>
+                if review.event_id == approval_event_id =>
             {
                 Some(review)
             }
@@ -357,7 +351,7 @@ pub(super) fn publish(
     let binding = PublicationBinding {
         workspace_id: api.workspace_id().into(),
         merge_request_id: mr_id.into(),
-        operation_id: input.operation_id,
+        operation_id,
         repository_id: mr.repository_id.clone(),
         repository_source_fingerprint: observed.source_fingerprint,
         target: target.selector,
@@ -437,11 +431,8 @@ pub(super) fn advance(api: &WorkspaceApi, mr_id: &str) -> ApiResult<()> {
     publish(
         api,
         mr_id,
-        server_api::PublishMergeRequestRequest {
-            operation_id: format!("mr-publication-{}", Uuid::now_v7()),
-            approval_event_id: approval.event_id.clone(),
-        },
-        None,
+        format!("mr-publication-{}", Uuid::now_v7()),
+        approval.event_id.clone(),
     )?;
     Ok(())
 }

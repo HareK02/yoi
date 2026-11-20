@@ -112,6 +112,8 @@ function detail(
   latestSubject = "source-2",
 ): MergeRequestDetail {
   return {
+    worker_assignment: null,
+    publications: [],
     view: "detail",
     summary: {
       review_status: reviewStatus,

@@ -14,9 +14,6 @@ pub(super) enum Command {
         after: Option<u64>,
         limit: Option<usize>,
     },
-    WorkerQuery {
-        merge_request_id: String,
-    },
     WorkerSet {
         merge_request_id: String,
         #[serde(flatten)]
@@ -27,14 +24,6 @@ pub(super) enum Command {
         operation_id: String,
         expected_owner_operation_id: String,
         body: String,
-    },
-    Publications {
-        merge_request_id: String,
-    },
-    Publish {
-        merge_request_id: String,
-        operation_id: String,
-        approval_event_id: String,
     },
     Readiness {
         merge_request_id: String,
@@ -78,12 +67,6 @@ impl Command {
                     limit: v.limit,
                 }
             }
-            Kind::WorkerQuery => {
-                let v: MergeRequestInput = parse(input)?;
-                Self::WorkerQuery {
-                    merge_request_id: v.merge_request_id,
-                }
-            }
             Kind::WorkerSet => {
                 let v: SetMergeRequestWorkerInput = parse(input)?;
                 Self::WorkerSet {
@@ -98,20 +81,6 @@ impl Command {
                     operation_id: v.operation_id,
                     expected_owner_operation_id: v.expected_owner_operation_id,
                     body: v.body,
-                }
-            }
-            Kind::Publications => {
-                let v: MergeRequestInput = parse(input)?;
-                Self::Publications {
-                    merge_request_id: v.merge_request_id,
-                }
-            }
-            Kind::Publish => {
-                let v: PublishMergeRequestInput = parse(input)?;
-                Self::Publish {
-                    merge_request_id: v.merge_request_id,
-                    operation_id: v.operation_id,
-                    approval_event_id: v.approval_event_id,
                 }
             }
             Kind::Readiness => {
@@ -156,11 +125,8 @@ impl Command {
     pub(super) fn kind(&self) -> Kind {
         match self {
             Self::Read { .. } => Kind::Show,
-            Self::WorkerQuery { .. } => Kind::WorkerQuery,
             Self::WorkerSet { .. } => Kind::WorkerSet,
             Self::Comment { .. } => Kind::Comment,
-            Self::Publications { .. } => Kind::Publications,
-            Self::Publish { .. } => Kind::Publish,
             Self::Readiness { .. } => Kind::Readiness,
             Self::Open { .. } => Kind::Open,
             Self::Complete { .. } => Kind::Complete,
@@ -192,7 +158,7 @@ pub(super) fn execute_value(
 ) -> Result<Value, ToolError> {
     let ownership_mutation = matches!(
         &command,
-        Command::WorkerSet { .. } | Command::Publish { .. } | Command::Comment { .. }
+        Command::WorkerSet { .. } | Command::Comment { .. }
     );
     let executor = Executor { client };
     let ws = executor.client.workspace_id().ok_or_else(|| {
@@ -225,24 +191,6 @@ pub(super) fn execute_value(
                 ));
             }
             return executor.show_merge_request(ws, &merge_request_id, view, after, limit);
-        }
-        Command::WorkerQuery { merge_request_id } => {
-            nonempty_named("merge_request_id", &merge_request_id)?;
-            executor.authorize(
-                "merge_request.read",
-                PermissionResource::MergeRequest {
-                    workspace_id: ws.into(),
-                    merge_request_id: merge_request_id.clone(),
-                },
-            )?;
-            (
-                WorkspaceRequestMethod::Get,
-                format!(
-                    "/api/w/{ws}/merge-requests/{}/worker",
-                    encode_path_segment(&merge_request_id)
-                ),
-                None,
-            )
         }
         Command::WorkerSet {
             merge_request_id,
@@ -301,48 +249,6 @@ pub(super) fn execute_value(
                 Some(
                     json!({"operation_id":operation_id,"expected_owner_operation_id":expected_owner_operation_id,"body":body}),
                 ),
-            )
-        }
-        Command::Publications { merge_request_id } => {
-            nonempty_named("merge_request_id", &merge_request_id)?;
-            executor.authorize(
-                "merge_request.read",
-                PermissionResource::MergeRequest {
-                    workspace_id: ws.into(),
-                    merge_request_id: merge_request_id.clone(),
-                },
-            )?;
-            (
-                WorkspaceRequestMethod::Get,
-                format!(
-                    "/api/w/{ws}/merge-requests/{}/publications",
-                    encode_path_segment(&merge_request_id)
-                ),
-                None,
-            )
-        }
-        Command::Publish {
-            merge_request_id,
-            operation_id,
-            approval_event_id,
-        } => {
-            nonempty_named("merge_request_id", &merge_request_id)?;
-            nonempty_named("operation_id", &operation_id)?;
-            nonempty_named("approval_event_id", &approval_event_id)?;
-            executor.authorize(
-                "merge_request.publish",
-                PermissionResource::MergeRequest {
-                    workspace_id: ws.into(),
-                    merge_request_id: merge_request_id.clone(),
-                },
-            )?;
-            (
-                WorkspaceRequestMethod::Post,
-                format!(
-                    "/api/w/{ws}/merge-requests/{}/publications",
-                    encode_path_segment(&merge_request_id)
-                ),
-                Some(json!({"operation_id":operation_id,"approval_event_id":approval_event_id})),
             )
         }
         Command::Readiness { merge_request_id } => {
@@ -476,7 +382,7 @@ pub(super) fn execute_value(
 
 fn ownership_outcome_unknown(detail: &str) -> ToolError {
     ToolError::ExecutionFailed(format!(
-        "MR mutation outcome is unknown after dispatch: {detail}. Reconcile the saved assignment, comment or publication; any exact retry must retain the original operation_id and full input. Do not automatically retry or mint a new operation_id."
+        "MR mutation outcome is unknown after dispatch: {detail}. Reconcile the saved assignment or comment; any exact retry must retain the original operation_id and full input. Do not automatically retry or mint a new operation_id."
     ))
 }
 

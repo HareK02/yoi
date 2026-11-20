@@ -417,11 +417,8 @@ pub struct MergeRequestFeatureConfigPartial {
     pub review: Option<bool>,
     pub readiness_check: Option<bool>,
     pub complete: Option<bool>,
-    pub worker_query: Option<bool>,
     pub worker_set: Option<bool>,
-    pub publications: Option<bool>,
     pub comment: Option<bool>,
-    pub publish: Option<bool>,
 }
 
 impl MergeRequestFeatureConfigPartial {
@@ -432,11 +429,8 @@ impl MergeRequestFeatureConfigPartial {
             review: other.review.or(self.review),
             readiness_check: other.readiness_check.or(self.readiness_check),
             complete: other.complete.or(self.complete),
-            worker_query: other.worker_query.or(self.worker_query),
             worker_set: other.worker_set.or(self.worker_set),
-            publications: other.publications.or(self.publications),
             comment: other.comment.or(self.comment),
-            publish: other.publish.or(self.publish),
         }
     }
 }
@@ -675,11 +669,8 @@ impl From<MergeRequestFeatureConfigPartial> for MergeRequestFeatureConfig {
             review: value.review.unwrap_or_default(),
             readiness_check: value.readiness_check.unwrap_or_default(),
             complete: value.complete.unwrap_or_default(),
-            worker_query: value.worker_query.unwrap_or_default(),
             worker_set: value.worker_set.unwrap_or_default(),
-            publications: value.publications.unwrap_or_default(),
             comment: value.comment.unwrap_or_default(),
-            publish: value.publish.unwrap_or_default(),
         }
     }
 }
@@ -692,11 +683,8 @@ impl From<MergeRequestFeatureConfig> for MergeRequestFeatureConfigPartial {
             review: Some(value.review),
             readiness_check: Some(value.readiness_check),
             complete: Some(value.complete),
-            worker_query: Some(value.worker_query),
             worker_set: Some(value.worker_set),
-            publications: Some(value.publications),
             comment: Some(value.comment),
-            publish: Some(value.publish),
         }
     }
 }
@@ -2832,15 +2820,15 @@ enabled = true
     }
 
     #[test]
-    fn merge_request_ownership_flags_default_off_merge_and_roundtrip_independently() {
+    fn merge_request_show_and_worker_set_flags_default_off_merge_and_roundtrip_independently() {
         let empty: MergeRequestFeatureConfigPartial = toml::from_str("").unwrap();
         let defaults = MergeRequestFeatureConfig::from(empty);
-        assert!(!defaults.worker_query && !defaults.worker_set && !defaults.any());
+        assert!(!defaults.show && !defaults.worker_set && !defaults.any());
         let base: MergeRequestFeatureConfigPartial =
-            toml::from_str("worker_query = true\nworker_set = true").unwrap();
+            toml::from_str("show = true\nworker_set = true").unwrap();
         let upper: MergeRequestFeatureConfigPartial = toml::from_str("worker_set = false").unwrap();
         let resolved = MergeRequestFeatureConfig::from(base.merge(upper));
-        assert!(resolved.worker_query);
+        assert!(resolved.show);
         assert!(!resolved.worker_set);
         assert!(resolved.any());
         let serialized =
@@ -2849,7 +2837,16 @@ enabled = true
         assert_eq!(MergeRequestFeatureConfig::from(reparsed), resolved);
         let set_only: MergeRequestFeatureConfig = toml::from_str("worker_set = true").unwrap();
         assert!(set_only.worker_set && set_only.any());
-        assert!(!set_only.worker_query);
+        assert!(!set_only.show);
+    }
+
+    #[test]
+    fn merge_request_removed_operation_flags_are_rejected() {
+        for flag in ["worker_query", "publications", "publish"] {
+            let input = format!("{flag} = true");
+            assert!(toml::from_str::<MergeRequestFeatureConfigPartial>(&input).is_err());
+            assert!(toml::from_str::<MergeRequestFeatureConfig>(&input).is_err());
+        }
     }
 
     #[test]

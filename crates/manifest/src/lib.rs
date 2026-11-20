@@ -555,15 +555,9 @@ pub struct MergeRequestFeatureConfig {
     #[serde(default)]
     pub complete: bool,
     #[serde(default)]
-    pub worker_query: bool,
-    #[serde(default)]
     pub worker_set: bool,
     #[serde(default)]
-    pub publications: bool,
-    #[serde(default)]
     pub comment: bool,
-    #[serde(default)]
-    pub publish: bool,
 }
 
 impl MergeRequestFeatureConfig {
@@ -573,11 +567,8 @@ impl MergeRequestFeatureConfig {
             || self.review
             || self.readiness_check
             || self.complete
-            || self.worker_query
             || self.worker_set
-            || self.publications
             || self.comment
-            || self.publish
     }
 }
 

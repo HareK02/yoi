@@ -109,7 +109,7 @@ pub(super) fn contract(kind: Kind) -> Contract {
         ),
         Kind::Show => (
             "read",
-            "Read this route-bound MR. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
+            "Read this route-bound MR. Summary and detail include worker_assignment (operation_id and worker) and saved publications. worker_assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. Ownership is not authority, Worker liveness or Ticket assignment. This read never sends or retries publication. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
             vec![
                 field("view", false, Shape::Enum(vec!["summary", "detail"])),
                 flattened(
@@ -122,14 +122,9 @@ pub(super) fn contract(kind: Kind) -> Contract {
                 ),
             ],
         ),
-        Kind::WorkerQuery => (
-            "worker_query",
-            "Read this route-bound MR's single Worker assignment. assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. This observation grants no authority and does not report Worker liveness or Ticket assignment.",
-            vec![],
-        ),
         Kind::WorkerSet => (
             "worker_set",
-            "Set, replace, or release this MR's Worker using the queried operation_id as expected_operation_id. Both expected_operation_id and worker are required null/value unions; null expectation means never assigned, null worker releases ownership. Preserve operation_id and full input for exact retry; reconcile conflict or unknown outcome without automatic retry or a new key. Ownership changes no Ticket assignment, authority, lifecycle, phase, approval, or publication.",
+            "Set, replace, or release this MR's Worker after read with view=summary, using worker_assignment.operation_id as expected_operation_id. Both expected_operation_id and worker are required null/value unions; null expectation means never assigned, null worker releases ownership. Preserve operation_id and full input for exact retry; reconcile conflict or unknown outcome without automatic retry or a new key. Ownership changes no Ticket assignment, authority, lifecycle, phase, approval, or publication.",
             vec![
                 field("operation_id", true, Shape::String),
                 field("expected_operation_id", true, nullable(Shape::String)),
@@ -150,19 +145,6 @@ pub(super) fn contract(kind: Kind) -> Contract {
                 field("operation_id", true, Shape::String),
                 field("expected_owner_operation_id", true, Shape::String),
                 field("body", true, Shape::String),
-            ],
-        ),
-        Kind::Publications => (
-            "publications",
-            "Read saved publication operations and outcomes. This does not send, retry, or conclude work.",
-            vec![],
-        ),
-        Kind::Publish => (
-            "publish",
-            "Publish the exact approved source through the current MR Worker Workdir. Preserve operation_id and approval_event_id for exact replay; a saved operation only reconciles, never redispatches. Unknown is not failure. No Subject stamp or Ticket conclusion.",
-            vec![
-                field("operation_id", true, Shape::String),
-                field("approval_event_id", true, Shape::String),
             ],
         ),
         Kind::Readiness => (

@@ -79,13 +79,23 @@ async fn mr_worker_http_assignment_requires_permission_and_preserves_cas_history
         "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/worker",
         mr.merge_request_id
     );
+    let show_path = format!(
+        "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}?view=summary",
+        mr.merge_request_id
+    );
     let (status, current) = response(
         &f.api,
-        runtime_source_request(&f.identity, Some(&f.source.worker_id), "GET", &path, vec![]),
+        runtime_source_request(
+            &f.identity,
+            Some(&f.source.worker_id),
+            "GET",
+            &show_path,
+            vec![],
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{current}");
-    let initial_operation = current["assignment"]["operation_id"].clone();
+    let initial_operation = current["worker_assignment"]["operation_id"].clone();
     let release = json!({"operation_id":"release-mr-worker", "expected_operation_id":initial_operation, "worker":null});
     let send = |body: &Value| {
         runtime_source_request(
@@ -108,6 +118,20 @@ async fn mr_worker_http_assignment_requires_permission_and_preserves_cas_history
     let (status, receipt) = response(&f.api, send(&release)).await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert!(receipt["worker"].is_null());
+    let (status, released) = response(
+        &f.api,
+        runtime_source_request(
+            &f.identity,
+            Some(&f.source.worker_id),
+            "GET",
+            &show_path,
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{released}");
+    assert_eq!(released["worker_assignment"], receipt);
+    assert_eq!(released["thread"], json!([]));
     let (status, replay) = response(&f.api, send(&release)).await;
     assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(receipt, replay);
@@ -165,23 +189,57 @@ async fn mr_worker_http_assignment_requires_permission_and_preserves_cas_history
         matches!(status, StatusCode::CONFLICT | StatusCode::FORBIDDEN),
         "{status}: {stale_reply}"
     );
-    let publications_path = format!(
-        "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/publications",
-        mr.merge_request_id
-    );
-    let (status, publications) = response(
+    let (status, shown) = response(
         &f.api,
         runtime_source_request(
             &f.identity,
             Some(&f.source.worker_id),
             "GET",
-            &publications_path,
+            &show_path,
             vec![],
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{publications}");
-    assert_eq!(publications["publications"], json!([]));
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_eq!(shown["publications"], json!([]));
+    assert_eq!(shown["worker_assignment"], restored);
+    // Dedicated reads and publication dispatch no longer exist. PUT /worker remains.
+    for (method, removed_path) in [
+        ("GET", path.clone()),
+        (
+            "GET",
+            format!(
+                "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/publications",
+                mr.merge_request_id
+            ),
+        ),
+        (
+            "POST",
+            format!(
+                "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/publications",
+                mr.merge_request_id
+            ),
+        ),
+    ] {
+        let (status, body) = response(
+            &f.api,
+            runtime_source_request(
+                &f.identity,
+                Some(&f.source.worker_id),
+                method,
+                &removed_path,
+                vec![],
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{method} {removed_path}: {status} {body}"
+        );
+    }
     let observed = store
         .get_by_id(TEST_WORKSPACE_ID, &mr.merge_request_id)
         .unwrap();
