@@ -773,7 +773,8 @@ impl Tool for SubWorkerSpawnTool {
                 "register Internal Worker session: {error}"
             )));
         }
-        if let Err(error) = session.send(input.task).await {
+        let task = reviewer_initial_task(input.task, input.review.as_ref());
+        if let Err(error) = session.send(task).await {
             let _ = session.stop().await;
             let _ = self.registry.remove_internal(&input.name).await;
             return Err(ToolError::ExecutionFailed(format!(
@@ -787,6 +788,19 @@ impl Tool for SubWorkerSpawnTool {
 
             attachments: Vec::new(),
         })
+    }
+}
+
+// The capability is held only by the trusted client. Its public target identifiers
+// must also reach the model: the caller's prose is not guaranteed to repeat them.
+fn reviewer_initial_task(task: String, review: Option<&ReviewerHandoffInput>) -> String {
+    match review {
+        None => task,
+        Some(review) => format!(
+            "Review request references (identifiers only, not a grant or verdict): {}\nRead this exact Ticket and MR before judging. Do not guess display IDs or infer requirements from Git alone.\n\n{}",
+            serde_json::json!({"ticket_id":review.ticket_id,"merge_request_id":review.merge_request_id}),
+            task
+        ),
     }
 }
 
@@ -1188,6 +1202,24 @@ mod tests {
     mod environment;
 
     use super::*;
+
+    #[test]
+    fn reviewer_initial_input_includes_exact_public_targets_without_capability_material() {
+        let review = ReviewerHandoffInput {
+            ticket_id: "canonical-ticket".into(),
+            merge_request_id: "canonical-mr".into(),
+        };
+        let input = reviewer_initial_task("Review the changes independently".into(), Some(&review));
+        assert!(input.contains("\"ticket_id\":\"canonical-ticket\""));
+        assert!(input.contains("\"merge_request_id\":\"canonical-mr\""));
+        assert!(input.ends_with("Review the changes independently"));
+        assert!(!input.contains("capability_token"));
+        assert!(!input.contains("subject_ref"));
+        assert_eq!(
+            reviewer_initial_task("ordinary task".into(), None),
+            "ordinary task"
+        );
+    }
     use manifest::{DelegationScope, Permission, Scope, SharedScope};
     use std::pin::Pin;
     use std::sync::Mutex;
