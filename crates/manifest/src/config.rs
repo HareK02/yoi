@@ -244,6 +244,8 @@ pub struct WorkerFeatureConfigPartial {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub direct_spawn: Option<bool>,
+    #[serde(default)]
+    pub self_read: Option<bool>,
 }
 
 impl WorkerFeatureConfigPartial {
@@ -251,6 +253,7 @@ impl WorkerFeatureConfigPartial {
         Self {
             enabled: other.enabled.or(self.enabled),
             direct_spawn: other.direct_spawn.or(self.direct_spawn),
+            self_read: other.self_read.or(self.self_read),
         }
     }
 }
@@ -260,6 +263,7 @@ impl From<WorkerFeatureConfigPartial> for WorkerFeatureConfig {
         Self {
             enabled: value.enabled.unwrap_or(false),
             direct_spawn: value.direct_spawn.unwrap_or(true),
+            self_read: value.self_read.unwrap_or(true),
         }
     }
 }
@@ -537,6 +541,7 @@ impl From<WorkerFeatureConfig> for WorkerFeatureConfigPartial {
         Self {
             enabled: Some(value.enabled),
             direct_spawn: Some(value.direct_spawn),
+            self_read: Some(value.self_read),
         }
     }
 }
@@ -2178,6 +2183,25 @@ unknown_future_field = "tolerated"
 "#;
         let cfg = WorkerManifestConfig::from_toml(ok).unwrap();
         assert_eq!(cfg.engine.max_tokens, Some(1000));
+    }
+
+    #[test]
+    fn worker_self_read_configuration_preserves_explicit_disable_across_layers() {
+        let base =
+            WorkerManifestConfig::from_toml("[feature.worker]\nenabled = true\nself_read = false")
+                .unwrap();
+        let upper =
+            WorkerManifestConfig::from_toml("[feature.worker]\ndirect_spawn = false").unwrap();
+        let resolved = WorkerFeatureConfig::from(base.merge(upper).feature.worker.unwrap());
+        assert!(resolved.enabled);
+        assert!(!resolved.self_read);
+        assert!(!resolved.direct_spawn);
+        let defaulted = WorkerFeatureConfig::from(WorkerFeatureConfigPartial::default());
+        assert!(defaulted.self_read);
+        assert!(!defaulted.enabled);
+        let roundtrip = WorkerFeatureConfig::from(WorkerFeatureConfigPartial::from(resolved));
+        assert_eq!(roundtrip, resolved);
+        assert!(WorkerManifestConfig::from_toml("[feature.worker]\nself_read = \"yes\"").is_err());
     }
 
     #[test]

@@ -108,9 +108,9 @@ fn assign_and_submit(
         .unwrap()
         .iter()
         .filter(|item| {
-            item["subject"]["kind"] == "runtime_worker"
-                && item["subject"]["runtime_id"] == spawned["runtime_id"]
-                && item["subject"]["worker_id"] == spawned["worker_id"]
+            item["target"]["kind"] == "runtime_worker"
+                && item["target"]["runtime_id"] == spawned["runtime_id"]
+                && item["target"]["worker_id"] == spawned["worker_id"]
         })
         .collect();
     assert_eq!(
@@ -158,7 +158,7 @@ fn assign_and_submit(
             &submit_id,
             "WorkerSendInput",
             json!({
-            "subject":worker["subject"],"content":"Implement the confirmed Ticket assignment",
+            "target":worker["target"],"content":"Implement the confirmed Ticket assignment",
             "segments":segments}),
         ));
     };
@@ -382,7 +382,7 @@ impl MrModel {
                 "mr-body-evidence-search",
                 "SearchSessionEntries",
                 json!({
-                "subject":child,"query":"exit_code","tool_part":"output","limit":4}),
+                "target":child,"query":"exit_code","tool_part":"output","limit":4}),
             );
         };
         let entries = evidence["entries"].as_array().unwrap();
@@ -397,7 +397,7 @@ impl MrModel {
                 "mr-body-evidence-read",
                 "ReadSessionEntry",
                 json!({
-                "subject":child,"entry_ref":entries[0]["entry_ref"],"mode":"full"}),
+                "target":child,"entry_ref":entries[0]["entry_ref"],"mode":"full"}),
             );
         };
         assert_eq!(inspected["truncated"], false);
@@ -1006,13 +1006,13 @@ impl FullModel {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|item| item["subject"]["kind"] == "sub_worker")
+                .find(|item| item["target"]["kind"] == "sub_worker")
                 .unwrap();
             return call(
                 request,
                 "full-coder-reviewer-stop",
                 "WorkerStop",
-                json!({"subject":child["subject"],"reason":"Exact-source formal verdict and committed child evidence inspected"}),
+                json!({"target":child["target"],"reason":"Exact-source formal verdict and committed child evidence inspected"}),
             );
         }
         if let Some(found) = success(request, "full-coder-review-search") {
@@ -1026,14 +1026,14 @@ impl FullModel {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|item| item["subject"]["kind"] == "sub_worker")
+                .find(|item| item["target"]["kind"] == "sub_worker")
                 .unwrap();
             let formal = entries.last().unwrap();
             return call(
                 request,
                 "full-coder-review-read",
                 "ReadSessionEntry",
-                json!({"subject":child["subject"],"entry_ref":formal["entry_ref"],"mode":"full"}),
+                json!({"target":child["target"],"entry_ref":formal["entry_ref"],"mode":"full"}),
             );
         }
         if let Some(list) = success(request, "full-coder-reviewer-list") {
@@ -1041,17 +1041,17 @@ impl FullModel {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|item| item["subject"]["kind"] == "sub_worker")
+                .filter(|item| item["target"]["kind"] == "sub_worker")
                 .collect();
             assert_eq!(children.len(), 1, "one independent direct child");
             assert_eq!(children[0]["relation"], "direct_child");
-            assert_eq!(children[0]["subject"]["name"], REVIEWER_NAME);
+            assert_eq!(children[0]["target"]["name"], REVIEWER_NAME);
             return call(
                 request,
                 "full-coder-review-search",
                 "SearchSessionEntries",
                 json!({
-                "subject":children[0]["subject"],"query":"Scripted independent Reviewer inspected","tool_part":"output","limit":4}),
+                "target":children[0]["target"],"query":"Scripted independent Reviewer inspected","tool_part":"output","limit":4}),
             );
         }
         if let Some(mr) = success(request, "full-coder-verdict") {

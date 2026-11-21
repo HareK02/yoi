@@ -5867,6 +5867,32 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.usage_history.clone()
     }
 
+    /// Bind self-observation to this Worker's live Session location. The narrow
+    /// reader follows compaction without exposing a Store or caller-selected IDs.
+    pub(crate) fn self_session_reader(
+        &self,
+    ) -> crate::feature::builtin::worker_observation::self_session::SelfSessionReader
+    where
+        St: Clone + Send + Sync + 'static,
+    {
+        let store = self.store.clone();
+        let state = Arc::clone(&self.segment_state);
+        crate::feature::builtin::worker_observation::self_session::SelfSessionReader::new(
+            move || {
+                let _guard = state
+                    .append_lock
+                    .lock()
+                    .map_err(|_| "Session append lock unavailable".to_string())?;
+                let location = state.location();
+                crate::feature::builtin::worker_observation::self_session::capture(
+                    &store,
+                    location.session_id,
+                    location.segment_id,
+                )
+            },
+        )
+    }
+
     /// Narrow read-only handle used by lifecycle Features after terminal run
     /// persistence. The capture is rebuilt from the committed log under the
     /// same append fence used by log writers.

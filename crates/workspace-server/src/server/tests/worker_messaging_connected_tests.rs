@@ -119,7 +119,7 @@ impl agen::llm_client::LlmClient for MessagingModel {
                     call(
                         "stopped-notify",
                         "WorkerNotify",
-                        json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":"MUST_NOT_REVIVE_STOPPED_CHILD"}),
+                        json!({"target":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":"MUST_NOT_REVIVE_STOPPED_CHILD"}),
                     )
                 }
             } else if messages.contains(REPLY) {
@@ -127,7 +127,7 @@ impl agen::llm_client::LlmClient for MessagingModel {
                 call(
                     "roundtrip-stop",
                     "WorkerStop",
-                    json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"reason":"connected roundtrip completed"}),
+                    json!({"target":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"reason":"connected roundtrip completed"}),
                 )
             } else if result(&request, "roundtrip-ping").is_some() {
                 // Hold this model boundary while the real child replies to a Busy
@@ -145,7 +145,7 @@ impl agen::llm_client::LlmClient for MessagingModel {
                     call(
                         "roundtrip-ping",
                         "WorkerNotify",
-                        json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":PING}),
+                        json!({"target":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":PING}),
                     )
                 } else {
                     // The origin has observe, not worker.list. A known target must
@@ -153,7 +153,7 @@ impl agen::llm_client::LlmClient for MessagingModel {
                     call(
                         "roundtrip-observe",
                         "ViewSessionOverview",
-                        json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]}}),
+                        json!({"target":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]}}),
                     )
                 }
             } else {
@@ -247,7 +247,7 @@ impl agen::llm_client::LlmClient for MessagingModel {
                     call(
                         "early-denied-notify",
                         "WorkerNotify",
-                        json!({"subject":{"kind":"runtime_worker","runtime_id":origin.runtime_id,"worker_id":origin.worker_id},"content":"MUST_NOT_ACCEPT_EARLY_REPLY"}),
+                        json!({"target":{"kind":"runtime_worker","runtime_id":origin.runtime_id,"worker_id":origin.worker_id},"content":"MUST_NOT_ACCEPT_EARLY_REPLY"}),
                     )
                 }
             } else {
@@ -278,7 +278,7 @@ impl agen::llm_client::LlmClient for MessagingModel {
                 call(
                     "roundtrip-reply",
                     "WorkerNotify",
-                    json!({"subject":origins[0]["subject"],"content":REPLY}),
+                    json!({"target":origins[0]["target"],"content":REPLY}),
                 )
             } else {
                 call("roundtrip-origin-list", "WorkerList", json!({}))

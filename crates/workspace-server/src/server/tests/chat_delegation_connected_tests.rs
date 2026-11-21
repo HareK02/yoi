@@ -176,9 +176,9 @@ impl DelegationModel {
             .unwrap()
             .iter()
             .filter(|worker| {
-                worker["subject"]["kind"] == "runtime_worker"
-                    && worker["subject"]["runtime_id"] == spawned["runtime_id"]
-                    && worker["subject"]["worker_id"] == spawned["worker_id"]
+                worker["target"]["kind"] == "runtime_worker"
+                    && worker["target"]["runtime_id"] == spawned["runtime_id"]
+                    && worker["target"]["worker_id"] == spawned["worker_id"]
             })
             .collect::<Vec<_>>();
         assert_eq!(workers.len(), 1, "claim the same created Worker: {listed}");
@@ -204,8 +204,8 @@ impl DelegationModel {
             json!({"alias":connection["alias"],"working_directory_id":connection["working_directory_id"],
                 "connection_id":connection["connection_id"]})
         }).collect::<Vec<_>>();
-        json!({"ticket":c.ticket,"runtime_id":worker["subject"]["runtime_id"],
-            "worker_id":worker["subject"]["worker_id"],"orchestrator_assignment_id":assignment["assignment_id"],
+        json!({"ticket":c.ticket,"runtime_id":worker["target"]["runtime_id"],
+            "worker_id":worker["target"]["worker_id"],"orchestrator_assignment_id":assignment["assignment_id"],
             "operation_id":operation,"workdir_bindings":bindings})
     }
     fn send(
@@ -318,7 +318,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                         assert_eq!(
                             claimed["assignment"]["principal"],
                             json!({"kind":"worker",
-                            "runtime_id":worker["subject"]["runtime_id"],"worker_id":worker["subject"]["worker_id"]})
+                            "runtime_id":worker["target"]["runtime_id"],"worker_id":worker["target"]["worker_id"]})
                         );
                         if output(&request, "ticket-submit").is_none() {
                             assert_eq!(
@@ -329,7 +329,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                             Some(call(
                                 "ticket-submit",
                                 "WorkerSendInput",
-                                json!({"subject":worker["subject"],
+                                json!({"target":worker["target"],
                                 "content":self.work_input(&value(&request, "origin-read"))}),
                             ))
                         } else {
@@ -498,7 +498,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     call(
                         "report",
                         "WorkerNotify",
-                        json!({"subject":origins[0]["subject"],"content":report}),
+                        json!({"target":origins[0]["target"],"content":report}),
                     )
                 }
                 3 | 4 => {
@@ -633,7 +633,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     call(
                         "revoked-notify",
                         "WorkerNotify",
-                        json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":"MUST_NOT_REACH_REVOKED_CHILD"}),
+                        json!({"target":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":"MUST_NOT_REACH_REVOKED_CHILD"}),
                     )
                 }
                 12 => {

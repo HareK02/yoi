@@ -230,7 +230,7 @@ async fn consumers_install_and_execute_with_contract_only_test_provider() {
         .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
     assert!(!report.has_errors(), "{report:?}");
     let overview = tool(&tools, "ViewSessionOverview");
-    let granted = r#"{"subject":{"kind":"sub_worker","name":"child"}}"#;
+    let granted = r#"{"target":{"kind":"sub_worker","name":"child"}}"#;
     overview
         .execute(granted, ToolExecutionContext::direct())
         .await
@@ -239,7 +239,7 @@ async fn consumers_install_and_execute_with_contract_only_test_provider() {
     services.revoked.store(true, Ordering::SeqCst);
     for denied in [
         granted,
-        r#"{"subject":{"kind":"sub_worker","name":"non-child"}}"#,
+        r#"{"target":{"kind":"sub_worker","name":"non-child"}}"#,
     ] {
         let error = overview
             .execute(denied, ToolExecutionContext::direct())

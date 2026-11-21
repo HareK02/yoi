@@ -5272,7 +5272,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
             "assign":{"ticket":case.ticket, "runtime_id":child.runtime_id, "worker_id":child.worker_id,
                 "orchestrator_assignment_id":case.delegation, "operation_id":format!("{}-existing-worker",case.subject),
                 "workdir_bindings":bindings},
-            "send":{"subject":{"kind":"runtime_worker", "runtime_id":child.runtime_id,"worker_id":child.worker_id},
+            "send":{"target":{"kind":"runtime_worker", "runtime_id":child.runtime_id,"worker_id":child.worker_id},
                 "content":content,"segments":[{"kind":"text","content":content}]},
         });
         let (status, accepted) = f

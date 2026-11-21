@@ -1,4 +1,7 @@
-//! Feature reading committed Sessions of Host-authorized Workers.
+//! Read local self history or committed Sessions of Host-authorized Workers.
+//!
+//! Self capture is a narrow Host-bound reader, not a Worker-control grant or a
+//! Workspace fallback. Remote captures retain their operation and target checks.
 //!
 //! The Host injects [`WorkerObservationProvider`]; model input never constructs grants, URLs,
 //! session handles, or provider clients. List returns only currently authorized subjects, and every
@@ -12,6 +15,9 @@
 //! they prompt inspection rather than substitute for reading the committed Session.
 
 use std::sync::Arc;
+
+pub(crate) mod self_session;
+use self_session::SelfSessionReader;
 
 #[cfg(test)]
 use agen::Item;
@@ -207,24 +213,39 @@ impl WorkerObservationProvider for ControlAuthorizedObservationProvider {
 
 pub struct WorkerObservationFeature {
     provider: Arc<dyn WorkerObservationProvider>,
+    self_reader: Option<SelfSessionReader>,
+    remote_enabled: bool,
 }
 
 impl WorkerObservationFeature {
     pub fn new(provider: Arc<dyn WorkerObservationProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            self_reader: None,
+            remote_enabled: true,
+        }
+    }
+
+    pub(crate) fn local(reader: SelfSessionReader) -> Self {
+        Self {
+            provider: Arc::new(CompositeWorkerObservationProvider::new(Vec::new())),
+            self_reader: Some(reader),
+            remote_enabled: false,
+        }
+    }
+
+    pub(crate) fn with_self_reader(mut self, reader: SelfSessionReader) -> Self {
+        self.self_reader = Some(reader);
+        self
     }
 }
 
 impl FeatureModule for WorkerObservationFeature {
     fn descriptor(&self) -> FeatureDescriptor {
-        FeatureDescriptor::builtin("worker-observation", "Worker Observation")
+        let descriptor = FeatureDescriptor::builtin("worker-observation", "Worker Observation")
             .with_description(
                 "Read-only exploration of explicitly granted active Worker sessions.",
             )
-            .with_service_requirement(ServiceRequirement::required(
-                ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                "Worker observation extends the known-Worker control authority",
-            ).with_version(ServiceVersionReq::exact(WORKER_CONTROL_SERVICE_VERSION)))
             .with_instruction(observation_instruction())
             .with_tool(ToolDeclaration::new(
                 "ViewSessionOverview",
@@ -237,7 +258,18 @@ impl FeatureModule for WorkerObservationFeature {
             .with_tool(ToolDeclaration::new(
                 "ReadSessionEntry",
                 "Read one committed entry from one granted Worker session by SessionEntryRef.",
-            ))
+            ));
+        if self.remote_enabled {
+            descriptor.with_service_requirement(
+                ServiceRequirement::required(
+                    ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
+                    "Remote observation requires Worker control authority",
+                )
+                .with_version(ServiceVersionReq::exact(WORKER_CONTROL_SERVICE_VERSION)),
+            )
+        } else {
+            descriptor
+        }
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
@@ -246,25 +278,31 @@ impl FeatureModule for WorkerObservationFeature {
             .register(FeatureInstructionContribution::new(
                 observation_instruction(),
             ))?;
-        let control = context
-            .services()
-            .require::<dyn WorkerControlService>(&ServiceId::builtin(WORKER_CONTROL_SERVICE_ID))?;
-        let provider: Arc<dyn WorkerObservationProvider> =
+        let provider: Arc<dyn WorkerObservationProvider> = if self.remote_enabled {
+            let control =
+                context
+                    .services()
+                    .require::<dyn WorkerControlService>(&ServiceId::builtin(
+                        WORKER_CONTROL_SERVICE_ID,
+                    ))?;
             Arc::new(ControlAuthorizedObservationProvider {
                 control,
                 inner: self.provider.clone(),
-            });
+            })
+        } else {
+            self.provider.clone()
+        };
         context.tools().register(ToolContribution::new(
             "ViewSessionOverview",
-            overview_definition(provider.clone()),
+            overview_definition(provider.clone(), self.self_reader.clone()),
         ))?;
         context.tools().register(ToolContribution::new(
             "SearchSessionEntries",
-            search_definition(provider.clone()),
+            search_definition(provider.clone(), self.self_reader.clone()),
         ))?;
         context.tools().register(ToolContribution::new(
             "ReadSessionEntry",
-            read_definition(provider),
+            read_definition(provider, self.self_reader.clone()),
         ))?;
         Ok(())
     }
@@ -380,52 +418,79 @@ impl WorkerObservationProvider for SpawnedSubWorkerObservationProvider {
     }
 }
 
-fn overview_definition(provider: Arc<dyn WorkerObservationProvider>) -> ToolDefinition {
+fn overview_definition(
+    provider: Arc<dyn WorkerObservationProvider>,
+    self_reader: Option<SelfSessionReader>,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = serde_json::to_value(schemars::schema_for!(ViewSessionOverviewParams))
             .unwrap_or_else(|_| serde_json::json!({}));
         let meta = ToolMeta::new("ViewSessionOverview")
-            .description("Show a sparse bounded index for one granted Worker session.")
+            .description("Show a sparse bounded index of your own saved Session (target kind self, when enabled) or a granted Worker Session.")
             .input_schema(schema);
         let tool: Arc<dyn Tool> = Arc::new(ViewSessionOverviewTool {
             provider: provider.clone(),
+            self_reader: self_reader.clone(),
         });
         (meta, tool)
     })
 }
 
-fn search_definition(provider: Arc<dyn WorkerObservationProvider>) -> ToolDefinition {
+fn search_definition(
+    provider: Arc<dyn WorkerObservationProvider>,
+    self_reader: Option<SelfSessionReader>,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = serde_json::to_value(schemars::schema_for!(SearchSessionEntriesParams))
             .unwrap_or_else(|_| serde_json::json!({}));
         let meta = ToolMeta::new("SearchSessionEntries")
-            .description("Search or list a bounded range in one granted Worker session.")
+            .description("Search saved history in your own Session (target kind self, when enabled) or a granted Worker Session.")
             .input_schema(schema);
         let tool: Arc<dyn Tool> = Arc::new(SearchSessionEntriesTool {
             provider: provider.clone(),
+            self_reader: self_reader.clone(),
         });
         (meta, tool)
     })
 }
 
-fn read_definition(provider: Arc<dyn WorkerObservationProvider>) -> ToolDefinition {
+fn read_definition(
+    provider: Arc<dyn WorkerObservationProvider>,
+    self_reader: Option<SelfSessionReader>,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = serde_json::to_value(schemars::schema_for!(ReadSessionEntryParams))
             .unwrap_or_else(|_| serde_json::json!({}));
         let meta = ToolMeta::new("ReadSessionEntry")
-            .description("Read one entry by SessionEntryRef from one granted Worker session.")
+            .description("Read one saved entry by SessionEntryRef from your own Session (target kind self, when enabled) or a granted Worker Session.")
             .input_schema(schema);
         let tool: Arc<dyn Tool> = Arc::new(ReadSessionEntryTool {
             provider: provider.clone(),
+            self_reader: self_reader.clone(),
         });
         (meta, tool)
     })
+}
+
+// Self is a local read target only, never a Worker-control or Workspace target.
+#[derive(Debug, serde::Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SessionReadTarget {
+    #[serde(rename = "self")]
+    CurrentSession {},
+    RuntimeWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
+    SubWorker {
+        name: String,
+    },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ViewSessionOverviewParams {
-    subject: WorkerObservationSubjectRef,
+    target: SessionReadTarget,
     #[serde(default)]
     offset: usize,
     #[serde(default)]
@@ -435,7 +500,7 @@ struct ViewSessionOverviewParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchSessionEntriesParams {
-    subject: WorkerObservationSubjectRef,
+    target: SessionReadTarget,
     #[serde(default)]
     query: String,
     #[serde(default)]
@@ -457,7 +522,7 @@ struct SearchSessionEntriesParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadSessionEntryParams {
-    subject: WorkerObservationSubjectRef,
+    target: SessionReadTarget,
     entry_ref: String,
     #[serde(default = "default_read_mode")]
     mode: String,
@@ -469,6 +534,7 @@ fn default_read_mode() -> String {
 
 struct ViewSessionOverviewTool {
     provider: Arc<dyn WorkerObservationProvider>,
+    self_reader: Option<SelfSessionReader>,
 }
 
 #[async_trait]
@@ -479,7 +545,7 @@ impl Tool for ViewSessionOverviewTool {
         _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ViewSessionOverviewParams = parse_input("ViewSessionOverview", input_json)?;
-        let view = latest_view(&*self.provider, &params.subject).await?;
+        let view = latest_view(&*self.provider, self.self_reader.as_ref(), &params.target).await?;
         let limit = bounded_limit(params.limit);
         let entries = view
             .overview()
@@ -505,7 +571,7 @@ impl Tool for ViewSessionOverviewTool {
                 entries.len()
             ),
             serde_json::json!({
-                "subject": params.subject,
+                "target": params.target,
                 "entries": entries,
                 "next_offset": has_more.then_some(params.offset + entries.len()),
             }),
@@ -515,6 +581,7 @@ impl Tool for ViewSessionOverviewTool {
 
 struct SearchSessionEntriesTool {
     provider: Arc<dyn WorkerObservationProvider>,
+    self_reader: Option<SelfSessionReader>,
 }
 
 #[async_trait]
@@ -525,7 +592,7 @@ impl Tool for SearchSessionEntriesTool {
         _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: SearchSessionEntriesParams = parse_input("SearchSessionEntries", input_json)?;
-        let view = latest_view(&*self.provider, &params.subject).await?;
+        let view = latest_view(&*self.provider, self.self_reader.as_ref(), &params.target).await?;
         let from = params.from.as_deref().map(parse_entry_ref).transpose()?;
         let through = params.through.as_deref().map(parse_entry_ref).transpose()?;
         let entries = view
@@ -562,13 +629,14 @@ impl Tool for SearchSessionEntriesTool {
             .collect::<Vec<_>>();
         json_output(
             format!("Found {} Worker session entrie(s).", entries.len()),
-            serde_json::json!({ "subject": params.subject, "entries": entries }),
+            serde_json::json!({ "target": params.target, "entries": entries }),
         )
     }
 }
 
 struct ReadSessionEntryTool {
     provider: Arc<dyn WorkerObservationProvider>,
+    self_reader: Option<SelfSessionReader>,
 }
 
 #[async_trait]
@@ -589,7 +657,7 @@ impl Tool for ReadSessionEntryTool {
                 )));
             }
         };
-        let view = latest_view(&*self.provider, &params.subject).await?;
+        let view = latest_view(&*self.provider, self.self_reader.as_ref(), &params.target).await?;
         let read = view.read(
             ReadSelector::Id(entry_ref.as_str()),
             ReadOptions {
@@ -624,7 +692,7 @@ impl Tool for ReadSessionEntryTool {
         json_output(
             format!("Read {} Worker session entry.", entries.len()),
             serde_json::json!({
-                "subject": params.subject,
+                "target": params.target,
                 "entries": entries,
                 "truncated": read.truncated,
             }),
@@ -634,10 +702,31 @@ impl Tool for ReadSessionEntryTool {
 
 async fn latest_view(
     provider: &dyn WorkerObservationProvider,
-    subject: &WorkerObservationSubjectRef,
+    self_reader: Option<&SelfSessionReader>,
+    target: &SessionReadTarget,
 ) -> Result<SessionCapture, ToolError> {
+    let remote = match target {
+        SessionReadTarget::CurrentSession {} => {
+            return self_reader
+                .ok_or_else(|| {
+                    ToolError::ExecutionFailed("Self Session reading is disabled".into())
+                })?
+                .capture()
+                .map_err(ToolError::ExecutionFailed);
+        }
+        SessionReadTarget::RuntimeWorker {
+            runtime_id,
+            worker_id,
+        } => WorkerObservationSubjectRef::RuntimeWorker {
+            runtime_id: runtime_id.clone(),
+            worker_id: worker_id.clone(),
+        },
+        SessionReadTarget::SubWorker { name } => {
+            WorkerObservationSubjectRef::SubWorker { name: name.clone() }
+        }
+    };
     let capture = provider
-        .capture_worker_session(subject)
+        .capture_worker_session(&remote)
         .await
         .map_err(tool_error)?;
     // Observation providers expose a stable subject scope rather than a raw
@@ -823,10 +912,10 @@ mod tests {
         let provider = Arc::new(FakeProvider {
             captures: Mutex::new(vec![message("u1", Role::User, "first")]),
         });
-        let read = read_definition(provider.clone())().1;
+        let read = read_definition(provider.clone(), None)().1;
         let hidden = read
             .execute(
-                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"unauthorized"},"entry_ref":"Efake-00000000"}"#,
+                r#"{"target":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"unauthorized"},"entry_ref":"Efake-00000000"}"#,
                 agen::tool::ToolExecutionContext::direct(),
             )
             .await
@@ -840,7 +929,7 @@ mod tests {
             .push(message("a1", Role::Assistant, "second"));
         let output = read
             .execute(
-                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"Efake-00000000"}"#,
+                r#"{"target":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"Efake-00000000"}"#,
                 agen::tool::ToolExecutionContext::direct(),
             )
             .await
@@ -849,7 +938,7 @@ mod tests {
 
         let output = read
             .execute(
-                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"Efake-00000001"}"#,
+                r#"{"target":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"Efake-00000001"}"#,
                 agen::tool::ToolExecutionContext::direct(),
             )
             .await

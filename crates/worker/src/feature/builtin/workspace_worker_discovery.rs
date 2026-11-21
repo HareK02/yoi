@@ -1,7 +1,7 @@
 //! Privileged, read-only discovery of Workspace-visible Workers.
 //!
 //! This feature deliberately stays separate from the canonical `WorkerList`
-//! control-grant surface. Discovery results carry the typed subject needed by a
+//! control-grant surface. Discovery results carry the typed target needed by a
 //! later control operation, but discovery itself grants no control authority.
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 100;
 const INSTRUCTION_ID: &str = "workspace-worker-discovery.policy";
 const PROMPT_REF: &str = "common.workspace_worker_discovery";
-const DESCRIPTION: &str = "List or directly find Workspace-visible Workers through Backend authority. Results include each W-key and the typed runtime_worker subject needed by later Worker control calls, but do not grant control authority.";
+const DESCRIPTION: &str = "List or directly find Workspace-visible Workers through Backend authority. Results include each W-key and the typed runtime_worker target needed by later Worker control calls, but do not grant control authority.";
 
 fn instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
@@ -141,9 +141,19 @@ impl Tool for ListWorkspaceWorkersTool {
             })
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         let count = page.workers.len();
+        let mut output = serde_json::to_value(&page)
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        for worker in output["workers"]
+            .as_array_mut()
+            .expect("typed discovery page")
+        {
+            let item = worker.as_object_mut().expect("typed discovery item");
+            let target = item.remove("subject").expect("typed discovery target");
+            item.insert("target".into(), target);
+        }
         Ok(ToolOutput {
             summary: format!("Listed {count} Workspace Worker(s)"),
-            content: Some(serde_json::to_string_pretty(&page).map_err(|error| {
+            content: Some(serde_json::to_string_pretty(&output).map_err(|error| {
                 ToolError::ExecutionFailed(format!(
                     "encode Workspace Worker discovery result: {error}"
                 ))
@@ -263,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_preserves_typed_subject_and_forwards_lookup() {
+    async fn tool_preserves_typed_target_and_forwards_lookup() {
         let client = Arc::new(RecordingClient {
             requests: Mutex::new(Vec::new()),
             authorizations: Mutex::default(),
@@ -284,8 +294,8 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
         assert_eq!(value["workers"][0]["resource_key"], "W-12");
-        assert_eq!(value["workers"][0]["subject"]["kind"], "runtime_worker");
-        assert_eq!(value["workers"][0]["subject"]["runtime_id"], "arcadia");
+        assert_eq!(value["workers"][0]["target"]["kind"], "runtime_worker");
+        assert_eq!(value["workers"][0]["target"]["runtime_id"], "arcadia");
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].query.as_deref(), Some("W-12"));

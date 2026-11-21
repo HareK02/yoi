@@ -105,9 +105,9 @@ fn assign_and_submit(
         .unwrap()
         .iter()
         .filter(|item| {
-            item["subject"]["kind"] == "runtime_worker"
-                && item["subject"]["runtime_id"] == spawned["runtime_id"]
-                && item["subject"]["worker_id"] == spawned["worker_id"]
+            item["target"]["kind"] == "runtime_worker"
+                && item["target"]["runtime_id"] == spawned["runtime_id"]
+                && item["target"]["worker_id"] == spawned["worker_id"]
         })
         .collect();
     assert_eq!(
@@ -155,7 +155,7 @@ fn assign_and_submit(
             &submit_id,
             "WorkerSendInput",
             json!({
-            "subject":worker["subject"],"content":"Implement the confirmed Ticket assignment",
+            "target":worker["target"],"content":"Implement the confirmed Ticket assignment",
             "segments":segments}),
         ));
     };
@@ -288,7 +288,7 @@ impl NormalModel {
                     request,
                     "normal-evidence-search",
                     "SearchSessionEntries",
-                    json!({"subject":subject,"query":"ordinary Subject edit","tool_part":"output","limit":4}),
+                    json!({"target":subject,"query":"ordinary Subject edit","tool_part":"output","limit":4}),
                 );
             };
             let entries = evidence["entries"].as_array().unwrap();
@@ -298,7 +298,7 @@ impl NormalModel {
                     request,
                     "normal-evidence-read",
                     "ReadSessionEntry",
-                    json!({"subject":subject,"entry_ref":entries[0]["entry_ref"],"mode":"full"}),
+                    json!({"target":subject,"entry_ref":entries[0]["entry_ref"],"mode":"full"}),
                 );
             };
             assert_eq!(inspected["truncated"], false);

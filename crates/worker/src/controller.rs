@@ -1582,6 +1582,8 @@ where
     }
 
     let worker_enabled = feature_config.worker.enabled;
+    let runtime_worker_enabled =
+        worker_enabled && worker.workspace_client_handle().workspace_id().is_some();
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let journal_grant = backend_job
         .as_ref()
@@ -1801,7 +1803,7 @@ where
     {
         feature_registry.add_module(subjektiv_lifecycle);
     }
-    if sub_worker_enabled && !worker_enabled {
+    if sub_worker_enabled && !runtime_worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
                 worker.workspace_client_handle(),
@@ -1930,7 +1932,7 @@ where
             ),
         );
     }
-    if feature_config.worker.enabled {
+    if worker_enabled && (runtime_worker_enabled || !feature_config.worker.self_read) {
         let workspace_client = worker.workspace_client_handle();
         let has_workspace_identity = workspace_client.workspace_id().is_some_and(|workspace_id| {
             !workspace_id.is_empty() && !workspace_id.chars().any(char::is_control)
@@ -2135,7 +2137,7 @@ where
         // including ordinary spawn and restore. Runtime's optional local peer
         // provider is not its enablement or authority: every actual capture still
         // requires current operation use and the target's Backend control grant.
-        if worker_enabled {
+        if runtime_worker_enabled {
             observation_providers.push(Arc::new(
                 crate::feature::builtin::worker_observation::WorkspaceClientWorkerObservationProvider::new(workspace_client),
             ));
@@ -2143,16 +2145,21 @@ where
         if let Some(provider) = host_worker_observation_provider {
             observation_providers.push(provider);
         }
-        if !observation_providers.is_empty() {
-            feature_registry = feature_registry.with_module(
+        let self_read = worker_enabled && feature_config.worker.self_read;
+        if !observation_providers.is_empty() || self_read {
+            let mut observation = if observation_providers.is_empty() {
+                crate::feature::builtin::worker_observation::WorkerObservationFeature::local(
+                    worker.self_session_reader(),
+                )
+            } else {
                 crate::feature::builtin::worker_observation::WorkerObservationFeature::new(
-                    Arc::new(
-                        crate::feature::builtin::worker_observation::CompositeWorkerObservationProvider::new(
-                            observation_providers,
-                        ),
-                    ),
-                ),
-            );
+                    Arc::new(crate::feature::builtin::worker_observation::CompositeWorkerObservationProvider::new(observation_providers)),
+                )
+            };
+            if self_read {
+                observation = observation.with_self_reader(worker.self_session_reader());
+            }
+            feature_registry = feature_registry.with_module(observation);
         }
     }
     let feature_install_report =
@@ -4457,6 +4464,7 @@ mod tests {
             }
         }
 
+        include!("controller/self_session_tests.rs");
         include!("controller/native_record_tests.rs");
         include!("controller/internal_notification_tests.rs");
 

@@ -278,6 +278,9 @@ pub struct WorkerFeatureConfig {
     /// available to dependent semantic features when this is false.
     #[serde(default = "default_true")]
     pub direct_spawn: bool,
+    /// Read this Worker's own committed Session locally, without Workspace access.
+    #[serde(default = "default_true")]
+    pub self_read: bool,
 }
 
 impl WorkerFeatureConfig {
@@ -285,6 +288,7 @@ impl WorkerFeatureConfig {
         Self {
             enabled: false,
             direct_spawn: true,
+            self_read: true,
         }
     }
 
@@ -292,6 +296,7 @@ impl WorkerFeatureConfig {
         Self {
             enabled: true,
             direct_spawn: true,
+            self_read: true,
         }
     }
 }
