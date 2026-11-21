@@ -942,6 +942,14 @@ mod tests {
             Ok(())
         }).unwrap();
         assert!(store.complete_removal_original_pin_cleanup(&retry).is_err());
+        // The injected trigger is not a published physical schema object. Remove
+        // the fault before normal reopen validation, without settling cleanup.
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_pin_cleanup;")?;
+                Ok(())
+            })
+            .unwrap();
         drop(store);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert_eq!(
@@ -950,12 +958,6 @@ mod tests {
                 .unwrap(),
             [retry.clone()]
         );
-        store
-            .with_conn(|conn| {
-                conn.execute_batch("DROP TRIGGER reject_pin_cleanup;")?;
-                Ok(())
-            })
-            .unwrap();
         let completed = store.complete_removal_original_pin_cleanup(&retry).unwrap();
         assert!(
             store.complete_removal_original_pin_cleanup(&retry).is_err(),
