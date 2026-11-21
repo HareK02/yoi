@@ -1609,8 +1609,8 @@ async fn seed_unstarted_pending_head(
         "status": "stopped",
         "workspace_id": TEST_WORKSPACE_ID,
         "execution_state": {
-            "state": "available",
-            "execution": { "request": request, "restore_intent": "explicit" },
+            "state": "not_started",
+            "execution": { "request": request, "binding": null },
         },
     });
     std::fs::write(
@@ -1926,6 +1926,8 @@ async fn connected_restore_fixture_with_pending_head(
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(record["execution_state"]["state"], "not_started");
+        assert!(record["execution_state"]["execution"]["binding"].is_null());
         assert!(record["restore_guard"]["execution_termination"].is_null());
         assert!(probe.handles.lock().unwrap().is_empty());
         assert!(probe.stops.lock().unwrap().is_empty());

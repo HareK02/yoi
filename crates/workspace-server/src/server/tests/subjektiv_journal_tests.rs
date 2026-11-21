@@ -6102,6 +6102,20 @@ mod immutable {
         let frozen = serde_json::to_vec(&request.input).unwrap();
         let digest = request.input_digest().unwrap();
         subjektiv_journal::prepare(&api, &reserved).unwrap();
+        // Model a cold Backend restart, not a second catalog owner sharing a
+        // still-live fake producer. Settle that source through the real Stop
+        // boundary before making its Session unavailable; the Job stays reserved.
+        api.runtime
+            .stop_worker(
+                &source,
+                WorkerLifecycleRequest {
+                    stop_intent: None,
+                    reason: Some("settle source before saved-input cold reopen".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(api.runtime.worker(&source).unwrap().state, "stopped");
         let generation = store
             .active_journal_generation(&host, &id)
             .unwrap()
