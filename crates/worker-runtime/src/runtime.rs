@@ -2410,9 +2410,13 @@ impl Runtime {
                 }
                 // Replay is historical: it must not attach a controller after a later stop.
                 if let Some(receipt) = &owner.receipt {
+                    // A terminal receipt alone cannot restore missing specification
+                    // or binding facts. Keep that finalization owner unresolved.
                     #[cfg(feature = "fs-store")]
                     if candidate.restore_guard.active_request_id.as_deref()
                         == Some(&request.request_id)
+                        && candidate.request.is_some()
+                        && (!candidate.status().is_active() || candidate.execution_bound)
                         && matches!(&candidate.execution, WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::RestoreFinalization(finalization))
                             if finalization.operation_id == owner.operation_id && finalization.evidence == RestoreFinalizationEvidence::ReceiptStored)
                     {

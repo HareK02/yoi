@@ -1086,4 +1086,115 @@ mod lifecycle_tests {
             );
         }
     }
+    #[test]
+    fn schema17_metadata_free_terminal_replay_retains_recovery_owner_on_save_and_reopen() {
+        for status in ["idle", "stopped"] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+                .with_runtime_id("metadata-free-finalization");
+            let (runtime, backend) = stored_runtime(options.clone());
+            let worker = runtime
+                .create_worker(task_request("metadata-free history"))
+                .unwrap();
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+            let request = runtime.test_restore_request(&worker.worker_ref);
+            let receipt = runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap();
+            let worker_path = dir
+                .path()
+                .join("runtime/workers")
+                .join(worker.worker_id.to_string())
+                .join("worker.json");
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
+            fn remove_lifecycle(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        fields.remove("lifecycle");
+                        for value in fields.values_mut() {
+                            remove_lifecycle(value);
+                        }
+                    }
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            remove_lifecycle(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            remove_lifecycle(&mut document);
+            document["schema_version"] = serde_json::json!(17);
+            document["status"] = serde_json::json!(status);
+            document["execution_state"] = serde_json::json!({"state":"unavailable"});
+            document["restore_guard"]["active_request_id"] = serde_json::json!(request.request_id);
+            std::fs::write(&worker_path, serde_json::to_vec(&document).unwrap()).unwrap();
+            let manifest_path = dir.path().join("runtime/runtime.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["schema_version"] = serde_json::json!(17);
+            std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            drop(runtime);
+            drop(backend);
+
+            let resumed = Runtime::with_fs_store(options.clone()).unwrap();
+            let canonical = runtime_store(&resumed)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            let original_guard = serde_json::to_value(&canonical.restore_guard).unwrap();
+            assert!(matches!(
+                canonical.execution_state,
+                PersistedWorkerExecutionState::RestoreFinalization(
+                    PersistedWorkerRestoreFinalization {
+                        execution: None,
+                        evidence: RestoreFinalizationEvidence::ReceiptStored,
+                        ..
+                    }
+                )
+            ));
+            for _ in 0..2 {
+                assert_eq!(
+                    resumed
+                        .restore_worker_operation(&worker.worker_ref, request.clone())
+                        .unwrap(),
+                    receipt
+                );
+                assert_no_current_execution(&resumed, &worker.worker_ref);
+                let detail = resumed.worker_detail(&worker.worker_ref).unwrap();
+                assert_eq!(detail.lifecycle, WorkerLifecycleState::RecoveryRequired);
+                assert!(!detail.execution_metadata_available);
+                let store = runtime_store(&resumed);
+                let saved = store.read_worker_record(&worker.worker_ref).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&saved.restore_guard).unwrap(),
+                    original_guard
+                );
+                store.write_worker_record(&saved).unwrap();
+            }
+            drop(resumed);
+            let reopened = Runtime::with_fs_store(options).unwrap();
+            assert_eq!(
+                reopened
+                    .worker_detail(&worker.worker_ref)
+                    .unwrap()
+                    .lifecycle,
+                WorkerLifecycleState::RecoveryRequired
+            );
+            assert_eq!(
+                reopened
+                    .restore_worker_operation(&worker.worker_ref, request)
+                    .unwrap(),
+                receipt
+            );
+            assert_no_current_execution(&reopened, &worker.worker_ref);
+            let canonical = runtime_store(&reopened)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&canonical.restore_guard).unwrap(),
+                original_guard
+            );
+        }
+    }
 }
