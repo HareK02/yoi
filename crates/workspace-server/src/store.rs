@@ -14271,6 +14271,7 @@ fn read_worker_registry_projection(
                 })?
             } else {
                 SubscriptionWorker {
+                    lifecycle: None,
                     restore_observation_token: None,
                     worker_id: SubscriptionWorkerId::new(worker.worker_id.to_string())
                         .map_err(|error| Error::InvalidInput(error.to_string()))?,
@@ -28826,6 +28827,7 @@ INSERT INTO worker_registry (
 
         for record in [&runtime_a, &runtime_b] {
             let observed = SubscriptionWorker {
+                lifecycle: Some(protocol::WorkerLifecycleState::Active),
                 restore_observation_token: None,
                 worker_id: SubscriptionWorkerId::new("shared-local-id").unwrap(),
                 runtime_id: Some(record.worker.runtime_id.clone()),
@@ -28964,6 +28966,7 @@ INSERT INTO worker_registry (
             Some("W-1")
         );
         let observed = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("known").unwrap(),
             runtime_id: Some("embedded".to_string()),
@@ -28985,6 +28988,7 @@ INSERT INTO worker_registry (
         };
         store.upsert_worker_registry(&other_catalog).unwrap();
         let other_observed = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("other").unwrap(),
             runtime_id: Some("runtime-other".to_string()),
@@ -28995,6 +28999,7 @@ INSERT INTO worker_registry (
             .apply_worker_registry_observation("local-dev", "runtime-other", &other_observed, "2")
             .unwrap();
         let orphan = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("orphan").unwrap(),
             ..observed.clone()
@@ -29162,6 +29167,7 @@ INSERT INTO worker_registry (
                 .is_none()
         );
         let event = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("removed").unwrap(),
             runtime_id: Some("embedded".to_string()),

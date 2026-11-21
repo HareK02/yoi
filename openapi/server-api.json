@@ -15765,6 +15765,17 @@
               "null"
             ]
           },
+          "lifecycle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerLifecycleState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runtime-owned lifecycle, absent when no Runtime observation is available."
+          },
           "pinned": {
             "default": false,
             "type": "boolean"
@@ -15810,7 +15821,6 @@
             ]
           },
           "state": {
-            "description": "Runtime catalog lifecycle compatibility state. Live foreground state, when\navailable, is carried separately in `worker_state`.",
             "type": "string"
           },
           "tags": {
@@ -16109,6 +16119,17 @@
               "string",
               "null"
             ]
+          },
+          "lifecycle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerLifecycleState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runtime-owned lifecycle, absent when no Runtime observation is available."
           },
           "pinned": {
             "default": false,
@@ -24203,6 +24224,17 @@
               "null"
             ]
           },
+          "lifecycle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerLifecycleState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runtime-owned lifecycle, absent when no Runtime observation is available."
+          },
           "pinned": {
             "type": "boolean"
           },
@@ -24337,6 +24369,20 @@
           "reason"
         ],
         "type": "object"
+      },
+      "WorkerLifecycleState": {
+        "description": "Runtime-owned execution lifecycle, independent of the last catalog status.\nOnly `Active` asserts that a current execution can expose controller snapshots.",
+        "enum": [
+          "not_started",
+          "awaiting_restore",
+          "active",
+          "stopped",
+          "creating",
+          "restoring",
+          "stopping",
+          "recovery_required"
+        ],
+        "type": "string"
       },
       "WorkerLifecycleStatus": {
         "enum": [
@@ -24720,6 +24766,17 @@
               "null"
             ]
           },
+          "lifecycle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerLifecycleState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Runtime-owned lifecycle, absent when no Runtime observation is available."
+          },
           "pinned": {
             "default": false,
             "type": "boolean"
@@ -24765,7 +24822,6 @@
             ]
           },
           "state": {
-            "description": "Runtime catalog lifecycle compatibility state. Live foreground state, when\navailable, is carried separately in `worker_state`.",
             "type": "string"
           },
           "tags": {
@@ -27093,7 +27149,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:6ff29dfb1d85f5410164c252b9e5ddaefe33d85aeba979ab58fae4363d079801"
+    "x-yoi-source-digest": "sha256:ddaed150ed797b4710a0cc6057b30217bf0dc34890a2e02c2e14b85a6139c981"
   },
   "openapi": "3.1.0",
   "paths": {

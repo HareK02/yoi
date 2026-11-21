@@ -254,7 +254,8 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
             BrokerSubscriptionEvent::Event {
                 payload: SubscriptionEventPayload::WorkerUpserted { ref worker },
                 ..
-            } if worker.state == SubscriptionWorkerState::Idle
+            } if worker.state == SubscriptionWorkerState::Running
+                && worker.lifecycle == Some(protocol::WorkerLifecycleState::Active)
                 && matches!(
                     worker.worker_state,
                     Some(protocol::WorkerStateSnapshot {
@@ -274,7 +275,8 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
         snapshot,
         SubscriptionSnapshot::Workers { workers }
             if workers.iter().any(|worker| {
-                worker.state == SubscriptionWorkerState::Idle
+                worker.state == SubscriptionWorkerState::Running
+                    && worker.lifecycle == Some(protocol::WorkerLifecycleState::Active)
                     && matches!(
                         worker.worker_state,
                         Some(protocol::WorkerStateSnapshot {
@@ -409,7 +411,8 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     assert!(matches!(next_event(&mut subscription).await,
     BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker }, .. }
     if worker.runtime_id.as_deref() == Some("embedded-worker-runtime")
-        && worker.state == SubscriptionWorkerState::Idle
+        && worker.state == SubscriptionWorkerState::Running
+        && worker.lifecycle == Some(protocol::WorkerLifecycleState::Active)
         && matches!(
             worker.worker_state,
             Some(protocol::WorkerStateSnapshot {
@@ -432,7 +435,8 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
         snapshot,
         SubscriptionSnapshot::Workers { workers }
             if workers.iter().any(|worker| {
-                worker.state == SubscriptionWorkerState::Idle
+                worker.state == SubscriptionWorkerState::Running
+                    && worker.lifecycle == Some(protocol::WorkerLifecycleState::Active)
                     && matches!(
                         worker.worker_state,
                         Some(protocol::WorkerStateSnapshot {

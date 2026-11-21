@@ -15,6 +15,7 @@ import type {
   WorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption,
   WorkerLaunchWorkerSummary,
+  WorkerLifecycleState,
   WorkerListResponse,
   WorkerStateSnapshot,
   WorkerSummary,
@@ -356,6 +357,18 @@ export type ParsedWorkerListResponse = Omit<WorkerListResponse, "items"> & {
   items: ParsedWorkerSummary[];
 };
 
+const WORKER_LIFECYCLE_STATES: readonly WorkerLifecycleState[] = [
+  "not_started", "awaiting_restore", "active", "stopped", "creating", "restoring",
+  "stopping", "recovery_required",
+];
+
+function workerLifecycle(value: unknown, label: string): WorkerLifecycleState {
+  if (typeof value !== "string" || !WORKER_LIFECYCLE_STATES.includes(value as WorkerLifecycleState)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value as WorkerLifecycleState;
+}
+
 const REMOVAL_STATES: readonly WorkerRemovalState[] = ["waiting", "held"];
 const REMOVAL_PHASES: readonly WorkerRemovalPhase[] = [
   "awaiting_quiescence", "recording", "awaiting_effects_end", "released", "completed",
@@ -414,6 +427,7 @@ export function parseWorkerSummary(
       "workspace",
       "availability",
       "state",
+      "lifecycle",
       "worker_state",
       "restore_observation_token",
       "removal",
@@ -457,6 +471,7 @@ export function parseWorkerSummary(
     workspace: workspaceSummary(item.workspace, `${label}.workspace`),
     availability,
     state: string(item.state, `${label}.state`),
+    lifecycle: optional(item.lifecycle, `${label}.lifecycle`, workerLifecycle),
     worker_state: workerState,
     removal: optional(item.removal, `${label}.removal`, parseWorkerRemovalObservation),
     restore_observation_token: optional(
@@ -670,6 +685,7 @@ function workerSummary(
       "tags",
       "workspace",
       "state",
+      "lifecycle",
       "last_seen_at",
       "pinned",
       "retention_state",
@@ -690,6 +706,7 @@ function workerSummary(
     tags: array(item.tags, `${label}.tags`, string),
     workspace: workspaceSummary(item.workspace, `${label}.workspace`),
     state: string(item.state, `${label}.state`),
+    lifecycle: optional(item.lifecycle, `${label}.lifecycle`, workerLifecycle),
     last_seen_at: nullableString(item.last_seen_at, `${label}.last_seen_at`),
     pinned: boolean(item.pinned, `${label}.pinned`),
     retention_state: string(item.retention_state, `${label}.retention_state`),

@@ -32,6 +32,7 @@ import {
   parseCreateWorkspaceWorkerRequest,
   parseWorkerLaunchOptionsResponse,
   parseWorkerSummary,
+  parseWorkerLaunchWorkerSummary,
 } from "./workers.ts";
 import { loadJson } from "./http.ts";
 
@@ -77,6 +78,41 @@ Deno.test("Worker summaries omit the removed management capabilities field", () 
     diagnostics: [],
   });
   assertEquals("capabilities" in created.worker, false);
+});
+
+Deno.test("Worker API parsers preserve lifecycle independently of catalog status", () => {
+  for (const lifecycle of [
+    "not_started", "awaiting_restore", "active", "stopped", "creating", "restoring",
+    "stopping", "recovery_required",
+  ]) {
+    const summary = parseWorkerSummary({
+      ...worker, resource_key: "W-1", availability: "observed", state: "running", lifecycle,
+    });
+    assertEquals(summary.lifecycle, lifecycle);
+    assertEquals(summary.state, "running");
+    assertEquals(parseWorkerLaunchWorkerSummary({ ...worker, lifecycle }).lifecycle, lifecycle);
+  }
+  for (const availability of ["observed", "unavailable"]) {
+    for (const state of ["running", "stopped"]) {
+      for (const lifecycle of [undefined, null]) {
+        const parsed = parseWorkerSummary({
+          ...worker, resource_key: "W-1", availability, state,
+          ...(lifecycle === undefined ? {} : { lifecycle }),
+        });
+        assertEquals(parsed.lifecycle, lifecycle);
+        assertEquals(parsed.state, state);
+        assertEquals(parseWorkerLaunchWorkerSummary({
+          ...worker, state, ...(lifecycle === undefined ? {} : { lifecycle }),
+        }).lifecycle, lifecycle);
+      }
+    }
+  }
+  for (const lifecycle of ["running", "unknown", 0, {}]) {
+    assertThrows(() => parseWorkerSummary({
+      ...worker, resource_key: "W-1", availability: "observed", lifecycle,
+    }), Error, "lifecycle is invalid");
+    assertThrows(() => parseWorkerLaunchWorkerSummary({ ...worker, lifecycle }), Error, "lifecycle is invalid");
+  }
 });
 
 Deno.test("Worker summary parser enforces observation freshness", () => {

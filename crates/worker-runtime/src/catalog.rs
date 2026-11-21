@@ -384,12 +384,7 @@ impl WorkerStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkerRestoreIntent {
-    Automatic,
-    Explicit,
-}
+pub use protocol::WorkerLifecycleState;
 
 /// Lightweight persisted Worker identity projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +394,7 @@ pub struct WorkerSummary {
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
+    pub lifecycle: WorkerLifecycleState,
     /// Creation timestamp in Unix epoch milliseconds for records created on this schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
@@ -426,6 +422,7 @@ pub struct WorkerDetail {
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
+    pub lifecycle: WorkerLifecycleState,
     /// Creation timestamp in Unix epoch milliseconds for records created on this schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
@@ -460,6 +457,7 @@ pub struct WorkerLifecycleAck {
     pub replayed: bool,
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
+    pub lifecycle: WorkerLifecycleState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
 }
@@ -487,9 +485,9 @@ mod tests {
     use super::WorkspaceApiRef;
 
     #[test]
-    fn legacy_stop_receipt_without_marker_is_marked_only_when_returned_as_history() {
+    fn stop_receipt_without_replay_marker_is_marked_only_when_returned_as_history() {
         let value = serde_json::json!({
-            "worker_ref": {"worker_id": crate::identity::WorkerId::now_v7()}, "status":"stopped"
+            "worker_ref": {"worker_id": crate::identity::WorkerId::now_v7()}, "status":"stopped", "lifecycle":"stopped"
         });
         let receipt: super::WorkerLifecycleAck = serde_json::from_value(value).unwrap();
         assert!(!receipt.replayed);

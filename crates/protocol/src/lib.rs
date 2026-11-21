@@ -1951,6 +1951,23 @@ pub enum WorkerStatus {
     Stopped,
 }
 
+/// Runtime-owned execution lifecycle, independent of the last catalog status.
+/// Only `Active` asserts that a current execution can expose controller snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLifecycleState {
+    NotStarted,
+    AwaitingRestore,
+    Active,
+    Stopped,
+    Creating,
+    Restoring,
+    Stopping,
+    RecoveryRequired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]

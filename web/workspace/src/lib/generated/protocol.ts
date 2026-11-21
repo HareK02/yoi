@@ -92,6 +92,8 @@ context?: string | null, };
 
 export type WorkerStatus = "idle" | "running" | "paused" | "stopped";
 
+export type WorkerLifecycleState = "not_started" | "awaiting_restore" | "active" | "stopped" | "creating" | "restoring" | "stopping" | "recovery_required";
+
 export type WorkerCommandEnvelope = { command_id: number, };
 
 export type WorkerCommandKind = "resume" | "cancel" | "pause" | "compact" | "shutdown";
@@ -436,7 +438,12 @@ availability: SubscriptionWorkerAvailability,
  */
 worker_state?: WorkerStateSnapshot | null,
 /**
- * Runtime catalog lifecycle compatibility projection; not foreground-state authority.
+ * Runtime-owned lifecycle when observed; absent for registry-only membership.
+ * Never inferred from the last catalog status or transport availability.
+ */
+lifecycle?: WorkerLifecycleState | null,
+/**
+ * Last Runtime catalog status; not current execution-lifecycle authority.
  */
 state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null,
 /**

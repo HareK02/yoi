@@ -338,17 +338,17 @@ impl Runtime {
             // supply evidence or choose the durable child for this retry.
             state.refresh_uncertain_worker_write(&worker_ref)?;
             let worker = state.worker(&worker_ref)?;
-            if let Some(pending) = worker.pending_stop {
+            if let Some(pending) = worker.pending_stop() {
                 (
                     WorkerExecutionStopRequest {
                         worker_ref: worker_ref.clone(),
                         operation_id: pending.operation_id,
                     },
-                    worker.restore_guard.execution_termination.clone(),
+                    worker.stop_termination().cloned(),
                     true,
                 )
             } else if let Some(saved) = worker.restore_guard.execution_termination.clone() {
-                if worker.status != WorkerStatus::Stopped || worker.pending_restore.is_some() {
+                if !worker.is_settled_inactive() || worker.pending_restore().is_some() {
                     return Err(RuntimeError::InvalidRequest(
                         "Subject canonical Stop is not settled".into(),
                     ));

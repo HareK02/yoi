@@ -223,6 +223,7 @@ fn subject_delete_unregistered_profile_controller_retries_unknown_shutdown_witho
     );
 }
 
+#[cfg(feature = "http-server")]
 #[test]
 #[serial_test::serial(worker_allocation)]
 fn subject_delete_pending_restore_fences_late_controller_and_never_restarts_it() {
@@ -613,10 +614,18 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
             matches!(before.execution_state, Execution::ReconciliationRequired(Operation::Stop(ref pending))
             if pending.operation_id == original.stop_operation_id)
         );
-        // Read the saved aggregate, not the adapter's still-warm receipt cache.
+        // Read the pending Stop's progress from the saved aggregate, not the
+        // adapter's still-warm cache or the guard's settled Stop history.
+        let progress = serde_json::to_value(&before.execution_state).unwrap()["execution"]["intent"]
+            ["progress"]
+            .clone();
+        assert_eq!(progress["phase"], "scope_terminated");
         assert_eq!(
-            serde_json::to_value(&before.restore_guard).unwrap()["execution_termination"],
+            progress["termination"],
             serde_json::to_value(&original).unwrap()
+        );
+        assert!(
+            serde_json::to_value(&before.restore_guard).unwrap()["execution_termination"].is_null()
         );
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         drop(execution);
@@ -637,30 +646,49 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
                 matches!(loaded.execution_state, Execution::ReconciliationRequired(Operation::Stop(ref pending))
                 if pending.operation_id == original.stop_operation_id)
             );
+            let progress = serde_json::to_value(&loaded.execution_state).unwrap()["execution"]
+                ["intent"]["progress"]
+                .clone();
+            assert_eq!(progress["phase"], "scope_terminated");
+            assert_eq!(
+                progress["termination"],
+                serde_json::to_value(&original).unwrap()
+            );
+            assert!(
+                serde_json::to_value(&loaded.restore_guard).unwrap()["execution_termination"]
+                    .is_null()
+            );
+            cleanup_allowed.store(true, Ordering::SeqCst);
+        } else {
+            assert!(matches!(
+                loaded.execution_state,
+                Execution::Stopped(Some(_))
+            ));
+            assert_eq!(loaded.status, crate::catalog::WorkerStatus::Stopped);
+            // Only successful cleanup moves the receipt into settled history.
             assert_eq!(
                 serde_json::to_value(&loaded.restore_guard).unwrap()["execution_termination"],
                 serde_json::to_value(&original).unwrap()
             );
-            cleanup_allowed.store(true, Ordering::SeqCst);
-        } else {
-            assert!(!matches!(
-                loaded.execution_state,
-                Execution::ReconciliationRequired(_)
-            ));
-            assert_eq!(loaded.status, crate::catalog::WorkerStatus::Stopped);
         }
         let cleanup_before = cleanup_calls.load(Ordering::SeqCst);
         reopened
             .subject_delete_worker_scoped(&scope, deletion)
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cold Subject retry failed (startup_recovers={startup_recovers}); loaded lifecycle={:?}; loaded guard={}; error={error:?}",
+                    loaded.execution_state,
+                    serde_json::to_value(&loaded.restore_guard).unwrap(),
+                )
+            });
         assert!(cleanup_calls.load(Ordering::SeqCst) > cleanup_before);
         let settled = reopened
             .test_runtime_store()
             .read_worker_record(&worker.worker_ref)
             .unwrap();
-        assert!(!matches!(
+        assert!(matches!(
             settled.execution_state,
-            Execution::ReconciliationRequired(_)
+            Execution::Stopped(Some(_))
         ));
         assert_eq!(settled.status, crate::catalog::WorkerStatus::Stopped);
         assert_eq!(
@@ -1068,13 +1096,12 @@ fn subject_delete_stopped_catalog_without_original_never_certifies_empty_backend
             created_at_ms: None,
             status: crate::catalog::WorkerStatus::Stopped,
             last_finished_submission_request_id: None,
-            execution_state: crate::fs_store::PersistedWorkerExecutionState::Available(
+            execution_state: crate::fs_store::PersistedWorkerExecutionState::Stopped(Some(
                 crate::fs_store::PersistedWorkerExecution {
                     request: create.clone(),
                     binding: None,
-                    restore_intent: crate::catalog::WorkerRestoreIntent::Explicit,
                 },
-            ),
+            )),
             workspace_id: Some(scope.workspace_id.clone()),
             workdir_attachments: Vec::new(),
             logical_workdir_attachments: Vec::new(),

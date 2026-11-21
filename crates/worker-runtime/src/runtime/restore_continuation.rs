@@ -126,8 +126,8 @@ impl Runtime {
             state.refresh_uncertain_worker_write(&worker_ref)?;
             let worker = state.worker(&worker_ref)?;
             state.ensure_subject_not_reserved(&worker_ref, false)?;
-            if worker.pending_stop.is_some()
-                || worker.pending_restore.is_none_or(|pending| {
+            if worker.pending_stop().is_some()
+                || worker.pending_restore().is_none_or(|pending| {
                     pending.operation_id != operation
                         || pending.commit == RestoreCommitFact::LegacyUnknown
                 })
@@ -145,15 +145,14 @@ impl Runtime {
                 owner.validate_workdir_preparation_authority(worker)?;
             }
             if worker
-                .pending_restore
+                .pending_restore()
                 .is_some_and(|pending| pending.source_repair_possible)
             {
                 return Ok(());
             }
             let mut candidate = worker.clone();
             candidate
-                .pending_restore
-                .as_mut()
+                .pending_restore_mut()
                 .expect("validated restore owner")
                 .source_repair_possible = true;
             // Grant before touching another canonical store. Unknown durability
@@ -241,7 +240,7 @@ impl Runtime {
             let state = self.lock()?;
             let worker = state.worker(worker_ref)?;
             worker
-                .pending_restore
+                .pending_restore()
                 .map(|pending| pending.operation_id)
                 .or_else(|| {
                     worker
@@ -339,9 +338,9 @@ impl Runtime {
             state.ensure_running()?;
             state.refresh_uncertain_worker_write(worker_ref)?;
             let worker = state.worker(worker_ref)?;
-            worker.pending_stop.is_some()
+            worker.pending_stop().is_some()
                 && worker
-                    .pending_restore
+                    .pending_restore()
                     .is_some_and(|pending| pending.operation_id == operation)
         };
         if stop_is_owned {
@@ -355,7 +354,7 @@ impl Runtime {
             state.ensure_running()?;
             state.refresh_uncertain_worker_write(worker_ref)?;
             let worker = state.worker(worker_ref)?;
-            if worker.pending_stop.is_some() {
+            if worker.pending_stop().is_some() {
                 return Ok(Step::Finished);
             }
             let owner = worker
@@ -367,7 +366,7 @@ impl Runtime {
             {
                 return Ok(Step::Finished);
             }
-            let Some(pending) = worker.pending_restore else {
+            let Some(pending) = worker.pending_restore() else {
                 return Ok(Step::Finished);
             };
             if pending.operation_id != operation {

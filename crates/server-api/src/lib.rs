@@ -10160,6 +10160,9 @@ pub struct RuntimeWorkerSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Runtime-owned lifecycle, absent when no Runtime observation is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<protocol::WorkerLifecycleState>,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<serde_json::Value>,
@@ -11429,8 +11432,9 @@ pub struct WorkerSummary {
     /// Freshness of the Runtime observation used to construct `worker_state`.
     /// `Unavailable` means no current controller snapshot is being asserted.
     pub availability: protocol::subscription::SubscriptionWorkerAvailability,
-    /// Runtime catalog lifecycle compatibility state. Live foreground state, when
-    /// available, is carried separately in `worker_state`.
+    /// Runtime-owned lifecycle, absent when no Runtime observation is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<protocol::WorkerLifecycleState>,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -11478,6 +11482,9 @@ pub struct WorkerLaunchWorkerSummary {
     pub singleton_key: Option<String>,
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Runtime-owned lifecycle, absent when no Runtime observation is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<protocol::WorkerLifecycleState>,
     pub state: String,
     pub last_seen_at: Option<String>,
     pub pinned: bool,
@@ -14214,6 +14221,7 @@ mod tests {
     fn worker_launch_summary() -> WorkerLaunchWorkerSummary {
         WorkerLaunchWorkerSummary {
             runtime_id: "runtime-a".to_string(),
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             worker_id: "worker-a".to_string(),
             host_id: "host-a".to_string(),
             display_name: "Worker A".to_string(),

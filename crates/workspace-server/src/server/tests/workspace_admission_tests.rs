@@ -62,6 +62,7 @@ impl Fixture {
                 .unwrap();
             runtime.workers.lock().unwrap().push(InternalWorkerSummary {
                 restore_observation_token: None,
+                lifecycle: Some(protocol::WorkerLifecycleState::Active),
                 worker: RuntimeWorkerRef::new(WorkdirlessFixtureRuntime::RUNTIME_ID, worker),
                 host_id: "fixture-host".into(),
                 display_name: worker.into(),
