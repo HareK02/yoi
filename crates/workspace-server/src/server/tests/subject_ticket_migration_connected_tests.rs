@@ -304,7 +304,7 @@ async fn retained106_explicit_transfer_to_normal_subject_evaluates_saved_result_
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            137
+            138
         );
         assert_eq!(
             conn.query_row(

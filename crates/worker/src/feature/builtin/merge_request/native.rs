@@ -85,6 +85,45 @@ fn nullable(ty: Shape) -> Shape {
 
 pub(super) fn contract(kind: Kind) -> Contract {
     let (name, summary, parameters) = match kind {
+        Kind::Query => (
+            "query",
+            "Query the MR collection by repository/target and saved phase (integration includes stale/re-review/conflict cases). assigned_to_self selects the authenticated current MR Worker, not the Ticket Subject. Follow next_cursor with unchanged filters. Each MR read requires separate authority; use item.read before acting. No assignment, publication, or execution order is created.",
+            vec![
+                field("repository_key", false, Shape::String),
+                field("selector_to", false, Shape::String),
+                field("selector_from", false, Shape::String),
+                renamed(
+                    "ticket",
+                    false,
+                    Shape::Reference(ReferenceKind::Ticket),
+                    "ticket_ref",
+                ),
+                field(
+                    "phase",
+                    false,
+                    Shape::Enum(vec![
+                        "implementation",
+                        "integration",
+                        "completed",
+                        "canceled",
+                    ]),
+                ),
+                field(
+                    "state",
+                    false,
+                    Shape::Enum(vec!["open", "merged", "closed"]),
+                ),
+                field("assigned_to_self", false, Shape::Boolean),
+                flattened(
+                    "page",
+                    false,
+                    vec![
+                        field("cursor", false, nullable(Shape::String)),
+                        field("limit", false, nullable(Shape::Integer)),
+                    ],
+                ),
+            ],
+        ),
         Kind::Open => (
             "open",
             "Open or reuse a Ticket-linked repository candidate. ticket is an Entry in the current Ticket collection; repository.source/target are selectors, not asserted commit evidence. Backend validates linkage and authority.",
@@ -104,7 +143,7 @@ pub(super) fn contract(kind: Kind) -> Contract {
         ),
         Kind::Show => (
             "read",
-            "Read this route-bound MR. Summary and detail include worker_assignment (operation_id and worker) and saved publications. worker_assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. Ownership is not authority, Worker liveness or Ticket assignment. This read never sends or retries publication. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
+            "Read this route-bound MR. Summary and detail include worker_assignment (operation_id and worker) and saved completion evidence. Read view=detail with bounded paging for publication failure comments; summary/readiness does not include those reasons or prove publication success. worker_assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. Ownership is not authority, Worker liveness or Ticket assignment. This read never sends or retries publication. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
             vec![
                 field("view", false, Shape::Enum(vec!["summary", "detail"])),
                 flattened(
@@ -131,6 +170,16 @@ pub(super) fn contract(kind: Kind) -> Contract {
                         field("worker_id", true, Shape::String),
                     ])),
                 ),
+            ],
+        ),
+        Kind::Complete => (
+            "complete",
+            "Record manual publication without pushing or additional approval. Backend verifies current MR ownership, authority, exact approved source/requirements and provider target. Unproven ancestry is rejected. Keep the exact input and operation_id on unknown outcome; no automatic push or new operation.",
+            vec![
+                field("operation_id", true, Shape::String),
+                field("expected_owner_operation_id", true, Shape::String),
+                field("approval_event_id", true, Shape::String),
+                field("expected_source_ref", true, Shape::String),
             ],
         ),
         Kind::Comment => (

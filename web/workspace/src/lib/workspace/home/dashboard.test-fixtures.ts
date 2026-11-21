@@ -214,6 +214,9 @@ export function dashboardFixture(
             integration_evidence_error: null,
             review_subject_ref: "abc123",
           },
+          worker_assignment: null,
+          worker_resource_key: null,
+
           thread_event_count: 1,
           ticket_ids: [],
           ref_diagnostics: [],

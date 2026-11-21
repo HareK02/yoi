@@ -166,7 +166,7 @@ pub(crate) use subject_release_recording_store::{
 
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
-const LATEST_SCHEMA_VERSION: i64 = 137;
+const LATEST_SCHEMA_VERSION: i64 = 138;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -627,6 +627,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 137,
         name: worker_lifecycle_notifications::MIGRATION_NAME,
         apply: worker_lifecycle_notifications::migrate,
+    },
+    Migration {
+        version: 138,
+        name: notification_routing::merge_requests::MIGRATION_NAME,
+        apply: notification_routing::merge_requests::migrate,
     },
 ];
 
@@ -17548,6 +17553,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::config_publication::SCHEMA)?;
     conn.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
     worker_lifecycle_notifications::install(conn)?;
+    notification_routing::merge_requests::install(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!("fresh Ticket schema verification failed: {error}"))
     })?;
@@ -22233,6 +22239,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 137,
                 name: worker_lifecycle_notifications::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 138,
+                name: notification_routing::merge_requests::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -22382,6 +22392,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (135, subject_release_recording_store::MIGRATION_NAME.into()),
                     (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
                     (137, worker_lifecycle_notifications::MIGRATION_NAME.into()),
+                    (138, notification_routing::merge_requests::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -25576,6 +25587,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     conn.execute("INSERT INTO merge_request_ticket_relations(workspace_id,merge_request_id,ticket_id,relation_kind,created_at)
                         VALUES('case-workspace',?1,?1,'implements','1')", [&id]).unwrap();
                     let evidence = merge_request::MergeEvent {
+                        owner_operation_id: None,
                         event_id: id.clone(),
                         sequence: 1,
                         operation_id: id.clone(),

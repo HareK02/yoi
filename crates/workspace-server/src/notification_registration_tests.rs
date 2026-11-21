@@ -16,18 +16,19 @@ fn notification_registration_covers_public_mr_event_kinds() {
         let kind = variant["properties"]["kind"]["const"]
             .as_str()
             .expect("MR event kind discriminator");
-        if matches!(kind, "comment" | "worker_assigned") {
-            // Communication and ownership history are not review results or
-            // handoffs. Ownership does not imply adoption, progress or completion.
-            continue;
-        }
         assert_ne!(
             NotificationEventKind::from_source(&format!("mr_{kind}")),
             NotificationEventKind::Unknown,
             "new public MR event {kind} needs a routing registration and source/receipt integration test"
         );
     }
-    for kind in ["implementation_result", "mr_source_changed"] {
+    for kind in [
+        "implementation_result",
+        "mr_source_changed",
+        "mr_publication_unconfirmed",
+        "mr_publication_not_published",
+        "mr_publication_published",
+    ] {
         assert_ne!(
             NotificationEventKind::from_source(kind),
             NotificationEventKind::Unknown,

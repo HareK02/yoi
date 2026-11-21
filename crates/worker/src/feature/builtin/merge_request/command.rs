@@ -8,6 +8,10 @@ use super::*;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub(super) enum Command {
+    Query {
+        #[serde(flatten)]
+        query: server_api::MergeRequestListQuery,
+    },
     Read {
         merge_request_id: String,
         view: Option<MergeRequestReadView>,
@@ -18,6 +22,11 @@ pub(super) enum Command {
         merge_request_id: String,
         #[serde(flatten)]
         request: server_api::SetMergeRequestWorkerRequest,
+    },
+    Complete {
+        merge_request_id: String,
+        #[serde(flatten)]
+        request: server_api::CompleteMergeRequestRequest,
     },
     Comment {
         merge_request_id: String,
@@ -46,6 +55,9 @@ impl Command {
     /// Tool-mode parsing remains governed by its own DTOs and schemars declarations.
     pub(super) fn from_tool(kind: Kind, input: &str) -> Result<Self, ToolError> {
         Ok(match kind {
+            Kind::Query => Self::Query {
+                query: parse(input)?,
+            },
             Kind::Show => {
                 let v: ShowMergeRequestInput = parse(input)?;
                 Self::Read {
@@ -58,6 +70,13 @@ impl Command {
             Kind::WorkerSet => {
                 let v: SetMergeRequestWorkerInput = parse(input)?;
                 Self::WorkerSet {
+                    merge_request_id: v.merge_request_id,
+                    request: v.request,
+                }
+            }
+            Kind::Complete => {
+                let v: CompleteMergeRequestInput = parse(input)?;
+                Self::Complete {
                     merge_request_id: v.merge_request_id,
                     request: v.request,
                 }
@@ -94,9 +113,11 @@ impl Command {
 
     pub(super) fn kind(&self) -> Kind {
         match self {
+            Self::Query { .. } => Kind::Query,
             Self::Read { .. } => Kind::Show,
             Self::WorkerSet { .. } => Kind::WorkerSet,
             Self::Comment { .. } => Kind::Comment,
+            Self::Complete { .. } => Kind::Complete,
             Self::Open { .. } => Kind::Open,
             Self::Review { .. } => Kind::Review,
         }
@@ -126,13 +147,14 @@ pub(super) fn execute_value(
 ) -> Result<Value, ToolError> {
     let ownership_mutation = matches!(
         &command,
-        Command::WorkerSet { .. } | Command::Comment { .. }
+        Command::WorkerSet { .. } | Command::Comment { .. } | Command::Complete { .. }
     );
     let executor = Executor { client };
     let ws = executor.client.workspace_id().ok_or_else(|| {
         ToolError::ExecutionFailed("Merge Request operations require Workspace identity".into())
     })?;
     let (method, path, body) = match command {
+        Command::Query { query } => return executor.query_merge_requests(ws, query),
         Command::Read {
             merge_request_id,
             view,
@@ -184,6 +206,38 @@ pub(super) fn execute_value(
                 WorkspaceRequestMethod::Put,
                 format!(
                     "/api/w/{ws}/merge-requests/{}/worker",
+                    encode_path_segment(&merge_request_id)
+                ),
+                Some(json!(request)),
+            )
+        }
+        Command::Complete {
+            merge_request_id,
+            request,
+        } => {
+            nonempty_named("merge_request_id", &merge_request_id)?;
+            for (name, value) in [
+                ("operation_id", &request.operation_id),
+                (
+                    "expected_owner_operation_id",
+                    &request.expected_owner_operation_id,
+                ),
+                ("approval_event_id", &request.approval_event_id),
+                ("expected_source_ref", &request.expected_source_ref),
+            ] {
+                nonempty_named(name, value)?;
+            }
+            executor.authorize(
+                "merge_request.complete",
+                PermissionResource::MergeRequest {
+                    workspace_id: ws.into(),
+                    merge_request_id: merge_request_id.clone(),
+                },
+            )?;
+            (
+                WorkspaceRequestMethod::Post,
+                format!(
+                    "/api/w/{ws}/merge-requests/{}/complete",
                     encode_path_segment(&merge_request_id)
                 ),
                 Some(json!(request)),
@@ -320,6 +374,49 @@ impl Executor {
                 ToolError::ExecutionFailed(format!("Merge Request operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"))
             })
     }
+    fn query_merge_requests(
+        &self,
+        workspace_id: &str,
+        query: server_api::MergeRequestListQuery,
+    ) -> Result<Value, ToolError> {
+        if query.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+            return Err(ToolError::InvalidArgument(
+                "limit must be between 1 and 100".into(),
+            ));
+        }
+        let fields = serde_json::to_value(&query)
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        let mut parameters = Vec::new();
+        for (key, value) in fields.as_object().expect("query is a record") {
+            if value.is_null() {
+                continue;
+            }
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            nonempty_named(key, &value)?;
+            parameters.push(format!("{key}={}", encode_path_segment(&value)));
+        }
+        self.authorize(
+            "merge_request.query",
+            PermissionResource::Workspace {
+                workspace_id: workspace_id.into(),
+            },
+        )?;
+        let response = self
+            .client
+            .execute(WorkspaceRequest::get(format!(
+                "/api/w/{workspace_id}/merge-requests?{}",
+                parameters.join("&")
+            )))
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if !response.is_success() {
+            return Err(api_error("Merge Request query API", &response));
+        }
+        response_value(&response.body)
+    }
+
     fn show_merge_request(
         &self,
         workspace_id: &str,

@@ -6642,57 +6642,10 @@ where
         materializer.authorize_repository_access(request)
     }
 
-    fn reject_repository_publication(
-        &self,
-        request: &crate::catalog::RepositoryPublicationRequest,
-        reason: &str,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
-        self.working_directory_materializer
-            .as_ref()
-            .ok_or_else(|| {
-                WorkingDirectoryDiagnostic::rejected(
-                    "repository_publication_unsupported",
-                    "Repository materializer unavailable",
-                )
-            })?
-            .reject_repository_publication(request, reason)
-    }
-
-    fn repository_publication_receipt(
-        &self,
-        binding: &crate::catalog::RepositoryPublicationBinding,
-    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
-    {
-        self.working_directory_materializer
-            .as_ref()
-            .ok_or_else(|| {
-                WorkingDirectoryDiagnostic::rejected(
-                    "repository_publication_unsupported",
-                    "Repository materializer unavailable",
-                )
-            })?
-            .repository_publication_receipt(binding)
-    }
-
-    fn reconcile_repository_publication(
-        &self,
-        request: &crate::catalog::RepositoryPublicationRequest,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
-        self.working_directory_materializer
-            .as_ref()
-            .ok_or_else(|| {
-                WorkingDirectoryDiagnostic::rejected(
-                    "repository_publication_unsupported",
-                    "Repository materializer unavailable",
-                )
-            })?
-            .reconcile_repository_publication(request)
-    }
-
     fn publish_repository_source(
         &self,
         request: &crate::catalog::RepositoryPublicationRequest,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+    ) -> Result<crate::catalog::RepositoryPublicationResult, WorkingDirectoryDiagnostic> {
         let denied = |message| {
             WorkingDirectoryDiagnostic::rejected("repository_publication_unavailable", message)
         };
@@ -6700,9 +6653,6 @@ where
             .working_directory_materializer
             .as_ref()
             .ok_or_else(|| denied("Repository materializer unavailable".to_string()))?;
-        if let Some(saved) = materializer.repository_publication_receipt(&request.binding)? {
-            return Ok(saved);
-        }
         let worker = WorkerRef::try_from(&request.binding.worker)
             .map_err(|_| denied("Publication Worker identity invalid".to_string()))?;
         let lock = self.worker_lock(&worker).map_err(denied)?;

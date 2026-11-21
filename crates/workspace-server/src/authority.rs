@@ -3226,6 +3226,7 @@ mod tests {
         request
             .thread
             .push(MergeRequestThreadEvent::Merge(merge_request::MergeEvent {
+                owner_operation_id: None,
                 event_id: "merge-1".into(),
                 sequence: 3,
                 operation_id: "operation-1".into(),

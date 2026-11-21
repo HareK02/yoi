@@ -19,6 +19,95 @@ const EVIDENCE_SOURCE: &str = "immutable-approved-source";
 const EVIDENCE_TARGET: &str = "immutable-target-result";
 
 #[tokio::test]
+async fn completion_writer_rejects_new_source_committed_after_provider_verification() {
+    let f = EvidenceApiFixture::new().await;
+    let approval = f.approve("original-source-approval");
+    f.api
+        .config_store
+        .observe_merge_request_source(
+            TEST_WORKSPACE_ID,
+            &f.auth.repository_id,
+            "work/t716",
+            EVIDENCE_SOURCE,
+        )
+        .unwrap();
+    let verified = merge_request::ConfirmedMergeRequestPublication {
+        workspace_id: TEST_WORKSPACE_ID.into(),
+        merge_request_id: EVIDENCE_MR.into(),
+        operation_id: "delayed-completion".into(),
+        repository_id: f.auth.repository_id.clone(),
+        target: "develop".into(),
+        source: EVIDENCE_SOURCE.into(),
+        approval_event_id: approval.event_id,
+        owner_operation_id: f.review_auth().assignment_id,
+        worker: merge_request::WorkerIdentity {
+            runtime_id: f.auth.runtime_id.clone(),
+            worker_id: f.auth.worker_id.clone(),
+        },
+        target_before: EVIDENCE_SOURCE.into(),
+        target_after: EVIDENCE_SOURCE.into(),
+    };
+    // Deterministic ordering at the provider/DB boundary: a new source and review
+    // request commit before the old provider proof enters the completion writer.
+    f.api
+        .config_store
+        .observe_merge_request_source(
+            TEST_WORKSPACE_ID,
+            &f.auth.repository_id,
+            "work/t716",
+            "new-source",
+        )
+        .unwrap();
+    f.store
+        .register_reviewer_child_session(RegisterReviewerChildSession {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            parent_runtime_id: f.auth.runtime_id.clone(),
+            parent_worker_id: f.auth.worker_id.clone(),
+            child_session_id: "new-source-reviewer".into(),
+            reviewer_profile: "builtin:reviewer".into(),
+            now: evidence_time(),
+        })
+        .unwrap();
+    f.store
+        .request_review(RequestMergeRequestReview {
+            merge_request_id: EVIDENCE_MR.into(),
+            ticket_id: f.ticket_id.clone(),
+            ticket_content_digest: f.content_digest(),
+            subject_ref: "new-source".into(),
+            ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
+                merge_request_id: EVIDENCE_MR.into(),
+                subject_ref: "new-source".into(),
+            }],
+            child_session_id: "new-source-reviewer".into(),
+            capability_token: "new-source-review-token".into(),
+            auth: f.review_auth(),
+            now: evidence_time(),
+        })
+        .unwrap();
+    let before = f.store.get_by_id(TEST_WORKSPACE_ID, EVIDENCE_MR).unwrap();
+    let result = f.store.record_verified_completion(
+        &verified,
+        &f.content_digest(),
+        evidence_time(),
+        |conn, current| mr_publication::validate_completion_source(conn, current, &verified.source),
+    );
+    assert!(matches!(
+        result,
+        Err(merge_request::MergeRequestError::NotReady(_))
+    ));
+    assert_eq!(
+        f.store.get_by_id(TEST_WORKSPACE_ID, EVIDENCE_MR).unwrap(),
+        before
+    );
+    let conn = Connection::open(&f.api.config.database_path).unwrap();
+    let status: String = conn.query_row("SELECT status FROM merge_request_review_grants WHERE capability_token='new-source-review-token'", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        status, "issued",
+        "refused completion must preserve the new review grant"
+    );
+}
+
+#[tokio::test]
 async fn integration_preserves_legacy_empty_post_ref_and_exposes_new_ref_with_server_schema() {
     let fixture = EvidenceApiFixture::new().await;
     let approval = fixture.approve("integration-post-ref");
@@ -434,7 +523,11 @@ async fn mr_summary_route_omits_history_but_keeps_page_external_approval() {
     assert_eq!(page.summary, summary.summary);
     assert_eq!(page.worker_assignment, summary.worker_assignment);
     assert!(summary.worker_assignment.is_some());
-    assert_eq!(page.publications, summary.publications);
+    assert_eq!(page.merge_request.state, summary.merge_request.state);
+    assert!(matches!(
+        summary.merge_request.state,
+        server_api::MergeRequestState::Completed { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1376,224 +1469,36 @@ async fn closed_and_reopened_tickets_allow_orchestrator_review_and_integration_w
     }
 }
 
-// Backend publication-result connection with real MR/Ticket persistence. The
-// trusted Runtime receipt is injected here; provider/Git transport is covered by
-// Runtime's connected publication tests, not claimed by this fixture.
+// Real persistence and HTTP projection of Backend failure comments; no Git
+// transport is claimed by this fixture.
 #[tokio::test]
-async fn publication_receipt_fences_binding_and_records_fact_without_subject_completion_stamp() {
-    use worker_runtime::catalog::{
-        RepositoryPublicationBinding, RepositoryPublicationOutcome, RepositoryPublicationReceipt,
-    };
-    for rescope in [false, true] {
-        let fixture = EvidenceApiFixture::new().await;
-        let approval = fixture.approve("publication-receipt");
-        let auth = fixture.review_auth();
-        let binding = merge_request::PublicationBinding {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-            merge_request_id: EVIDENCE_MR.into(),
-            operation_id: "provider-publication".into(),
-            repository_id: auth.repository_id.clone(),
-            repository_source_fingerprint: "fixed-repository".into(),
-            alias: "source".into(),
-            target: "refs/heads/develop".into(),
-            source: EVIDENCE_SOURCE.into(),
-            approval_event_id: approval.event_id.clone(),
-            owner_operation_id: auth.assignment_id.clone(),
-            worker: merge_request::WorkerIdentity {
-                runtime_id: auth.runtime_id.clone(),
-                worker_id: auth.worker_id.clone(),
-            },
-            working_directory_id: "saved-workdir".into(),
-            connection_id: "saved-connection".into(),
-            target_before: "before".into(),
-        };
-        let (saved, acquired) = fixture
-            .store
-            .claim_publication(binding.clone(), evidence_time(), |_| Ok(()))
-            .unwrap();
-        assert!(acquired);
-        let mut receipt = RepositoryPublicationReceipt {
-            binding: RepositoryPublicationBinding {
-                workspace_id: binding.workspace_id.clone(),
-                merge_request_id: binding.merge_request_id.clone(),
-                operation_id: binding.operation_id.clone(),
-                repository_id: binding.repository_id.clone(),
-                repository_source_fingerprint: binding.repository_source_fingerprint.clone(),
-                alias: workdir::WorkdirAttachmentAlias::new(binding.alias.clone()).unwrap(),
-                target: binding.target.clone(),
-                source: binding.source.clone(),
-                approval_event_id: binding.approval_event_id.clone(),
-                owner_operation_id: binding.owner_operation_id.clone(),
-                worker: RuntimeWorkerRef::new(&auth.runtime_id, &auth.worker_id),
-                working_directory_id: binding.working_directory_id.clone(),
-                connection_id: binding.connection_id.clone(),
-                target_before: binding.target_before.clone(),
-            },
-            outcome: RepositoryPublicationOutcome::Published {
-                target_after: EVIDENCE_SOURCE.into(),
-                observed_at_epoch_seconds: 946684800,
-            },
-        };
-        receipt.binding.connection_id = "other-connection".into();
-        assert!(mr_publication::accept_receipt(&fixture.api, &saved, receipt.clone()).is_err());
-        assert_eq!(
-            fixture
-                .store
-                .publication(TEST_WORKSPACE_ID, &binding.operation_id)
-                .unwrap()
-                .unwrap(),
-            saved
-        );
-        receipt.binding.connection_id = binding.connection_id.clone();
+async fn publication_failure_is_an_ordinary_backend_comment_not_a_receipt() {
+    let fixture = EvidenceApiFixture::new().await;
+    fixture.approve("publication-failure");
+    let body = "Automatic Git publication outcome cannot be confirmed. Inspect the remote before the Subject chooses the next action.";
+    fixture
+        .store
+        .record_publication_problem(TEST_WORKSPACE_ID, EVIDENCE_MR, body, evidence_time())
+        .unwrap();
+    let shown = get_json(
+        fixture.app.clone(),
+        &format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{EVIDENCE_MR}?view=detail&limit=100"),
+    )
+    .await;
+    assert!(shown.get("publications").is_none());
+    assert_eq!(shown["state"]["kind"], "integration");
+    assert!(
+        shown["thread"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "comment" && e["body"] == body && e["author"].is_null())
+    );
+    assert!(
         fixture
             .store
-            .set_worker(
-                merge_request::SetMergeRequestWorker {
-                    workspace_id: TEST_WORKSPACE_ID.into(),
-                    merge_request_id: EVIDENCE_MR.into(),
-                    operation_id: "owner-after-push".into(),
-                    expected_operation_id: Some(auth.assignment_id),
-                    worker: None,
-                    assigned_by: merge_request::WorkerIdentity {
-                        runtime_id: auth.runtime_id,
-                        worker_id: auth.worker_id,
-                    },
-                    now: evidence_time(),
-                },
-                |_| Ok(()),
-            )
-            .unwrap();
-        if rescope {
-            Connection::open(&fixture.api.config.database_path)
-                .unwrap()
-                .execute(
-                    "UPDATE typed_tickets SET title='requirements changed' WHERE ticket_id=?1",
-                    [&fixture.ticket_id],
-                )
-                .unwrap();
-        }
-        assert_ne!(
-            fixture
-                .api
-                .require_configured_workspace_repository(&binding.repository_id)
-                .unwrap()
-                .source_fingerprint,
-            binding.repository_source_fingerprint
-        );
-        let mut unknown = receipt.clone();
-        unknown.outcome = RepositoryPublicationOutcome::Unknown {};
-        fixture
-            .api
-            .runtime
-            .register_or_replace(ReceiptOnlyRuntime(unknown));
-        assert_eq!(
-            mr_publication::reconcile(&fixture.api, saved.clone()).unwrap(),
-            saved
-        );
-        fixture
-            .api
-            .runtime
-            .register_or_replace(ReceiptOnlyRuntime(receipt.clone()));
-        let result = mr_publication::reconcile(&fixture.api, saved.clone()).unwrap();
-        assert!(matches!(
-            result.outcome,
-            merge_request::PublicationOutcome::Published { .. }
-        ));
-        let replay = mr_publication::accept_receipt(&fixture.api, &result, receipt).unwrap();
-        assert_eq!(replay, result);
-        let mr = fixture
-            .store
-            .get_by_id(TEST_WORKSPACE_ID, EVIDENCE_MR)
-            .unwrap();
-        assert_eq!(mr.state.is_completed(), !rescope);
-        assert_eq!(
-            mr.thread
-                .iter()
-                .filter(|e| matches!(e, merge_request::MergeRequestThreadEvent::Merge(_)))
-                .count(),
-            usize::from(!rescope)
-        );
-        assert_eq!(
-            fixture
-                .backend
-                .show(fixture.ticket_id.clone().into())
-                .unwrap()
-                .meta
-                .workflow_state,
-            ticket::TicketState::Open
-        );
-        let saved_publication = mr_publication::public(result.clone());
-        let shown = get_json(
-            fixture.app.clone(),
-            &format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{EVIDENCE_MR}?view=summary"),
-        )
-        .await;
-        assert_eq!(
-            shown["publications"],
-            serde_json::json!([saved_publication])
-        );
-        assert_eq!(
-            shown["worker_assignment"]["operation_id"],
-            "owner-after-push"
-        );
-        assert!(shown["worker_assignment"]["worker"].is_null());
-        let page = fixture.detail(0, 1).await;
-        assert_eq!(page.publications, vec![saved_publication]);
-        // A known publication replay uses the saved result even with no MR owner,
-        // no live Worker, and no usable repository credentials in this fixture.
-        assert_eq!(
-            mr_publication::publish(
-                &fixture.api,
-                EVIDENCE_MR,
-                binding.operation_id,
-                approval.event_id
-            )
-            .unwrap(),
-            result
-        );
-    }
-}
-
-/// Only the remote Runtime transport is substituted. Every unexpected new-access
-/// method fails, so receipt recovery cannot accidentally acquire fresh authority.
-struct ReceiptOnlyRuntime(worker_runtime::catalog::RepositoryPublicationReceipt);
-impl crate::hosts::WorkspaceWorkerRuntime for ReceiptOnlyRuntime {
-    fn runtime_id(&self) -> &str {
-        &self.0.binding.worker.runtime_id
-    }
-    fn runtime_summary(&self, _: usize) -> crate::hosts::InternalRuntimeSummary {
-        panic!("receipt recovery does not inspect live Runtime state")
-    }
-    fn list_hosts(&self, _: usize) -> crate::hosts::RuntimeList<crate::hosts::InternalHostSummary> {
-        panic!("no live Host query")
-    }
-    fn list_workers(
-        &self,
-        _: usize,
-    ) -> crate::hosts::RuntimeList<crate::hosts::InternalWorkerSummary> {
-        panic!("no live Worker query")
-    }
-    fn worker(&self, _: &str) -> crate::hosts::WorkerLookupResult {
-        panic!("stopped Worker is not required")
-    }
-    fn repository_publication_receipt(
-        &self,
-        binding: worker_runtime::catalog::RepositoryPublicationBinding,
-    ) -> std::result::Result<Option<worker_runtime::catalog::RepositoryPublicationReceipt>, Error>
-    {
-        assert_eq!(binding, self.0.binding);
-        Ok(Some(self.0.clone()))
-    }
-    fn publish_repository_source(
-        &self,
-        _: worker_runtime::catalog::RepositoryPublicationRequest,
-    ) -> std::result::Result<worker_runtime::catalog::RepositoryPublicationReceipt, Error> {
-        panic!("recovery must not publish")
-    }
-    fn reconcile_repository_publication(
-        &self,
-        _: worker_runtime::catalog::RepositoryPublicationRequest,
-    ) -> std::result::Result<worker_runtime::catalog::RepositoryPublicationReceipt, Error> {
-        panic!("terminal receipt needs no new provider access")
-    }
+            .publications(TEST_WORKSPACE_ID, EVIDENCE_MR)
+            .unwrap()
+            .is_empty()
+    );
 }

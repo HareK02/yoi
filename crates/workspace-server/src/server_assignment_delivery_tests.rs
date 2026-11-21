@@ -2155,3 +2155,75 @@ async fn catalog_shutdown_stops_notification_hook_and_fences_later_dispatch() {
 }
 
 include!("server_job_notification_tests.rs");
+
+fn delivery_mr_event(api: &WorkspaceApi, id: &str, kind: &str, mut payload: Value) {
+    payload["event_id"] = json!(id);
+    payload["created_at"] = json!(TEST_CREATED_AT);
+    payload["operation_id"] = json!(id);
+    api.config_store.with_conn(|conn| {
+        conn.execute("INSERT INTO merge_request_thread_events(workspace_id,merge_request_id,event_id,sequence,kind,payload_json,operation_id,created_at) SELECT ?1,'notification-mr',?2,COALESCE(MAX(sequence),0)+1,?3,?4,?2,'2' FROM merge_request_thread_events WHERE workspace_id=?1 AND merge_request_id='notification-mr'", rusqlite::params![TEST_WORKSPACE_ID,id,kind,payload.to_string()])?;
+        Ok(())
+    }).unwrap();
+}
+
+// The event boundary is seeded in SQLite; routing, recovery, Runtime admission,
+// real Worker/session persistence and ACKs are production code. Only the model
+// and the explicit loss of its response are replaced by delivery_real_fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mr_worker_notification_closed_ticket_recovers_real_acceptance_without_duplicate_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, _) = delivery_real_fixture(dir.path(), false).await;
+    let worker = spawn_ticket_check_source(&api, "mr-notification-recipient");
+    let ticket = delivery_ticket(&api, "MR remains in Integration after Ticket closure");
+    let repository_id = api
+        .store
+        .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+        .unwrap()
+        .expect("notification fixture requires the registered Repository")
+        .repository_id;
+    api.config_store.with_conn(|conn| {
+        conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_to,created_at,updated_at) VALUES(?1,'notification-mr',?2,'{\"kind\":\"implementation\"}','develop','1','1')", rusqlite::params![TEST_WORKSPACE_ID,repository_id])?;
+        conn.execute("INSERT INTO merge_request_ticket_relations VALUES(?1,'notification-mr',?2,'implements','1')", rusqlite::params![TEST_WORKSPACE_ID,ticket.id])?;
+        Ok(())
+    }).unwrap();
+    delivery_mr_event(&api, "approval", "review", json!({"decision":"approve", "body":"Exact source approved", "findings":[], "request_event_id":"request", "subject_ref":"source", "ticket_content_digest":"digest", "ticket_merge_request_subjects":[], "reviewer":{"runtime_id":"review-runtime","worker_id":"reviewer"}}));
+    api.config_store.with_conn(|conn| {
+        conn.execute("UPDATE merge_requests SET state='{\"kind\":\"integration\",\"started_by\":\"approval\"}' WHERE workspace_id=?1 AND merge_request_id='notification-mr'", [TEST_WORKSPACE_ID])?;
+        Ok(())
+    }).unwrap();
+    delivery_mr_event(&api, "mr-owner", "worker_assigned", json!({"worker":worker,"assigned_by":worker}));
+    delivery_mr_event(&api, "before-close", "comment", json!({"body":"Conflict needs attention", "author":{"runtime_id":"review-runtime","worker_id":"reviewer"}}));
+    let pending = delivery_worker_pending(&api);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].merge_request_id.as_deref(), Some("notification-mr"));
+    execution.lose_responses.store(true, std::sync::atomic::Ordering::SeqCst);
+    recover_ticket_notifications(&api);
+    delivery_wait_idle(&api, &worker, 1).await;
+    let accepted = execution.attempts.lock().unwrap()[0].clone();
+    assert_eq!(accepted.0, pending[0].request_id);
+    assert_eq!(delivery_receipts(&api, &worker).len(), 1);
+    assert_eq!(delivery_worker_pending(&api), pending);
+    // Close after saved request and actual acceptance, but before Backend ACK.
+    api.config_store.with_conn(|conn| {
+        conn.execute("UPDATE typed_tickets SET workflow_state='closed' WHERE workspace_id=?1 AND ticket_id=?2", rusqlite::params![TEST_WORKSPACE_ID,ticket.id])?;
+        Ok(())
+    }).unwrap();
+    let mut recovered = api.clone();
+    recovered.store = Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
+    execution.lose_responses.store(false, std::sync::atomic::Ordering::SeqCst);
+    recover_ticket_notifications(&recovered);
+    let attempts = execution.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2, "closed Ticket suppressed recovery of the MR owner request");
+    assert!(attempts.iter().all(|attempt| *attempt == accepted));
+    assert_eq!(delivery_commits(&recovered, &worker).iter().filter(|body| **body == accepted.1).count(), 1);
+    assert!(delivery_worker_pending(&recovered).is_empty());
+    delivery_mr_event(&recovered, "after-close", "comment", json!({"body":"Resolution ready", "author":{"runtime_id":"review-runtime","worker_id":"reviewer"}}));
+    recover_ticket_notifications(&recovered);
+    delivery_wait_idle(&recovered, &worker, 2).await;
+    assert_eq!(delivery_receipts(&recovered, &worker).len(), 2);
+    assert!(delivery_worker_pending(&recovered).is_empty());
+    let count = execution.attempts.lock().unwrap().len();
+    recover_ticket_notifications(&recovered);
+    assert_eq!(execution.attempts.lock().unwrap().len(), count);
+    delivery_stop(&recovered, &worker);
+}

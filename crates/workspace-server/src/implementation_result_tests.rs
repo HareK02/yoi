@@ -975,6 +975,9 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
             let state = r#"{"kind":"implementation"}"#;
             conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_from,selector_to,created_at,updated_at) VALUES('w','actor-mr','main',?1,'work','main','3','3')", [state])?;
             conn.execute_batch("INSERT INTO merge_request_ticket_relations VALUES('w','actor-mr','tracking','implements','3');")?;
+            if !historical {
+                conn.execute("INSERT INTO merge_request_thread_events VALUES('w','actor-mr','owner',0,'worker_assigned',?1,'owner','3')", [serde_json::json!({"worker":{"runtime_id":"r","worker_id":"replacement"}}).to_string()])?;
+            }
             for (index, (kind, field, worker, _)) in events.iter().enumerate() {
                 let mut payload = serde_json::json!({"subject_ref":"source-a"});
                 if let (Some(field), Some(worker)) = (field, worker) {
@@ -990,9 +993,10 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
             notification_routing::route_pending(conn,"w")?;
             for (kind, _, worker, suppressed_role) in events {
                 for role in ["worker", "orchestrator"] {
+                    let captured_role = if !historical && role=="worker" { "mr_worker" } else { role };
                     let (actor,disposition,reason):(Option<String>,String,String) = conn.query_row(
                         "SELECT s.actor,d.disposition,d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id=?1 AND s.role=?2",
-                        params![format!("mr-event:actor-mr:{kind}"),role],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                        params![format!("mr-event:actor-mr:{kind}"),captured_role],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
                     assert_eq!(actor,worker.map(|w|format!("worker:r/{w}")),"{kind}, historical={historical}");
                     if historical && role == "orchestrator" {
                         assert_eq!((disposition.as_str(),reason.as_str()),("suppress","unsupported_recipient"),

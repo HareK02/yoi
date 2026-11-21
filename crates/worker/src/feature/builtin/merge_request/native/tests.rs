@@ -24,11 +24,13 @@ pub(super) fn roots() -> ReferenceRoots {
 
 fn all_config() -> MergeRequestFeatureConfig {
     MergeRequestFeatureConfig {
+        query: true,
         show: true,
         open: true,
         review: true,
         worker_set: true,
         comment: true,
+        complete: true,
     }
 }
 
@@ -60,7 +62,7 @@ async fn inspect_interface(runtime: &WipRuntime, path: &str) -> String {
 async fn removed_tools_and_native_operations_are_not_available() {
     let client = Arc::new(RecordingWorkspaceClient::new(vec![]));
     let definitions = enabled_merge_request_definitions(client.clone(), all_config());
-    assert_eq!(definitions.len(), 5);
+    assert_eq!(definitions.len(), 7);
     let names: Vec<_> = definitions
         .iter()
         .map(|definition| definition().0.name)
@@ -68,11 +70,13 @@ async fn removed_tools_and_native_operations_are_not_available() {
     assert_eq!(
         names,
         [
+            "QueryMergeRequest",
             "ShowMergeRequest",
             "OpenMergeRequest",
             "ReviewMergeRequest",
             "SetMergeRequestWorker",
-            "CommentMergeRequest"
+            "CommentMergeRequest",
+            "CompleteMergeRequest"
         ]
     );
     let native_tools = native_merge_request_tools(client.clone(), all_config()).unwrap();
@@ -81,14 +85,21 @@ async fn removed_tools_and_native_operations_are_not_available() {
             .iter()
             .map(|tool| tool.contract.name)
             .collect::<Vec<_>>(),
-        ["read", "open", "review", "worker_set", "comment"]
+        [
+            "query",
+            "read",
+            "open",
+            "review",
+            "worker_set",
+            "comment",
+            "complete"
+        ]
     );
     let native = runtime(client.clone());
     for (tool, operation) in [
         ("QueryMergeRequestWorker", "worker_query"),
         ("PublishMergeRequest", "publish"),
         ("QueryMergeRequestPublications", "publications"),
-        ("CompleteMergeRequest", "complete"),
         ("CheckMergeRequestReadiness", "readiness"),
     ] {
         assert!(!names.iter().any(|name| name == tool));

@@ -201,23 +201,74 @@ async fn mr_worker_http_assignment_requires_permission_and_preserves_cas_history
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{shown}");
-    assert_eq!(shown["publications"], json!([]));
+    assert!(shown.get("publications").is_none());
     assert_eq!(shown["worker_assignment"], restored);
     assert_eq!(shown["summary"]["readiness"]["ready"], false);
     assert!(shown["summary"]["readiness"]["blockers"].is_array());
-    // Dedicated reads, publication dispatch and completion no longer exist. PUT /worker remains.
+    // Completion is a current-owner operation, not a removed publication route.
+    // This Workdirless fixture rejects before provider access; the connected Git
+    // suite owns successful manual-push completion.
+    let complete_path = format!(
+        "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/complete",
+        mr.merge_request_id
+    );
+    let completion = json!({
+        "operation_id": "manual-completion",
+        "expected_owner_operation_id": restored["operation_id"],
+        "approval_event_id": "missing-approval",
+        "expected_source_ref": "source"
+    });
+    let send_completion = |body: &Value| {
+        runtime_source_request(
+            &f.identity,
+            Some(&f.source.worker_id),
+            "POST",
+            &complete_path,
+            serde_json::to_vec(body).unwrap(),
+        )
+    };
+    let before_completion = store
+        .get_by_id(TEST_WORKSPACE_ID, &mr.merge_request_id)
+        .unwrap();
+    let (status, denied) = response(&f.api, send_completion(&completion)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let (status, denied) = response(&f.api, send_completion(&completion)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "read is required: {denied}");
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "merge_request"; keys = ["merge_request.read", "merge_request.complete"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let mut stale_completion = completion.clone();
+    stale_completion["expected_owner_operation_id"] = receipt["operation_id"].clone();
+    let (status, denied) = response(&f.api, send_completion(&stale_completion)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "stale owner: {denied}");
+    let (status, unapproved) = response(&f.api, send_completion(&completion)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{unapproved}");
+    assert!(
+        unapproved
+            .to_string()
+            .contains("completion approval was not found on this MR"),
+        "current owner must reach approval validation: {unapproved}"
+    );
+    assert_eq!(
+        store
+            .get_by_id(TEST_WORKSPACE_ID, &mr.merge_request_id)
+            .unwrap(),
+        before_completion,
+        "rejected completion must not change MR state or history"
+    );
+    // Dedicated reads and publication dispatch remain removed. PUT /worker remains.
     for (method, removed_path) in [
         (
             "GET",
             format!(
                 "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/readiness",
-                mr.merge_request_id
-            ),
-        ),
-        (
-            "POST",
-            format!(
-                "/api/w/{TEST_WORKSPACE_ID}/merge-requests/{}/complete",
                 mr.merge_request_id
             ),
         ),
@@ -267,5 +318,227 @@ async fn mr_worker_http_assignment_requires_permission_and_preserves_cas_history
             .get_by_id(TEST_WORKSPACE_ID, &mr.merge_request_id)
             .unwrap(),
         observed
+    );
+}
+
+#[tokio::test]
+async fn mr_query_http_checks_collection_and_item_permissions_and_authenticated_self() {
+    let f = Fixture::new().await;
+    let repository_id = f
+        .api
+        .store
+        .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+        .unwrap()
+        .unwrap()
+        .repository_id;
+    let ticket = browser_ticket_backend(&f.api)
+        .unwrap()
+        .create(NewTicket::new("query target"))
+        .unwrap()
+        .id;
+    let initial = Arc::new(InitialMrAuthority(
+        merge_request::CurrentAssignment {
+            assignment_id: "initial-query".into(),
+            ticket_id: ticket.clone(),
+            runtime_id: f.source.runtime_id.clone(),
+            worker_id: f.source.worker_id.clone(),
+        },
+        repository_id.clone(),
+    ));
+    let store = merge_request::MergeRequestStore::open(
+        &f.api.config.database_path,
+        initial.clone(),
+        initial,
+    )
+    .unwrap();
+    store
+        .open_merge_request(merge_request::OpenMergeRequest {
+            merge_request_id: "query-mr".into(),
+            ticket_id: ticket.clone(),
+            repository_id: repository_id.clone(),
+            selector_from: "work/query".into(),
+            selector_to: "refs/heads/develop".into(),
+            summary: String::new(),
+            auth: merge_request::MergeRequestAuth {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                repository_id,
+                runtime_id: f.source.runtime_id.clone(),
+                worker_id: f.source.worker_id.clone(),
+                assignment_id: "initial-query".into(),
+            },
+            now: Utc::now(),
+        })
+        .unwrap();
+    let path = format!(
+        "/api/w/{TEST_WORKSPACE_ID}/merge-requests?repository_key=test-repository&selector_to=develop&phase=implementation&assigned_to_self=true&limit=1"
+    );
+    let send = |path: &str| {
+        runtime_source_request(&f.identity, Some(&f.source.worker_id), "GET", path, vec![])
+    };
+    let query_permission = ScopedPermission {
+        operation: "merge_request.query".into(),
+        resource: PermissionResource::Workspace {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        },
+    };
+    let read_permission = ScopedPermission {
+        operation: "merge_request.read".into(),
+        resource: PermissionResource::MergeRequest {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            merge_request_id: "query-mr".into(),
+        },
+    };
+    f.seed_saved_policy(vec![read_permission.clone()], vec![]);
+    let (status, _) = response(&f.api, send(&path)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "item read is not collection query"
+    );
+    f.seed_saved_policy(vec![query_permission.clone()], vec![]);
+    let (status, denied) = response(&f.api, send(&path)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "query is not item read: {denied}"
+    );
+    assert!(denied.get("items").is_none());
+    f.seed_saved_policy(vec![query_permission.clone(), read_permission], vec![]);
+    let (status, result) = response(&f.api, send(&path)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["items"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(
+        result["items"][0]["summary"]["merge_request_id"],
+        "query-mr"
+    );
+    assert!(result["next_cursor"].is_null());
+    let item = &result["items"][0];
+    let detail_path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/query-mr?view=summary");
+    let (status, detail) = response(&f.api, send(&detail_path)).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(item["worker_assignment"], detail["worker_assignment"]);
+    assert_eq!(
+        item["worker_assignment"]["worker"]["worker_id"],
+        f.source.worker_id
+    );
+    let key = f
+        .api
+        .store
+        .worker_resource_key(TEST_WORKSPACE_ID, &f.source)
+        .unwrap()
+        .unwrap();
+    assert!(key.starts_with("W-"));
+    assert_eq!(item["worker_resource_key"], key);
+    assert_eq!(detail["worker_resource_key"], key);
+    assert!(item.get("publications").is_none());
+    assert!(item["summary"].get("worker_assignment").is_none());
+    assert!(item["summary"].get("publications").is_none());
+    assert!(item.get("readiness").is_none());
+    for (suffix, expected) in [
+        ("&phase=bogus", StatusCode::BAD_REQUEST),
+        ("&limit=0", StatusCode::BAD_REQUEST),
+    ] {
+        // Invalid values are tested without duplicate query keys.
+        let invalid = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests?{}", &suffix[1..]);
+        let (status, _) = response(&f.api, send(&invalid)).await;
+        assert!(
+            status == expected || status == StatusCode::UNPROCESSABLE_ENTITY,
+            "{invalid}: {status}"
+        );
+    }
+    let (status, empty) = response(
+        &f.api,
+        send(&path.replace("phase=implementation", "phase=integration")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert!(empty["items"].as_array().unwrap().is_empty());
+    // Self is authenticated, never selected by query arguments or historical Ticket assignment.
+    let current = store
+        .current_worker(TEST_WORKSPACE_ID, "query-mr")
+        .unwrap()
+        .unwrap();
+    store
+        .set_worker(
+            merge_request::SetMergeRequestWorker {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                merge_request_id: "query-mr".into(),
+                operation_id: "query-release".into(),
+                expected_operation_id: Some(current.operation_id),
+                worker: None,
+                assigned_by: merge_request::WorkerIdentity {
+                    runtime_id: f.source.runtime_id.clone(),
+                    worker_id: f.source.worker_id.clone(),
+                },
+                now: Utc::now(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    let (status, empty) = response(&f.api, send(&path)).await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert!(empty["items"].as_array().unwrap().is_empty());
+    let (status, all) = response(
+        &f.api,
+        send(&path.replace("assigned_to_self=true", "assigned_to_self=false")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        all["items"][0]["worker_assignment"]["operation_id"],
+        "query-release"
+    );
+    assert!(all["items"][0]["worker_assignment"]["worker"].is_null());
+    assert!(all["items"][0]["worker_resource_key"].is_null());
+    let (status, released_detail) = response(&f.api, send(&detail_path)).await;
+    assert_eq!(status, StatusCode::OK, "{released_detail}");
+    assert_eq!(
+        all["items"][0]["worker_assignment"],
+        released_detail["worker_assignment"]
+    );
+
+    // Publication failures are ordinary thread comments, not an operation ledger.
+    let listing = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests");
+    store
+        .record_publication_problem(
+            TEST_WORKSPACE_ID,
+            "query-mr",
+            "Workdir unavailable; Subject action required",
+            Utc::now(),
+        )
+        .unwrap();
+    let (status, detail) = response(&f.api, send(&detail_path)).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert!(detail.get("publications").is_none());
+    f.seed_saved_policy(vec![query_permission], vec![]);
+    let (status, denied) = response(&f.api, send(&listing)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert!(
+        denied.get("items").is_none(),
+        "saved ownership/publication cannot bypass item read"
+    );
+    let (status, _) = response(
+        &f.api,
+        Request::builder().uri(&path).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "anonymous query is not a Worker identity"
+    );
+    let (status, _) = response(&f.api, human_request(&f.owner, "GET", &path, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "browser has no Runtime Worker self"
+    );
+    f.seed_saved_policy(vec![], vec![]);
+    let (status, _) = response(&f.api, send(&path)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "revocation is checked even on an empty filtered page"
     );
 }

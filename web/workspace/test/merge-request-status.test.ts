@@ -4,7 +4,7 @@ import type {
   MergeRequestDetail,
   MergeRequestThreadEvent,
 } from "../src/lib/workspace/api/merge-requests.ts";
-import { sourceReviewFreshness } from "../src/lib/workspace/merge-request-status.ts";
+import { sourceReviewFreshness, targetIntegrationStatus } from "../src/lib/workspace/merge-request-status.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (actual !== expected) {
@@ -112,8 +112,9 @@ function detail(
   latestSubject = "source-2",
 ): MergeRequestDetail {
   return {
+    worker_resource_key: null,
     worker_assignment: null,
-    publications: [],
+
     view: "detail",
     summary: {
       review_status: reviewStatus,
@@ -202,6 +203,16 @@ Deno.test("status uses complete backend evidence rather than a selected history 
     "Current source approved at exact ref source-2.");
   assertEquals(sourceReviewFreshness(detail([], "request_changes")),
     "Current source requests changes at exact ref source-2.");
+});
+
+Deno.test("unknown target and canceled phase never imply completion", () => {
+  const unknown = detail([]);
+  unknown.target = { status: "unknown", ref: "retained-but-unverified", observed_at: createdAt };
+  assertEquals(targetIntegrationStatus(unknown),
+    "Target observation unavailable; MR completion has not been recorded.");
+  unknown.state = { kind: "canceled", from: { kind: "integration", started_by: "approval-1" } };
+  assertEquals(targetIntegrationStatus(unknown),
+    "Merge Request canceled; cancellation is not evidence of target publication.");
 });
 
 Deno.test("source movement explains the exact stale and current refs", () => {

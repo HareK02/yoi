@@ -183,8 +183,9 @@ Deno.test("Merge Request routes distinguish recorded approval from live source o
 
 Deno.test("merged detail uses backend validated immutable evidence even with a partial thread", () => {
   const detail: MergeRequestDetail = {
+    worker_resource_key: null,
     worker_assignment: null,
-    publications: [],
+
     view: "detail",
     summary: {
       review_status: "approved",

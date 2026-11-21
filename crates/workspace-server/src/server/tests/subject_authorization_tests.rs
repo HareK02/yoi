@@ -4392,6 +4392,17 @@ impl ConnectedWorkerHarness {
                                 assert!(
                                     matches!(
                                         api_macros::http::decode_problem_response::<
+                                            runtime_api::control_failure::RuntimeControlFailure,
+                                        >(
+                                            &bytes,
+                                            parts.status.as_u16(),
+                                            content_type,
+                                            &runtime_api::control_failure::ControlBoundary,
+                                            error_contract::Budget::new(16384, 16384),
+                                        ),
+                                        error_contract::DecodeFailure::Known(_)
+                                    ) || matches!(
+                                        api_macros::http::decode_problem_response::<
                                             runtime_api::control_failure::RuntimeControlCause,
                                         >(
                                             &bytes,
@@ -4413,7 +4424,7 @@ impl ConnectedWorkerHarness {
                                         ),
                                         error_contract::DecodeFailure::Known(_)
                                     ),
-                                    "RuntimeHTTP must emit a valid Startup, Control or Workdir management Problem"
+                                    "RuntimeHTTP must emit a valid Startup, Control or Workdir management Problem: {body}"
                                 );
                             }
                             body["detail"].as_str().expect("Problem detail")

@@ -1593,6 +1593,8 @@ function parseMergeRequestListItem(
   const item = object(value, label);
   exact(item, [
     "ref_diagnostics",
+    "worker_assignment",
+    "worker_resource_key",
     "summary",
     "thread_event_count",
     "ticket_ids",
@@ -1603,6 +1605,8 @@ function parseMergeRequestListItem(
       `${label}.ref_diagnostics`,
       parseMergeRequestDiagnostic,
     ),
+    worker_assignment: parseMergeRequestAssignment(item.worker_assignment, `${label}.worker_assignment`),
+    worker_resource_key: nullableString(item.worker_resource_key, `${label}.worker_resource_key`),
     summary: parseTicketMergeRequestSummary(item.summary, `${label}.summary`),
     thread_event_count: integer(
       item.thread_event_count,
@@ -1798,7 +1802,7 @@ function parseMergeRequestThreadEvent(
       kind,
       operation_id: optionalNullableString(item.operation_id, `${label}.operation_id`),
       owner_operation_id: optionalNullableString(item.owner_operation_id, `${label}.owner_operation_id`),
-      author: parseMergeRequestWorker(item.author, `${label}.author`),
+      author: item.author === null ? null : parseMergeRequestWorker(item.author, `${label}.author`),
       body: string(item.body, `${label}.body`),
     };
   }
@@ -1987,42 +1991,6 @@ function parseMergeRequestAssignment(
   };
 }
 
-function parseMergeRequestPublication(
-  value: unknown,
-  label: string,
-): MergeRequestDetailResponse["publications"][number] {
-  const item = object(value, label);
-  exact(item, ["operation_id", "merge_request_id", "approval_event_id", "source_ref", "target_selector", "target_ref_before", "outcome"], label);
-  const result = object(item.outcome, `${label}.outcome`);
-  const kind = string(result.kind, `${label}.outcome.kind`);
-  let outcome: MergeRequestDetailResponse["publications"][number]["outcome"];
-  if (kind === "unconfirmed") {
-    exact(result, ["kind"], `${label}.outcome`);
-    outcome = { kind };
-  } else if (kind === "not_published") {
-    exact(result, ["kind", "reason"], `${label}.outcome`);
-    outcome = { kind, reason: string(result.reason, `${label}.outcome.reason`) };
-  } else if (kind === "published") {
-    exact(result, ["kind", "target_after", "observed_at"], `${label}.outcome`);
-    outcome = {
-      kind,
-      target_after: string(result.target_after, `${label}.outcome.target_after`),
-      observed_at: string(result.observed_at, `${label}.outcome.observed_at`),
-    };
-  } else {
-    throw new TicketBrowserContractError(`${label}.outcome.kind is invalid`);
-  }
-  return {
-    operation_id: string(item.operation_id, `${label}.operation_id`),
-    merge_request_id: string(item.merge_request_id, `${label}.merge_request_id`),
-    approval_event_id: string(item.approval_event_id, `${label}.approval_event_id`),
-    source_ref: string(item.source_ref, `${label}.source_ref`),
-    target_selector: string(item.target_selector, `${label}.target_selector`),
-    target_ref_before: string(item.target_ref_before, `${label}.target_ref_before`),
-    outcome,
-  };
-}
-
 export function parseMergeRequestDetailResponse(
   value: unknown,
 ): MergeRequestDetailResponse {
@@ -2043,7 +2011,7 @@ export function parseMergeRequestDetailResponse(
     "view",
     "event_page",
     "worker_assignment",
-    "publications",
+    "worker_resource_key",
     "ticket_ids",
     "updated_at",
     "workspace_id",
@@ -2057,8 +2025,8 @@ export function parseMergeRequestDetailResponse(
     view,
     summary: parseMergeRequestStatusSummary(item.summary, `${label}.summary`),
     event_page: parseMergeRequestEventPage(item.event_page, `${label}.event_page`),
+    worker_resource_key: nullableString(item.worker_resource_key, `${label}.worker_resource_key`),
     worker_assignment: parseMergeRequestAssignment(item.worker_assignment, `${label}.worker_assignment`),
-    publications: array(item.publications, `${label}.publications`, parseMergeRequestPublication),
     created_at: string(item.created_at, `${label}.created_at`),
     linked_tickets: array(
       item.linked_tickets,

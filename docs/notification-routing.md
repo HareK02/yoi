@@ -11,7 +11,7 @@ Ticket case/handling, MR approval, Job execution, or Worker lifecycle.
 | --- | --- | --- | --- |
 | Ticket Assign, Answer, item/content edits | Ticket transaction triggers → `notification_routing` | Original delegation; explicit request vs attention. No recipient, released/history, closed/done, unsupported recipient and self-notification are recorded separately. | Assignment reservations, pinned requests, authorized targets and ACKs; common recovery; `assignment_delivery_tests.rs` and `server_assignment_delivery_tests.rs`. |
 | Ticket comments/post edits, tags, case, tracking, release | Same capture and routing ledger | They do not become new Orchestrator requests. Applicable implementation-Worker attention is distinct from new delegation. | Same evidence; `notification_routing_tests.rs` covers positive and negative routes. Unknown source kinds defer explicitly. |
-| MR review requested/result/revoked/cancelled/merge and observed source changes | MR transaction/source-observation triggers → common routing | Ticket delegation and implementation recipient captured at the event. MR remains the freshness/approval authority. | Stable MR event identity; current MR must be reread before action. Ordinary review comments are not inferred handoffs. `implementation_result_tests.rs` and `server_implementation_result_tests.rs` cover capture, self-suppression, recovery and public diagnostics. |
+| MR review・担当変更・コメント・merge・source観測・公開操作の保存結果 | MR transaction／source観測／publication保存trigger → 共通routing | 保存時点のTicket担当Subjectと現在のMR担当Workerを記録する。Ticket実装担当からMR担当を推測しない。コメントはattentionであり、承認・完了・結果へ分類し直さない。 | 既存source・request・ACK・recoveryを使用。MR担当の操作ID、現在のSubject本体、配送時のTicket／MR読取権限で再確認する。受信者は現在のMR・担当・公開結果を再読する。 |
 | Explicit implementation result/handoff/blocker | Authenticated `TicketImplementationResult` transaction | Authenticated Workspace Worker and Ticket, without assignment membership requirements. The current Orchestrator is captured at report-save time, or no-recipient is recorded. No substitution of AssignmentAnswer or self-reported handling. | Result and source persist together; same common delivery/receipt path. No MR is required. |
 | Backend Job accepted result | Result transaction → `notification_routing::jobs` | Fixed recipient, never replacement by the current Orchestrator. No target, checker no-findings and stale content suppress without ACK. Domain validation/rendering remains in the adapter. | Common request/ACK/failure ledger, fixed bytes/recipient, startup and periodic recovery; `job_notification_tests.rs` and `server_job_notification_tests.rs`. |
 | Explicit WorkerNotify/WorkerSendInput | Authenticated caller | Explicit communication, not automatic business routing. | Existing Worker control boundary; not inferred from Ticket activity. |
@@ -21,8 +21,13 @@ The capture adapters and the central event-kind mapping must be updated together
 The tests intentionally exercise unknown kinds and missing source capture: neither
 is represented as successful delivery or intentional suppression. Adding a producer
 requires a positive persisted-receipt test and a negative/suppression test, not merely
-an assertion that a send function ran. `notification_registration_tests.rs` checks
-public MR event variants against the central mapping; comments are explicitly excluded.
+an assertion that a send function ran. `notification_registration_tests.rs`では公開MRイベントと中央mappingの対応を確認する。
+コメントも通知対象だが、本文から結果や承認を推定しない。
+
+MR通知のcapture変更は将来の保存に適用し、既存source・request・ACK・宛先証拠を
+書き換えない。過去にcaptureしなかったコメントを現在の担当へ遡及配送すると当時の
+宛先を推測することになるため、移行時のbackfillは行わない。公開操作の`unconfirmed`
+は進行中と結果不明を区別する証拠ではなく、配送受理も公開成功の証拠ではない。
 
 MR source changes are captured when an existing Backend MR operation observes the
 provider ref, not by an external Git-push listener. The initial source observation

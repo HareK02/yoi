@@ -49,6 +49,7 @@ feature = {
     objective = { enabled = true; };
     ticket = { enabled = true; authoring = true; thread = true; };
     merge_request = {
+        query = false;
         show = false;
         open = false;
         review = false;

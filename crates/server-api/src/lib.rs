@@ -627,8 +627,7 @@ impl_openapi_schema!(
     MergeRequestWorkerAssignedEvent,
     SetMergeRequestWorkerRequest,
     CommentMergeRequestRequest,
-    MergeRequestPublication,
-    MergeRequestPublicationOutcome,
+    CompleteMergeRequestRequest,
     ObjectiveCreateRequest,
     ObjectiveDetail,
     ObjectiveEditRequest,
@@ -3968,6 +3967,7 @@ pub trait ServerApi {
     #[get("/api/w/{workspace_id}/merge-requests", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_list(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: MergeRequestListQuery,
     ) -> Result<MergeRequestListResponse, RepositoryApiError>;
@@ -4048,6 +4048,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CommentMergeRequestRequest,
     ) -> Result<MergeRequestCommentEvent, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn merge_request_complete(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CompleteMergeRequestRequest,
+    ) -> Result<MergeEvent, RepositoryApiError>;
     #[post("/workspaces/{workspace_id}/tickets/{ticket_id}/case", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_case_update(
         &self,
@@ -8750,6 +8758,10 @@ pub struct MergeRequestRefDiagnostic {
 #[serde(deny_unknown_fields)]
 pub struct MergeRequestListItem {
     pub summary: TicketMergeRequestSummary,
+    /// Current MR ownership, including a retained release operation with null Worker.
+    pub worker_assignment: Option<MergeRequestWorkerAssignedEvent>,
+    /// Canonical Workspace Worker reference when retained; never an internal-ID fallback.
+    pub worker_resource_key: Option<String>,
     pub ticket_ids: Vec<String>,
     #[cfg_attr(feature = "typescript", ts(type = "number"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
@@ -9633,7 +9645,7 @@ merge_request_event!(MergeRequestCommentEvent {
     operation_id: Option<String>,
     owner_operation_id: Option<String>,
     body: String,
-    author: MergeRequestWorkerIdentity,
+    author: Option<MergeRequestWorkerIdentity>,
 });
 merge_request_event!(MergeRequestWorkerAssignedEvent {
     operation_id: String,
@@ -9641,32 +9653,6 @@ merge_request_event!(MergeRequestWorkerAssignedEvent {
     worker: Option<MergeRequestWorkerIdentity>,
     assigned_by: MergeRequestWorkerIdentity,
 });
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum MergeRequestPublicationOutcome {
-    Unconfirmed {},
-    NotPublished {
-        reason: String,
-    },
-    Published {
-        target_after: String,
-        observed_at: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct MergeRequestPublication {
-    pub operation_id: String,
-    pub merge_request_id: String,
-    pub approval_event_id: String,
-    pub source_ref: String,
-    pub target_selector: String,
-    pub target_ref_before: String,
-    pub outcome: MergeRequestPublicationOutcome,
-}
 
 fn required_nullable_schema<T: JsonSchema>(
     generator: &mut schemars::SchemaGenerator,
@@ -9758,14 +9744,28 @@ pub struct PublicMergeRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeRequestListQuery {
+    /// Exact saved lifecycle phase, independent of review freshness.
+    pub phase: Option<MergeRequestPhaseFilter>,
+    /// Match the authenticated caller's current MR Worker, not the Ticket Subject.
+    /// Requires a Runtime Worker source; omitted/false does not filter assignment.
+    pub assigned_to_self: Option<bool>,
     pub state: Option<String>,
     pub repository_key: Option<String>,
     pub ticket_ref: Option<String>,
     pub selector_from: Option<String>,
     pub selector_to: Option<String>,
     pub cursor: Option<String>,
-    #[schemars(range(min = 0, max = 1000))]
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeRequestPhaseFilter {
+    Implementation,
+    Integration,
+    Completed,
+    Canceled,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9882,9 +9882,8 @@ pub struct MergeRequestDetailResponse {
     /// Current assignment, including its CAS operation ID, independent of the thread page.
     /// Null means never assigned; a released assignment retains its operation ID and null Worker.
     pub worker_assignment: Option<MergeRequestWorkerAssignedEvent>,
-    /// Latest publication operations, newest first, bounded to 100 (not a complete history).
-    /// Reading these saved facts never dispatches or retries publication.
-    pub publications: Vec<MergeRequestPublication>,
+    /// Canonical Workspace Worker reference when retained; never an internal-ID fallback.
+    pub worker_resource_key: Option<String>,
     pub event_page: MergeRequestEventPage,
 }
 
@@ -13655,19 +13654,11 @@ mod tests {
                 .count(),
             11
         );
-        assert_eq!(
-            operations
-                .iter()
-                .filter(|operation| operation.operation_id.starts_with("merge_request_"))
-                .count(),
-            11
-        );
         for removed in [
             "merge_request_worker_get",
             "merge_request_publications",
             "merge_request_publish",
             "merge_request_readiness",
-            "merge_request_complete",
         ] {
             assert!(
                 !operations
@@ -13686,6 +13677,11 @@ mod tests {
                 "ticket_relation_query",
                 HttpMethod::Post,
                 "/api/w/{workspace_id}/tickets/relations/search",
+            ),
+            (
+                "merge_request_complete",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/merge-requests/{id}/complete",
             ),
             (
                 "merge_request_show",
@@ -16009,6 +16005,7 @@ mod openapi_artifact_tests {
             "current_worker_workdir_detach",
             "current_worker_workdir_operation",
             "merge_request_worker_set",
+            "merge_request_complete",
             "merge_request_comment",
             "merge_request_open",
             "merge_request_review_capability_register",
@@ -16483,4 +16480,16 @@ pub struct CommentMergeRequestRequest {
     pub operation_id: String,
     pub expected_owner_operation_id: String,
     pub body: String,
+}
+
+/// Records verified manual publication; it never sends a Git push. The source and
+/// approval are expectations, not proof. Backend observes the configured provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CompleteMergeRequestRequest {
+    pub operation_id: String,
+    pub expected_owner_operation_id: String,
+    pub approval_event_id: String,
+    pub expected_source_ref: String,
 }

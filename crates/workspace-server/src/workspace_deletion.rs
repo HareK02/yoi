@@ -1087,6 +1087,11 @@ mod tests {
             "worker_launch_policies",
         ];
         store.with_conn(|conn| {
+            let history_guard: String = conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='merge_request_publication_history_no_insert'",
+                [], |row| row.get(0),
+            )?;
+            conn.execute_batch("DROP TRIGGER merge_request_publication_history_no_insert")?;
             for workspace in ["workspace-a", "workspace-b"] {
                 conn.execute("INSERT INTO repositories(workspace_id,repository_id,repository_key,kind,provider,uri,created_at,updated_at,source_kind,source_uri,source_fingerprint) VALUES(?1,?1,'main','git','git','file:///main','1','1','file','file:///main','sha256:fixture')", [workspace])?;
                 conn.execute("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,selector_from,selector_to,state,created_at,updated_at) VALUES(?1,'mr',?1,'source','main','{\"kind\":\"implementation\"}','1','1')", [workspace])?;
@@ -1101,6 +1106,8 @@ mod tests {
                 conn.execute("INSERT INTO backend_job_reference_migration_targets VALUES(?1,'physical')", [workspace])?;
                 conn.execute("INSERT INTO backend_job_reference_migration_jobs VALUES(?1,'legacy-job')", [workspace])?;
             }
+            conn.execute_batch(&history_guard)?;
+            assert!(conn.execute("INSERT INTO merge_request_publications VALUES('workspace-a','new-publication','mr','workspace-a','refs/heads/main','approval',1,'{}')", []).is_err());
             Ok(())
         }).unwrap();
         let counts = |workspace: &str| {

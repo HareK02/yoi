@@ -149,6 +149,11 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
         K::Workspace,
         &[
             (
+                "merge_request.query",
+                "Query Merge Requests",
+                "Query the Workspace MR collection; each returned MR separately requires read permission.",
+            ),
+            (
                 "ticket.create",
                 "Create Tickets",
                 "Create open Tickets in this Workspace; no read or edit rights to existing Tickets are implied.",
@@ -441,12 +446,12 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
             (
                 "merge_request.publish",
                 "Publish approved MR source",
-                "Publish only the approved fixed source to this MR target using the current Workdir and durable publication evidence.",
+                "Publish only the approved fixed source to this MR target using the current Workdir and normal non-force Git execution.",
             ),
             (
                 "merge_request.complete",
                 "Record MR integration",
-                "Record an already-applied exact-source integration with existing approval and source checks.",
+                "Record provider-verified manual publication as the current MR Worker with valid approval; never push or add Subject approval.",
             ),
         ],
     );

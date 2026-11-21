@@ -550,6 +550,8 @@ pub struct TicketFeatureConfig {
 #[serde(deny_unknown_fields)]
 pub struct MergeRequestFeatureConfig {
     #[serde(default)]
+    pub query: bool,
+    #[serde(default)]
     pub show: bool,
     #[serde(default)]
     pub open: bool,
@@ -559,11 +561,19 @@ pub struct MergeRequestFeatureConfig {
     pub worker_set: bool,
     #[serde(default)]
     pub comment: bool,
+    #[serde(default)]
+    pub complete: bool,
 }
 
 impl MergeRequestFeatureConfig {
     pub fn any(self) -> bool {
-        self.show || self.open || self.review || self.worker_set || self.comment
+        self.query
+            || self.show
+            || self.open
+            || self.review
+            || self.worker_set
+            || self.comment
+            || self.complete
     }
 }
 

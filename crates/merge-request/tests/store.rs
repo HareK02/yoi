@@ -8,6 +8,8 @@ mod lifecycle;
 mod ownership;
 #[path = "store/publication.rs"]
 mod publication;
+#[path = "store/query.rs"]
+mod query;
 
 use chrono::{TimeZone, Utc};
 use merge_request::*;
@@ -361,7 +363,7 @@ fn v12_migration_revokes_old_grants_preserves_integration_and_requires_fresh_con
             .query_row("SELECT version FROM merge_request_schema", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
 }
 
@@ -946,7 +948,7 @@ fn fresh_schema_reopens_as_current() {
             r.get::<_, i64>(0)
         })
         .unwrap(),
-        16
+        17
     );
     merge_request::migrate(&c).unwrap();
 }
@@ -1147,7 +1149,13 @@ fn first_class_list_and_detail_are_workspace_scoped_and_cursor_bounded() {
         )
         .unwrap();
     assert_eq!(first.items[0].merge_request_id, "MR-2");
-    assert_eq!(first.next_cursor.as_deref(), Some("MR-2"));
+    assert!(
+        first
+            .next_cursor
+            .as_deref()
+            .unwrap()
+            .starts_with("mr-page:")
+    );
 
     let second = store
         .list(

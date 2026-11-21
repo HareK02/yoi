@@ -178,3 +178,56 @@ async fn comment_unknown_transport_outcome_does_not_retry() {
     assert!(error.to_string().contains("outcome is unknown"), "{error}");
     assert_eq!(client.requests.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn complete_tool_native_dispatch_preserves_binding_and_replay_input() {
+    let input = json!({"operation_id":"comment-1", "expected_owner_operation_id":"owner-1", "approval_event_id":"approval-1", "expected_source_ref":"approved-source"});
+    let receipt = json!({"operation_id":"comment-1", "event_id":"event-1"});
+    let client = Arc::new(RecordingWorkspaceClient::new(vec![
+        response(receipt.clone());
+        3
+    ]));
+    let mut tool_input = input.clone();
+    tool_input["merge_request_id"] = json!("MR-1");
+    let tool = MergeRequestTool {
+        client: client.clone(),
+        kind: Kind::Complete,
+    };
+    tool.execute(&tool_input.to_string(), ToolExecutionContext::direct())
+        .await
+        .unwrap();
+    let native = runtime(client.clone());
+    for _ in 0..2 {
+        let output = native
+            .invoke(
+                "/changes/MR-1".into(),
+                crate::wip::root_reference(MERGE_REQUEST_ITEM_INTERFACE),
+                "complete".into(),
+                input.clone(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(value["data"], receipt);
+    }
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        assert_eq!(request.path, "/api/w/ws/merge-requests/MR-1/complete");
+        assert_eq!(request.body, requests[0].body);
+        assert_eq!(request.method, WorkspaceRequestMethod::Post);
+        assert_eq!(
+            serde_json::from_str::<Value>(request.body.as_deref().unwrap()).unwrap(),
+            input
+        );
+    }
+    assert!(
+        client
+            .authorizations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|a| a.operation == "merge_request.complete")
+    );
+}

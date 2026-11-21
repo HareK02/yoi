@@ -16,6 +16,7 @@ import "./base.dcdl" // {
         manage_workdir = { enabled = true; };
         ticket = { enabled = true; thread = true; workflow = true; };
         merge_request = {
+            query = true;
             show = true;
             open = false;
             review = false;

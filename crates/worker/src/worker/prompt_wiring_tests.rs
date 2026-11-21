@@ -42,7 +42,7 @@ impl WorkspaceClient for GuidanceHost {
         };
         Ok(WorkspaceResponse {
             status: 200,
-                content_type: None,
+            content_type: None,
             body: serde_json::to_string(&source).unwrap(),
         })
     }
@@ -119,9 +119,60 @@ async fn builtin_coder_flow_records_resolved_instructions_and_digest() {
                 .as_str()
         )
     );
+    assert_eq!(state.instance.current_state.as_str(), "observe");
     assert!(
         serde_json::to_string(&state)
             .unwrap()
             .contains(&builtin.content_digest)
     );
+    // Ordinary input/restoration cannot replace an active pinned definition.
+    let mut restored: flow::FlowRuntimeState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    *worker.flow_runtime_state.lock().unwrap() = Some(restored.clone());
+    let (_, unchanged, _) = worker
+        .prepare_flow_input(vec![Segment::Text {
+            content: "Continue the existing MR from its saved Integration phase".into(),
+        }])
+        .unwrap();
+    assert!(unchanged.is_none());
+    assert!(matches!(worker.prepare_flow_input(vec![Segment::Flow {
+        selector: "builtin:coder-review".into(),
+    }]), Err(WorkerError::FlowInput(message)) if message.contains("active Flow")));
+    assert_eq!(
+        *worker.flow_runtime_state.lock().unwrap(),
+        Some(restored.clone())
+    );
+    // Model judgments are scripted here. This checks the actual entry boundary,
+    // not MR authority or whether natural-language conditions are fulfilled.
+    for (n, target) in ["integrate", "complete", "done"].iter().enumerate() {
+        let id = format!("resume-{n}");
+        let attempt = restored
+            .begin_or_recover_transition(&id, "fixture evidence")
+            .unwrap();
+        let results = attempt
+            .transitions
+            .iter()
+            .map(|transition| flow::TransitionConditionResult {
+                transition_id: transition.transition_id.clone(),
+                verdict: if transition.target.as_str() == *target {
+                    flow::ConditionVerdict::Met
+                } else {
+                    flow::ConditionVerdict::NotMet
+                },
+                rationale: "Scripted graph condition; Backend evidence is tested separately".into(),
+            })
+            .collect();
+        restored
+            .resolve_active_transition(&id, flow::FlowVerifierOutcome::Completed { results })
+            .unwrap();
+    }
+    *worker.flow_runtime_state.lock().unwrap() = Some(restored);
+    let (_, next, _) = worker
+        .prepare_flow_input(vec![Segment::Flow {
+            selector: "builtin:coder-review".into(),
+        }])
+        .unwrap();
+    let next = next.unwrap();
+    assert_eq!(next.instance.current_state.as_str(), "observe");
+    assert_ne!(next.instance.instance_id, state.instance.instance_id);
 }
