@@ -1,6 +1,7 @@
-//! Journal scope pinned to the existing Worker removal intent. Checkpoints and
-//! execution-end evidence stay in their owning domains; these phases are progress
-//! observations, never authority to release a writer or remove a Runtime Worker.
+//! Frozen input handoff pinned to the existing Worker removal intent. It retains
+//! originals only until finite Host Jobs accept their bytes (or Subject deletion
+//! fences admission). It never owns recording, checkpoint recovery or Job completion.
+//! Physical removal phases are observations, not authority to release a writer.
 
 use super::*;
 use crate::retention::PreparedWorkerRemoval;
@@ -46,7 +47,7 @@ pub struct PendingWorkerRemovalIntent {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FrozenJournalRemovalMember {
+pub struct WorkerInputHandoffMember {
     pub session_id: String,
     pub active_segment_id: Option<session_store::SegmentId>,
     pub materialized: bool,
@@ -54,7 +55,7 @@ pub struct FrozenJournalRemovalMember {
     pub descriptors: Vec<session_store::public_material::PublicMaterialDescriptor>,
 }
 
-impl From<&runtime_api::WorkerRemovalSessionMember> for FrozenJournalRemovalMember {
+impl From<&runtime_api::WorkerRemovalSessionMember> for WorkerInputHandoffMember {
     fn from(member: &runtime_api::WorkerRemovalSessionMember) -> Self {
         Self {
             session_id: member.session_id.to_string(),
@@ -68,7 +69,7 @@ impl From<&runtime_api::WorkerRemovalSessionMember> for FrozenJournalRemovalMemb
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct JournalRemovalBinding {
+pub struct WorkerInputHandoffBinding {
     pub subject_id: String,
     pub writer_session_id: String,
     pub writer_binding_id: String,
@@ -89,7 +90,7 @@ mod database_identity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum JournalRemovalPhase {
+pub enum WorkerInputHandoffPhase {
     AwaitingQuiescence,
     Recording,
     AwaitingEffectsEnd,
@@ -99,7 +100,7 @@ pub enum JournalRemovalPhase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum JournalRemovalCause {
+pub enum WorkerInputHandoffCause {
     RecordingDisabled,
     SourceUnavailable,
     OwnershipUnknown,
@@ -111,40 +112,75 @@ pub enum JournalRemovalCause {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct JournalRemovalProgress {
+pub struct WorkerInputHandoffProgress {
     pub plan_id: String,
     pub operation_id: String,
     pub input_fingerprint: String,
     pub workspace_id: String,
     pub worker: RuntimeWorkerRef,
-    pub metadata: JournalRemovalMetadata,
+    pub metadata: WorkerInputHandoffMetadata,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct JournalRemovalMetadata {
-    pub binding: JournalRemovalBinding,
-    pub phase: JournalRemovalPhase,
-    pub cause: Option<JournalRemovalCause>,
+pub struct WorkerInputHandoffMetadata {
+    pub binding: WorkerInputHandoffBinding,
+    pub phase: WorkerInputHandoffPhase,
+    pub cause: Option<WorkerInputHandoffCause>,
     /// None means the source is not yet frozen; Some(empty) is a confirmed empty scope.
-    pub members: Option<Vec<FrozenJournalRemovalMember>>,
+    pub members: Option<Vec<WorkerInputHandoffMember>>,
     /// Absent until a verified archive owns the complete frozen originals.
-    pub retained_recording: Option<RetainedJournalRecording>,
+    #[serde(rename = "retained_recording")]
+    pub released_input_handoff: Option<ReleasedInputHandoff>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RetainedJournalRecording {
+pub struct ReleasedInputHandoff {
     pub archive_id: String,
-    pub completed: bool,
-    pub cause: Option<JournalRemovalCause>,
+    /// Historical recording completion, retained only for persisted compatibility.
+    /// Even a completed legacy child must be imported into a finite owning Job.
+    #[serde(rename = "completed")]
+    pub legacy_completed: bool,
+    pub cause: Option<WorkerInputHandoffCause>,
+    #[serde(default)]
+    pub handoff_status: InputHandoffStatus,
+}
+
+/// Only admission is tracked here. No state depends on recording Job completion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputHandoffStatus {
+    #[default]
+    Pending,
+    Admitted,
+    SubjectDeleted,
+}
+
+impl InputHandoffStatus {
+    pub fn terminal(self) -> bool {
+        self != Self::Pending
+    }
+}
+
+pub(super) fn validate_handoff_transition(
+    current: InputHandoffStatus,
+    next: InputHandoffStatus,
+    cause: Option<WorkerInputHandoffCause>,
+) -> Result<()> {
+    if (current.terminal() && current != next) || (next.terminal() && cause.is_some()) {
+        return Err(invalid(
+            "Terminal input handoff cannot be reopened or carry a failure",
+        ));
+    }
+    Ok(())
 }
 
 fn invalid(message: &str) -> Error {
     Error::InvalidInput(message.into())
 }
 
-fn validate_binding(binding: &JournalRemovalBinding) -> Result<()> {
+fn validate_binding(binding: &WorkerInputHandoffBinding) -> Result<()> {
     for value in [
         &binding.subject_id,
         &binding.writer_session_id,
@@ -195,7 +231,7 @@ fn validate_plan(conn: &Connection, plan: &crate::retention::WorkerRemovalPlan) 
     Ok(())
 }
 
-fn load(conn: &Connection, operation_id: &str) -> Result<Option<JournalRemovalProgress>> {
+fn load(conn: &Connection, operation_id: &str) -> Result<Option<WorkerInputHandoffProgress>> {
     let row = conn.query_row(
         "SELECT plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,journal_removal_json
          FROM worker_removal_operations WHERE operation_id=?1 AND journal_removal_json IS NOT NULL",
@@ -208,7 +244,7 @@ fn load(conn: &Connection, operation_id: &str) -> Result<Option<JournalRemovalPr
         |(plan_id, input_fingerprint, workspace_id, runtime_id, worker_id, json)| {
             let metadata = serde_json::from_str(&json)
                 .map_err(|_| Error::Store("Invalid Journal removal metadata".into()))?;
-            Ok(JournalRemovalProgress {
+            Ok(WorkerInputHandoffProgress {
                 plan_id,
                 operation_id: operation_id.into(),
                 input_fingerprint,
@@ -224,7 +260,11 @@ fn load(conn: &Connection, operation_id: &str) -> Result<Option<JournalRemovalPr
     .transpose()
 }
 
-fn save(conn: &Connection, operation_id: &str, metadata: &JournalRemovalMetadata) -> Result<()> {
+fn save(
+    conn: &Connection,
+    operation_id: &str,
+    metadata: &WorkerInputHandoffMetadata,
+) -> Result<()> {
     let json =
         serde_json::to_string(metadata).map_err(|_| invalid("Invalid Journal removal metadata"))?;
     conn.execute(
@@ -237,31 +277,31 @@ fn save(conn: &Connection, operation_id: &str, metadata: &JournalRemovalMetadata
 impl SqliteWorkspaceStore {
     /// Read retained recording progress without reconstructing an executable
     /// request from Worker metadata which may have been intentionally purged.
-    pub fn get_journal_removal_for_plan(
+    pub fn get_worker_input_handoff_for_plan(
         &self,
         plan: &crate::retention::WorkerRemovalPlan,
-    ) -> Result<Option<JournalRemovalProgress>> {
+    ) -> Result<Option<WorkerInputHandoffProgress>> {
         self.with_conn(|conn| {
             validate_plan(conn, plan)?;
             load(conn, &plan.operation_id)
         })
     }
 
-    pub fn get_journal_removal(
+    pub fn get_worker_input_handoff(
         &self,
         prepared: &PreparedWorkerRemoval,
-    ) -> Result<Option<JournalRemovalProgress>> {
+    ) -> Result<Option<WorkerInputHandoffProgress>> {
         self.with_conn(|conn| {
             validate_prepared(conn, prepared)?;
             load(conn, &prepared.plan.operation_id)
         })
     }
 
-    pub fn init_journal_removal(
+    pub fn init_worker_input_handoff(
         &self,
         prepared: &PreparedWorkerRemoval,
-        binding: &JournalRemovalBinding,
-    ) -> Result<JournalRemovalProgress> {
+        binding: &WorkerInputHandoffBinding,
+    ) -> Result<WorkerInputHandoffProgress> {
         validate_binding(binding)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -286,12 +326,12 @@ impl SqliteWorkspaceStore {
             save(
                 &tx,
                 &prepared.plan.operation_id,
-                &JournalRemovalMetadata {
+                &WorkerInputHandoffMetadata {
                     binding: binding.clone(),
-                    phase: JournalRemovalPhase::AwaitingQuiescence,
+                    phase: WorkerInputHandoffPhase::AwaitingQuiescence,
                     cause: None,
                     members: None,
-                    retained_recording: None,
+                    released_input_handoff: None,
                 },
             )?;
             let current = load(&tx, &prepared.plan.operation_id)?.expect("saved removal intent");
@@ -302,12 +342,12 @@ impl SqliteWorkspaceStore {
 
     /// Bind once after Runtime has fenced input and confirmed quiescence. This
     /// stores only Session identities and ends; it does not attest Runtime quiescence.
-    pub fn freeze_journal_removal(
+    pub fn freeze_worker_input_handoff(
         &self,
         prepared: &PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
-        members: &[FrozenJournalRemovalMember],
-    ) -> Result<JournalRemovalProgress> {
+        expected: &WorkerInputHandoffProgress,
+        members: &[WorkerInputHandoffMember],
+    ) -> Result<WorkerInputHandoffProgress> {
         let mut seen = HashSet::new();
         for member in members {
             if member.session_id.is_empty()
@@ -318,18 +358,18 @@ impl SqliteWorkspaceStore {
                 return Err(invalid("Invalid or duplicate frozen Session identity"));
             }
         }
-        self.change_journal_removal(prepared, expected, |metadata| {
+        self.change_worker_input_handoff(prepared, expected, |metadata| {
             if let Some(frozen) = &metadata.members {
                 if frozen != members {
                     return Err(invalid("Journal removal frozen scope changed"));
                 }
                 return Ok(());
             }
-            if metadata.phase != JournalRemovalPhase::AwaitingQuiescence {
+            if metadata.phase != WorkerInputHandoffPhase::AwaitingQuiescence {
                 return Err(invalid("Journal removal is not awaiting quiescence"));
             }
             metadata.members = Some(members.to_vec());
-            metadata.phase = JournalRemovalPhase::Recording;
+            metadata.phase = WorkerInputHandoffPhase::Recording;
             metadata.cause = None;
             Ok(())
         })
@@ -337,62 +377,63 @@ impl SqliteWorkspaceStore {
 
     /// Save source responsibility before releasing the producer. Replaying the same
     /// archive is harmless; a different archive cannot replace a retained source.
-    pub fn retain_journal_recording(
+    pub fn retain_released_input_handoff(
         &self,
         prepared: &PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
+        expected: &WorkerInputHandoffProgress,
         archive_id: &str,
-    ) -> Result<JournalRemovalProgress> {
+    ) -> Result<WorkerInputHandoffProgress> {
         if archive_id.is_empty()
             || prepared.runtime_request.archive_id.as_deref() != Some(archive_id)
         {
             return Err(invalid("Journal archive differs from removal intent"));
         }
-        self.change_journal_removal(prepared, expected, |metadata| {
+        self.change_worker_input_handoff(prepared, expected, |metadata| {
             if metadata.members.as_ref().is_none_or(Vec::is_empty) {
                 return Err(invalid("Recording handoff has no frozen originals"));
             }
-            if let Some(retained) = &metadata.retained_recording {
+            if let Some(retained) = &metadata.released_input_handoff {
                 if retained.archive_id != archive_id {
                     return Err(invalid("Recording archive identity changed"));
                 }
             } else {
-                metadata.retained_recording = Some(RetainedJournalRecording {
+                metadata.released_input_handoff = Some(ReleasedInputHandoff {
                     archive_id: archive_id.into(),
-                    completed: false,
+                    legacy_completed: false,
                     cause: None,
+                    handoff_status: InputHandoffStatus::Pending,
                 });
             }
             Ok(())
         })
     }
 
-    pub fn list_retained_journal_recordings(
+    pub fn list_pending_released_input_handoffs(
         &self,
         workspace_id: &str,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<JournalRemovalProgress>> {
+    ) -> Result<Vec<WorkerInputHandoffProgress>> {
         if !(1..=100).contains(&limit) {
             return Err(invalid("Recording page limit must be 1..=100"));
         }
         self.with_conn(|conn| {
-            let ids = conn.prepare("SELECT operation_id FROM worker_removal_operations WHERE workspace_id=?1 AND json_extract(journal_removal_json,'$.retained_recording.completed')=0 AND (?2 IS NULL OR operation_id>?2) ORDER BY operation_id LIMIT ?3")?
+            let ids = conn.prepare("SELECT operation_id FROM worker_removal_operations WHERE workspace_id=?1 AND json_type(journal_removal_json,'$.retained_recording')='object' AND COALESCE(json_extract(journal_removal_json,'$.retained_recording.handoff_status'),'pending')='pending' AND (?2 IS NULL OR operation_id>?2) ORDER BY operation_id LIMIT ?3")?
                 .query_map(params![workspace_id,after,limit as i64], |r|r.get::<_,String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ids.iter().map(|id| load(conn,id)?.ok_or_else(|| invalid("Recording responsibility disappeared"))).collect()
         })
     }
 
-    /// Recording progress is independent of the removal case, including after its
-    /// completed commit. Current domain checkpoints and erasure fences are checked
-    /// by the caller; CAS prevents a stale callback from overwriting newer evidence.
-    pub fn update_retained_journal_recording(
+    /// One-time admission receipt, including after physical removal completes.
+    /// Legacy completed flags are never admission evidence. A terminal receipt
+    /// removes this handoff from recovery without waiting for a Job checkpoint.
+    pub fn update_released_input_handoff(
         &self,
-        expected: &JournalRemovalProgress,
-        completed: bool,
-        cause: Option<JournalRemovalCause>,
-    ) -> Result<JournalRemovalProgress> {
+        expected: &WorkerInputHandoffProgress,
+        status: InputHandoffStatus,
+        cause: Option<WorkerInputHandoffCause>,
+    ) -> Result<WorkerInputHandoffProgress> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut current = load(&tx, &expected.operation_id)?
@@ -402,16 +443,11 @@ impl SqliteWorkspaceStore {
             }
             let recording = current
                 .metadata
-                .retained_recording
+                .released_input_handoff
                 .as_mut()
                 .ok_or_else(|| invalid("Recording handoff missing"))?;
-            if recording.completed && !completed {
-                return Err(invalid("Completed recording cannot be reopened"));
-            }
-            if completed && cause.is_some() {
-                return Err(invalid("Completed recording cannot carry a failure"));
-            }
-            recording.completed = completed;
+            validate_handoff_transition(recording.handoff_status, status, cause)?;
+            recording.handoff_status = status;
             recording.cause = cause;
             save(&tx, &current.operation_id, &current.metadata)?;
             tx.commit()?;
@@ -422,15 +458,15 @@ impl SqliteWorkspaceStore {
     /// CAS progress only. The Server must read domain checkpoints, execution-end
     /// evidence and guarded writer ownership before recording release. Completed
     /// cannot be supplied here: it is derived from the canonical removal commit.
-    pub fn update_journal_removal_progress(
+    pub fn update_worker_input_handoff_progress(
         &self,
         prepared: &PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
-        phase: JournalRemovalPhase,
-        cause: Option<JournalRemovalCause>,
-    ) -> Result<JournalRemovalProgress> {
-        use JournalRemovalPhase::*;
-        self.change_journal_removal(prepared, expected, |metadata| {
+        expected: &WorkerInputHandoffProgress,
+        phase: WorkerInputHandoffPhase,
+        cause: Option<WorkerInputHandoffCause>,
+    ) -> Result<WorkerInputHandoffProgress> {
+        use WorkerInputHandoffPhase::*;
+        self.change_worker_input_handoff(prepared, expected, |metadata| {
             let allowed = matches!(
                 (metadata.phase, phase),
                 (AwaitingQuiescence, AwaitingQuiescence)
@@ -442,7 +478,8 @@ impl SqliteWorkspaceStore {
                     | (Released, Released)
             );
             if !allowed
-                || (phase == Released && (cause.is_some() || metadata.retained_recording.is_none()))
+                || (phase == Released
+                    && (cause.is_some() || metadata.released_input_handoff.is_none()))
             {
                 return Err(invalid("Invalid Journal removal phase transition"));
             }
@@ -452,12 +489,12 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    fn change_journal_removal(
+    fn change_worker_input_handoff(
         &self,
         prepared: &PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
-        update: impl FnOnce(&mut JournalRemovalMetadata) -> Result<()>,
-    ) -> Result<JournalRemovalProgress> {
+        expected: &WorkerInputHandoffProgress,
+        update: impl FnOnce(&mut WorkerInputHandoffMetadata) -> Result<()>,
+    ) -> Result<WorkerInputHandoffProgress> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_prepared(&tx, prepared)?;
@@ -543,12 +580,12 @@ impl SqliteWorkspaceStore {
             .collect())
     }
 
-    pub fn list_pending_journal_removals(
+    pub fn list_pending_worker_input_handoffs(
         &self,
         workspace_id: &str,
         after_operation_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<JournalRemovalProgress>> {
+    ) -> Result<Vec<WorkerInputHandoffProgress>> {
         if !(1..=100).contains(&limit) {
             return Err(invalid("Journal removal page limit must be 1..=100"));
         }
@@ -637,9 +674,9 @@ pub(super) fn migrate_retained_to_v127(conn: &Connection) -> Result<()> {
 /// remain visible without rewriting frozen scope or re-opening writer authority.
 pub(crate) fn record_physical_failure(conn: &Connection, operation_id: &str) -> Result<()> {
     if let Some(mut progress) = load(conn, operation_id)?
-        && progress.metadata.phase == JournalRemovalPhase::Released
+        && progress.metadata.phase == WorkerInputHandoffPhase::Released
     {
-        progress.metadata.cause = Some(JournalRemovalCause::ExecutionUnconfirmed);
+        progress.metadata.cause = Some(WorkerInputHandoffCause::ExecutionUnconfirmed);
         save(conn, operation_id, &progress.metadata)?;
     }
     Ok(())
@@ -649,10 +686,10 @@ pub(crate) fn record_physical_failure(conn: &Connection, operation_id: &str) -> 
 /// not a caller-supplied Journal completion assertion.
 pub(crate) fn complete(conn: &Connection, operation_id: &str) -> Result<()> {
     if let Some(mut progress) = load(conn, operation_id)? {
-        if progress.metadata.phase != JournalRemovalPhase::Released {
+        if progress.metadata.phase != WorkerInputHandoffPhase::Released {
             return Err(invalid("Journal writer has not been released"));
         }
-        progress.metadata.phase = JournalRemovalPhase::Completed;
+        progress.metadata.phase = WorkerInputHandoffPhase::Completed;
         progress.metadata.cause = None;
         save(conn, operation_id, &progress.metadata)?;
     }
@@ -662,6 +699,101 @@ pub(crate) fn complete(conn: &Connection, operation_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_completed_recordings_are_import_input_not_admission_receipts() {
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
+        store.with_conn(|conn| {
+            conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('a','user','a','A','t','t');
+                INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at,owner_account_id) VALUES('w','W','active','t','t','a');")?;
+            for (id, completed, status) in [
+                ("legacy-complete", true, None),
+                ("legacy-unsubmitted", false, None),
+                ("already-admitted", false, Some("admitted")),
+                ("deleted", true, Some("subject_deleted")),
+            ] {
+                let mut json = serde_json::json!({
+                    "binding": {"subject_id":"subject","writer_session_id":"session","writer_binding_id":"binding",
+                        "database":{"scope":"workspace","feature":"subjektiv","physical":"physical"}},
+                    "phase":"completed", "cause":null, "members":[],
+                    "retained_recording":{"archive_id":"archive","completed":completed,"cause":null},
+                });
+                if let Some(status) = status { json["retained_recording"]["handoff_status"] = status.into(); }
+                conn.execute("INSERT INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at,journal_removal_json)
+                    VALUES(?1,?1,'fp','w','r','worker','observed','policy','digest','archive','tombstone','forever','purge','[]','succeeded','cleanup','t','t',?2)", params![id,json.to_string()])?;
+            }
+            Ok(())
+        }).unwrap();
+        let page = store
+            .list_pending_released_input_handoffs("w", None, 100)
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|p| p.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["legacy-complete", "legacy-unsubmitted"]
+        );
+        let legacy = &page[0];
+        let retained = legacy.metadata.released_input_handoff.as_ref().unwrap();
+        assert!(retained.legacy_completed);
+        assert_eq!(retained.handoff_status, InputHandoffStatus::Pending);
+        let terminal = store
+            .update_released_input_handoff(legacy, InputHandoffStatus::SubjectDeleted, None)
+            .unwrap();
+        assert!(
+            terminal
+                .metadata
+                .released_input_handoff
+                .as_ref()
+                .unwrap()
+                .legacy_completed
+        );
+        assert!(
+            store
+                .update_released_input_handoff(&terminal, InputHandoffStatus::Pending, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .update_released_input_handoff(legacy, InputHandoffStatus::Admitted, None)
+                .is_err(),
+            "stale migration snapshot must be fenced"
+        );
+        assert_eq!(
+            store
+                .list_pending_released_input_handoffs("w", None, 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        let persisted = serde_json::to_value(&terminal.metadata).unwrap();
+        assert_eq!(persisted["retained_recording"]["completed"], true);
+        assert_eq!(
+            persisted["retained_recording"]["handoff_status"],
+            "subject_deleted"
+        );
+    }
+
+    #[test]
+    fn terminal_handoff_cannot_become_a_recording_retry() {
+        for status in [
+            InputHandoffStatus::Admitted,
+            InputHandoffStatus::SubjectDeleted,
+        ] {
+            assert!(validate_handoff_transition(status, status, None).is_ok());
+            assert!(
+                validate_handoff_transition(status, InputHandoffStatus::Pending, None).is_err()
+            );
+            assert!(
+                validate_handoff_transition(
+                    status,
+                    status,
+                    Some(WorkerInputHandoffCause::JobPending)
+                )
+                .is_err()
+            );
+        }
+    }
 
     fn shape(conn: &Connection) -> Result<Vec<(String, String)>> {
         Ok(conn
@@ -796,7 +928,7 @@ mod tests {
             .unwrap();
         assert!(
             reopened
-                .list_pending_journal_removals("w", None, 100)
+                .list_pending_worker_input_handoffs("w", None, 100)
                 .unwrap()
                 .is_empty(),
             "migration must not invent Journal intent or evidence"

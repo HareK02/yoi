@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use subjektiv::journal::transport::*;
 use subjektiv::journal::*;
 
+#[path = "job_application_tests.rs"]
+mod application;
+
 #[path = "subjektiv_journal_connected_tests.rs"]
 mod connected;
 
@@ -3731,14 +3734,20 @@ async fn stopped_subject_removal_hands_off_originals_while_job_is_pending() {
         .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
         .unwrap()
         .unwrap();
-    let progress = f.api.store.get_journal_removal(&prepared).unwrap().unwrap();
+    let progress = f
+        .api
+        .store
+        .get_worker_input_handoff(&prepared)
+        .unwrap()
+        .unwrap();
     assert!(
-        !progress
+        progress
             .metadata
-            .retained_recording
+            .released_input_handoff
             .as_ref()
             .unwrap()
-            .completed
+            .handoff_status
+            == crate::store::InputHandoffStatus::Admitted
     );
     let host = JournalHostContext::validated_session(&f.store, f.attr.clone()).unwrap();
     let after = f.store.read_journal(&host, &grant.journal_id).unwrap();
@@ -3906,7 +3915,9 @@ async fn subject_removal_failed_job_keeps_unrecorded_input_after_cleanup_without
 
 #[tokio::test]
 async fn retained_journal_handoff_allows_unrecorded_removal_and_bodyless_new_job() {
-    use crate::store::{FrozenJournalRemovalMember, JournalRemovalBinding, JournalRemovalPhase};
+    use crate::store::{
+        WorkerInputHandoffBinding, WorkerInputHandoffMember, WorkerInputHandoffPhase,
+    };
     let f = SubjectRemovalFixture::new().await;
     let inventory = f.api.runtime.worker_retention_inventory(&f.target).unwrap();
     let plan = f
@@ -3930,9 +3941,9 @@ async fn retained_journal_handoff_allows_unrecorded_removal_and_bodyless_new_job
     let progress = f
         .api
         .store
-        .init_journal_removal(
+        .init_worker_input_handoff(
             &prepared,
-            &JournalRemovalBinding {
+            &WorkerInputHandoffBinding {
                 subject_id: f.attr.subject_id.clone(),
                 writer_session_id: f.attr.session_id.clone(),
                 writer_binding_id: f.host.writer_binding_id().unwrap().into(),
@@ -3952,12 +3963,12 @@ async fn retained_journal_handoff_allows_unrecorded_removal_and_bodyless_new_job
     let members: Vec<_> = freeze
         .members
         .iter()
-        .map(FrozenJournalRemovalMember::from)
+        .map(WorkerInputHandoffMember::from)
         .collect();
     let progress = f
         .api
         .store
-        .freeze_journal_removal(&prepared, &progress, &members)
+        .freeze_worker_input_handoff(&prepared, &progress, &members)
         .unwrap();
     let archive = f
         .api
@@ -3978,7 +3989,7 @@ async fn retained_journal_handoff_allows_unrecorded_removal_and_bodyless_new_job
     let progress = f
         .api
         .store
-        .retain_journal_recording(&prepared, &progress, &archive.archive_id)
+        .retain_released_input_handoff(&prepared, &progress, &archive.archive_id)
         .unwrap();
     assert!(
         subjektiv_journal::retained_source_store(&f.api, &f.attr).is_err(),
@@ -3994,7 +4005,12 @@ async fn retained_journal_handoff_allows_unrecorded_removal_and_bodyless_new_job
         .unwrap();
     f.api
         .store
-        .update_journal_removal_progress(&prepared, &progress, JournalRemovalPhase::Released, None)
+        .update_worker_input_handoff_progress(
+            &prepared,
+            &progress,
+            WorkerInputHandoffPhase::Released,
+            None,
+        )
         .unwrap();
     let mut mismatched = result.clone();
     mismatched.archive.as_mut().unwrap().source_session_id = "different-session".into();
@@ -4069,8 +4085,28 @@ async fn retained_journal_handoff_allows_unrecorded_removal_and_bodyless_new_job
     let id = guarded
         .accept_journal_sources(&source, "retained", &ranges)
         .unwrap();
-    subjektiv_journal::dispatch_retained_with_capture(&f.api, f.attr.clone(), &id, capture)
-        .unwrap();
+    let start = session_store::capture::RecordingPosition::default();
+    let (end, chunks) =
+        backend_recording_job::capture_scope(start, Some(freeze.members[0].end), capture).unwrap();
+    let host_job = backend_recording_job::admit(
+        &f.api,
+        crate::store::BackendJobRecordingScope {
+            subject_id: f.attr.subject_id.clone(),
+            session_id: f.attr.session_id.clone(),
+            worker: f.target.clone(),
+            binding_id: f.host.writer_binding_id().unwrap().into(),
+            database: f
+                .api
+                .feature_storage
+                .existing_identity(&f.api.subjektiv_registration)
+                .unwrap(),
+            start,
+            end,
+        },
+        &chunks,
+    )
+    .unwrap();
+    backend_recording_job::step(&f.api, &host_job).unwrap();
     let jobs = f
         .api
         .store
@@ -4542,14 +4578,12 @@ async fn assert_prior_purge_receipt(stale_catalog: bool, missing_shutdown: bool)
 }
 
 #[tokio::test]
-async fn denied_recording_admission_retains_unadmitted_originals_after_removal_and_recovery() {
+async fn failed_finite_job_admission_retains_originals_after_removal_and_recovery() {
     let f = SubjectRemovalFixture::new().await;
-    set_test_subject_policy_as_owner(
-        &f.api,
-        &f.attr.subject_id,
-        Default::default(),
-        Default::default(),
-    );
+    // Fail the actual ownership transaction, not the later Worker execution policy.
+    // Recovery must retain the original snapshot until a finite Job owns its bytes.
+    let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+    conn.execute_batch("CREATE TRIGGER deny_finite_input BEFORE INSERT ON backend_job_recording_inputs BEGIN SELECT RAISE(ABORT,'injected input admission failure'); END;").unwrap();
     assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
     let response = f.remove();
     assert_eq!(
@@ -4569,12 +4603,24 @@ async fn denied_recording_admission_retains_unadmitted_originals_after_removal_a
     let session = f.attr.session_id.parse().unwrap();
     assert!(!retention.pins(session).unwrap().is_empty());
     subjektiv_journal::recover(&f.api).unwrap();
-    let progress = f.api.store.get_journal_removal(&prepared).unwrap().unwrap();
-    assert!(!progress.metadata.retained_recording.unwrap().completed);
+    let progress = f
+        .api
+        .store
+        .get_worker_input_handoff(&prepared)
+        .unwrap()
+        .unwrap();
+    assert!(
+        progress
+            .metadata
+            .released_input_handoff
+            .unwrap()
+            .handoff_status
+            == crate::store::InputHandoffStatus::Pending
+    );
     assert!(f.store.journal_for_session(&f.host).unwrap().is_none());
     assert!(
         !retention.pins(session).unwrap().is_empty(),
-        "no admitted ranges is not evidence that the frozen originals are reflected"
+        "failed finite Job admission cannot release the original pin"
     );
 }
 
@@ -4597,10 +4643,18 @@ async fn disabled_source_profile_does_not_block_retained_history_handoff() {
         .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
         .unwrap()
         .unwrap();
-    let progress = f.api.store.get_journal_removal(&prepared).unwrap().unwrap();
-    let retained = progress.metadata.retained_recording.unwrap();
+    let progress = f
+        .api
+        .store
+        .get_worker_input_handoff(&prepared)
+        .unwrap()
+        .unwrap();
+    let retained = progress.metadata.released_input_handoff.unwrap();
     assert_eq!(retained.archive_id, archive_id);
-    assert!(!retained.completed, "handoff is not recording completion");
+    assert!(
+        retained.handoff_status == crate::store::InputHandoffStatus::Admitted,
+        "handoff is not recording completion"
+    );
     let runtime_api::SessionRecordingCaptureAvailability::Captured { slice } = f
         .api
         .runtime
@@ -7785,5 +7839,103 @@ mod journal_input_validation {
                 0
             );
         }
+    }
+}
+
+/// Main-DB deletion fence → real legacy import recovery, with no model execution.
+/// Old JSON fixtures deliberately omit handoff_status; completed was reflection,
+/// not finite input admission, and must not bypass deletion or revive its database.
+#[tokio::test]
+async fn legacy_release_import_respects_deletion_for_incomplete_and_completed_rows() {
+    let f = SubjectRemovalFixture::new().await;
+    let members = vec![crate::store::WorkerInputHandoffMember {
+        session_id: f.attr.session_id.clone(),
+        active_segment_id: None,
+        materialized: true,
+        end: session_store::capture::RecordingPosition {
+            canonical_order: 1,
+            byte_offset: 0,
+        },
+        descriptors: vec![],
+    }];
+    let database = feature_storage::DatabaseIdentity {
+        scope: "workspace".into(),
+        feature: "subjektiv".into(),
+        physical: "deleted-legacy-physical-database".into(),
+    };
+    let conn = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+    for (operation, subject, completed) in [
+        ("legacy-incomplete", f.attr.subject_id.as_str(), false),
+        ("legacy-complete", f.attr.subject_id.as_str(), true),
+        ("legacy-other-subject", "unrelated-subject", true),
+    ] {
+        conn.execute("INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at) VALUES(?1,?2,?2,?3,'legacy-fixture','created','t','t')",
+            rusqlite::params![TEST_WORKSPACE_ID, operation, f.target.runtime_id]).unwrap();
+        // Encode the historical struct field order, as the old storage writer did.
+        let binding = crate::store::WorkerInputHandoffBinding {
+            subject_id: subject.into(),
+            writer_session_id: f.attr.session_id.clone(),
+            writer_binding_id: "legacy-binding".into(),
+            database: database.clone(),
+        };
+        let legacy = format!(
+            r#"{{"binding":{},"members":{},"completed":{},"cause":null}}"#,
+            serde_json::to_string(&binding).unwrap(),
+            serde_json::to_string(&members).unwrap(),
+            completed
+        );
+        conn.execute("INSERT INTO subject_worker_releases(workspace_id,runtime_id,worker_id,singleton_key,singleton_generation,binding_id,operation_id,proof,completed,recording_json) VALUES(?1,?2,?3,?4,1,'legacy-binding',?3,'runtime_disconnected',1,?5)",
+            rusqlite::params![TEST_WORKSPACE_ID, f.target.runtime_id, operation,
+                format!("subjektiv:{subject}"), legacy.to_string()]).unwrap();
+    }
+    f.api
+        .config_store
+        .prepare_subject_deletion(
+            TEST_WORKSPACE_ID,
+            &f.attr.subject_id,
+            "delete-before-legacy-import",
+            &[],
+        )
+        .unwrap();
+    let jobs_before: usize = conn
+        .query_row("SELECT count(*) FROM backend_jobs", [], |r| r.get(0))
+        .unwrap();
+    for _ in 0..2 {
+        subjektiv_journal::recover(&f.api).unwrap();
+        for operation in ["legacy-incomplete", "legacy-complete"] {
+            let progress = f
+                .api
+                .config_store
+                .get_subject_release_input_handoff(
+                    TEST_WORKSPACE_ID,
+                    &RuntimeWorkerRef::new(&f.target.runtime_id, operation),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                progress.handoff.handoff_status,
+                crate::store::InputHandoffStatus::SubjectDeleted
+            );
+        }
+        let other = f
+            .api
+            .config_store
+            .get_subject_release_input_handoff(
+                TEST_WORKSPACE_ID,
+                &RuntimeWorkerRef::new(&f.target.runtime_id, "legacy-other-subject"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            other.handoff.handoff_status,
+            crate::store::InputHandoffStatus::Pending
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM backend_jobs", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            jobs_before,
+            "a deletion fence cannot dispatch or reserve legacy recording work"
+        );
     }
 }

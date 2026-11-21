@@ -764,20 +764,21 @@ impl RemovalFixture {
         let progress = self
             .api()
             .config_store
-            .get_journal_removal(&prepared)
+            .get_worker_input_handoff(&prepared)
             .unwrap()
             .unwrap();
         assert_eq!(
             progress.metadata.phase,
-            crate::store::JournalRemovalPhase::Released
+            crate::store::WorkerInputHandoffPhase::Released
         );
         assert!(
-            !progress
+            progress
                 .metadata
-                .retained_recording
+                .released_input_handoff
                 .as_ref()
                 .unwrap()
-                .completed
+                .handoff_status
+                == crate::store::InputHandoffStatus::Admitted
         );
         prepared
     }
@@ -819,7 +820,7 @@ impl RemovalFixture {
         })
         .await
         .unwrap_or_else(|_| {
-            let progress = self.api().config_store.get_journal_removal(&self.prepared()).unwrap();
+            let progress = self.api().config_store.get_worker_input_handoff(&self.prepared()).unwrap();
             let mut sessions = vec![self.attr.session_id.clone()];
             if let Some(members) = progress.as_ref().and_then(|progress| progress.metadata.members.as_ref()) {
                 sessions.extend(members.iter().map(|member| member.session_id.clone()));
@@ -863,100 +864,22 @@ impl RemovalFixture {
         assert!(!self.root().exists());
     }
     async fn wait_recorded(&self) {
-        // Multi-member fixtures chain several bounded Jobs. Each must finish
-        // Controller teardown before the next prefix can acquire ownership.
-        tokio::time::timeout(Duration::from_secs(240), async {
-            loop {
-                if self
-                    .api()
-                    .store
-                    .list_retained_journal_recordings(TEST_WORKSPACE_ID, None, 100)
-                    .unwrap()
-                    .is_empty()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            let progress = self
-                .api()
-                .store
-                .list_retained_journal_recordings(TEST_WORKSPACE_ID, None, 100)
-                .unwrap();
-            let states = progress
-                .iter()
-                .flat_map(|p| p.metadata.members.iter().flatten())
-                .flat_map(|m| {
-                    self.api()
-                        .store
-                        .list_backend_journal_jobs(TEST_WORKSPACE_ID, &m.session_id, None, 100)
-                        .unwrap()
-                })
-                .map(|job| {
-                    let attempts = self
-                        .api()
-                        .store
-                        .list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id)
-                        .unwrap();
-                    (
-                        job.request.job_id,
-                        job.state,
-                        job.failure_category,
-                        job.failure_detail,
-                        attempts
-                            .into_iter()
-                            .map(|a| {
-                                (
-                                    a.state,
-                                    a.worker_cleanup_state,
-                                    a.worker_cleanup_failure_category,
-                                    a.worker_cleanup_failure_detail,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            panic!(
-                "retained recording stalled: progress={:?}, jobs={states:?}",
-                progress
-                    .iter()
-                    .map(|p| (&p.metadata.phase, &p.metadata.retained_recording))
-                    .collect::<Vec<_>>()
-            );
-        });
         let progress = self
             .api()
             .config_store
-            .get_journal_removal(&self.prepared())
+            .get_worker_input_handoff(&self.prepared())
             .unwrap()
             .unwrap();
-        assert!(
+        assert_eq!(
             progress
                 .metadata
-                .retained_recording
+                .released_input_handoff
                 .as_ref()
                 .unwrap()
-                .completed
+                .handoff_status,
+            crate::store::InputHandoffStatus::Admitted
         );
-        for member in progress.metadata.members.as_ref().unwrap() {
-            let jobs = self
-                .api()
-                .store
-                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &member.session_id, None, 100)
-                .unwrap();
-            assert!(
-                !jobs.is_empty(),
-                "materialized fixture must have real recording Jobs"
-            );
-            for job in jobs {
-                assert_eq!(job.state, BackendJobState::Completed);
-                assert_job_teardown(self.api(), &job);
-            }
-        }
+        wait_members_recorded(self, progress.metadata.members.as_ref().unwrap()).await;
     }
     async fn restart(&mut self) {
         // Reopen at a persisted boundary, with no live original Controller. This is
@@ -987,6 +910,60 @@ impl RemovalFixture {
     }
 }
 
+/// Observe the owning finite Jobs and the real checkpoint/Worker cleanup fences.
+/// A terminal input handoff alone is deliberately insufficient for this wait.
+async fn wait_members_recorded(
+    f: &RemovalFixture,
+    members: &[crate::store::WorkerInputHandoffMember],
+) {
+    tokio::time::timeout(Duration::from_secs(240), async {
+        loop {
+            let mut complete = true;
+            for member in members {
+                let conn = rusqlite::Connection::open(&f.api().config.database_path).unwrap();
+                let ids = conn.prepare("SELECT job_id FROM backend_job_recording_inputs WHERE workspace_id=?1 AND json_extract(scope_json,'$.session_id')=?2")
+                    .unwrap().query_map(rusqlite::params![TEST_WORKSPACE_ID, member.session_id], |r| r.get::<_, String>(0))
+                    .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                assert!(!ids.is_empty(), "each frozen member must have a finite owning Job");
+                for id in ids {
+                    let job = f.api().store.get_backend_job(TEST_WORKSPACE_ID, &id).unwrap().unwrap();
+                    assert_ne!(job.state, BackendJobState::Failed,
+                        "owning Job failed: {:?}", (&job.failure_category, &job.failure_detail));
+                    complete &= job.state == BackendJobState::Completed;
+                }
+            }
+            if complete { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("finite owning Jobs complete, independently of handoff admission");
+    let store = open_subjektiv_store(f.api()).unwrap();
+    for member in members {
+        if !member.materialized {
+            continue;
+        }
+        let attr = store
+            .session_attribution(&member.session_id)
+            .unwrap()
+            .unwrap();
+        let host = JournalHostContext::validated_session(&store, attr).unwrap();
+        let id = store.journal_for_session(&host).unwrap().unwrap();
+        let journal = store.read_journal(&host, &id).unwrap();
+        assert_eq!(
+            (journal.process_order, journal.process_byte),
+            (member.end.canonical_order, member.end.byte_offset)
+        );
+        let jobs = f
+            .api()
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &member.session_id, None, 100)
+            .unwrap();
+        for job in jobs {
+            assert_eq!(job.state, BackendJobState::Completed);
+            assert_job_teardown(f.api(), &job);
+        }
+    }
+}
+
 /// Removal commits the source's release, not Journal success or explicit erasure.
 /// Check both durable responsibility and actual body readability after registry loss.
 fn assert_retained_recording(
@@ -1005,21 +982,21 @@ fn assert_retained_recording(
     );
     let progress = api
         .config_store
-        .get_journal_removal(&prepared)
+        .get_worker_input_handoff(&prepared)
         .unwrap()
         .unwrap();
     assert_eq!(
         progress.metadata.phase,
-        crate::store::JournalRemovalPhase::Completed
+        crate::store::WorkerInputHandoffPhase::Completed
     );
-    let recording = progress.metadata.retained_recording.as_ref().unwrap();
-    assert!(!recording.completed);
+    let recording = progress.metadata.released_input_handoff.as_ref().unwrap();
+    assert!(recording.handoff_status == crate::store::InputHandoffStatus::Admitted);
     assert!(
         api.store
-            .list_retained_journal_recordings(TEST_WORKSPACE_ID, None, 100)
+            .list_pending_released_input_handoffs(TEST_WORKSPACE_ID, None, 100)
             .unwrap()
             .iter()
-            .any(|p| p.operation_id == progress.operation_id)
+            .all(|p| p.operation_id != progress.operation_id)
     );
     assert!(
         api.store
@@ -1059,7 +1036,20 @@ fn assert_retained_recording(
     let members = progress.metadata.members.as_ref().unwrap();
     assert!(!members.is_empty());
     for member in members {
-        // Read every original, including bytes not yet selected into any Job.
+        assert_eq!(
+            api.config_store
+                .accepted_recording_end(
+                    TEST_WORKSPACE_ID,
+                    &attr.subject_id,
+                    &member.session_id,
+                    &progress.metadata.binding.writer_binding_id
+                )
+                .unwrap(),
+            Some(member.end),
+            "source release requires durable finite Job ownership through the frozen end"
+        );
+        // Every original is already in finite Job input, even if no bounded
+        // Worker prefix has reflected these bytes yet. The archive stays readable.
         for descriptor in &member.descriptors {
             let mut bytes = Vec::new();
             while (bytes.len() as u64) < descriptor.total_bytes {
@@ -1384,9 +1374,9 @@ async fn stopped_removal_hands_off_originals_before_recording_and_recovers_witho
     f.wait_for_input().await;
     f.wait_removed().await;
     assert!(
-        !f.api()
+        f.api()
             .store
-            .list_retained_journal_recordings(TEST_WORKSPACE_ID, None, 100)
+            .list_pending_released_input_handoffs(TEST_WORKSPACE_ID, None, 100)
             .unwrap()
             .is_empty()
     );
@@ -1407,7 +1397,7 @@ async fn stopped_removal_hands_off_originals_before_recording_and_recovers_witho
     let successor = RemovalFixture::create_body(f.api(), &f.attr.subject_id, false).await;
     assert!(f.api().runtime.worker(&successor).is_ok());
     f.model.set(ModelAction::Record);
-    // Recording proceeds from retained originals after the producer is gone.
+    // Recording proceeds from immutable finite Job input after the producer is gone.
     f.wait_recorded().await;
     let store = open_subjektiv_store(f.api()).unwrap();
     assert!(
@@ -1501,7 +1491,7 @@ async fn unnotified_multisession_multisegment_utf8_history_chains_bounded_jobs_w
     let progress = f
         .api()
         .config_store
-        .get_journal_removal(&prepared)
+        .get_worker_input_handoff(&prepared)
         .unwrap()
         .unwrap();
     assert_eq!(progress.metadata.members.as_ref().unwrap().len(), 2);
@@ -1602,21 +1592,22 @@ async fn unnotified_multisession_multisegment_utf8_history_chains_bounded_jobs_w
     let prefix_progress = f
         .api()
         .config_store
-        .get_journal_removal(&prepared)
+        .get_worker_input_handoff(&prepared)
         .unwrap()
         .unwrap();
     assert_eq!(
         prefix_progress.metadata.phase,
-        crate::store::JournalRemovalPhase::Completed
+        crate::store::WorkerInputHandoffPhase::Completed
     );
     assert!(
-        !prefix_progress
+        prefix_progress
             .metadata
-            .retained_recording
+            .released_input_handoff
             .as_ref()
             .unwrap()
-            .completed,
-        "one bounded prefix must not complete the retained all-member recording responsibility"
+            .handoff_status
+            == crate::store::InputHandoffStatus::Admitted,
+        "the finite owning Jobs already captured every member before prefix completion"
     );
     f.model.set(ModelAction::Record);
     f.wait_recorded().await;
@@ -1879,7 +1870,7 @@ async fn browser_recording(f: &RemovalFixture) -> Value {
         .unwrap()
         .iter()
         .find(|item| item["journal"]["source_session_id"] == f.attr.session_id)
-        .expect("recorded Session remains browseable")["retained_recording"]
+        .expect("recorded Session remains browseable")["input_handoff"]
         .clone()
 }
 
@@ -1893,7 +1884,7 @@ async fn failed_recording_releases_producer_but_retains_input_checkpoint_and_fai
     // Set a short ORIGINAL deadline at reservation, before any owner observes it.
     // Never mutate a running owner's deadline/CAS snapshot.
     let conn = rusqlite::Connection::open(&f.api().config.database_path).unwrap();
-    conn.execute_batch("CREATE TRIGGER short_journal_deadline AFTER INSERT ON backend_job_attempts WHEN NEW.job_id LIKE 'journal-recording:%' BEGIN UPDATE backend_job_attempts SET deadline_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+15 seconds') WHERE workspace_id=NEW.workspace_id AND attempt_id=NEW.attempt_id; END;").unwrap();
+    conn.execute_batch("CREATE TRIGGER short_journal_deadline AFTER INSERT ON backend_job_attempts WHEN EXISTS(SELECT 1 FROM backend_jobs j WHERE j.workspace_id=NEW.workspace_id AND j.job_id=NEW.job_id AND j.purpose='subjektiv_journal') BEGIN UPDATE backend_job_attempts SET deadline_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+15 seconds') WHERE workspace_id=NEW.workspace_id AND attempt_id=NEW.attempt_id; END;").unwrap();
     drop(conn);
     let response = f.remove().await;
     assert_eq!(
@@ -1968,26 +1959,26 @@ async fn failed_recording_releases_producer_but_retains_input_checkpoint_and_fai
     let held: Value = serde_json::from_str(&retry.body).unwrap();
     assert_eq!(held["removed"], true);
     subjektiv_journal::resume_removals(f.api()).unwrap();
-    let responsibility = f
+    assert!(
+        f.api()
+            .store
+            .list_pending_released_input_handoffs(TEST_WORKSPACE_ID, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    let progress = f
         .api()
         .store
-        .list_retained_journal_recordings(TEST_WORKSPACE_ID, None, 100)
+        .get_worker_input_handoff(&before)
+        .unwrap()
         .unwrap();
-    assert_eq!(responsibility.len(), 1);
-    let recording = responsibility[0]
-        .metadata
-        .retained_recording
-        .as_ref()
-        .unwrap();
-    assert!(!recording.completed);
-    assert_eq!(
-        recording.cause,
-        Some(crate::store::JournalRemovalCause::JobFailed)
-    );
+    let recording = progress.metadata.released_input_handoff.as_ref().unwrap();
+    assert!(recording.handoff_status == crate::store::InputHandoffStatus::Admitted);
+    assert_eq!(recording.cause, None);
     assert_eq!(
         browser_recording(&f).await,
         json!({
-            "producer": "removed", "completed": false, "cause": "job_failed"
+            "producer": "removed", "status": "admitted", "cause": null
         })
     );
     assert_eq!(f.prepared().plan.operation_id, before.plan.operation_id);
@@ -2138,7 +2129,7 @@ async fn completed_checkpoint_with_failed_job_cleanup_keeps_job_finalizing_not_s
     let progress = f
         .api()
         .config_store
-        .get_journal_removal(&f.prepared())
+        .get_worker_input_handoff(&f.prepared())
         .unwrap()
         .unwrap();
     let end = progress.metadata.members.as_ref().unwrap()[0].end;
@@ -2328,10 +2319,10 @@ async fn physical_archive_publication_failure_holds_source_then_restarts_origina
     let progress = f
         .api()
         .config_store
-        .get_journal_removal(&original)
+        .get_worker_input_handoff(&original)
         .unwrap()
         .unwrap();
-    assert!(progress.metadata.retained_recording.is_none());
+    assert!(progress.metadata.released_input_handoff.is_none());
     assert!(
         !progress.metadata.members.as_ref().unwrap()[0]
             .descriptors
@@ -2339,7 +2330,7 @@ async fn physical_archive_publication_failure_holds_source_then_restarts_origina
     );
     assert_ne!(
         progress.metadata.phase,
-        crate::store::JournalRemovalPhase::Released
+        crate::store::WorkerInputHandoffPhase::Released
     );
     f.assert_held();
     assert!(f.model.inputs.lock().unwrap().is_empty());
@@ -2454,20 +2445,21 @@ async fn archived_removal_rejects_wrong_receipts_and_restarts_original_catalog_c
     let progress = f
         .api()
         .config_store
-        .get_journal_removal(&failed)
+        .get_worker_input_handoff(&failed)
         .unwrap()
         .unwrap();
     assert_eq!(
         progress.metadata.phase,
-        crate::store::JournalRemovalPhase::Released
+        crate::store::WorkerInputHandoffPhase::Released
     );
     assert!(
-        !progress
+        progress
             .metadata
-            .retained_recording
+            .released_input_handoff
             .as_ref()
             .unwrap()
-            .completed
+            .handoff_status
+            == crate::store::InputHandoffStatus::Admitted
     );
     f.model.set(ModelAction::Record);
     f.wait_recorded().await;
@@ -2802,7 +2794,7 @@ async fn explicit_source_erasure_uses_permanent_purge_without_a_recording_wait_o
     assert!(
         f.api()
             .config_store
-            .get_journal_removal(&completed)
+            .get_worker_input_handoff(&completed)
             .unwrap()
             .is_none()
     );
@@ -2883,7 +2875,7 @@ async fn nonjournal_stopped_real_worker_removes_without_journal_scope_or_recordi
     assert!(
         f.api()
             .config_store
-            .get_journal_removal(&completed)
+            .get_worker_input_handoff(&completed)
             .unwrap()
             .is_none()
     );

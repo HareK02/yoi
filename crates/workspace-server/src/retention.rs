@@ -1690,7 +1690,7 @@ mod tests {
             journal_erasure: None,
         }
     }
-    fn journal_binding(root: &std::path::Path) -> crate::store::JournalRemovalBinding {
+    fn journal_binding(root: &std::path::Path) -> crate::store::WorkerInputHandoffBinding {
         let manager = feature_storage::FeatureStorage::new(root);
         let registration = manager
             .register(feature_storage::FeatureRegistration::new(
@@ -1699,7 +1699,7 @@ mod tests {
             ))
             .unwrap();
         let database = manager.scope("w").unwrap().open(&registration).unwrap();
-        crate::store::JournalRemovalBinding {
+        crate::store::WorkerInputHandoffBinding {
             subject_id: "subject".into(),
             writer_session_id: "session".into(),
             writer_binding_id: "binding".into(),
@@ -1707,7 +1707,7 @@ mod tests {
         }
     }
 
-    fn frozen_journal_member(root: &std::path::Path) -> crate::store::FrozenJournalRemovalMember {
+    fn frozen_journal_member(root: &std::path::Path) -> crate::store::WorkerInputHandoffMember {
         use session_store::public_material::SessionPublicMaterialReader;
         use session_store::{FsStore, LogEntry, Store};
         let session_id = session_store::new_session_id();
@@ -1748,7 +1748,7 @@ mod tests {
                 .unwrap();
         let descriptors: Vec<_> = reader.descriptors().cloned().collect();
         assert_eq!(descriptors.len(), 1);
-        crate::store::FrozenJournalRemovalMember {
+        crate::store::WorkerInputHandoffMember {
             session_id: session_id.to_string(),
             active_segment_id: Some(segment),
             materialized: true,
@@ -1764,7 +1764,7 @@ mod tests {
     // the current registry. The unrelated permission cutover is a fixture precondition.
     #[test]
     fn published_journal_histories_preserve_frozen_intents_through_owner_preflight_and_reopen() {
-        use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
+        use crate::store::{WorkerInputHandoffCause as Cause, WorkerInputHandoffPhase as Phase};
         use rusqlite::types::Value;
         type SavedTable = (String, Vec<String>, Vec<Vec<Value>>);
         fn quoted(name: &str) -> String {
@@ -1925,7 +1925,7 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            let expected: crate::store::JournalRemovalMetadata =
+            let expected: crate::store::WorkerInputHandoffMetadata =
                 serde_json::from_str(&metadata).unwrap();
             assert_eq!(expected.phase, Phase::AwaitingEffectsEnd);
             assert_eq!(expected.cause, Some(Cause::ExecutionUnconfirmed));
@@ -1953,7 +1953,10 @@ mod tests {
                     .recover_worker_removal_execution("w", &req().worker)
                     .unwrap()
                     .unwrap();
-                let progress = reopened.get_journal_removal(&prepared).unwrap().unwrap();
+                let progress = reopened
+                    .get_worker_input_handoff(&prepared)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(progress.operation_id, operation_id);
                 assert_eq!(progress.metadata, expected);
                 assert!(
@@ -1964,7 +1967,7 @@ mod tests {
                 );
                 assert!(
                     reopened
-                        .freeze_journal_removal(&prepared, &progress, &[])
+                        .freeze_worker_input_handoff(&prepared, &progress, &[])
                         .is_err()
                 );
                 assert_eq!(
@@ -2034,7 +2037,7 @@ mod tests {
 
     #[test]
     fn journal_removal_metadata_reopens_and_cas_fences_same_operation() {
-        use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
+        use crate::store::{WorkerInputHandoffCause as Cause, WorkerInputHandoffPhase as Phase};
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
         let store = setup();
@@ -2044,53 +2047,61 @@ mod tests {
             .unwrap();
         let binding = journal_binding(&temp.path().join("features"));
         let authority: &dyn ControlPlaneStore = &store;
-        let initial = authority.init_journal_removal(&prepared, &binding).unwrap();
+        let initial = authority
+            .init_worker_input_handoff(&prepared, &binding)
+            .unwrap();
         assert_eq!(initial.metadata.phase, Phase::AwaitingQuiescence);
         assert_eq!(initial.metadata.members, None);
         assert_eq!(
-            authority.init_journal_removal(&prepared, &binding).unwrap(),
+            authority
+                .init_worker_input_handoff(&prepared, &binding)
+                .unwrap(),
             initial
         );
         let mut replacement = binding.clone();
         replacement.writer_session_id = "successor".into();
         assert!(
             authority
-                .init_journal_removal(&prepared, &replacement)
+                .init_worker_input_handoff(&prepared, &replacement)
                 .is_err()
         );
         replacement = binding.clone();
         replacement.writer_binding_id = "successor-binding".into();
         assert!(
             authority
-                .init_journal_removal(&prepared, &replacement)
+                .init_worker_input_handoff(&prepared, &replacement)
                 .is_err()
         );
         replacement = journal_binding(&temp.path().join("replacement-features"));
         assert_ne!(replacement.database, binding.database);
         assert!(
             authority
-                .init_journal_removal(&prepared, &replacement)
+                .init_worker_input_handoff(&prepared, &replacement)
                 .is_err()
         );
         let mut wrong = prepared.clone();
         wrong.plan.input_fingerprint = "changed".into();
-        assert!(authority.get_journal_removal(&wrong).is_err());
+        assert!(authority.get_worker_input_handoff(&wrong).is_err());
         wrong = prepared.clone();
         wrong.plan.worker.runtime_id = "another-runtime".into();
-        assert!(authority.get_journal_removal(&wrong).is_err());
+        assert!(authority.get_worker_input_handoff(&wrong).is_err());
         wrong = prepared.clone();
         wrong.plan.workspace_id = "another-workspace".into();
-        assert!(authority.init_journal_removal(&wrong, &binding).is_err());
+        assert!(
+            authority
+                .init_worker_input_handoff(&wrong, &binding)
+                .is_err()
+        );
         let members = vec![frozen_journal_member(&temp.path().join("history"))];
         let frozen = authority
-            .freeze_journal_removal(&prepared, &initial, &members)
+            .freeze_worker_input_handoff(&prepared, &initial, &members)
             .unwrap();
         assert_eq!(frozen.operation_id, plan.operation_id);
         assert_eq!(frozen.input_fingerprint, plan.input_fingerprint);
         assert_eq!(frozen.metadata.phase, Phase::Recording);
         assert!(
             authority
-                .update_journal_removal_progress(
+                .update_worker_input_handoff_progress(
                     &prepared,
                     &initial,
                     Phase::AwaitingQuiescence,
@@ -2099,7 +2110,7 @@ mod tests {
                 .is_err()
         );
         let held = authority
-            .update_journal_removal_progress(
+            .update_worker_input_handoff_progress(
                 &prepared,
                 &frozen,
                 Phase::Recording,
@@ -2108,12 +2119,12 @@ mod tests {
             .unwrap();
         assert!(
             authority
-                .update_journal_removal_progress(&prepared, &held, Phase::Completed, None)
+                .update_worker_input_handoff_progress(&prepared, &held, Phase::Completed, None)
                 .is_err()
         );
         assert!(
             authority
-                .update_journal_removal_progress(&prepared, &held, Phase::Released, None)
+                .update_worker_input_handoff_progress(&prepared, &held, Phase::Released, None)
                 .is_err()
         );
         store
@@ -2131,34 +2142,34 @@ mod tests {
         let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let concurrent = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert_eq!(
-            reopened.get_journal_removal(&prepared).unwrap(),
+            reopened.get_worker_input_handoff(&prepared).unwrap(),
             Some(held.clone())
         );
         assert_eq!(
             reopened
-                .list_pending_journal_removals("w", None, 1)
+                .list_pending_worker_input_handoffs("w", None, 1)
                 .unwrap(),
             vec![held.clone()]
         );
         assert!(
             reopened
-                .list_pending_journal_removals("other", None, 1)
+                .list_pending_worker_input_handoffs("other", None, 1)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             reopened
-                .list_pending_journal_removals("w", Some(&held.operation_id), 1)
+                .list_pending_worker_input_handoffs("w", Some(&held.operation_id), 1)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             reopened
-                .list_pending_journal_removals("w", None, 101)
+                .list_pending_worker_input_handoffs("w", None, 101)
                 .is_err()
         );
         let next = concurrent
-            .update_journal_removal_progress(
+            .update_worker_input_handoff_progress(
                 &prepared,
                 &held,
                 Phase::AwaitingEffectsEnd,
@@ -2167,7 +2178,7 @@ mod tests {
             .unwrap();
         assert!(
             reopened
-                .update_journal_removal_progress(
+                .update_worker_input_handoff_progress(
                     &prepared,
                     &held,
                     Phase::Recording,
@@ -2179,7 +2190,7 @@ mod tests {
         changed[0].end.byte_offset += 1;
         assert!(
             reopened
-                .freeze_journal_removal(&prepared, &next, &changed)
+                .freeze_worker_input_handoff(&prepared, &next, &changed)
                 .is_err()
         );
         for mutate in [0, 1, 2, 3, 4] {
@@ -2196,32 +2207,32 @@ mod tests {
             }
             assert!(
                 reopened
-                    .freeze_journal_removal(&prepared, &next, &changed)
+                    .freeze_worker_input_handoff(&prepared, &next, &changed)
                     .is_err()
             );
         }
         assert_eq!(
             reopened
-                .freeze_journal_removal(&prepared, &next, &members)
+                .freeze_worker_input_handoff(&prepared, &next, &members)
                 .unwrap(),
             next
         );
         let json = serde_json::to_value(&next).unwrap();
         assert_eq!(
-            serde_json::from_value::<crate::store::JournalRemovalProgress>(json).unwrap(),
+            serde_json::from_value::<crate::store::WorkerInputHandoffProgress>(json).unwrap(),
             next
         );
         let mut invalid_metadata = serde_json::to_value(&next.metadata).unwrap();
         invalid_metadata["body"] = serde_json::json!("not admitted metadata");
         assert!(
-            serde_json::from_value::<crate::store::JournalRemovalMetadata>(invalid_metadata)
+            serde_json::from_value::<crate::store::WorkerInputHandoffMetadata>(invalid_metadata)
                 .is_err()
         );
     }
 
     #[test]
     fn journal_removal_physical_failure_preserves_frozen_metadata_and_cas_atomically() {
-        use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
+        use crate::store::{WorkerInputHandoffCause as Cause, WorkerInputHandoffPhase as Phase};
         let temp = tempfile::tempdir().unwrap();
         let store = setup();
         let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
@@ -2229,28 +2240,33 @@ mod tests {
             .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
             .unwrap();
         let initial = store
-            .init_journal_removal(&prepared, &journal_binding(&temp.path().join("features")))
+            .init_worker_input_handoff(&prepared, &journal_binding(&temp.path().join("features")))
             .unwrap();
         let frozen = store
-            .freeze_journal_removal(
+            .freeze_worker_input_handoff(
                 &prepared,
                 &initial,
                 &[frozen_journal_member(&temp.path().join("history"))],
             )
             .unwrap();
         let effects = store
-            .update_journal_removal_progress(&prepared, &frozen, Phase::AwaitingEffectsEnd, None)
+            .update_worker_input_handoff_progress(
+                &prepared,
+                &frozen,
+                Phase::AwaitingEffectsEnd,
+                None,
+            )
             .unwrap();
         // These are store observations only, not a Runtime archive publication proof.
         let retained = store
-            .retain_journal_recording(
+            .retain_released_input_handoff(
                 &prepared,
                 &effects,
                 prepared.runtime_request.archive_id.as_deref().unwrap(),
             )
             .unwrap();
         let released = store
-            .update_journal_removal_progress(&prepared, &retained, Phase::Released, None)
+            .update_worker_input_handoff_progress(&prepared, &retained, Phase::Released, None)
             .unwrap();
         store.with_conn(|conn| {
             conn.execute_batch("CREATE TRIGGER reject_failure_cause BEFORE UPDATE OF journal_removal_json ON worker_removal_operations WHEN json_extract(NEW.journal_removal_json,'$.cause')='execution_unconfirmed' BEGIN SELECT RAISE(ABORT,'injected cause save failure'); END;")?;
@@ -2267,7 +2283,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            store.get_journal_removal(&prepared).unwrap(),
+            store.get_worker_input_handoff(&prepared).unwrap(),
             Some(released.clone())
         );
         assert_eq!(
@@ -2296,7 +2312,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            store.get_journal_removal(&prepared).unwrap(),
+            store.get_worker_input_handoff(&prepared).unwrap(),
             Some(released.clone())
         );
         store
@@ -2307,7 +2323,7 @@ mod tests {
                 "runtime_remove",
             )
             .unwrap();
-        let held = store.get_journal_removal(&prepared).unwrap().unwrap();
+        let held = store.get_worker_input_handoff(&prepared).unwrap().unwrap();
         assert_eq!(held.metadata.phase, Phase::Released);
         assert_eq!(held.metadata.cause, Some(Cause::ExecutionUnconfirmed));
         assert_eq!(held.metadata.binding, released.metadata.binding);
@@ -2323,13 +2339,13 @@ mod tests {
         );
         assert!(
             store
-                .update_journal_removal_progress(&prepared, &released, Phase::Released, None)
+                .update_worker_input_handoff_progress(&prepared, &released, Phase::Released, None)
                 .is_err(),
             "failure annotation must fence the old full-progress CAS"
         );
         assert!(
             store
-                .update_journal_removal_progress(&prepared, &held, Phase::Completed, None)
+                .update_worker_input_handoff_progress(&prepared, &held, Phase::Completed, None)
                 .is_err()
         );
     }
@@ -2343,7 +2359,7 @@ mod tests {
             .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
             .unwrap();
         store
-            .init_journal_removal(&prepared, &journal_binding(temp.path()))
+            .init_worker_input_handoff(&prepared, &journal_binding(temp.path()))
             .unwrap();
         store
             .with_conn(|conn| {
@@ -2436,7 +2452,7 @@ mod tests {
         assert_eq!(pinned.operation_id, plan.operation_id);
         assert_eq!(
             store
-                .list_pending_journal_removals("w", None, 100)
+                .list_pending_worker_input_handoffs("w", None, 100)
                 .unwrap()
                 .len(),
             1
@@ -2517,10 +2533,15 @@ mod tests {
         }).unwrap();
         assert!(
             store
-                .init_journal_removal(&expected[0], &journal_binding(temp.path()))
+                .init_worker_input_handoff(&expected[0], &journal_binding(temp.path()))
                 .is_err()
         );
-        assert!(store.get_journal_removal(&expected[0]).unwrap().is_none());
+        assert!(
+            store
+                .get_worker_input_handoff(&expected[0])
+                .unwrap()
+                .is_none()
+        );
         let authority: &dyn ControlPlaneStore = &store;
         let first = authority
             .list_pending_worker_removal_intents("w", None, 2)
@@ -2568,7 +2589,7 @@ mod tests {
         );
         assert!(
             authority
-                .list_pending_journal_removals("w", None, 100)
+                .list_pending_worker_input_handoffs("w", None, 100)
                 .unwrap()
                 .is_empty()
         );
@@ -2719,7 +2740,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_journal_removal(
+                .get_worker_input_handoff(
                     &store
                         .recover_worker_removal_execution("w", &request.worker)
                         .unwrap()

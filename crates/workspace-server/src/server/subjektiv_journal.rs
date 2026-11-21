@@ -8,9 +8,9 @@ use subjektiv::journal::recording::JournalInput;
 use subjektiv::journal::transport::*;
 use subjektiv::journal::{self, *};
 
-#[path = "journal_removal.rs"]
+#[path = "worker_input_handoff.rs"]
 mod removal;
-#[path = "journal_retained_source.rs"]
+#[path = "retained_input_source.rs"]
 mod retained;
 pub(super) use removal::{advance_worker_removal, removal_observation, resume_removals};
 pub(super) use retained::RetainedSourceProgress;
@@ -592,6 +592,9 @@ pub(super) fn close(
             "Journal cleanup owner mismatch".into(),
         ));
     }
+    if backend_job_application::target_not_required(api, request)? {
+        return Ok(());
+    }
     let store = store(api)?;
     let host = host(api, &store, grant)?;
     if store.journal_session_erased(&host).map_err(domain)? {
@@ -903,7 +906,7 @@ pub(super) fn retained_source_progress(
 ) -> Result<RetainedSourceProgress> {
     let mut after = None;
     loop {
-        let page = api.store.list_retained_journal_recordings(
+        let page = api.store.list_pending_released_input_handoffs(
             api.workspace_id(),
             after.as_deref(),
             100,
@@ -915,14 +918,14 @@ pub(super) fn retained_source_progress(
                 && progress.metadata.binding.subject_id == attr.subject_id
                 && matches!(
                     progress.metadata.phase,
-                    crate::store::JournalRemovalPhase::Released
-                        | crate::store::JournalRemovalPhase::Completed
+                    crate::store::WorkerInputHandoffPhase::Released
+                        | crate::store::WorkerInputHandoffPhase::Completed
                 )
                 && progress
                     .metadata
-                    .retained_recording
+                    .released_input_handoff
                     .as_ref()
-                    .is_some_and(|r| !r.completed && !r.archive_id.is_empty())
+                    .is_some_and(|r| !r.handoff_status.terminal() && !r.archive_id.is_empty())
                 && progress.metadata.members.as_ref().is_some_and(|members| {
                     members
                         .iter()
@@ -936,12 +939,12 @@ pub(super) fn retained_source_progress(
             let worker = RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id);
             if let Some(progress) = api
                 .config_store
-                .get_release_journal_recording(api.workspace_id(), &worker)?
+                .get_subject_release_input_handoff(api.workspace_id(), &worker)?
                 && progress.released
-                && !progress.recording.completed
-                && progress.recording.binding.subject_id == attr.subject_id
+                && !progress.handoff.handoff_status.terminal()
+                && progress.handoff.binding.subject_id == attr.subject_id
                 && progress
-                    .recording
+                    .handoff
                     .members
                     .iter()
                     .any(|member| member.session_id == attr.session_id)
@@ -973,220 +976,6 @@ pub(super) fn retained_source_store(
         .map_err(|error| error.error)
 }
 
-fn dispatch(
-    api: &WorkspaceApi,
-    attribution: crate::subjektiv::SubjectSessionAttribution,
-    journal_id: &str,
-) -> Result<()> {
-    dispatch_saved_or_new(api, attribution, journal_id, true)
-}
-
-fn dispatch_saved_or_new(
-    api: &WorkspaceApi,
-    attribution: crate::subjektiv::SubjectSessionAttribution,
-    journal_id: &str,
-    capture_new: bool,
-) -> Result<()> {
-    dispatch_with_capture(
-        api,
-        attribution.clone(),
-        journal_id,
-        capture_new,
-        |order, offset, budget| capture_input(api, &attribution, order, offset, budget),
-    )
-}
-
-enum RecordingAdmission {
-    Producer,
-    Retained,
-}
-
-pub(super) fn dispatch_retained_with_capture(
-    api: &WorkspaceApi,
-    attribution: crate::subjektiv::SubjectSessionAttribution,
-    journal_id: &str,
-    mut capture: impl FnMut(u64, u64, usize) -> Result<session_store::capture::CaptureDto>,
-) -> Result<()> {
-    dispatch_with_admission(
-        api,
-        attribution,
-        journal_id,
-        true,
-        RecordingAdmission::Retained,
-        |order, offset, budget| capture(order, offset, budget),
-    )
-}
-
-fn dispatch_with_capture(
-    api: &WorkspaceApi,
-    attribution: crate::subjektiv::SubjectSessionAttribution,
-    journal_id: &str,
-    capture_new: bool,
-    capture: impl FnOnce(u64, u64, usize) -> Result<session_store::capture::CaptureDto>,
-) -> Result<()> {
-    dispatch_with_admission(
-        api,
-        attribution,
-        journal_id,
-        capture_new,
-        RecordingAdmission::Producer,
-        capture,
-    )
-}
-
-fn dispatch_with_admission(
-    api: &WorkspaceApi,
-    attribution: crate::subjektiv::SubjectSessionAttribution,
-    journal_id: &str,
-    capture_new: bool,
-    admission: RecordingAdmission,
-    capture: impl FnOnce(u64, u64, usize) -> Result<session_store::capture::CaptureDto>,
-) -> Result<()> {
-    let gate = lifecycle_lock(api, &attribution.subject_id)?;
-    let _gate = gate
-        .lock()
-        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
-    let store = store(api)?;
-    let host =
-        JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
-    if store.journal_session_erased(&host).map_err(domain)? {
-        return Err(Error::WorkspacePermissionDenied(
-            "Session was explicitly erased".into(),
-        ));
-    }
-    subjektiv_deletion::require_available(api, &attribution.subject_id)?;
-    // Existing Jobs use only their saved grant/input. Source-body authority is
-    // needed below solely when admitting newly captured history.
-    let mut after = None;
-    loop {
-        let jobs = api.store.list_backend_journal_jobs(
-            api.workspace_id(),
-            &attribution.session_id,
-            after.as_deref(),
-            100,
-        )?;
-        for job in &jobs {
-            if job
-                .request
-                .grants
-                .subjektiv_journal
-                .as_ref()
-                .is_none_or(|g| g.journal_id != journal_id)
-            {
-                continue;
-            }
-            if matches!(
-                job.state,
-                BackendJobState::Pending | BackendJobState::Finalizing
-            ) {
-                return Ok(());
-            }
-            if job.state == BackendJobState::Failed {
-                if !can_resume_partial(job) {
-                    return Ok(());
-                }
-                require_job_effects_ended(api, job)?;
-                let mut cleanup_returns = Vec::new();
-                for attempt in api
-                    .store
-                    .list_backend_job_attempts(api.workspace_id(), &job.request.job_id)?
-                {
-                    if attempt.worker.is_some() {
-                        if attempt.worker_cleanup_state
-                            != Some(BackendJobWorkerCleanupState::Completed)
-                        {
-                            return Err(Error::RepositoryConflict(
-                                "Prior Journal attempt cleanup remains owned".into(),
-                            ));
-                        }
-                        cleanup_returns.push(
-                            crate::backend_job_host_effects::JobHostEffects::try_fence_retained(
-                                &api.config.database_path,
-                                &attempt,
-                            )?,
-                        );
-                    }
-                }
-                job.load_executable_request()?;
-                saved_input(
-                    &job.request,
-                    job.request
-                        .grants
-                        .subjektiv_journal
-                        .as_ref()
-                        .expect("checked Journal grant"),
-                )?;
-                subject_authorization::authorize_job_input(api, &job.request)
-                    .map_err(|error| error.error)?;
-                let reservation = api.store.reserve_backend_job_retry(
-                    api.workspace_id(),
-                    &job.request.job_id,
-                    &Utc::now().to_rfc3339(),
-                )?;
-                return queue_reservation(api, reservation);
-            }
-        }
-        if jobs.len() < 100 {
-            break;
-        }
-        after = jobs.last().map(|j| j.request.job_id.clone());
-    }
-    if !capture_new {
-        return Ok(());
-    }
-    let (store, host) = match admission {
-        RecordingAdmission::Producer => {
-            authorize_source(api, &attribution, "journal.recording.request")?;
-            (store, host)
-        }
-        RecordingAdmission::Retained => {
-            let store = retained_source_store(api, &attribution)?;
-            let host = JournalHostContext::validated_recording_source(&store, attribution.clone())
-                .map_err(domain)?;
-            (store, host)
-        }
-    };
-    let input = JournalInput::build(&store, &host, journal_id, |order, offset, budget| {
-        // Build reads its snapshot directly; recheck native source authority before
-        // acquiring protected bytes from the retained archive callback.
-        store.journal_resume_state(&host, journal_id)?;
-        capture(order, offset, budget).map_err(|e| JournalError::Conflict(e.to_string()))
-    })
-    .map_err(domain)?;
-    if input.selected_ranges.is_empty() {
-        return Ok(());
-    }
-    if matches!(admission, RecordingAdmission::Producer) {
-        authorize_source(api, &attribution, "journal.recording.request")?;
-    }
-    store
-        .accept_journal_sources(&host, "Session activity", &input.selected_ranges)
-        .map_err(domain)?;
-    let request = recording_request(&store, attribution, journal_id, input)?;
-    // The intent is saved before generation binding or dispatch. If binding/dispatch fails,
-    // Reserved recovery repeats this exact intent, never creates a replacement blindly.
-    api.resolve_backend_job_profile(&request)?;
-    let reservation = api.store.reserve_backend_job(
-        api.workspace_id(),
-        &request,
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-    )?;
-    queue_reservation(api, reservation)
-}
-
-fn queue_reservation(api: &WorkspaceApi, reservation: BackendJobReservation) -> Result<()> {
-    // The durable intent is already accepted. Host capacity is only an eager-dispatch
-    // optimization: its rejection must not leave this same attempt without recovery.
-    api.own_backend_job_recovery(&reservation.attempt);
-    let queued = api.clone();
-    if let Err(error)=api.host_executors.host()?.dispatch(move || {
-        if let Err(error)=queued.dispatch_backend_job_reservation(reservation) {
-            tracing::warn!(%error,"Journal dispatch failed; reservation and saved operations retained");
-        }
-    }) {tracing::warn!(%error,"Journal Host capacity unavailable; durable reservation retained");}
-    Ok(())
-}
-
 fn admit(
     api: &WorkspaceApi,
     attribution: crate::subjektiv::SubjectSessionAttribution,
@@ -1205,9 +994,13 @@ fn admit_sources(
 fn admit_sources_in_store(
     api: &WorkspaceApi,
     attribution: crate::subjektiv::SubjectSessionAttribution,
-    dispatch_jobs: bool,
+    _dispatch_jobs: bool,
     store: crate::subjektiv::SubjektivStore,
 ) -> Result<JournalRecordingResponse> {
+    let gate = lifecycle_lock(api, &attribution.subject_id)?;
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal admission lifecycle lock poisoned".into()))?;
     authorize_source(api, &attribution, "journal.recording.request")?;
     let host =
         JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
@@ -1216,44 +1009,62 @@ fn admit_sources_in_store(
             "Session was explicitly erased".into(),
         ));
     }
-    let mut id = store.journal_for_session(&host).map_err(domain)?;
-    let (order, offset) = if let Some(id) = id.as_deref() {
-        let journal = store.read_journal(&host, id).map_err(domain)?;
-        (journal.process_order, journal.process_byte)
-    } else {
-        (0, 0)
-    };
-    let capture = capture_input(
-        api,
-        &attribution,
-        order,
-        offset,
-        JournalInput::capture_budget(),
-    )?;
-    authorize_source(api, &attribution, "journal.recording.request")?;
-    retain_source(
-        api.runtime.as_ref(),
+    let binding = host
+        .writer_binding_id()
+        .ok_or_else(|| Error::WorkspacePermissionDenied("Source lifetime is missing".into()))?;
+    let mut start = session_store::capture::RecordingPosition::default();
+    if let Some(id) = store.journal_for_session(&host).map_err(domain)? {
+        let journal = store.read_journal(&host, &id).map_err(domain)?;
+        start = session_store::capture::RecordingPosition {
+            canonical_order: journal.process_order,
+            byte_offset: journal.process_byte,
+        };
+    }
+    if let Some(accepted) = api.config_store.accepted_recording_end(
         api.workspace_id(),
-        &attribution,
-        material_source(api, &attribution)?,
-        capture.segment_id == "not-materialized",
-    )?;
-    let sources = journal::recording::capture_ranges(&capture).map_err(domain)?;
-    for batch in sources.chunks(MAX_JOURNAL_RANGES) {
-        authorize_source(api, &attribution, "journal.recording.request")?;
-        id = Some(
-            store
-                .accept_journal_sources(&host, "Session activity", batch)
-                .map_err(domain)?,
-        );
+        &attribution.subject_id,
+        &attribution.session_id,
+        binding,
+    )? {
+        if (accepted.canonical_order, accepted.byte_offset)
+            > (start.canonical_order, start.byte_offset)
+        {
+            start = accepted;
+        }
     }
-    let Some(id) = id else {
+    let (end, chunks) =
+        backend_recording_job::capture_scope(start, None, |order, offset, budget| {
+            capture_input(api, &attribution, order, offset, budget)
+        })?;
+    if chunks.is_empty() {
         return Ok(JournalRecordingResponse::NoNewSources);
-    };
-    // Failure to start never retracts admission. Capacity preserves a Reserved intent.
-    if dispatch_jobs && let Err(error) = dispatch(api, attribution, &id) {
-        tracing::warn!(%error,journal_id=%id,"Journal admitted; Job dispatch remains recoverable");
     }
+    authorize_source(api, &attribution, "journal.recording.request")?;
+    for chunk in &chunks {
+        let ranges = journal::recording::capture_ranges(chunk).map_err(domain)?;
+        store
+            .accept_journal_sources(&host, "Session activity", &ranges)
+            .map_err(domain)?;
+    }
+    let database = api
+        .feature_storage
+        .existing_identity(&api.subjektiv_registration)
+        .map_err(Error::SubjektivStorage)?;
+    backend_recording_job::admit(
+        api,
+        crate::store::BackendJobRecordingScope {
+            subject_id: attribution.subject_id.clone(),
+            session_id: attribution.session_id.clone(),
+            worker: RuntimeWorkerRef::new(&attribution.runtime_id, &attribution.worker_id),
+            binding_id: binding.into(),
+            database,
+            start,
+            end,
+        },
+        &chunks,
+    )?;
+    // The Job now owns every unprocessed original byte in this finite view. It
+    // no longer borrows the producer or a removal/release drain to retain input.
     Ok(JournalRecordingResponse::Accepted)
 }
 
@@ -1432,7 +1243,7 @@ fn confirm_runtime_disconnect(
     }
     if let Some(prepared) = api
         .config_store
-        .get_release_journal_recording(api.workspace_id(), &lease.worker)?
+        .get_subject_release_input_handoff(api.workspace_id(), &lease.worker)?
     {
         let scope = disconnected.recording_scope.as_ref().ok_or_else(|| {
             Error::RepositoryConflict("Disconnected recording scope missing".into())
@@ -1444,9 +1255,9 @@ fn confirm_runtime_disconnect(
             || scope
                 .members
                 .iter()
-                .map(crate::store::FrozenJournalRemovalMember::from)
+                .map(crate::store::WorkerInputHandoffMember::from)
                 .collect::<Vec<_>>()
-                != prepared.recording.members
+                != prepared.handoff.members
         {
             return Err(Error::RepositoryConflict(
                 "Disconnected recording scope changed".into(),
@@ -1626,7 +1437,7 @@ pub(super) fn release_subject(
             &input.operation_id,
         )?;
         drop(_guard);
-        if let Err(error) = retained::recover_releases(api) {
+        if let Err(error) = retained::recover_release_input_handoffs(api) {
             tracing::warn!(%error, "Released Journal continuation deferred");
         }
         return Ok(response());
@@ -1785,7 +1596,7 @@ pub(super) fn release_subject(
     )?;
     drop(storage_guard);
     drop(_guard);
-    if let Err(error) = retained::recover_releases(api) {
+    if let Err(error) = retained::recover_release_input_handoffs(api) {
         tracing::warn!(%error, "Released Journal continuation deferred");
     }
     Ok(response())
@@ -1960,37 +1771,6 @@ fn enabled(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> Result<bool> {
     Ok(manifest.feature.subjektiv.enabled())
 }
 
-pub(super) fn drain_after_completion(api: &WorkspaceApi, request: &BackendJobRequest) {
-    if let Some(grant) = &request.grants.subjektiv_journal {
-        let result = (|| {
-            let store = store(api)?;
-            let attr = store
-                .session_attribution(&grant.session_id)
-                .map_err(|e| Error::Store(e.to_string()))?
-                .ok_or_else(|| Error::Store("Journal Session attribution missing".into()))?;
-            let target = RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id);
-            if let Some(prepared) = api
-                .config_store
-                .recover_worker_removal_plan(api.workspace_id(), &target)
-                .map_err(|error| Error::Store(error.to_string()))?
-                && api.store.get_journal_removal_for_plan(&prepared)?.is_some()
-            {
-                // The removal parent owns selection from its fixed union. Normal
-                // live drain must not replace its scope or bypass the saved end.
-                return resume_removals(api);
-            }
-            // The completed immutable prefix has already passed every execution/cleanup
-            // fence and input retirement. Admit a new bounded prefix; never replace or
-            // reselect input for an unfinished Job during recovery.
-            dispatch_saved_or_new(api, attr.clone(), &grant.journal_id, true)?;
-            release_completed_source(api, &attr)
-        })();
-        if let Err(error) = result {
-            tracing::warn!(%error,"Journal pending prefix drain failed; saved input retained");
-        }
-    }
-}
-
 fn material_source(
     api: &WorkspaceApi,
     attribution: &crate::subjektiv::SubjectSessionAttribution,
@@ -2043,82 +1823,7 @@ pub(super) fn reconcile_created_worker(
 }
 
 pub(super) fn recover(api: &WorkspaceApi) -> Result<()> {
-    resume_removals(api)?;
-    let store = store(api)?;
-    let mut after: Option<(String, String)> = None;
-    loop {
-        let page = store
-            .list_subjects_after(
-                100,
-                after
-                    .as_ref()
-                    .map(|(time, id): &(String, String)| (time.as_str(), id.as_str())),
-            )
-            .map_err(|e| Error::Store(e.to_string()))?;
-        for subject in &page.items {
-            let mut cursor: Option<(String, String)> = None;
-            let snapshot = Utc::now().to_rfc3339();
-            loop {
-                let attrs = store
-                    .subject_session_attribution_page(
-                        &subject.id,
-                        None,
-                        &snapshot,
-                        cursor.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
-                        100,
-                    )
-                    .map_err(|e| Error::Store(e.to_string()))?;
-                for attr in &attrs.items {
-                    let session_host = JournalHostContext::validated_session(&store, attr.clone())
-                        .map_err(domain)?;
-                    let erased = store
-                        .journal_session_erased(&session_host)
-                        .map_err(domain)?;
-                    if let Err(error) = reconcile_session_jobs(api, attr, erased) {
-                        tracing::warn!(%error,session_id=%attr.session_id,"Journal attempt recovery remains unresolved");
-                    }
-                    if erased {
-                        if let Err(error) = material_source(api, attr).and_then(|source| {
-                            erase_source(api.runtime.as_ref(), api.workspace_id(), attr, source)
-                        }) {
-                            tracing::warn!(%error,session_id=%attr.session_id,"Erased Session physical cleanup remains recoverable");
-                        }
-                        continue;
-                    }
-                    // Recovery only consumes saved Job input and domain receipts. A missed
-                    // admission notification is not permission to reread/reselect live history.
-                    if let Ok(Some(id)) = store.journal_for_session(&session_host) {
-                        if let Err(error) = dispatch_saved_or_new(api, attr.clone(), &id, false)
-                            .and_then(|_| release_completed_source(api, attr))
-                        {
-                            tracing::warn!(%error,session_id=%attr.session_id,"retained Journal prefix recovery blocked");
-                        }
-                    }
-                }
-                if !attrs.has_more {
-                    break;
-                }
-                cursor = attrs
-                    .items
-                    .last()
-                    .map(|a| (a.attributed_at.clone(), a.session_id.clone()));
-                if cursor.is_none() {
-                    break;
-                }
-            }
-        }
-        if !page.has_more {
-            break;
-        }
-        after = page
-            .items
-            .last()
-            .map(|s| (s.created_at.clone(), s.id.clone()));
-        if after.is_none() {
-            break;
-        }
-    }
-    Ok(())
+    resume_removals(api)
 }
 
 pub(super) fn recording_request(
@@ -2539,13 +2244,13 @@ pub(super) fn validate_removal_retention(
         ));
     }
     // Source removal owns the handoff, not the recording Job's completion.
-    // Only the retained-recording owner may declare the whole frozen scope
-    // complete and release its pins; a saved checkpoint alone is insufficient.
+    // The input handoff releases pins after finite Job admission, independently
+    // of recording checkpoints and execution completion.
     let release = service
         .store
-        .get_journal_removal(prepared)?
-        .and_then(|progress| progress.metadata.retained_recording)
-        .is_some_and(|recording| recording.completed);
+        .get_worker_input_handoff(prepared)?
+        .and_then(|progress| progress.metadata.released_input_handoff)
+        .is_some_and(|handoff| handoff.handoff_status.terminal());
     if let Err(original) = retain_source(&runtime, &service.workspace_id, &attr, source, release) {
         // A lost reply may follow the physical transfer. Reconcile only the exact
         // reserved archive and Session, whether or not an admitted remainder exists.
@@ -2625,7 +2330,7 @@ pub(super) fn finish_worker_removal<T>(
     let _guard = gate
         .lock()
         .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
-    let progress = service.store.get_journal_removal(prepared)?;
+    let progress = service.store.get_worker_input_handoff(prepared)?;
     let identity = match &progress {
         Some(progress) => progress.metadata.binding.database.clone(),
         None => service
@@ -2816,8 +2521,8 @@ fn release_completed_source(
         .map_err(|error| Error::Store(error.to_string()))?
         && api
             .store
-            .get_journal_removal_for_plan(&prepared)?
-            .is_some_and(|progress| progress.metadata.retained_recording.is_some())
+            .get_worker_input_handoff_for_plan(&prepared)?
+            .is_some_and(|progress| progress.metadata.released_input_handoff.is_some())
     {
         // The frozen-scope owner releases pins after every original is reflected.
         // An empty/admitted checkpoint says nothing about its unadmitted tail.
@@ -2825,7 +2530,7 @@ fn release_completed_source(
     }
     if api
         .config_store
-        .get_release_journal_recording(api.workspace_id(), &target)?
+        .get_subject_release_input_handoff(api.workspace_id(), &target)?
         .is_some()
     {
         // Even a prepared handoff owns the whole scope, not just admitted ranges.
@@ -2898,7 +2603,7 @@ fn require_job_workspace(api: &WorkspaceApi, job: &BackendJobRecord) -> Result<(
     Ok(())
 }
 
-fn can_resume_partial(job: &BackendJobRecord) -> bool {
+pub(super) fn can_resume_partial(job: &BackendJobRecord) -> bool {
     job.state == BackendJobState::Failed
         && matches!(
             job.failure_category.as_deref(),
@@ -2915,37 +2620,11 @@ fn can_resume_partial(job: &BackendJobRecord) -> bool {
             .is_some_and(|grant| saved_input(&job.request, grant).is_ok())
 }
 
-/// Continue only the frozen partial Job whose actual termination initiated cleanup.
-/// Reopen/retry rereads the same canonical Job and still checks all historical fences.
-pub(super) fn resume_after_execution_cleanup(
-    api: &WorkspaceApi,
-    job: &BackendJobRecord,
-    attempt: &BackendJobAttemptRecord,
-) -> Result<()> {
-    if job.failure_category.as_deref() != Some("journal_execution_terminated")
-        || !can_resume_partial(job)
-        || job.current_attempt != attempt.attempt
-    {
-        return Ok(());
-    }
-    let grant = job
-        .request
-        .grants
-        .subjektiv_journal
-        .as_ref()
-        .ok_or_else(|| Error::Store("Journal continuation grant missing".into()))?;
-    let attribution = store(api)?
-        .session_attribution(&grant.session_id)
-        .map_err(|error| Error::Store(error.to_string()))?
-        .ok_or_else(|| Error::Store("Journal continuation attribution missing".into()))?;
-    dispatch_saved_or_new(api, attribution, &grant.journal_id, false)
-}
-
 /// Outcome is not a shutdown receipt. Inspect every earlier attempt as well: a late
 /// Host operation/cleanup from one of them must not affect the next owner. The root
 /// checks exact Runtime/Controller, Feature/background, Host-drain and cleanup evidence
 /// without waiting under this Subject gate or reconstructing empty live ownership.
-pub(super) fn require_job_effects_ended(_api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()> {
+pub(super) fn require_job_effects_ended(api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()> {
     if matches!(
         job.state,
         BackendJobState::Pending | BackendJobState::Finalizing
@@ -2954,8 +2633,21 @@ pub(super) fn require_job_effects_ended(_api: &WorkspaceApi, job: &BackendJobRec
             "Journal Job is still pending".into(),
         ));
     }
-    // Terminal Job state is published only by common finalization; consumers
-    // do not reconstruct cleanup from historical Runtime resources.
+    // Failed execution is terminal before cleanup. Read the committed common
+    // cleanup checkpoint, not registry absence or a reconstructed live owner.
+    let attempts = api
+        .store
+        .list_backend_job_attempts(api.workspace_id(), &job.request.job_id)?;
+    if attempts.is_empty()
+        || attempts.iter().any(|attempt| {
+            !attempt.state.terminal()
+                || attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+        })
+    {
+        return Err(Error::RepositoryConflict(
+            "Journal Job cleanup is not complete".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2979,14 +2671,14 @@ fn require_session_job_effects_ended(api: &WorkspaceApi, session: &str) -> Resul
 }
 
 fn require_retained_recording_handoff(
-    progress: &crate::store::JournalRemovalProgress,
+    progress: &crate::store::WorkerInputHandoffProgress,
     attr: &crate::subjektiv::SubjectSessionAttribution,
     archive: &worker_runtime::retention::WorkerSessionArchiveManifest,
 ) -> Result<()> {
-    use crate::store::JournalRemovalPhase;
+    use crate::store::WorkerInputHandoffPhase;
     if !matches!(
         progress.metadata.phase,
-        JournalRemovalPhase::Released | JournalRemovalPhase::Completed
+        WorkerInputHandoffPhase::Released | WorkerInputHandoffPhase::Completed
     ) || progress.metadata.binding.subject_id != attr.subject_id
         || progress.worker.runtime_id != attr.runtime_id
         || progress.worker.worker_id != attr.worker_id
@@ -2997,7 +2689,7 @@ fn require_retained_recording_handoff(
         || progress.worker.worker_id != archive.source_worker_id.to_string()
         || progress
             .metadata
-            .retained_recording
+            .released_input_handoff
             .as_ref()
             .is_none_or(|retained| retained.archive_id != archive.archive_id)
     {
@@ -3315,38 +3007,7 @@ fn reconcile_attempt_under_gate(
     // Do not call admission here: it can select newer live Session bytes. Existing
     // bounded retry uses only this Job's input and the operation/checkpoint receipts.
     drop(guard);
-    dispatch_saved_or_new(api, attr, &grant.journal_id, false)
-}
-
-/// Cleanup return is the retry boundary for an interrupted normal Job, not
-/// Completed cleanup metadata or an earlier result/Stop callback.
-pub(super) fn resume_recording_after_cleanup(
-    api: &WorkspaceApi,
-    ended: &BackendJobAttemptRecord,
-) -> Result<()> {
-    let Some(job) = api
-        .store
-        .get_backend_job(api.workspace_id(), &ended.job_id)?
-    else {
-        return Ok(());
-    };
-    if job.current_attempt != ended.attempt || !can_resume_partial(&job) {
-        return Ok(());
-    }
-    let Some(grant) = job.request.grants.subjektiv_journal.as_ref() else {
-        return Ok(());
-    };
-    let store = store(api)?;
-    let attr = store
-        .session_attribution(&grant.session_id)
-        .map_err(subjektiv_store_error)?
-        .filter(|attr| attr.subject_id == grant.subject_id)
-        .ok_or_else(|| {
-            Error::WorkspacePermissionDenied("Journal retry source ownership missing".into())
-        })?;
-    // Dispatch repeats exact attempt cleanup/effect fencing, current authority,
-    // immutable input validation and the saved maximum-attempt budget.
-    dispatch_saved_or_new(api, attr, &grant.journal_id, false)
+    Ok(())
 }
 
 fn reconcile_session_jobs(
@@ -3480,6 +3141,12 @@ impl WorkspaceApi {
         store
             .erase_journal_session(&host, request_id)
             .map_err(domain)?;
+        self.config_store
+            .erase_backend_job_recording_inputs_for_session(
+                self.workspace_id(),
+                &attr.subject_id,
+                &attr.session_id,
+            )?;
         reconcile_session_jobs(self, &attr, true)?;
         erase_source(
             self.runtime.as_ref(),

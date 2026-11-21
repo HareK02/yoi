@@ -2,8 +2,8 @@
 //! Release keeps live pinned originals; removal supplies the same scope from an archive.
 use super::*;
 use crate::store::{
-    FrozenJournalRemovalMember, JournalRemovalBinding, JournalRemovalProgress,
-    ReleaseJournalRecordingProgress,
+    SubjectReleaseInputHandoffProgress, WorkerInputHandoffBinding, WorkerInputHandoffMember,
+    WorkerInputHandoffProgress,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,13 +21,13 @@ pub(super) enum RetainedSourceOrigin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::server) struct RetainedSourceProgress {
     pub worker: RuntimeWorkerRef,
-    pub binding: JournalRemovalBinding,
-    pub members: Vec<FrozenJournalRemovalMember>,
+    pub binding: WorkerInputHandoffBinding,
+    pub members: Vec<WorkerInputHandoffMember>,
     origin: RetainedSourceOrigin,
 }
 
 impl RetainedSourceProgress {
-    pub(super) fn removal(progress: &JournalRemovalProgress) -> Result<Self> {
+    pub(super) fn removal(progress: &WorkerInputHandoffProgress) -> Result<Self> {
         Ok(Self {
             worker: progress.worker.clone(),
             binding: progress.metadata.binding.clone(),
@@ -41,7 +41,7 @@ impl RetainedSourceProgress {
                 input_fingerprint: progress.input_fingerprint.clone(),
                 archive_id: progress
                     .metadata
-                    .retained_recording
+                    .released_input_handoff
                     .as_ref()
                     .ok_or_else(|| Error::Store("Archive handoff absent".into()))?
                     .archive_id
@@ -50,11 +50,11 @@ impl RetainedSourceProgress {
         })
     }
 
-    pub(super) fn release(progress: &ReleaseJournalRecordingProgress) -> Self {
+    pub(super) fn release(progress: &SubjectReleaseInputHandoffProgress) -> Self {
         Self {
             worker: progress.worker.clone(),
-            binding: progress.recording.binding.clone(),
-            members: progress.recording.members.clone(),
+            binding: progress.handoff.binding.clone(),
+            members: progress.handoff.members.clone(),
             origin: RetainedSourceOrigin::Release {
                 operation_id: progress.operation_id.clone(),
             },
@@ -157,8 +157,8 @@ pub(super) fn prepare_release(
             "Release recording attribution differs from fixed scope".into(),
         ));
     }
-    let metadata = crate::store::ReleaseJournalRecording {
-        binding: JournalRemovalBinding {
+    let metadata = crate::store::SubjectReleaseInputHandoff {
+        binding: WorkerInputHandoffBinding {
             subject_id: binding.subject_id.clone(),
             writer_session_id: sessions[0].session_id.clone(),
             writer_binding_id: binding.binding_id.clone(),
@@ -167,17 +167,18 @@ pub(super) fn prepare_release(
         members: scope
             .members
             .iter()
-            .map(FrozenJournalRemovalMember::from)
+            .map(WorkerInputHandoffMember::from)
             .collect(),
-        completed: false,
+        legacy_completed: false,
+        handoff_status: crate::store::InputHandoffStatus::Pending,
         cause: None,
     };
-    let prepared = ReleaseJournalRecordingProgress {
+    let prepared = SubjectReleaseInputHandoffProgress {
         workspace_id: api.workspace_id().into(),
         worker: lease.worker.clone(),
         operation_id: operation.into(),
         released: false,
-        recording: metadata,
+        handoff: metadata,
     };
     let source = RetainedSourceProgress::release(&prepared);
     for member in &scope.members {
@@ -205,24 +206,26 @@ pub(super) fn prepare_release(
         // originals, before returning even the first bounded slice.
         source.capture(api, member, 0, 0, JournalInput::capture_budget())?;
     }
-    api.config_store.prepare_release_journal_recording(
+    api.config_store.prepare_subject_release_input_handoff(
         api.workspace_id(),
         lease,
         operation,
-        &prepared.recording.binding,
-        &prepared.recording.members,
+        &prepared.handoff.binding,
+        &prepared.handoff.members,
     )?;
     Ok(())
 }
 
-pub(super) fn recover_releases(api: &WorkspaceApi) -> Result<()> {
+pub(super) fn recover_release_input_handoffs(api: &WorkspaceApi) -> Result<()> {
     let mut after = None;
     loop {
-        let page = api.config_store.list_pending_release_journal_recordings(
-            api.workspace_id(),
-            after.as_deref(),
-            100,
-        )?;
+        let page = api
+            .config_store
+            .list_pending_subject_release_input_handoffs(
+                api.workspace_id(),
+                after.as_deref(),
+                100,
+            )?;
         for progress in &page {
             let outcome = (|| {
                 // A subsequent ordinary removal owns transfer and unpinning. Do not
@@ -231,52 +234,55 @@ pub(super) fn recover_releases(api: &WorkspaceApi) -> Result<()> {
                     .config_store
                     .recover_worker_removal_plan(api.workspace_id(), &progress.worker)
                     .map_err(|error| Error::Store(error.to_string()))?
-                    && let Some(removal) = api.store.get_journal_removal_for_plan(&prepared)?
-                    && let Some(recording) = &removal.metadata.retained_recording
+                    && let Some(removal) = api.store.get_worker_input_handoff_for_plan(&prepared)?
+                    && let Some(recording) = &removal.metadata.released_input_handoff
                 {
-                    if removal.metadata.binding.subject_id != progress.recording.binding.subject_id
-                        || removal.metadata.binding.database != progress.recording.binding.database
+                    if removal.metadata.binding.subject_id != progress.handoff.binding.subject_id
+                        || removal.metadata.binding.database != progress.handoff.binding.database
                         || removal.metadata.binding.writer_binding_id
-                            != progress.recording.binding.writer_binding_id
-                        || removal.metadata.members.as_ref() != Some(&progress.recording.members)
+                            != progress.handoff.binding.writer_binding_id
+                        || removal.metadata.members.as_ref() != Some(&progress.handoff.members)
                     {
                         return Err(Error::RepositoryConflict(
                             "Removal changed released recording scope".into(),
                         ));
                     }
-                    return Ok(recording.completed);
+                    return Ok(recording.handoff_status);
                 }
-                removal::resume_retained_source(api, &RetainedSourceProgress::release(progress))
+                removal::admit_retained_input(api, &RetainedSourceProgress::release(progress))
             })();
             let (complete, cause) = match outcome {
-                Ok(true) => (true, None),
-                Ok(false) => (false, Some(crate::store::JournalRemovalCause::JobPending)),
+                Ok(status) => (status, None),
                 Err(error) => {
                     tracing::warn!(operation_id=%progress.operation_id, %error, "Released Journal recording awaits recovery");
                     let cause = match error {
                         Error::WorkspacePermissionDenied(_) => {
-                            crate::store::JournalRemovalCause::OwnershipUnknown
+                            crate::store::WorkerInputHandoffCause::OwnershipUnknown
                         }
                         Error::SubjektivStorage(_) => {
-                            crate::store::JournalRemovalCause::StorageUnavailable
+                            crate::store::WorkerInputHandoffCause::StorageUnavailable
                         }
-                        _ => crate::store::JournalRemovalCause::SourceUnavailable,
+                        _ => crate::store::WorkerInputHandoffCause::SourceUnavailable,
                     };
-                    (false, Some(cause))
+                    (crate::store::InputHandoffStatus::Pending, Some(cause))
                 }
             };
-            let cause = if !complete
-                && removal::members_have_failed_job(api, &progress.recording.members)?
-            {
-                Some(crate::store::JournalRemovalCause::JobFailed)
-            } else {
-                cause
-            };
-            if let Err(error) = api
+            match api
                 .config_store
-                .update_release_journal_recording(progress, complete, cause)
+                .update_subject_release_input_handoff(progress, complete, cause)
             {
-                tracing::debug!(operation_id=%progress.operation_id, %error, "Release recording progress changed");
+                Err(error) => {
+                    tracing::debug!(operation_id=%progress.operation_id, %error, "Release input handoff changed")
+                }
+                Ok(()) if complete == crate::store::InputHandoffStatus::Admitted => {
+                    if let Err(error) = removal::release_original_pins(
+                        api,
+                        &RetainedSourceProgress::release(progress),
+                    ) {
+                        tracing::warn!(operation_id=%progress.operation_id, %error, "Job owns input; original pin cleanup remains unconfirmed");
+                    }
+                }
+                Ok(()) => {}
             }
         }
         if page.len() < 100 {

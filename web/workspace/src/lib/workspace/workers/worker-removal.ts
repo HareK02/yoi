@@ -1,6 +1,4 @@
-import type {
-  RuntimeCleanupExecutionResult,
-} from "#lib/generated/runtime-api.ts";
+import type { RuntimeCleanupExecutionResult } from "#lib/generated/runtime-api.ts";
 import type {
   WorkerRemovalCause,
   WorkerRemovalObservation,
@@ -9,10 +7,10 @@ import type {
 
 export const removalPhaseLabels: Record<WorkerRemovalPhase, string> = {
   awaiting_quiescence: "Awaiting quiescence",
-  recording: "Recording Journal",
+  input_handoff: "Preparing Job input",
   awaiting_effects_end: "Awaiting execution end",
   released: "Writer released; deletion pending",
-  completed: "Journal complete; deletion unconfirmed",
+  completed: "Input handoff complete; deletion unconfirmed",
 };
 
 export const removalCauseLabels: Record<WorkerRemovalCause, string> = {
@@ -63,8 +61,6 @@ export function deletionNotice(outcome: WorkerDeletionOutcome): {
   return {
     level: outcome.removal.state === "held" ? "warning" : "info",
     title: "Worker removal accepted",
-    message: `${
-      removalDescription(outcome.removal)
-    } View Removal operation for the saved intent.`,
+    message: `${removalDescription(outcome.removal)} View Removal operation for the saved intent.`,
   };
 }

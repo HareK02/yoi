@@ -14,10 +14,13 @@ async fn explicit_release_recording_transfers_to_later_removal_without_losing_sc
     let released = f
         .api()
         .config_store
-        .get_release_journal_recording(TEST_WORKSPACE_ID, &f.source)
+        .get_subject_release_input_handoff(TEST_WORKSPACE_ID, &f.source)
         .unwrap()
         .unwrap();
-    assert!(released.released && !released.recording.completed);
+    assert!(
+        released.released
+            && released.handoff.handoff_status == crate::store::InputHandoffStatus::Admitted
+    );
     RemovalFixture::stop_body(f.api(), &f.source).await;
     let response = f.remove().await;
     assert_eq!(
@@ -30,20 +33,21 @@ async fn explicit_release_recording_transfers_to_later_removal_without_losing_sc
     let removed = f
         .api()
         .store
-        .get_journal_removal(&f.prepared())
+        .get_worker_input_handoff(&f.prepared())
         .unwrap()
         .unwrap();
     assert_eq!(
         removed.metadata.members.as_ref(),
-        Some(&released.recording.members)
+        Some(&released.handoff.members)
     );
     assert!(
-        !removed
+        removed
             .metadata
-            .retained_recording
+            .released_input_handoff
             .as_ref()
             .unwrap()
-            .completed
+            .handoff_status
+            == crate::store::InputHandoffStatus::Admitted
     );
     f.model.set(ModelAction::Record);
     f.wait_recorded().await;
@@ -86,22 +90,17 @@ async fn release(f: &RemovalFixture, operation: &str) -> runtime_api::SubjectRel
 }
 
 async fn wait_recorded(f: &RemovalFixture) {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            let progress = f
-                .api()
-                .config_store
-                .get_release_journal_recording(TEST_WORKSPACE_ID, &f.source)
-                .unwrap()
-                .unwrap();
-            if progress.recording.completed {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("released fixed scope reaches every checkpoint and closes Jobs");
+    let progress = f
+        .api()
+        .config_store
+        .get_subject_release_input_handoff(TEST_WORKSPACE_ID, &f.source)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        progress.handoff.handoff_status,
+        crate::store::InputHandoffStatus::Admitted
+    );
+    wait_members_recorded(f, &progress.handoff.members).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -119,14 +118,17 @@ async fn explicit_release_hands_off_unadmitted_multisession_history_without_wait
     let saved = f
         .api()
         .config_store
-        .get_release_journal_recording(TEST_WORKSPACE_ID, &f.source)
+        .get_subject_release_input_handoff(TEST_WORKSPACE_ID, &f.source)
         .unwrap()
         .unwrap();
-    assert!(saved.released && !saved.recording.completed);
-    assert_eq!(saved.recording.members.len(), 2);
+    assert!(
+        saved.released
+            && saved.handoff.handoff_status == crate::store::InputHandoffStatus::Admitted
+    );
+    assert_eq!(saved.handoff.members.len(), 2);
     assert!(
         saved
-            .recording
+            .handoff
             .members
             .iter()
             .any(|m| m.session_id == retained.session_id && m.descriptors.len() >= 3)
@@ -153,7 +155,7 @@ async fn explicit_release_hands_off_unadmitted_multisession_history_without_wait
     f.wait_for_input().await;
     let observed = browser_recording(&f).await;
     assert_eq!(observed["producer"], "released");
-    assert_eq!(observed["completed"], false);
+    assert_eq!(observed["status"], "admitted");
     assert_eq!(
         release(&f, "release-pending-recording").await.state,
         runtime_api::SubjectReleaseState::Disconnected
@@ -173,17 +175,17 @@ async fn explicit_release_hands_off_unadmitted_multisession_history_without_wait
     assert_eq!(
         browser_recording(&f).await,
         json!({
-            "producer": "released", "completed": true, "cause": null
+            "producer": "released", "status": "admitted", "cause": null
         })
     );
     let current = f
         .api()
         .config_store
-        .get_release_journal_recording(TEST_WORKSPACE_ID, &f.source)
+        .get_subject_release_input_handoff(TEST_WORKSPACE_ID, &f.source)
         .unwrap()
         .unwrap();
-    assert_eq!(current.recording.members, saved.recording.members);
-    for member in &current.recording.members {
+    assert_eq!(current.handoff.members, saved.handoff.members);
+    for member in &current.handoff.members {
         let attr = store
             .session_attribution(&member.session_id)
             .unwrap()

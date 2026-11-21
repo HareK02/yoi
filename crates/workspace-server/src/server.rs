@@ -26,8 +26,10 @@
 
 use subjektiv::api::*;
 mod attachment_failure;
+mod backend_job_application;
 mod backend_job_profile;
 mod backend_job_recovery;
+mod backend_recording_job;
 mod chat;
 mod core_worker_creation;
 mod external_grant_failure;
@@ -5371,9 +5373,6 @@ impl WorkspaceApi {
                     .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))
             })
             .transpose()?;
-        if let Some(subject) = subjektiv_deletion::job_subject(&reservation.job.request) {
-            subjektiv_deletion::require_available(self, subject)?;
-        }
         let current_job = self
             .store
             .get_backend_job(&self.config.workspace_id, &reservation.job.request.job_id)?
@@ -5392,6 +5391,17 @@ impl WorkspaceApi {
             replayed: reservation.replayed,
             resource_reused: reservation.resource_reused,
         };
+        if backend_job_application::target_not_required(self, &reservation.job.request)? {
+            backend_job_application::settle_not_required(
+                self,
+                &reservation.job,
+                &reservation.attempt,
+            )?;
+            return Ok(BackendJobReservation {
+                replayed: true,
+                ..reservation
+            });
+        }
         if matches!(
             reservation.job.input_disposition,
             crate::backend_job::JobInputDisposition::Erased
@@ -6064,6 +6074,7 @@ impl WorkspaceApi {
             // admitted owners even if they remain pending or change timestamps.
             after = Some(next);
         }
+        backend_recording_job::recover(self)?;
         subjektiv_journal::recover_attempts(self)?;
         self.recover_backend_job_worker_cleanups()?;
         self.drain_reserved_backend_jobs();
@@ -6102,11 +6113,31 @@ impl WorkspaceApi {
                     .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
             })
             .transpose()?;
-        if let Some(subject) = result_job
-            .as_ref()
-            .and_then(|job| subjektiv_deletion::job_subject(&job.request))
+        if let Some(job) = &result_job
+            && backend_job_application::target_not_required(self, &job.request)?
         {
-            subjektiv_deletion::require_available(self, subject)?;
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    self.workspace_id(),
+                    &submission.job_id,
+                    &submission.attempt_id,
+                )?
+                .ok_or_else(|| {
+                    Error::WorkspacePermissionDenied("Result attempt is missing".into())
+                })?;
+            if job.current_attempt != attempt.attempt
+                || attempt.worker.as_ref() != Some(source_worker)
+                || attempt.input_digest != submission.input_digest
+            {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Result owner changed".into(),
+                ));
+            }
+            backend_job_application::settle_not_required(self, job, &attempt)?;
+            return Err(Error::WorkspacePermissionDenied(
+                "Result application is not required for the deleted target".into(),
+            ));
         }
         let accepted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let mut verified_submission = submission.clone();
@@ -6242,6 +6273,15 @@ impl WorkspaceApi {
             &verified_submission,
             &accepted_at,
         )?;
+        if subjektiv_deletion::job_subject(&acceptance.job.request).is_some() {
+            self.store.record_backend_job_result_application(
+                self.workspace_id(),
+                &acceptance.attempt,
+                &acceptance.job.intent_fingerprint,
+                crate::backend_job::JobResultApplicationDisposition::Applied,
+                &accepted_at,
+            )?;
+        }
         drop(subject_guard);
         // Closing a generation/releasing pins is a writer operation, not a consequence
         // of accepting a result. Canonical cleanup performs it after independent fences.

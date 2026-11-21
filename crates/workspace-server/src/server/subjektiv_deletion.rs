@@ -39,6 +39,17 @@ pub(super) fn require_available(api: &WorkspaceApi, subject: &str) -> Result<()>
     Ok(())
 }
 
+/// The erasure owner verifies canonical Worker/Host removal receipts before
+/// committing jobs_erased. A missing row without this receipt proves nothing.
+pub(super) fn job_erasure_confirmed(api: &WorkspaceApi, job_id: &str) -> Result<bool> {
+    api.config_store.with_conn(|connection| {
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM subject_deletion_jobs j JOIN subject_deletions d USING(workspace_id,subject_id) WHERE j.workspace_id=?1 AND j.job_id=?2 AND d.jobs_erased=1)",
+            params![api.workspace_id(), job_id], |row| row.get(0),
+        )?)
+    })
+}
+
 pub(super) fn pending(api: &WorkspaceApi, subject: &str) -> Result<bool> {
     api.config_store.with_conn(|connection| {
         Ok(connection.query_row(

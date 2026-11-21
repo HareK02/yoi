@@ -979,6 +979,51 @@ impl BackendJobWorkerCleanupState {
     }
 }
 
+/// Host-owned settlement of domain result application, independent of execution,
+/// result acceptance, cleanup and input retirement. This is not a Job outcome.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobResultApplicationDisposition {
+    Applied,
+    NotRequired,
+}
+
+impl JobResultApplicationDisposition {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::NotRequired => "not_required",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "applied" => Ok(Self::Applied),
+            "not_required" => Ok(Self::NotRequired),
+            other => Err(Error::Store(format!(
+                "unknown Backend Job result application disposition `{other}`"
+            ))),
+        }
+    }
+}
+
+/// Immutable application receipt. Replay returns the original settlement time,
+/// even when execution/cleanup/input retirement have subsequently progressed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendJobResultApplicationReceipt {
+    pub workspace_id: String,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub attempt: u8,
+    pub input_digest: String,
+    pub intent_fingerprint: String,
+    pub worker: Option<RuntimeWorkerRef>,
+    pub runtime_run_id: Option<String>,
+    pub disposition: JobResultApplicationDisposition,
+    pub recorded_at: String,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BackendJobAttemptRecord {
     pub workspace_id: String,
@@ -1000,6 +1045,11 @@ pub struct BackendJobAttemptRecord {
     pub failure_detail: Option<String>,
     #[serde(skip)]
     pub failure_cause: Option<StoredFailure>,
+    /// None means unsettled, not failed or implicitly applied.
+    #[serde(default)]
+    pub result_application_disposition: Option<JobResultApplicationDisposition>,
+    #[serde(default)]
+    pub result_application_recorded_at: Option<String>,
     pub worker_cleanup_state: Option<BackendJobWorkerCleanupState>,
     /// Cleanup never replaces the original result/cause.
     #[serde(skip)]

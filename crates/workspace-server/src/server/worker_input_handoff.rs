@@ -1,12 +1,12 @@
-//! A removal intent supplies bounded immutable Jobs until every frozen original
-//! has a checkpoint. Job recovery owns attempts; this parent owns only fixed scope
-//! and continuation. Waiting returns without retaining a lifecycle/DB lock.
+//! Physical removal retains frozen input only until finite Host Job admission.
+//! Legacy removal/release JSON is imported once; it never drains checkpoints,
+//! follows child completion or manufactures subsequent recording work.
 
 use super::*;
 use crate::retention::PreparedWorkerRemoval;
 use crate::store::{
-    FrozenJournalRemovalMember, JournalRemovalBinding, JournalRemovalCause as Cause,
-    JournalRemovalPhase as Phase, JournalRemovalProgress,
+    InputHandoffStatus, WorkerInputHandoffBinding, WorkerInputHandoffCause as Cause,
+    WorkerInputHandoffMember, WorkerInputHandoffPhase as Phase, WorkerInputHandoffProgress,
 };
 use worker_runtime::retention::{WorkerRemovalFreeze, WorkerRemovalSessionMember};
 
@@ -23,14 +23,16 @@ fn existing_database(api: &WorkspaceApi) -> Result<crate::FeatureDatabase> {
 fn waiting(
     service: &WorkerRemovalService,
     prepared: &PreparedWorkerRemoval,
-    progress: &JournalRemovalProgress,
+    progress: &WorkerInputHandoffProgress,
     phase: Phase,
     cause: Cause,
 ) -> Result<Option<worker::WorkspaceResponse>> {
-    let current =
-        service
-            .store
-            .update_journal_removal_progress(prepared, progress, phase, Some(cause))?;
+    let current = service.store.update_worker_input_handoff_progress(
+        prepared,
+        progress,
+        phase,
+        Some(cause),
+    )?;
     service.worker_projection.refresh(&current.worker)?;
     tracing::info!(operation_id=%current.operation_id, runtime_id=%current.worker.runtime_id,
         worker_id=%current.worker.worker_id, ?phase, ?cause,
@@ -63,7 +65,7 @@ pub(in crate::server) fn removal_observation(
     else {
         return Ok(None);
     };
-    let Some(progress) = api.store.get_journal_removal_for_plan(&prepared)? else {
+    let Some(progress) = api.store.get_worker_input_handoff_for_plan(&prepared)? else {
         return Ok(None);
     };
     if progress.metadata.phase == Phase::Completed {
@@ -72,7 +74,9 @@ pub(in crate::server) fn removal_observation(
     Ok(Some(progress_observation(&progress)))
 }
 
-fn progress_observation(progress: &JournalRemovalProgress) -> server_api::WorkerRemovalObservation {
+fn progress_observation(
+    progress: &WorkerInputHandoffProgress,
+) -> server_api::WorkerRemovalObservation {
     let cause = progress.metadata.cause.map(|cause| match cause {
         Cause::RecordingDisabled => server_api::WorkerRemovalCause::RecordingDisabled,
         Cause::SourceUnavailable => server_api::WorkerRemovalCause::SourceUnavailable,
@@ -101,7 +105,7 @@ fn progress_observation(progress: &JournalRemovalProgress) -> server_api::Worker
         },
         phase: match progress.metadata.phase {
             Phase::AwaitingQuiescence => server_api::WorkerRemovalPhase::AwaitingQuiescence,
-            Phase::Recording => server_api::WorkerRemovalPhase::Recording,
+            Phase::Recording => server_api::WorkerRemovalPhase::InputHandoff,
             Phase::AwaitingEffectsEnd => server_api::WorkerRemovalPhase::AwaitingEffectsEnd,
             Phase::Released => server_api::WorkerRemovalPhase::Released,
             Phase::Completed => server_api::WorkerRemovalPhase::Completed,
@@ -131,65 +135,8 @@ fn member_attribution(
         })
 }
 
-/// The same checkpoint/attempt test is used for explicit release and Remove.
-/// An admitted prefix is not a fixed endpoint, and a terminal Job is not a checkpoint.
-fn require_member_complete(
-    api: &WorkspaceApi,
-    store: &crate::subjektiv::SubjektivStore,
-    attr: &crate::subjektiv::SubjectSessionAttribution,
-    member: &WorkerRemovalSessionMember,
-) -> Result<()> {
-    require_session_job_effects_ended(api, &attr.session_id)?;
-    let host = JournalHostContext::validated_session(store, attr.clone()).map_err(domain)?;
-    if store.journal_session_erased(&host).map_err(domain)? {
-        return Err(Error::RepositoryConflict(
-            "Session erasure must use its separate removal path".into(),
-        ));
-    }
-    let id = store.journal_for_session(&host).map_err(domain)?;
-    if !member.descriptors.is_empty() {
-        let id = id.as_deref().ok_or_else(|| {
-            Error::RepositoryConflict("Frozen original history has not been admitted".into())
-        })?;
-        let journal = store.read_journal(&host, id).map_err(domain)?;
-        if (journal.process_order, journal.process_byte)
-            != (member.end.canonical_order, member.end.byte_offset)
-        {
-            return Err(Error::RepositoryConflict(
-                "Journal checkpoint has not reached the frozen end".into(),
-            ));
-        }
-        for descriptor in &member.descriptors {
-            let source = store
-                .read_journal_source(&host, id, descriptor.canonical_order)
-                .map_err(domain)?;
-            if source.source.pointer.segment_id != descriptor.identity.segment_id
-                || source.source.pointer.entry_ref != descriptor.identity.entry_ref
-                || source.source.content_sha256 != descriptor.sha256
-                || source.source.total_bytes != descriptor.total_bytes
-                || source.reflected_bytes != descriptor.total_bytes
-                || !source.unavailable.is_empty()
-            {
-                return Err(Error::RepositoryConflict(
-                    "Frozen original has no matching full checkpoint".into(),
-                ));
-            }
-        }
-    } else if member.end.canonical_order != 0 || member.end.byte_offset != 0 {
-        return Err(Error::RepositoryConflict(
-            "Frozen empty scope has a nonempty endpoint".into(),
-        ));
-    }
-    if store.journal_retention_required(&host).map_err(domain)? {
-        return Err(Error::RepositoryConflict(
-            "Journal still retains unreflected input or a generation".into(),
-        ));
-    }
-    Ok(())
-}
-
 pub(super) fn require_archive_scope(
-    progress: &JournalRemovalProgress,
+    progress: &WorkerInputHandoffProgress,
     archive: &worker_runtime::retention::WorkerSessionArchiveManifest,
 ) -> Result<()> {
     let members =
@@ -352,7 +299,7 @@ pub(in crate::server) fn advance_worker_removal(
     {
         return Ok(None);
     }
-    let saved = service.store.get_journal_removal(prepared)?;
+    let saved = service.store.get_worker_input_handoff(prepared)?;
     if saved.is_none()
         && !service
             .store
@@ -417,7 +364,7 @@ pub(in crate::server) fn advance_worker_removal(
     }
     if saved.as_ref().is_some_and(|progress| {
         matches!(progress.metadata.phase, Phase::Released | Phase::Completed)
-            && progress.metadata.retained_recording.is_some()
+            && progress.metadata.released_input_handoff.is_some()
     }) {
         // The handoff is durable. Replaying physical removal must not freeze or
         // republish a producer already removed by this exact operation. The
@@ -443,9 +390,9 @@ pub(in crate::server) fn advance_worker_removal(
         require_body_recording_and_effects_ended(&api, &store, &attr)?;
         return Ok(None);
     }
-    let mut progress = service.store.init_journal_removal(
+    let mut progress = service.store.init_worker_input_handoff(
         prepared,
-        &JournalRemovalBinding {
+        &WorkerInputHandoffBinding {
             subject_id: attr.subject_id.clone(),
             writer_session_id: attr.session_id.clone(),
             writer_binding_id: host
@@ -472,7 +419,7 @@ pub(in crate::server) fn advance_worker_removal(
     let members: Vec<_> = freeze
         .members
         .iter()
-        .map(|member| FrozenJournalRemovalMember {
+        .map(|member| WorkerInputHandoffMember {
             session_id: member.session_id.to_string(),
             end: member.end,
             active_segment_id: member.active_segment_id,
@@ -482,7 +429,7 @@ pub(in crate::server) fn advance_worker_removal(
         .collect();
     progress = service
         .store
-        .freeze_journal_removal(prepared, &progress, &members)?;
+        .freeze_worker_input_handoff(prepared, &progress, &members)?;
     let attributed: std::collections::HashSet<_> = store
         .subject_session_attributions(&attr.subject_id)
         .map_err(subjektiv_store_error)?
@@ -549,11 +496,12 @@ pub(in crate::server) fn advance_worker_removal(
         }
     };
     require_archive_scope(&progress, &archive)?;
-    progress = service
-        .store
-        .retain_journal_recording(prepared, &progress, &archive.archive_id)?;
+    progress =
+        service
+            .store
+            .retain_released_input_handoff(prepared, &progress, &archive.archive_id)?;
     // The archive shares the Session pin namespace with the producer. Never
-    // release those pins here: recording completion or explicit erasure owns them.
+    // release those pins here: successful finite input admission or erasure owns them.
     let gate = lifecycle_lock(&api, &attr.subject_id)?;
     let _gate = gate
         .lock()
@@ -579,7 +527,7 @@ pub(in crate::server) fn advance_worker_removal(
         })
         .map_err(domain)?;
     if progress.metadata.phase != Phase::Released {
-        service.store.update_journal_removal_progress(
+        service.store.update_worker_input_handoff_progress(
             prepared,
             &progress,
             Phase::Released,
@@ -588,143 +536,191 @@ pub(in crate::server) fn advance_worker_removal(
     }
     drop(_storage);
     drop(_gate);
-    if let Err(error) = recover_retained_recordings(&api) {
+    if let Err(error) = recover_input_handoffs(&api) {
         tracing::warn!(operation_id=%progress.operation_id, %error, "Retained recording continuation deferred");
     }
     Ok(None)
 }
 
-pub(super) fn resume_retained_source(
+/// Import the *whole* frozen view, including already reflected legacy prefixes.
+/// Starting at a checkpoint or accepted prefix loses legacy child input ownership
+/// and makes crash replay depend on a moving cursor. A stable [0,end) snapshot
+/// instead replays the same finite Job admission even after application advances.
+pub(super) fn admit_retained_input(
     api: &WorkspaceApi,
     progress: &RetainedSourceProgress,
-) -> Result<bool> {
+) -> Result<InputHandoffStatus> {
+    let gate = lifecycle_lock(api, &progress.binding.subject_id)?;
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Input handoff lifecycle lock poisoned".into()))?;
+    // The main-DB fence survives domain destruction. Check it before opening the
+    // old database, looking up attribution, capturing bytes or reserving a Job.
+    if subjektiv_deletion::pending(api, &progress.binding.subject_id)? {
+        return Ok(InputHandoffStatus::SubjectDeleted);
+    }
+    let database = api
+        .feature_storage
+        .open_existing(&api.subjektiv_registration, &progress.binding.database)
+        .map_err(Error::SubjektivStorage)?;
+    let _storage = database
+        .guard(&progress.binding.database)
+        .map_err(Error::SubjektivStorage)?;
+    let store = crate::subjektiv::SubjektivStore::from_database(database.clone())
+        .map_err(subjektiv_store_error)?;
+    // Domain-first deletion may have fenced the Subject before main-DB inventory
+    // was committed. Neither ordering permits recreation or a fresh admission.
+    if store
+        .subject_deletion(&progress.binding.subject_id)
+        .map_err(subjektiv_store_error)?
+        .is_some()
+    {
+        return Ok(InputHandoffStatus::SubjectDeleted);
+    }
+    if store
+        .subject(&progress.binding.subject_id)
+        .map_err(subjektiv_store_error)?
+        .is_none()
+    {
+        return Err(Error::SubjektivSubjectNotFound(
+            progress.binding.subject_id.clone(),
+        ));
+    }
+    for frozen in &progress.members {
+        let attr = store
+            .session_attribution(&frozen.session_id)
+            .map_err(subjektiv_store_error)?
+            .filter(|a| {
+                a.subject_id == progress.binding.subject_id
+                    && a.runtime_id == progress.worker.runtime_id
+                    && a.worker_id == progress.worker.worker_id
+            })
+            .ok_or_else(|| {
+                Error::RepositoryConflict("Input handoff attribution mismatch".into())
+            })?;
+        let host = JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
+        if store.journal_session_erased(&host).map_err(domain)? {
+            continue; // The canonical Session erasure path, not a checkpoint.
+        }
+        let binding = host
+            .writer_binding_id()
+            .filter(|binding| *binding == progress.binding.writer_binding_id)
+            .ok_or_else(|| {
+                Error::WorkspacePermissionDenied("Input handoff lifetime changed".into())
+            })?;
+        let member = WorkerRemovalSessionMember {
+            session_id: frozen
+                .session_id
+                .parse()
+                .map_err(|_| Error::Store("Invalid frozen Session identity".into()))?,
+            active_segment_id: frozen.active_segment_id,
+            materialized: frozen.materialized,
+            end: frozen.end,
+            descriptors: frozen.descriptors.clone(),
+        };
+        verify_members(std::slice::from_ref(&member))?;
+        let start = session_store::capture::RecordingPosition::default();
+        let (end, chunks) = backend_recording_job::capture_scope(
+            start,
+            Some(frozen.end),
+            |order, offset, budget| progress.capture(api, &member, order, offset, budget),
+        )?;
+        // Empty/unmaterialized Sessions also get a finite owning Job. Legacy
+        // completed=true never substitutes for a common Job admission receipt.
+        backend_recording_job::admit(
+            api,
+            crate::store::BackendJobRecordingScope {
+                subject_id: attr.subject_id.clone(),
+                session_id: attr.session_id.clone(),
+                worker: progress.worker.clone(),
+                binding_id: binding.into(),
+                database: progress.binding.database.clone(),
+                start,
+                end,
+            },
+            &chunks,
+        )?;
+    }
+    // Do not unpin here: the caller first commits the terminal handoff receipt.
+    // Admission failure (including a partial multi-Session import) retains every
+    // original so recovery can replay the same fixed Jobs without skipping bytes.
+    Ok(InputHandoffStatus::Admitted)
+}
+
+/// Best-effort pin cleanup *after* the terminal admission receipt. Cleanup faults
+/// must not re-open legacy recovery or wait for recording/checkpoint completion.
+pub(super) fn release_original_pins(
+    api: &WorkspaceApi,
+    progress: &RetainedSourceProgress,
+) -> Result<()> {
+    let gate = lifecycle_lock(api, &progress.binding.subject_id)?;
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Input handoff lifecycle lock poisoned".into()))?;
+    if subjektiv_deletion::pending(api, &progress.binding.subject_id)? {
+        return Ok(());
+    }
     let database = api
         .feature_storage
         .open_existing(&api.subjektiv_registration, &progress.binding.database)
         .map_err(Error::SubjektivStorage)?;
     let store =
         crate::subjektiv::SubjektivStore::from_database(database).map_err(subjektiv_store_error)?;
-    let mut complete = true;
+    if store
+        .subject_deletion(&progress.binding.subject_id)
+        .map_err(subjektiv_store_error)?
+        .is_some()
+    {
+        return Ok(());
+    }
     for frozen in &progress.members {
+        if !frozen.materialized {
+            continue;
+        }
         let attr = store
             .session_attribution(&frozen.session_id)
             .map_err(subjektiv_store_error)?
-            .filter(|attr| {
-                attr.subject_id == progress.binding.subject_id
-                    && attr.runtime_id == progress.worker.runtime_id
-                    && attr.worker_id == progress.worker.worker_id
+            .filter(|a| {
+                a.subject_id == progress.binding.subject_id
+                    && a.runtime_id == progress.worker.runtime_id
+                    && a.worker_id == progress.worker.worker_id
             })
             .ok_or_else(|| {
-                Error::RepositoryConflict("Retained recording attribution mismatch".into())
+                Error::RepositoryConflict("Input handoff cleanup attribution mismatch".into())
             })?;
-        let session_host =
-            JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
-        if store
-            .journal_session_erased(&session_host)
-            .map_err(domain)?
-        {
-            continue;
-        }
-        let member = WorkerRemovalSessionMember {
-            session_id: frozen
-                .session_id
-                .parse()
-                .map_err(|_| Error::Store("Invalid retained Session identity".into()))?,
-            active_segment_id: frozen.active_segment_id,
-            materialized: frozen.materialized,
-            end: frozen.end,
-            descriptors: frozen.descriptors.clone(),
-        };
-        if require_member_complete(api, &store, &attr, &member).is_ok() {
-            if !member.materialized {
-                continue;
-            }
-            retain_source(
-                api.runtime.as_ref(),
-                api.workspace_id(),
-                &attr,
-                progress.material_source()?,
-                true,
-            )?;
-            continue;
-        }
-        complete = false;
-        // Admission checks current Subject policy, not the removed producers grant.
-        // The guarded store repeats that check at each persisted source effect.
-        let source_store = retained_source_store(api, &attr)?;
-        let source_host =
-            JournalHostContext::validated_recording_source(&source_store, attr.clone())
-                .map_err(domain)?;
-        let mut journal = source_store
-            .journal_for_session(&source_host)
-            .map_err(domain)?;
-        if journal.is_none() && !member.descriptors.is_empty() {
-            let capture = progress.capture(api, &member, 0, 0, JournalInput::capture_budget())?;
-            let ranges = journal::recording::capture_ranges(&capture).map_err(domain)?;
-            if ranges.is_empty() {
-                return Err(Error::RepositoryConflict(
-                    "Frozen recording source unexpectedly empty".into(),
-                ));
-            }
-            journal = Some(
-                source_store
-                    .accept_journal_sources(&source_host, "Session activity", &ranges)
-                    .map_err(domain)?,
-            );
-        }
-        if let Some(journal) = journal {
-            dispatch_retained_with_capture(api, attr, &journal, |order, offset, budget| {
-                progress.capture(api, &member, order, offset, budget)
-            })?;
-        }
+        retain_source(
+            api.runtime.as_ref(),
+            api.workspace_id(),
+            &attr,
+            progress.material_source()?,
+            true,
+        )?;
     }
-    Ok(complete)
+    Ok(())
 }
 
-pub(super) fn members_have_failed_job(
-    api: &WorkspaceApi,
-    members: &[FrozenJournalRemovalMember],
-) -> Result<bool> {
-    for member in members {
-        let mut after = None;
-        loop {
-            let jobs = api.store.list_backend_journal_jobs(
-                api.workspace_id(),
-                &member.session_id,
-                after.as_deref(),
-                100,
-            )?;
-            if jobs
-                .iter()
-                .any(|job| job.state == BackendJobState::Failed && !can_resume_partial(job))
-            {
-                return Ok(true);
-            }
-            if jobs.len() < 100 {
-                break;
-            }
-            after = jobs.last().map(|job| job.request.job_id.clone());
-        }
-    }
-    Ok(false)
-}
-
-/// Resume only durable unfinished recording responsibilities, including after the
-/// producers removal commit. This never reopens removal or restores a producer.
-pub(super) fn recover_retained_recordings(api: &WorkspaceApi) -> Result<()> {
+/// Import only unfinished input handoffs, including legacy completed recordings.
+/// This never reopens physical removal, restores a producer or waits for a Job.
+pub(super) fn recover_input_handoffs(api: &WorkspaceApi) -> Result<()> {
     let mut after = None;
     loop {
-        let page = api.store.list_retained_journal_recordings(
+        let page = api.store.list_pending_released_input_handoffs(
             api.workspace_id(),
             after.as_deref(),
             100,
         )?;
         for progress in &page {
-            let outcome = RetainedSourceProgress::removal(progress)
-                .and_then(|source| resume_retained_source(api, &source));
-            let (complete, mut cause) = match outcome {
-                Ok(true) => (true, None),
-                Ok(false) => (false, Some(Cause::JobPending)),
+            let outcome = subjektiv_deletion::pending(api, &progress.metadata.binding.subject_id)
+                .and_then(|deleted| {
+                    if deleted {
+                        Ok(InputHandoffStatus::SubjectDeleted)
+                    } else {
+                        RetainedSourceProgress::removal(progress)
+                            .and_then(|source| admit_retained_input(api, &source))
+                    }
+                });
+            let (status, cause) = match outcome {
+                Ok(status) => (status, None),
                 Err(error) => {
                     let cause = match &error {
                         Error::WorkspacePermissionDenied(_) => Cause::OwnershipUnknown,
@@ -732,26 +728,24 @@ pub(super) fn recover_retained_recordings(api: &WorkspaceApi) -> Result<()> {
                         _ => Cause::SourceUnavailable,
                     };
                     tracing::warn!(operation_id=%progress.operation_id, %error, "Retained Journal recording awaits recovery");
-                    (false, Some(cause))
+                    (InputHandoffStatus::Pending, Some(cause))
                 }
             };
-            if !complete
-                && members_have_failed_job(
-                    api,
-                    progress.metadata.members.as_deref().unwrap_or_default(),
-                )?
-            {
-                cause = Some(Cause::JobFailed);
-            }
             if let Err(error) = api
                 .store
-                .update_retained_journal_recording(progress, complete, cause)
+                .update_released_input_handoff(progress, status, cause)
             {
-                tracing::debug!(operation_id=%progress.operation_id, %error, "Recording progress changed during recovery");
+                tracing::debug!(operation_id=%progress.operation_id, %error, "Input handoff changed during import");
+            } else if status == InputHandoffStatus::Admitted {
+                if let Err(error) = RetainedSourceProgress::removal(progress)
+                    .and_then(|source| release_original_pins(api, &source))
+                {
+                    tracing::warn!(operation_id=%progress.operation_id, %error, "Admitted input pin cleanup deferred; Jobs already own all bytes");
+                }
             }
         }
         if page.len() < 100 {
-            return retained::recover_releases(api);
+            return retained::recover_release_input_handoffs(api);
         }
         after = page.last().map(|p| p.operation_id.clone());
     }
@@ -760,7 +754,7 @@ pub(super) fn recover_retained_recordings(api: &WorkspaceApi) -> Result<()> {
 /// Startup and exact Job-cleanup completion both resume saved parent intentions.
 /// No retry timer blindly resubmits failures; the same operation is reconciled.
 pub(in crate::server) fn resume_removals(api: &WorkspaceApi) -> Result<()> {
-    recover_retained_recordings(api)?;
+    recover_input_handoffs(api)?;
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| Error::Store(error.to_string()))?;
     let mut after = None;

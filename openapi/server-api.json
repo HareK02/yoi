@@ -24492,7 +24492,7 @@
       "WorkerRemovalPhase": {
         "enum": [
           "awaiting_quiescence",
-          "recording",
+          "input_handoff",
           "awaiting_effects_end",
           "released",
           "completed"
@@ -27149,7 +27149,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:ddaed150ed797b4710a0cc6057b30217bf0dc34890a2e02c2e14b85a6139c981"
+    "x-yoi-source-digest": "sha256:334fdb96edb11345145604b8c000bfa27b0fe72b7a3315320ae953a93be38f94"
   },
   "openapi": "3.1.0",
   "paths": {

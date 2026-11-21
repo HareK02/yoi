@@ -65,7 +65,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
                     .find(|(version, _)| *version == 127)
                     .unwrap()
                     .1,
-                journal_removal_store::MIGRATION_NAME
+                worker_input_handoff_store::MIGRATION_NAME
             );
             assert_eq!(
                 &upgraded[upgraded.len() - 8..],
@@ -74,7 +74,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
                     (131, crate::launch_policy::MIGRATION_NAME.into()),
                     (133, crate::subject_policy::MIGRATION_NAME.into()),
                     (134, backend_job_finalizing::MIGRATION_NAME.into()),
-                    (135, subject_release_recording_store::MIGRATION_NAME.into()),
+                    (135, subject_release_input_handoff_store::MIGRATION_NAME.into()),
                     (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
                     (137, worker_lifecycle_notifications::MIGRATION_NAME.into()),
                     (138, notification_routing::merge_requests::MIGRATION_NAME.into()),

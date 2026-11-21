@@ -14,14 +14,14 @@ pub(super) const SETTLEMENT_BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
 
 #[derive(Default)]
 pub(super) struct RecoveryOwners {
-    running: Mutex<HashSet<String>>,
+    pub(super) running: Mutex<HashSet<String>>,
     cleanup_running: Mutex<HashSet<String>>,
     gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     hosts: Mutex<HashMap<String, (JobHostOwner, Arc<JobHostEffects>)>>,
     results: Mutex<HashMap<String, (RuntimeWorkerRef, BackendJobResultSubmission)>>,
     submitted: Mutex<HashSet<String>>,
-    stopping: std::sync::atomic::AtomicBool,
-    changed: tokio::sync::Notify,
+    pub(super) stopping: std::sync::atomic::AtomicBool,
+    pub(super) changed: tokio::sync::Notify,
     // Already accepted owners take fair turns before entering the finite Host
     // lane. Immediate rejection plus independent retry timers otherwise lets
     // earlier reservations monopolize every slot after a large reopen.
@@ -69,7 +69,7 @@ impl RecoveryOwners {
         self.cleanup_running.lock().unwrap().clone()
     }
 
-    async fn pause(&self, duration: Duration) {
+    pub(super) async fn pause(&self, duration: Duration) {
         let notified = self.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -619,14 +619,6 @@ impl WorkspaceApi {
             // run_backend_job_cleanup has actually returned and dropped its exact
             // Host writer lease. Parent deletion must not mistake an earlier
             // Completed row (or result callback) for that boundary.
-            if let Err(error) = subjektiv_journal::resume_recording_after_cleanup(&api, &expected) {
-                tracing::debug!(job_id=%expected.job_id, attempt_id=%expected.attempt_id, %error,
-                    "Bounded same-input Journal continuation remains retained");
-            }
-            if let Err(error) = subjektiv_journal::resume_removals(&api) {
-                tracing::warn!(job_id=%expected.job_id, attempt_id=%expected.attempt_id, %error,
-                    "Journal parent continuation remains retained");
-            }
         });
         true
     }
@@ -650,8 +642,12 @@ impl WorkspaceApi {
                 .host_executors
                 .cleanup()?
                 .run(move || {
-                    let job = api.store.get_backend_job(api.workspace_id(), &owner.job_id)?
-                        .ok_or_else(|| Error::Store("Cleanup Job disappeared".into()))?;
+                    let Some(job) = api.store.get_backend_job(api.workspace_id(), &owner.job_id)? else {
+                        if subjektiv_deletion::job_erasure_confirmed(&api, &owner.job_id)? {
+                            return Ok(());
+                        }
+                        return Err(Error::Store("Cleanup Job disappeared without canonical retirement evidence".into()));
+                    };
                     if matches!(job.state, BackendJobState::Completed | BackendJobState::Failed) {
                         return Ok(());
                     }
@@ -1131,7 +1127,12 @@ impl WorkspaceApi {
             &expected.attempt_id,
         )?
         else {
-            return Err(Error::Store("Accepted Job attempt missing".into()));
+            if subjektiv_deletion::job_erasure_confirmed(self, &expected.job_id)? {
+                return Ok(true);
+            }
+            return Err(Error::Store(
+                "Accepted Job attempt missing without canonical retirement evidence".into(),
+            ));
         };
         let job = self
             .store
@@ -1141,6 +1142,16 @@ impl WorkspaceApi {
             return Err(Error::RepositoryConflict(
                 "Recovery owner no longer current".into(),
             ));
+        }
+        if let Some(subject) = subjektiv_deletion::job_subject(&job.request) {
+            let gate = subjektiv_journal::lifecycle_lock(self, subject)?;
+            let _guard = gate
+                .lock()
+                .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
+            if backend_job_application::target_not_required(self, &job.request)? {
+                backend_job_application::settle_not_required(self, &job, &attempt)?;
+                return Ok(attempt.state.terminal());
+            }
         }
         let retained = self
             .backend_job_recovery
@@ -1571,11 +1582,16 @@ impl WorkspaceApi {
                 }
             }
             if job.input_disposition == crate::backend_job::JobInputDisposition::Available {
+                let reason = if backend_job_application::target_not_required(self, &job.request)? {
+                    crate::backend_job::JobInputRetirementReason::ExplicitErasure
+                } else {
+                    crate::backend_job::JobInputRetirementReason::Completed
+                };
                 self.store.reclaim_backend_job_input(
                     self.workspace_id(),
                     job_id,
                     &job.input_digest,
-                    crate::backend_job::JobInputRetirementReason::Completed,
+                    reason,
                 )?;
             }
         }
@@ -1594,12 +1610,7 @@ impl WorkspaceApi {
                 },
             );
         }
-        if job.request.grants.subjektiv_journal.is_some() {
-            if job.state == BackendJobState::Completed {
-                subjektiv_journal::drain_after_completion(self, &job.request);
-            }
-            subjektiv_journal::resume_after_execution_cleanup(self, &job, &current)?;
-        }
+
         // Only after durable fences/retirement may live bookkeeping be forgotten.
         self.backend_job_recovery
             .hosts

@@ -50,9 +50,7 @@ function entry(index: number) {
     state: index === 0 ? "open" : "fixed",
     title: index === 2
       ? "Corrected release evidence"
-      : `Release milestone ${
-        String(index).padStart(2, "0")
-      } · ${journalFixture.literalQuery}`,
+      : `Release milestone ${String(index).padStart(2, "0")} · ${journalFixture.literalQuery}`,
     correction_refs: index === 2 ? ["entry-00"] : [],
     content_token: `content-entry-${index}`,
     created_at: "2026-01-02T03:04:05Z",
@@ -64,9 +62,7 @@ const entries = Array.from({ length: 28 }, (_, index) => entry(index));
 const related = Array.from({ length: 8 }, (_, index) => ({
   related: {
     selector: {
-      memory_id: index === 0
-        ? journalFixture.memoryId
-        : `memory-related-${index}`,
+      memory_id: index === 0 ? journalFixture.memoryId : `memory-related-${index}`,
       change_id: "change-current",
       candidate_id: journalFixture.candidateId,
     },
@@ -129,11 +125,11 @@ export async function journalBrowserFixture(
           journal: journal(id, subjectId),
           original_source: source(id),
           unreflected_sources: id === "journal-review",
-          retained_recording: id === "journal-release"
-            ? { producer: "removed", completed: false, cause: "job_failed" }
+          input_handoff: id === "journal-release"
+            ? { producer: "removed", status: "pending", cause: "source_unavailable" }
             : id === "journal-review"
-            ? { producer: "released", completed: false, cause: "job_pending" }
-            : { producer: "removed", completed: true, cause: null },
+            ? { producer: "released", status: "admitted", cause: null }
+            : { producer: "removed", status: "subject_deleted", cause: null },
         })),
         next: offset === 0 ? "fixture-sessions-2" : null,
       });
@@ -162,29 +158,21 @@ export async function journalBrowserFixture(
       });
     }
     case "entry": {
-      const e = entries.find((e) =>
-        e.id === r.entry_id && e.journal_id === r.journal_id
-      );
+      const e = entries.find((e) => e.id === r.entry_id && e.journal_id === r.journal_id);
       return e
         ? reply({
           journal: journal(e.journal_id, subjectId),
           entry: e,
-          correction_targets: entries.filter((target) =>
-            e.correction_refs.includes(target.id)
-          ),
+          correction_targets: entries.filter((target) => e.correction_refs.includes(target.id)),
           original_source: source(e.journal_id),
         })
         : failure(404, "Journal entry not found");
     }
     case "text": {
       const e = r.entry_id
-        ? entries.find((e) =>
-          e.id === r.entry_id && e.journal_id === r.journal_id
-        )
+        ? entries.find((e) => e.id === r.entry_id && e.journal_id === r.journal_id)
         : null;
-      const token = r.field === "current_position"
-        ? `state-${r.journal_id}`
-        : e?.content_token;
+      const token = r.field === "current_position" ? `state-${r.journal_id}` : e?.content_token;
       if (!token) return failure(404, "Journal text not found");
       if (r.expected_token && r.expected_token !== token) {
         return failure(409, "Journal text changed; reread from the beginning");
@@ -269,9 +257,7 @@ export async function journalBrowserFixture(
       ) => ({
         link: {
           source_index: offset + index,
-          original_source: e.journal_id === "journal-release"
-            ? "missing"
-            : "unknown",
+          original_source: e.journal_id === "journal-release" ? "missing" : "unknown",
           connection: {
             state: "linked",
             journal_id: e.journal_id,

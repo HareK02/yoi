@@ -10903,7 +10903,7 @@ pub enum WorkerRemovalState {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRemovalPhase {
     AwaitingQuiescence,
-    Recording,
+    InputHandoff,
     AwaitingEffectsEnd,
     Released,
     Completed,
@@ -14190,7 +14190,7 @@ mod tests {
             let wire = serde_json::json!({
                 "removed": false, "runtime_id": "runtime-a", "worker_id": "worker-a",
                 "operation_id": "original-operation", "state": state,
-                "phase": "recording", "cause": cause,
+                "phase": "input_handoff", "cause": cause,
             });
             let response: WorkerRemoveResponse = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(response.status_code(), 202);
