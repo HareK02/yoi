@@ -2410,6 +2410,18 @@ impl Runtime {
                 }
                 // Replay is historical: it must not attach a controller after a later stop.
                 if let Some(receipt) = &owner.receipt {
+                    #[cfg(feature = "fs-store")]
+                    if candidate.restore_guard.active_request_id.as_deref()
+                        == Some(&request.request_id)
+                        && matches!(&candidate.execution, WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::RestoreFinalization(finalization))
+                            if finalization.operation_id == owner.operation_id && finalization.evidence == RestoreFinalizationEvidence::ReceiptStored)
+                    {
+                        candidate.restore_guard.finish(receipt.clone());
+                        candidate.settle_restore();
+                        state.persist_restore_worker_record(&candidate)?;
+                        state.workers.insert(worker_ref.worker_id, candidate);
+                        state.publish_worker_upsert(worker_ref.worker_id)?;
+                    }
                     return Ok((Some(receipt.clone()), None));
                 }
                 if candidate.restore_guard.active_request_id.as_deref() != Some(&request.request_id)
@@ -8356,7 +8368,9 @@ impl RestoreGuard {
         if let Some(id) = self.active_request_id.take()
             && let Some(owner) = self.owners.get_mut(&id)
         {
-            owner.receipt = Some(result);
+            if owner.receipt.is_none() {
+                owner.receipt = Some(result);
+            }
         }
     }
 }
@@ -8415,6 +8429,22 @@ impl WorkerRecord {
         let mut candidate = self.clone();
         let restore_receipt =
             RuntimeWorkerRestoreResult::superseded_by_stop(candidate.pending_restore());
+        #[cfg(feature = "fs-store")]
+        let restore_receipt = if candidate
+            .stop_operation()
+            .and_then(|stop| stop.restore_finalization.as_ref())
+            .is_some_and(|finalization| {
+                finalization.evidence == RestoreFinalizationEvidence::LegacyAggregatePublished
+            }) {
+            RuntimeWorkerRestoreResult::failed(
+                WorkerRestoreState::Superseded,
+                RuntimeControlCause::ExecutionRejected,
+                "worker_restore_committed_then_stopped",
+                "Restore aggregate was published, then its execution was stopped; prior durable effects are not rolled back",
+            )
+        } else {
+            restore_receipt
+        };
         candidate.settle_stopped();
         candidate.restore_guard.rotate();
 
@@ -8732,6 +8762,13 @@ impl WorkerRecord {
                                 }
                             },
                             restore: stop.pending_restore.map(RestoreOperation::from_persisted),
+                            restore_finalization: stop.restore_finalization.map(|finalization| {
+                                RestoreFinalization {
+                                    operation_id: finalization.operation_id,
+                                    evidence: finalization.evidence,
+                                    last_settled_status: stop.last_settled_status,
+                                }
+                            }),
                             create: None,
                             execution: None,
                         }),
@@ -8814,6 +8851,13 @@ impl WorkerRecord {
                 PersistedWorkerLifecycleOperation::Stop(PersistedWorkerStopOperation {
                     operation_id: stop.pending.operation_id,
                     pending_restore: stop.restore.as_ref().map(|restore| restore.persisted(self)),
+                    restore_finalization: stop.restore_finalization.as_ref().map(|finalization| {
+                        PersistedWorkerRestoreFinalization {
+                            operation_id: finalization.operation_id,
+                            evidence: finalization.evidence,
+                            execution: spec(),
+                        }
+                    }),
                     request: self.request.clone(),
                     binding: (self.execution_bound && self.request.is_some())
                         .then_some(PersistedWorkerExecutionBinding {}),
@@ -15634,6 +15678,20 @@ mod tests {
                 .unwrap(),
             receipt
         );
+        {
+            let state = resumed.lock().unwrap();
+            let record = state.worker(&worker.worker_ref).unwrap();
+            assert!(
+                record.restore_guard.active_request_id.is_none(),
+                "replay must finalize the matching durable terminal owner"
+            );
+            assert_eq!(
+                record.lifecycle(),
+                crate::catalog::WorkerLifecycleState::AwaitingRestore
+            );
+            assert!(record.worker_state().is_none());
+        }
+        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 0);
         // Also exercise the accepted-aggregate/receipt-pending crash gap.
         {
             let mut state = resumed.lock().unwrap();

@@ -941,4 +941,149 @@ mod lifecycle_tests {
         );
         assert_eq!(record.lifecycle(), WorkerLifecycleState::Active);
     }
+    #[test]
+    fn stop_owns_finalization_across_failed_backend_terminal_save_and_cold_retry() {
+        for receipt_stored in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+                .with_runtime_id("finalization-stop");
+            let (runtime, backend) = stored_runtime(options.clone());
+            let worker = runtime
+                .create_worker(task_request("finalization owner"))
+                .unwrap();
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+            let request = runtime.test_restore_request(&worker.worker_ref);
+            let receipt = runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap();
+            let store = runtime_store(&runtime);
+            let mut saved = store.read_worker_record(&worker.worker_ref).unwrap();
+            let spec = match &saved.execution_state {
+                PersistedWorkerExecutionState::Runnable(spec) => spec.clone(),
+                other => panic!("expected runnable after real restore: {other:?}"),
+            };
+            let owner = saved
+                .restore_guard
+                .owners
+                .get_mut(&request.request_id)
+                .unwrap();
+            let restore_operation = owner.operation_id;
+            if !receipt_stored {
+                owner.receipt = None;
+            }
+            saved.restore_guard.active_request_id = Some(request.request_id.clone());
+            saved.execution_state = PersistedWorkerExecutionState::RestoreFinalization(
+                PersistedWorkerRestoreFinalization {
+                    operation_id: restore_operation,
+                    execution: Some(spec),
+                    evidence: if receipt_stored {
+                        RestoreFinalizationEvidence::ReceiptStored
+                    } else {
+                        RestoreFinalizationEvidence::LegacyAggregatePublished
+                    },
+                },
+            );
+            store.write_worker_record(&saved).unwrap();
+            drop(store);
+            drop(runtime);
+            drop(backend);
+
+            // Migration's canonical finalization is reopened without a live Controller.
+            let resumed = Runtime::with_fs_store(options.clone()).unwrap();
+            let stop_operation = WorkerLifecycleOperationId::new();
+            resumed
+                .begin_stop_operation(&worker.worker_ref, stop_operation)
+                .unwrap();
+            let canonical = runtime_store(&resumed)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            let PersistedWorkerExecutionState::ReconciliationRequired(
+                PersistedWorkerLifecycleOperation::Stop(stop),
+            ) = &canonical.execution_state
+            else {
+                panic!("Stop admission lost its phase")
+            };
+            assert_eq!(stop.operation_id, stop_operation);
+            assert!(
+                stop.pending_restore.is_none(),
+                "finalization is not an uncommitted restore"
+            );
+            assert_eq!(
+                stop.restore_finalization.as_ref().unwrap().operation_id,
+                restore_operation
+            );
+            let failure = WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Stop,
+                "backend unavailable",
+            );
+            assert!(
+                resumed
+                    .commit_stopped_worker(&worker.worker_ref, stop_operation, failure)
+                    .is_err()
+            );
+            runtime_store(&resumed)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            drop(resumed);
+
+            let resumed = Runtime::with_fs_store(options.clone()).unwrap();
+            let backend = Arc::new(TestExecutionBackend::default());
+            resumed.lock().unwrap().execution_backend =
+                Some(crate::execution::WorkerExecutionBackendRef::new(backend.clone()).unwrap());
+            assert_eq!(
+                resumed
+                    .lock()
+                    .unwrap()
+                    .worker(&worker.worker_ref)
+                    .unwrap()
+                    .pending_stop()
+                    .unwrap()
+                    .operation_id,
+                stop_operation
+            );
+            runtime_store(&resumed)
+                .fail_next_worker_write(crate::fs_store::AtomicWriteFault::BeforeRename);
+            assert!(resumed.stop_worker(&worker.worker_ref, None).is_err());
+            runtime_store(&resumed)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            drop(resumed);
+
+            let resumed = Runtime::with_fs_store(options).unwrap();
+            resumed.lock().unwrap().execution_backend =
+                Some(crate::execution::WorkerExecutionBackendRef::new(backend.clone()).unwrap());
+            let ack = resumed.stop_worker(&worker.worker_ref, None).unwrap();
+            assert_eq!(ack.lifecycle, WorkerLifecycleState::Stopped);
+            let record = runtime_store(&resumed)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            assert!(matches!(
+                record.execution_state,
+                PersistedWorkerExecutionState::Stopped(_)
+            ));
+            assert!(record.restore_guard.active_request_id.is_none());
+            let final_receipt = record.restore_guard.owners[&request.request_id]
+                .receipt
+                .as_ref()
+                .unwrap();
+            if receipt_stored {
+                assert_eq!(final_receipt, &receipt, "Stop cannot overwrite history");
+            } else {
+                assert_eq!(final_receipt.state, WorkerRestoreState::Superseded);
+                assert_eq!(
+                    final_receipt.reason_code.as_deref(),
+                    Some("worker_restore_committed_then_stopped")
+                );
+            }
+            assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+            assert!(
+                backend
+                    .stop_operation_ids
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|id| *id == stop_operation)
+            );
+        }
+    }
 }

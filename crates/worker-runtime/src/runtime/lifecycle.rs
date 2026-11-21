@@ -83,6 +83,8 @@ struct StopOperation {
     pending: PendingWorkerStop,
     progress: StopProgress,
     restore: Option<RestoreOperation>,
+    #[cfg(feature = "fs-store")]
+    restore_finalization: Option<RestoreFinalization>,
     create: Option<CreateOperation>,
     execution: Option<ActiveWorkerExecution>,
 }
@@ -285,6 +287,13 @@ impl WorkerRecord {
         });
     }
     fn begin_stop(&mut self, pending: PendingWorkerStop) {
+        #[cfg(feature = "fs-store")]
+        let restore_finalization = match &self.execution {
+            WorkerExecutionState::RecoveryRequired(
+                WorkerLifecycleOperation::RestoreFinalization(finalization),
+            ) => Some(finalization.clone()),
+            _ => None,
+        };
         let old = std::mem::replace(&mut self.execution, WorkerExecutionState::NotStarted);
         let (restore, create, execution) = match old {
             WorkerExecutionState::Restoring(restore)
@@ -302,6 +311,8 @@ impl WorkerRecord {
             pending,
             progress: StopProgress::AwaitingTermination,
             restore,
+            #[cfg(feature = "fs-store")]
+            restore_finalization,
             create,
             execution,
         });

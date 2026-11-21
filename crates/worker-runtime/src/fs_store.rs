@@ -756,6 +756,8 @@ pub(crate) struct PersistedWorkerStopOperation {
     /// Restore resources remain operation-owned until stop confirms cleanup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_restore: Option<PersistedWorkerRestoreOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_finalization: Option<PersistedWorkerRestoreFinalization>,
     /// Stop can reconcile an identity whose execution metadata is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) request: Option<CreateWorkerRequest>,
@@ -1611,6 +1613,7 @@ fn migrate_v18_lifecycle(
                 PersistedWorkerLifecycleOperation::Stop(PersistedWorkerStopOperation {
                     operation_id: stop.operation_id,
                     pending_restore: stop.pending_restore,
+                    restore_finalization: None,
                     request: stop.request,
                     binding: stop.binding,
                     last_settled_status: stop.last_settled_status,
@@ -3003,7 +3006,12 @@ impl WorkerAggregateRecord {
             ) => stop
                 .pending_restore
                 .as_ref()
-                .map(|restore| restore.operation_id),
+                .map(|restore| restore.operation_id)
+                .or_else(|| {
+                    stop.restore_finalization
+                        .as_ref()
+                        .map(|finalization| finalization.operation_id)
+                }),
             _ => None,
         };
         if active_owner.is_some() && active_owner != operation_id {
@@ -3015,16 +3023,17 @@ impl WorkerAggregateRecord {
         let active_receipt = active_evidence
             .as_ref()
             .is_some_and(|owner| owner.receipt_stored);
+        let finalization = match &execution_state {
+            PersistedWorkerExecutionState::RestoreFinalization(finalization) => Some(finalization),
+            PersistedWorkerExecutionState::ReconciliationRequired(
+                PersistedWorkerLifecycleOperation::Stop(stop),
+            ) => stop.restore_finalization.as_ref(),
+            _ => None,
+        };
         if active_receipt
-            && !matches!(
-                &execution_state,
-                PersistedWorkerExecutionState::RestoreFinalization(
-                    PersistedWorkerRestoreFinalization {
-                        evidence: RestoreFinalizationEvidence::ReceiptStored,
-                        ..
-                    }
-                )
-            )
+            && finalization.is_none_or(|finalization| {
+                finalization.evidence != RestoreFinalizationEvidence::ReceiptStored
+            })
         {
             return Err(runtime_store_corrupt(
                 path,
@@ -3072,43 +3081,44 @@ impl WorkerAggregateRecord {
                 }
                 Ok(())
             };
-        match &execution_state {
-            PersistedWorkerExecutionState::RestoreFinalization(finalization) => {
-                if active_owner != Some(finalization.operation_id) {
+        if let Some(finalization) = finalization {
+            if active_owner != Some(finalization.operation_id) {
+                return Err(runtime_store_corrupt(
+                    path,
+                    "Restore finalization has no matching owner".into(),
+                ));
+            }
+            match finalization.evidence {
+                RestoreFinalizationEvidence::ReceiptStored if !active_receipt => {
                     return Err(runtime_store_corrupt(
                         path,
-                        "Restore finalization has no matching owner".into(),
+                        "receipt finalization lost its historical receipt".into(),
                     ));
                 }
-                match finalization.evidence {
-                    RestoreFinalizationEvidence::ReceiptStored if !active_receipt => {
-                        return Err(runtime_store_corrupt(
-                            path,
-                            "receipt finalization lost its historical receipt".into(),
-                        ));
-                    }
-                    RestoreFinalizationEvidence::LegacyAggregatePublished
-                        if active_receipt
-                            || !identity.status.is_active()
-                            || finalization
-                                .execution
-                                .as_ref()
-                                .is_none_or(|e| e.binding.is_none())
-                            || active_evidence
-                                .as_ref()
-                                .is_none_or(|owner| !owner.execution_started) =>
-                    {
-                        return Err(runtime_store_corrupt(
-                            path,
-                            "legacy finalization lacks published aggregate evidence".into(),
-                        ));
-                    }
-                    _ => {}
+                RestoreFinalizationEvidence::LegacyAggregatePublished
+                    if active_receipt
+                        || !identity.status.is_active()
+                        || finalization
+                            .execution
+                            .as_ref()
+                            .is_none_or(|e| e.binding.is_none())
+                        || active_evidence
+                            .as_ref()
+                            .is_none_or(|owner| !owner.execution_started) =>
+                {
+                    return Err(runtime_store_corrupt(
+                        path,
+                        "legacy finalization lacks published aggregate evidence".into(),
+                    ));
                 }
-                if let Some(execution) = &finalization.execution {
-                    validate_request(&execution.request)?;
-                }
+                _ => {}
             }
+            if let Some(execution) = &finalization.execution {
+                validate_request(&execution.request)?;
+            }
+        }
+        match &execution_state {
+            PersistedWorkerExecutionState::RestoreFinalization(_) => {}
             PersistedWorkerExecutionState::Runnable(execution) => {
                 if !identity.status.is_active() || execution.binding.is_none() {
                     return Err(mismatch());
@@ -3164,9 +3174,26 @@ impl WorkerAggregateRecord {
                 }
                 PersistedWorkerLifecycleOperation::Stop(stop) => {
                     if identity.status != stop.last_settled_status
-                        || (!stop.last_settled_status.is_active() && stop.pending_restore.is_none())
+                        || (!stop.last_settled_status.is_active()
+                            && stop.pending_restore.is_none()
+                            && stop.restore_finalization.is_none())
+                        || (stop.pending_restore.is_some() && stop.restore_finalization.is_some())
                     {
                         return Err(mismatch());
+                    }
+                    if let Some(finalization) = &stop.restore_finalization
+                        && (finalization.execution.as_ref().map(|spec| &spec.request)
+                            != stop.request.as_ref()
+                            || finalization
+                                .execution
+                                .as_ref()
+                                .and_then(|spec| spec.binding.as_ref())
+                                != stop.binding.as_ref())
+                    {
+                        return Err(runtime_store_corrupt(
+                            path,
+                            "Stop and finalization specifications differ".into(),
+                        ));
                     }
                     if stop.request.is_none()
                         && (stop.binding.is_some() || stop.pending_restore.is_some())
@@ -5141,6 +5168,7 @@ mod tests {
                 PersistedWorkerLifecycleOperation::Stop(PersistedWorkerStopOperation {
                     operation_id: WorkerLifecycleOperationId::new(),
                     pending_restore: Some(restore),
+                    restore_finalization: None,
                     request: Some(execution.request),
                     binding: execution.binding,
                     progress: PersistedWorkerStopProgress::AwaitingTermination,
