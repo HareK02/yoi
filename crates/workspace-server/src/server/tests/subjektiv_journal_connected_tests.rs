@@ -2215,7 +2215,7 @@ async fn confirmed_restore_preserves_attribution_with_revoked_host_trust_but_pro
         owner["operation_id"], operation,
         "the durable operation identity must survive accepted replay and read denial"
     );
-    assert_eq!(record["execution_state"]["state"], "available");
+    assert_eq!(record["execution_state"]["state"], "runnable");
     assert!(
         !owner["receipt"].is_null(),
         "successful Restore must retain its Accepted receipt"

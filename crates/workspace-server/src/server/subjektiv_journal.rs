@@ -575,12 +575,16 @@ pub(super) fn close(
         .store
         .get_backend_job(api.workspace_id(), &request.job_id)?
         .ok_or_else(|| Error::WorkspacePermissionDenied("Journal cleanup Job missing".into()))?;
-    let saved_attempt = api
+    let mut saved_attempt = api
         .store
         .get_backend_job_attempt(api.workspace_id(), &request.job_id, &attempt.attempt_id)?
         .ok_or_else(|| {
             Error::WorkspacePermissionDenied("Journal cleanup attempt missing".into())
         })?;
+    // A consumer may settle omission while cleanup owns the exact execution.
+    // That independent fact does not revoke this cleanup's identity/history.
+    saved_attempt.result_application_disposition = attempt.result_application_disposition;
+    saved_attempt.result_application_recorded_at = attempt.result_application_recorded_at.clone();
     if saved.workspace_id != api.workspace_id()
         || saved.request.grants != request.grants
         || saved.request.source_worker != request.source_worker
@@ -2620,6 +2624,97 @@ pub(super) fn can_resume_partial(job: &BackendJobRecord) -> bool {
             .is_some_and(|grant| saved_input(&job.request, grant).is_ok())
 }
 
+/// Continue an interrupted saved Job, including ordinary Jobs predating finite Host
+/// inputs. `false` keeps common recovery on this terminal attempt until every prior
+/// cleanup commits; `true` releases that owner (a reserved retry owns its own recovery).
+/// Linked children remain the finite Host Job's responsibility.
+pub(super) fn resume_partial_job(api: &WorkspaceApi, job_id: &str) -> Result<bool> {
+    let Some(observed) = api.store.get_backend_job(api.workspace_id(), job_id)? else {
+        return Err(Error::Store("Journal continuation Job missing".into()));
+    };
+    let Some(grant) = observed.request.grants.subjektiv_journal.as_ref() else {
+        return Ok(true);
+    };
+    let gate = lifecycle_lock(api, &grant.subject_id)?;
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    // The Host retry path uses this same gate. Reread inside it so concurrent
+    // cleanup/recovery cannot reserve two successors or dispatch an old attempt.
+    let job = api
+        .store
+        .get_backend_job(api.workspace_id(), job_id)?
+        .ok_or_else(|| Error::Store("Journal continuation Job missing".into()))?;
+    require_job_workspace(api, &job)?;
+    if job.state == BackendJobState::Finalizing
+        && matches!(
+            job.failure_category.as_deref(),
+            Some("journal_attempt_fenced" | "journal_execution_terminated")
+        )
+        && job.input_disposition == crate::backend_job::JobInputDisposition::Available
+        && job.current_attempt < job.request.limits.max_attempts
+    {
+        return Ok(false);
+    }
+    if !can_resume_partial(&job) {
+        return Ok(true);
+    }
+    let linked = api.config_store.with_conn(|conn| {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM backend_job_recording_children WHERE workspace_id=?1 AND child_job_id=?2)",
+            rusqlite::params![api.workspace_id(), job_id],
+            |row| row.get::<_, bool>(0),
+        )?)
+    })?;
+    if linked || backend_job_application::target_not_required(api, &job.request)? {
+        return Ok(true);
+    }
+    let attempts = api
+        .store
+        .list_backend_job_attempts(api.workspace_id(), job_id)?;
+    if attempts.len() != job.current_attempt as usize {
+        return Err(Error::Store(
+            "Journal continuation attempt history missing".into(),
+        ));
+    }
+    for (index, attempt) in attempts.iter().enumerate() {
+        let number = index as u8 + 1;
+        if attempt.workspace_id != job.workspace_id
+            || attempt.job_id != job.request.job_id
+            || attempt.attempt != number
+            || attempt.attempt_id != crate::backend_job::attempt_id(job_id, number)
+            || attempt.input_digest != job.input_digest
+            || attempt
+                .runtime_run_id
+                .as_ref()
+                .is_some_and(|run| run != &crate::backend_job::runtime_run_id(&attempt.attempt_id))
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Journal continuation attempt identity mismatch".into(),
+            ));
+        }
+        if !attempt.state.terminal()
+            || attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+        {
+            return Ok(false);
+        }
+    }
+    subject_authorization::authorize_job_input(api, &job.request).map_err(|error| error.error)?;
+    // Canonical cleanup is the shutdown proof; close only this Job's exact saved
+    // generation, never admission/capture of newer live Session bytes.
+    let current = attempts
+        .last()
+        .ok_or_else(|| Error::Store("Journal continuation current attempt missing".into()))?;
+    close(api, &job.request, current)?;
+    let reservation = api.store.reserve_backend_job_retry(
+        api.workspace_id(),
+        job_id,
+        &Utc::now().to_rfc3339(),
+    )?;
+    api.own_backend_job_recovery(&reservation.attempt);
+    Ok(true)
+}
+
 /// Outcome is not a shutdown receipt. Inspect every earlier attempt as well: a late
 /// Host operation/cleanup from one of them must not affect the next owner. The root
 /// checks exact Runtime/Controller, Feature/background, Host-drain and cleanup evidence
@@ -3369,6 +3464,18 @@ mod recovery_input_tests {
             completed_at: Some("2026-01-01T00:00:00Z".into()),
         };
         assert!(can_resume_partial(&job));
+        for state in [
+            BackendJobState::Pending,
+            BackendJobState::Finalizing,
+            BackendJobState::Completed,
+        ] {
+            let mut settled = job.clone();
+            settled.state = state;
+            assert!(!can_resume_partial(&settled), "{state:?}");
+        }
+        let mut terminated = job.clone();
+        terminated.failure_category = Some("journal_execution_terminated".into());
+        assert!(can_resume_partial(&terminated));
         for cause in [
             "unrecognized_failure",
             "journal_body_released",

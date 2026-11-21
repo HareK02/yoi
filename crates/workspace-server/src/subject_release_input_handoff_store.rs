@@ -49,6 +49,9 @@ pub(crate) struct SubjectReleaseInputHandoff {
     pub cause: Option<WorkerInputHandoffCause>,
     #[serde(default)]
     pub handoff_status: InputHandoffStatus,
+    /// Admission and release of the original Session pins are separate checkpoints.
+    #[serde(default)]
+    pub original_pins_released: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +116,7 @@ impl SqliteWorkspaceStore {
                 return Ok(saved);
             }
             let metadata = SubjectReleaseInputHandoff {
-                binding: binding.clone(), members: members.into(), legacy_completed: false, cause: None, handoff_status: InputHandoffStatus::Pending,
+                binding: binding.clone(), members: members.into(), legacy_completed: false, cause: None, handoff_status: InputHandoffStatus::Pending, original_pins_released: false,
             };
             let changed = tx.execute("UPDATE subject_worker_releases SET recording_json=?3 WHERE workspace_id=?1 AND operation_id=?2 AND recording_json IS NULL AND cancelled=0 AND completed=0",
                 params![workspace,operation,serde_json::to_string(&metadata).map_err(|e|Error::Store(e.to_string()))?])?;
@@ -155,6 +158,42 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    pub(crate) fn list_pending_release_original_pin_cleanup(
+        &self,
+        workspace: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SubjectReleaseInputHandoffProgress>> {
+        if !(1..=100).contains(&limit) {
+            return Err(Error::InvalidInput(
+                "Pin cleanup page limit must be 1..=100".into(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let ids = conn.prepare("SELECT operation_id FROM subject_worker_releases WHERE workspace_id=?1 AND cancelled=0 AND completed=1 AND json_extract(recording_json,'$.handoff_status')='admitted' AND COALESCE(json_extract(recording_json,'$.original_pins_released'),0)=0 AND (?2 IS NULL OR operation_id>?2) ORDER BY operation_id LIMIT ?3")?
+                .query_map(params![workspace,after,limit as i64],|r|r.get::<_,String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.into_iter().map(|id| read(conn,workspace,&id)?.ok_or_else(||Error::Store("Release pin cleanup disappeared".into()))).collect()
+        })
+    }
+
+    pub(crate) fn complete_release_original_pin_cleanup(
+        &self,
+        expected: &SubjectReleaseInputHandoffProgress,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if read(&tx,&expected.workspace_id,&expected.operation_id)?.as_ref() != Some(expected)
+                || !expected.released || expected.handoff.handoff_status != InputHandoffStatus::Admitted {
+                return Err(Error::RepositoryConflict("Release pin cleanup owner changed".into()));
+            }
+            tx.execute("UPDATE subject_worker_releases SET recording_json=json_set(recording_json,'$.original_pins_released',json('true')) WHERE workspace_id=?1 AND operation_id=?2",
+                params![expected.workspace_id,expected.operation_id])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn update_subject_release_input_handoff(
         &self,
         expected: &SubjectReleaseInputHandoffProgress,
@@ -166,12 +205,13 @@ impl SqliteWorkspaceStore {
             if read(&tx,&expected.workspace_id,&expected.operation_id)?.as_ref() != Some(expected) || !expected.released {
                 return Err(Error::RepositoryConflict("Release recording changed or body not released".into()));
             }
-            let mut next = expected.handoff.clone();
-            worker_input_handoff_store::validate_handoff_transition(next.handoff_status, status, cause)?;
-            next.handoff_status = status;
-            next.cause = cause;
-            tx.execute("UPDATE subject_worker_releases SET recording_json=?3 WHERE workspace_id=?1 AND operation_id=?2",
-                params![expected.workspace_id,expected.operation_id,serde_json::to_string(&next).map_err(|e|Error::Store(e.to_string()))?])?;
+            worker_input_handoff_store::validate_handoff_transition(expected.handoff.handoff_status, status, cause)?;
+            // Preserve the frozen binding/member JSON representation checked by
+            // the immutable-scope trigger, including legacy object key order.
+            tx.execute("UPDATE subject_worker_releases SET recording_json=json_set(recording_json,'$.handoff_status',json(?3),'$.cause',json(?4)) WHERE workspace_id=?1 AND operation_id=?2",
+                params![expected.workspace_id,expected.operation_id,
+                    serde_json::to_string(&status).map_err(|e|Error::Store(e.to_string()))?,
+                    serde_json::to_string(&cause).map_err(|e|Error::Store(e.to_string()))?])?;
             tx.commit()?;
             Ok(())
         })
@@ -181,6 +221,77 @@ impl SqliteWorkspaceStore {
 #[cfg(test)]
 mod input_handoff_tests {
     use super::*;
+
+    #[test]
+    fn admitted_release_retains_original_pin_cleanup_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        store.with_conn(|conn| {
+            conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('pin-owner','user','pin-owner','Owner','t','t');
+                INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at,owner_account_id) VALUES('pin-w','W','active','t','t','pin-owner');
+                INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at,singleton_key,singleton_generation) VALUES('pin-w','a','worker','runtime','fp','created','t','t','subjektiv:subject',1);")?;
+            let legacy = serde_json::json!({
+                "binding":{"subject_id":"subject","writer_session_id":"session","writer_binding_id":"binding",
+                    "database":{"scope":"workspace","feature":"subjektiv","physical":"physical"}},
+                "members":[], "completed":false, "cause":null,
+            });
+            conn.execute("INSERT INTO subject_worker_releases(workspace_id,runtime_id,worker_id,singleton_key,singleton_generation,binding_id,operation_id,proof,completed,recording_json) VALUES('pin-w','runtime','worker','subjektiv:subject',1,'binding','release','runtime_disconnected',1,?1)", [legacy.to_string()])?;
+            Ok(())
+        }).unwrap();
+        let pending = store
+            .list_pending_subject_release_input_handoffs("pin-w", None, 100)
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .update_subject_release_input_handoff(&pending, InputHandoffStatus::Admitted, None)
+            .unwrap();
+        drop(store);
+        // Crash after admission, or after only some Session unpins, must never
+        // readmit recording and must retain the entire idempotent cleanup scope.
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert!(
+            store
+                .list_pending_subject_release_input_handoffs("pin-w", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        let cleanup = store
+            .list_pending_release_original_pin_cleanup("pin-w", None, 100)
+            .unwrap();
+        assert_eq!(cleanup.len(), 1);
+        assert!(!cleanup[0].handoff.original_pins_released);
+        assert_eq!(cleanup[0].handoff.binding, pending.handoff.binding);
+        assert!(
+            store
+                .complete_release_original_pin_cleanup(&pending)
+                .is_err()
+        );
+        drop(store);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let cleanup = store
+            .list_pending_release_original_pin_cleanup("pin-w", None, 100)
+            .unwrap();
+        assert_eq!(cleanup.len(), 1);
+        store
+            .complete_release_original_pin_cleanup(&cleanup[0])
+            .unwrap();
+        drop(store);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert!(
+            store
+                .list_pending_release_original_pin_cleanup("pin-w", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_pending_subject_release_input_handoffs("pin-w", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn completed_legacy_release_requires_one_time_finite_job_admission() {

@@ -384,53 +384,109 @@ async fn journal_host_capacity_rejection_keeps_same_reservation_autonomously_own
         callback().await.unwrap().0,
         JournalRecordingResponse::Accepted
     );
-    let jobs = api
-        .store
-        .list_backend_journal_jobs(TEST_WORKSPACE_ID, &session.to_string(), None, 100)
+    let hosts = api
+        .config_store
+        .list_active_backend_job_recording_ids(TEST_WORKSPACE_ID, None, 100)
         .unwrap();
-    assert_eq!(jobs.len(), 1);
-    let job = &jobs[0];
-    let attempt_id = crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt);
+    assert_eq!(
+        hosts.len(),
+        1,
+        "accepted finite input must have a Host Job owner"
+    );
+    let host_id = &hosts[0];
     let before = api
         .store
-        .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
+        .get_backend_job(TEST_WORKSPACE_ID, host_id)
         .unwrap()
         .unwrap();
-    assert_eq!(before.state, BackendJobAttemptState::Reserved);
-    assert!(before.worker.is_none());
+    assert_eq!(before.state, BackendJobState::Pending);
+    let before_input = api
+        .config_store
+        .get_backend_job_recording_input(TEST_WORKSPACE_ID, host_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        api.store
+            .list_backend_job_attempts(TEST_WORKSPACE_ID, host_id)
+            .unwrap()
+            .is_empty(),
+        "Host-only finite input must not invent a Worker attempt"
+    );
     assert!(execution.take_inputs().is_empty());
     assert!(
         api.backend_job_recovery
             .recovery_owner_ids()
-            .contains(&attempt_id),
-        "accepted Journal reservation lost its owner when Host admission was rejected"
+            .contains(&format!("recording-host:{host_id}")),
+        "accepted finite input lost its Host owner when Host admission was rejected"
+    );
+    assert!(
+        api.store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &session.to_string(), None, 100)
+            .unwrap()
+            .is_empty(),
+        "a blocked Host has not selected a Worker prefix yet"
     );
     drop(held);
     // No request replay, manual sweep, restart or replacement Job drives this transition.
-    let dispatched = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let (job, dispatched) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(25));
         loop {
             tick.tick().await;
-            let current = api
+            let jobs = api
                 .store
-                .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
-                .unwrap()
+                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &session.to_string(), None, 100)
                 .unwrap();
-            if current.state == BackendJobAttemptState::Dispatched
-                && !execution.inputs.lock().unwrap().is_empty()
-            {
-                break current;
+            if let Some(job) = jobs.into_iter().next() {
+                let attempt_id =
+                    crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt);
+                let current = api
+                    .store
+                    .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
+                    .unwrap()
+                    .unwrap();
+                if current.state == BackendJobAttemptState::Dispatched
+                    && !execution.inputs.lock().unwrap().is_empty()
+                {
+                    break (job, current);
+                }
             }
         }
     })
     .await
-    .expect("same accepted Journal did not recover after Host capacity returned");
-    assert_eq!(dispatched.attempt_id, before.attempt_id);
-    assert_eq!(dispatched.deadline_at, before.deadline_at);
-    assert_eq!(dispatched.input_digest, before.input_digest);
+    .expect("accepted finite Host input did not dispatch after Host capacity returned");
+    let after = api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, host_id)
+        .unwrap()
+        .unwrap();
+    let after_input = api
+        .config_store
+        .get_backend_job_recording_input(TEST_WORKSPACE_ID, host_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.current_attempt, before.current_attempt);
+    assert_eq!(after.input_digest, before.input_digest);
+    assert_eq!(after.request, before.request);
+    assert_eq!(after_input.scope, before_input.scope);
+    assert_eq!(after_input.scope_digest, before_input.scope_digest);
+    assert_eq!(after_input.chunk_count, before_input.chunk_count);
+    assert_eq!(after_input.total_bytes, before_input.total_bytes);
+    assert_eq!(
+        after_input.current_child_job_id.as_deref(),
+        Some(job.request.job_id.as_str())
+    );
+    let attempt_id = dispatched.attempt_id;
+    // The entire finite scope was accepted by the first callback; replay must
+    // not create a replacement Host Job or redispatch its Worker prefix.
     assert_eq!(
         callback().await.unwrap().0,
-        JournalRecordingResponse::Accepted
+        JournalRecordingResponse::NoNewSources
+    );
+    assert_eq!(
+        api.config_store
+            .list_active_backend_job_recording_ids(TEST_WORKSPACE_ID, None, 100)
+            .unwrap(),
+        hosts
     );
     let inputs = execution.take_inputs();
     assert_eq!(inputs.len(), 1);
@@ -1319,13 +1375,34 @@ impl RuntimeFixture {
     }
     fn assert_no_erased_resurrection(&self) {
         self.execution.take_inputs();
-        // Internal dispatch must reread and reject retired input, including stale
-        // terminal reservations. Exact public API replay is a separate contract.
-        assert!(
-            self.api
-                .dispatch_backend_job_reservation(self.reserved.clone())
-                .is_err()
+        // Dispatch returns the pre-settlement observation; verify durable facts
+        // separately. An already accepted completion remains Completed/Applied,
+        // while deletion without a result settles Failed/NotRequired.
+        let before = current_journal_attempt(self, &self.reserved.attempt.attempt_id);
+        self.api
+            .dispatch_backend_job_reservation(self.reserved.clone())
+            .unwrap();
+        let settled = current_journal_attempt(self, &self.reserved.attempt.attempt_id);
+        assert_eq!(
+            settled.state,
+            if before.result.is_some() {
+                BackendJobAttemptState::Completed
+            } else {
+                BackendJobAttemptState::Failed
+            }
         );
+        assert_eq!(
+            settled.result_application_disposition,
+            Some(if before.result.is_some() {
+                crate::backend_job::JobResultApplicationDisposition::Applied
+            } else {
+                crate::backend_job::JobResultApplicationDisposition::NotRequired
+            })
+        );
+        assert!(settled.result_application_recorded_at.is_some());
+        assert_eq!(settled.result, before.result);
+        assert_eq!(settled.worker, before.worker);
+        assert_eq!(settled.runtime_run_id, before.runtime_run_id);
         assert!(
             self.execution.take_inputs().is_empty(),
             "stale saved body must not resurrect a delivered copy"
@@ -2494,7 +2571,7 @@ async fn saved_checkpoint_never_promotes_erased_source_or_input_to_success() {
         subjektiv_journal::reconcile_attempt(&f.api, &job, &attempt).unwrap();
         drop(dispatch_finished);
         let failed = current_journal_job(&f);
-        let failed_attempt = current_journal_attempt(&f, &attempt.attempt_id);
+        let mut failed_attempt = current_journal_attempt(&f, &attempt.attempt_id);
         assert!(
             matches!(
                 failed.state,
@@ -2540,6 +2617,17 @@ async fn saved_checkpoint_never_promotes_erased_source_or_input_to_success() {
             let replay = replay.unwrap();
             assert!(replay.replayed, "{unavailable}");
             assert_eq!(replay.job, failed, "{unavailable}");
+            assert_eq!(
+                replay.attempt.result_application_disposition,
+                Some(crate::backend_job::JobResultApplicationDisposition::NotRequired)
+            );
+            assert!(replay.attempt.result_application_recorded_at.is_some());
+            // Dispatch may settle result application, but cannot change the
+            // execution, failure, checkpoint or cleanup evidence.
+            failed_attempt.result_application_disposition =
+                replay.attempt.result_application_disposition;
+            failed_attempt.result_application_recorded_at =
+                replay.attempt.result_application_recorded_at.clone();
             assert_eq!(replay.attempt, failed_attempt, "{unavailable}");
         }
         assert_eq!(
@@ -6370,6 +6458,42 @@ mod immutable {
             )
             .unwrap();
         append(&f, compact, "append-during-job");
+        // Accept an explicit finite Host scope after the compaction/appends.
+        // The first legacy Worker Job remains immutable; its completion alone
+        // must not discover or schedule unaccepted Journal work.
+        let start = session_store::capture::RecordingPosition::default();
+        let (end, chunks) =
+            backend_recording_job::capture_scope(start, None, |order, offset, budget| {
+                subjektiv_journal::capture_input(&f.api, &attr, order, offset, budget)
+            })
+            .unwrap();
+        assert_eq!(end.canonical_order, 133);
+        assert_eq!(end.byte_offset, 0);
+        let host_job = backend_recording_job::admit(
+            &f.api,
+            crate::store::BackendJobRecordingScope {
+                subject_id: attr.subject_id.clone(),
+                session_id: attr.session_id.clone(),
+                worker: f.source.clone(),
+                binding_id: f.host.writer_binding_id().unwrap().into(),
+                database: f
+                    .api
+                    .feature_storage
+                    .existing_identity(&f.api.subjektiv_registration)
+                    .unwrap(),
+                start,
+                end,
+            },
+            &chunks,
+        )
+        .unwrap();
+        assert!(
+            f.api
+                .config_store
+                .get_backend_job_recording_input(TEST_WORKSPACE_ID, &host_job)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             serde_json::to_vec(
                 &f.api

@@ -171,6 +171,7 @@ pub(super) fn prepare_release(
             .collect(),
         legacy_completed: false,
         handoff_status: crate::store::InputHandoffStatus::Pending,
+        original_pins_released: false,
         cause: None,
     };
     let prepared = SubjectReleaseInputHandoffProgress {
@@ -274,20 +275,67 @@ pub(super) fn recover_release_input_handoffs(api: &WorkspaceApi) -> Result<()> {
                 Err(error) => {
                     tracing::debug!(operation_id=%progress.operation_id, %error, "Release input handoff changed")
                 }
-                Ok(()) if complete == crate::store::InputHandoffStatus::Admitted => {
-                    if let Err(error) = removal::release_original_pins(
-                        api,
-                        &RetainedSourceProgress::release(progress),
-                    ) {
-                        tracing::warn!(operation_id=%progress.operation_id, %error, "Job owns input; original pin cleanup remains unconfirmed");
-                    }
-                }
                 Ok(()) => {}
+            }
+        }
+        if page.len() < 100 {
+            return recover_release_original_pin_cleanup(api);
+        }
+        after = page.last().map(|p| p.operation_id.clone());
+    }
+}
+
+fn recover_release_original_pin_cleanup(api: &WorkspaceApi) -> Result<()> {
+    let mut after = None;
+    loop {
+        let page = api.config_store.list_pending_release_original_pin_cleanup(
+            api.workspace_id(),
+            after.as_deref(),
+            100,
+        )?;
+        for progress in &page {
+            let outcome = (|| {
+                let mut source = RetainedSourceProgress::release(progress);
+                // Ordinary removal may have transferred the same pins to its
+                // archive. Never address a removed producer or race publication.
+                if let Some(plan) = api
+                    .config_store
+                    .recover_worker_removal_plan(api.workspace_id(), &progress.worker)
+                    .map_err(|error| Error::Store(error.to_string()))?
+                {
+                    let Some(removal) = api.store.get_worker_input_handoff_for_plan(&plan)? else {
+                        return Ok(()); // removal has not published its fixed archive yet
+                    };
+                    if removal.metadata.binding.subject_id != progress.handoff.binding.subject_id
+                        || removal.metadata.binding.database != progress.handoff.binding.database
+                        || removal.metadata.binding.writer_binding_id
+                            != progress.handoff.binding.writer_binding_id
+                        || removal.metadata.members.as_ref() != Some(&progress.handoff.members)
+                    {
+                        return Err(Error::RepositoryConflict(
+                            "Removal changed released pin cleanup scope".into(),
+                        ));
+                    }
+                    let Some(handoff) = &removal.metadata.released_input_handoff else {
+                        return Ok(());
+                    };
+                    if handoff.handoff_status == crate::store::InputHandoffStatus::Pending {
+                        return Ok(());
+                    }
+                    source = RetainedSourceProgress::removal(&removal)?;
+                }
+                removal::release_original_pins(api, &source)?;
+                api.config_store
+                    .complete_release_original_pin_cleanup(progress)
+            })();
+            if let Err(error) = outcome {
+                tracing::warn!(operation_id=%progress.operation_id, %error,
+                    "Released original pin cleanup remains pending; input already admitted");
             }
         }
         if page.len() < 100 {
             return Ok(());
         }
-        after = page.last().map(|p| p.operation_id.clone());
+        after = page.last().map(|progress| progress.operation_id.clone());
     }
 }

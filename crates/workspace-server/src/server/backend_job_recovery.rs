@@ -1194,8 +1194,9 @@ impl WorkspaceApi {
         }
         if attempt.state.terminal() {
             self.schedule_backend_job_worker_cleanup(&attempt);
+            let done = subjektiv_journal::resume_partial_job(self, &attempt.job_id)?;
             self.drain_reserved_backend_jobs();
-            return Ok(true);
+            return Ok(done);
         }
         if attempt.state == BackendJobAttemptState::Reserved {
             let deadline = chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)

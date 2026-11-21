@@ -2098,7 +2098,7 @@ mod tests {
             .unwrap();
         assert_eq!(frozen.operation_id, plan.operation_id);
         assert_eq!(frozen.input_fingerprint, plan.input_fingerprint);
-        assert_eq!(frozen.metadata.phase, Phase::Recording);
+        assert_eq!(frozen.metadata.phase, Phase::PreparingInput);
         assert!(
             authority
                 .update_worker_input_handoff_progress(
@@ -2113,7 +2113,7 @@ mod tests {
             .update_worker_input_handoff_progress(
                 &prepared,
                 &frozen,
-                Phase::Recording,
+                Phase::PreparingInput,
                 Some(Cause::JobPending),
             )
             .unwrap();
@@ -2181,7 +2181,7 @@ mod tests {
                 .update_worker_input_handoff_progress(
                     &prepared,
                     &held,
-                    Phase::Recording,
+                    Phase::PreparingInput,
                     Some(Cause::JobFailed)
                 )
                 .is_err()

@@ -92,7 +92,8 @@ mod database_identity {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerInputHandoffPhase {
     AwaitingQuiescence,
-    Recording,
+    #[serde(rename = "recording")]
+    PreparingInput,
     AwaitingEffectsEnd,
     Released,
     Completed,
@@ -145,6 +146,10 @@ pub struct ReleasedInputHandoff {
     pub cause: Option<WorkerInputHandoffCause>,
     #[serde(default)]
     pub handoff_status: InputHandoffStatus,
+    /// Independent of admission: replay the full fixed scope until every unpin succeeds.
+    /// Missing on old receipts means cleanup is still owed, never re-admission.
+    #[serde(default)]
+    pub original_pins_released: bool,
 }
 
 /// Only admission is tracked here. No state depends on recording Job completion.
@@ -267,8 +272,18 @@ fn save(
 ) -> Result<()> {
     let json =
         serde_json::to_string(metadata).map_err(|_| invalid("Invalid Journal removal metadata"))?;
+    // Keep frozen JSON subtrees byte-for-byte: legacy object key ordering can
+    // differ from Serde's current output, and the identity trigger fences text.
     conn.execute(
-        "UPDATE worker_removal_operations SET journal_removal_json=?1,updated_at=?2 WHERE operation_id=?3",
+        "UPDATE worker_removal_operations SET journal_removal_json=
+         CASE WHEN journal_removal_json IS NULL THEN ?1 ELSE
+           json_set(journal_removal_json,
+             '$.phase',json_extract(?1,'$.phase'),
+             '$.cause',json_extract(?1,'$.cause'),
+             '$.members',CASE WHEN json_type(journal_removal_json,'$.members')='array'
+                THEN json_extract(journal_removal_json,'$.members') ELSE json_extract(?1,'$.members') END,
+             '$.retained_recording',json_extract(?1,'$.retained_recording')) END,
+         updated_at=?2 WHERE operation_id=?3",
         params![json, chrono::Utc::now().to_rfc3339(), operation_id],
     )?;
     Ok(())
@@ -369,7 +384,7 @@ impl SqliteWorkspaceStore {
                 return Err(invalid("Journal removal is not awaiting quiescence"));
             }
             metadata.members = Some(members.to_vec());
-            metadata.phase = WorkerInputHandoffPhase::Recording;
+            metadata.phase = WorkerInputHandoffPhase::PreparingInput;
             metadata.cause = None;
             Ok(())
         })
@@ -402,6 +417,7 @@ impl SqliteWorkspaceStore {
                     legacy_completed: false,
                     cause: None,
                     handoff_status: InputHandoffStatus::Pending,
+                    original_pins_released: false,
                 });
             }
             Ok(())
@@ -422,6 +438,52 @@ impl SqliteWorkspaceStore {
                 .query_map(params![workspace_id,after,limit as i64], |r|r.get::<_,String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ids.iter().map(|id| load(conn,id)?.ok_or_else(|| invalid("Recording responsibility disappeared"))).collect()
+        })
+    }
+
+    /// Cleanup discovery is deliberately separate from input admission recovery.
+    pub fn list_pending_removal_original_pin_cleanup(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WorkerInputHandoffProgress>> {
+        if !(1..=100).contains(&limit) {
+            return Err(invalid("Pin cleanup page limit must be 1..=100"));
+        }
+        self.with_conn(|conn| {
+            let ids = conn.prepare("SELECT operation_id FROM worker_removal_operations WHERE workspace_id=?1 AND json_extract(journal_removal_json,'$.retained_recording.handoff_status')='admitted' AND COALESCE(json_extract(journal_removal_json,'$.retained_recording.original_pins_released'),0)=0 AND (?2 IS NULL OR operation_id>?2) ORDER BY operation_id LIMIT ?3")?
+                .query_map(params![workspace_id,after,limit as i64], |r|r.get::<_,String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.iter().map(|id| load(conn,id)?.ok_or_else(|| invalid("Pin cleanup responsibility disappeared"))).collect()
+        })
+    }
+
+    /// Only a successful full-scope Runtime release may settle this obligation.
+    /// A partial failure or lost response leaves it pending for idempotent replay.
+    pub fn complete_removal_original_pin_cleanup(
+        &self,
+        expected: &WorkerInputHandoffProgress,
+    ) -> Result<WorkerInputHandoffProgress> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut current = load(&tx, &expected.operation_id)?
+                .ok_or_else(|| invalid("Pin cleanup handoff missing"))?;
+            if &current != expected {
+                return Err(invalid("Pin cleanup progress CAS conflict"));
+            }
+            let handoff = current
+                .metadata
+                .released_input_handoff
+                .as_mut()
+                .ok_or_else(|| invalid("Pin cleanup handoff missing"))?;
+            if handoff.handoff_status != InputHandoffStatus::Admitted {
+                return Err(invalid("Pin cleanup requires admitted input"));
+            }
+            handoff.original_pins_released = true;
+            save(&tx, &current.operation_id, &current.metadata)?;
+            tx.commit()?;
+            Ok(current)
         })
     }
 
@@ -470,10 +532,13 @@ impl SqliteWorkspaceStore {
             let allowed = matches!(
                 (metadata.phase, phase),
                 (AwaitingQuiescence, AwaitingQuiescence)
-                    | (Recording, Recording | AwaitingEffectsEnd | Released)
+                    | (
+                        PreparingInput,
+                        PreparingInput | AwaitingEffectsEnd | Released
+                    )
                     | (
                         AwaitingEffectsEnd,
-                        AwaitingEffectsEnd | Recording | Released
+                        AwaitingEffectsEnd | PreparingInput | Released
                     )
                     | (Released, Released)
             );
@@ -733,6 +798,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["legacy-complete", "legacy-unsubmitted"]
         );
+        let cleanup = store
+            .list_pending_removal_original_pin_cleanup("w", None, 100)
+            .unwrap();
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].operation_id, "already-admitted");
+        assert!(
+            !cleanup[0]
+                .metadata
+                .released_input_handoff
+                .as_ref()
+                .unwrap()
+                .original_pins_released
+        );
         let legacy = &page[0];
         let retained = legacy.metadata.released_input_handoff.as_ref().unwrap();
         assert!(retained.legacy_completed);
@@ -772,6 +850,146 @@ mod tests {
             persisted["retained_recording"]["handoff_status"],
             "subject_deleted"
         );
+    }
+
+    #[test]
+    fn admitted_removal_pin_cleanup_survives_partial_release_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cleanup.db");
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        store.with_conn(|conn| {
+            conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('a','user','a','A','t','t');
+                INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at,owner_account_id) VALUES('w','W','active','t','t','a');")?;
+            let json = serde_json::json!({
+                "binding":{"subject_id":"subject","writer_session_id":"session-1","writer_binding_id":"binding",
+                    "database":{"scope":"workspace","feature":"subjektiv","physical":"physical"}},
+                "phase":"completed", "cause":null,
+                "members":[
+                    {"session_id":"session-1","active_segment_id":null,"materialized":true,"end":{"canonical_order":0,"byte_offset":0},"descriptors":[]},
+                    {"session_id":"session-2","active_segment_id":null,"materialized":true,"end":{"canonical_order":0,"byte_offset":0},"descriptors":[]}
+                ],
+                "retained_recording":{"archive_id":"archive","completed":false,"cause":null}
+            });
+            conn.execute("INSERT INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at,journal_removal_json)
+                VALUES('op','plan','fp','w','r','worker','observed','policy','digest','archive','tombstone','forever','purge','[]','succeeded','cleanup','t','t',?1)", [json.to_string()])?;
+            Ok(())
+        }).unwrap();
+        let pending = store
+            .list_pending_released_input_handoffs("w", None, 100)
+            .unwrap()
+            .remove(0);
+        assert!(
+            store
+                .complete_removal_original_pin_cleanup(&pending)
+                .is_err()
+        );
+        let admitted = store
+            .update_released_input_handoff(&pending, InputHandoffStatus::Admitted, None)
+            .unwrap();
+        // Stop at the durable admission boundary, before contacting Runtime.
+        drop(store);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert!(
+            store
+                .list_pending_released_input_handoffs("w", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        let cleanup = store
+            .list_pending_removal_original_pin_cleanup("w", None, 100)
+            .unwrap()
+            .remove(0);
+        assert_eq!(cleanup, admitted);
+        assert!(
+            !cleanup
+                .metadata
+                .released_input_handoff
+                .as_ref()
+                .unwrap()
+                .original_pins_released
+        );
+        assert!(
+            store
+                .complete_removal_original_pin_cleanup(&pending)
+                .is_err(),
+            "pre-admission CAS must remain fenced"
+        );
+        let mut changed_identity = cleanup.clone();
+        changed_identity.input_fingerprint = "different".into();
+        assert!(
+            store
+                .complete_removal_original_pin_cleanup(&changed_identity)
+                .is_err()
+        );
+        // Runtime stand-in: the first Session is released, the second fails. No
+        // completion is saved. Full-scope replay must retain both fixed members.
+        let mut remaining_pins = BTreeSet::from(["session-1".to_string(), "session-2".to_string()]);
+        remaining_pins.remove(&cleanup.metadata.members.as_ref().unwrap()[0].session_id);
+        drop(store);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let retry = store
+            .list_pending_removal_original_pin_cleanup("w", None, 100)
+            .unwrap()
+            .remove(0);
+        assert_eq!(retry, cleanup);
+        for member in retry.metadata.members.as_ref().unwrap() {
+            remaining_pins.remove(&member.session_id); // already absent is idempotent
+        }
+        assert!(remaining_pins.is_empty());
+        // Simulate a lost completion write after every Runtime unpin succeeded.
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_pin_cleanup BEFORE UPDATE ON worker_removal_operations WHEN json_extract(NEW.journal_removal_json,'$.retained_recording.original_pins_released')=1 BEGIN SELECT RAISE(ABORT,'injected pin cleanup failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(store.complete_removal_original_pin_cleanup(&retry).is_err());
+        drop(store);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert_eq!(
+            store
+                .list_pending_removal_original_pin_cleanup("w", None, 100)
+                .unwrap(),
+            [retry.clone()]
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_pin_cleanup;")?;
+                Ok(())
+            })
+            .unwrap();
+        let completed = store.complete_removal_original_pin_cleanup(&retry).unwrap();
+        assert!(
+            store.complete_removal_original_pin_cleanup(&retry).is_err(),
+            "stale cleanup CAS must be rejected"
+        );
+        store
+            .complete_removal_original_pin_cleanup(&completed)
+            .unwrap();
+        drop(store);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert!(
+            store
+                .list_pending_removal_original_pin_cleanup("w", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_pending_released_input_handoffs("w", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.with_conn(|conn| load(conn, "op")).unwrap().unwrap(),
+            completed
+        );
+    }
+
+    #[test]
+    fn admitted_legacy_removal_receipt_defaults_to_pending_pin_cleanup() {
+        let json = serde_json::json!({"archive_id":"archive","completed":true,"cause":null,"handoff_status":"admitted"});
+        let handoff: ReleasedInputHandoff = serde_json::from_value(json).unwrap();
+        assert!(!handoff.original_pins_released);
+        assert_eq!(handoff.handoff_status, InputHandoffStatus::Admitted);
     }
 
     #[test]

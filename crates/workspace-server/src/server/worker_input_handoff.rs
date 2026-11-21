@@ -105,7 +105,7 @@ fn progress_observation(
         },
         phase: match progress.metadata.phase {
             Phase::AwaitingQuiescence => server_api::WorkerRemovalPhase::AwaitingQuiescence,
-            Phase::Recording => server_api::WorkerRemovalPhase::InputHandoff,
+            Phase::PreparingInput => server_api::WorkerRemovalPhase::InputHandoff,
             Phase::AwaitingEffectsEnd => server_api::WorkerRemovalPhase::AwaitingEffectsEnd,
             Phase::Released => server_api::WorkerRemovalPhase::Released,
             Phase::Completed => server_api::WorkerRemovalPhase::Completed,
@@ -647,8 +647,9 @@ pub(super) fn admit_retained_input(
     Ok(InputHandoffStatus::Admitted)
 }
 
-/// Best-effort pin cleanup *after* the terminal admission receipt. Cleanup faults
-/// must not re-open legacy recovery or wait for recording/checkpoint completion.
+/// Idempotent full-scope pin cleanup after the terminal admission receipt.
+/// The caller settles its separate durable obligation only after this succeeds;
+/// partial failures replay the same scope, never recording or admission.
 pub(super) fn release_original_pins(
     api: &WorkspaceApi,
     progress: &RetainedSourceProgress,
@@ -736,18 +737,40 @@ pub(super) fn recover_input_handoffs(api: &WorkspaceApi) -> Result<()> {
                 .update_released_input_handoff(progress, status, cause)
             {
                 tracing::debug!(operation_id=%progress.operation_id, %error, "Input handoff changed during import");
-            } else if status == InputHandoffStatus::Admitted {
-                if let Err(error) = RetainedSourceProgress::removal(progress)
-                    .and_then(|source| release_original_pins(api, &source))
-                {
-                    tracing::warn!(operation_id=%progress.operation_id, %error, "Admitted input pin cleanup deferred; Jobs already own all bytes");
-                }
             }
         }
         if page.len() < 100 {
+            recover_removal_original_pin_cleanup(api)?;
             return retained::recover_release_input_handoffs(api);
         }
         after = page.last().map(|p| p.operation_id.clone());
+    }
+}
+
+fn recover_removal_original_pin_cleanup(api: &WorkspaceApi) -> Result<()> {
+    let mut after = None;
+    loop {
+        let page = api.config_store.list_pending_removal_original_pin_cleanup(
+            api.workspace_id(),
+            after.as_deref(),
+            100,
+        )?;
+        for progress in &page {
+            let outcome = RetainedSourceProgress::removal(progress)
+                .and_then(|source| release_original_pins(api, &source))
+                .and_then(|()| {
+                    api.config_store
+                        .complete_removal_original_pin_cleanup(progress)
+                });
+            if let Err(error) = outcome {
+                tracing::warn!(operation_id=%progress.operation_id, %error,
+                    "Original pin cleanup remains pending; input already admitted");
+            }
+        }
+        if page.len() < 100 {
+            return Ok(());
+        }
+        after = page.last().map(|progress| progress.operation_id.clone());
     }
 }
 

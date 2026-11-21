@@ -9118,7 +9118,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             // without reserving the writer or changing the last dispatch fact.
             let tx = conn.unchecked_transaction()?;
             let mut statement = tx.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('reserved', 'dispatching', 'dispatched') AND a.attempt=j.current_attempt AND j.state='pending' AND j.input_disposition='available' ORDER BY a.job_id, a.attempt_id LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.attempt=j.current_attempt AND j.input_disposition='available' AND ((a.state IN ('reserved', 'dispatching', 'dispatched') AND j.state='pending') OR (a.state='failed' AND j.state='failed' AND j.failure_category IN ('journal_attempt_fenced','journal_execution_terminated') AND j.current_attempt < json_extract(j.request_json,'$.limits.max_attempts'))) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
             // Identities remain stable when earlier owners update state or
             // timestamps. Reading a page never grants allocation/Submit authority.
