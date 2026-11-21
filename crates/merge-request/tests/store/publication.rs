@@ -1,5 +1,5 @@
-//! Real SQLite publication claims/results, with provider receipts injected only
-//! at the trusted evidence boundary. These do not exercise Git transport.
+//! Real SQLite approval validation and confirmed completion. Git transport is
+//! exercised by Runtime/Backend connected tests, not by this store suite.
 use super::*;
 
 fn binding(store: &MergeRequestStore) -> PublicationBinding {
@@ -127,114 +127,40 @@ fn prepare_independent_mr(
 }
 
 #[test]
-fn independent_preparation_is_not_serialized_but_same_target_publication_is() {
+fn independent_preparation_never_reserves_a_target() {
     let (dir, _) = fixture();
     let (a, ba) = prepare_independent_mr(dir.path(), "T-a", "MR-a", "refs/heads/develop");
     let (b, bb) = prepare_independent_mr(dir.path(), "T-b", "MR-b", "refs/heads/develop");
-    let (c, bc) = prepare_independent_mr(dir.path(), "T-c", "MR-c", "refs/heads/release");
-    assert!(matches!(
-        a.get_by_id("W", "MR-a").unwrap().state,
-        MergeRequestState::Integration { .. }
-    ));
-    assert!(matches!(
-        b.get_by_id("W", "MR-b").unwrap().state,
-        MergeRequestState::Integration { .. }
-    ));
-    let barrier = std::sync::Barrier::new(2);
-    let (ra, rb) = std::thread::scope(|scope| {
-        let left = scope.spawn(|| {
-            barrier.wait();
-            a.claim_publication(ba.clone(), at(6), |_| Ok(()))
-        });
-        let right = scope.spawn(|| {
-            barrier.wait();
-            b.claim_publication(bb.clone(), at(6), |_| Ok(()))
-        });
-        (left.join().unwrap(), right.join().unwrap())
-    });
-    assert_ne!(
-        ra.is_ok(),
-        rb.is_ok(),
-        "same target admits exactly one operation: {ra:?} {rb:?}"
-    );
-    assert!(
-        c.claim_publication(bc, at(6), |_| Ok(())).unwrap().1,
-        "different target proceeds while the first is unconfirmed"
-    );
-    let (winner, loser) = if ra.is_ok() { (&ba, &bb) } else { (&bb, &ba) };
-    assert!(
-        a.claim_publication(loser.clone(), at(7), |_| Ok(()))
-            .is_err(),
-        "unknown outcome must not release target"
-    );
-    a.record_publication_outcome(
-        winner,
-        PublicationOutcome::NotPublished {
-            reason: "confirmed pre-send failure".into(),
-        },
-    )
-    .unwrap();
-    assert!(
-        a.claim_publication(loser.clone(), at(8), |_| Ok(()))
-            .unwrap()
-            .1
-    );
-}
-
-fn published() -> PublicationOutcome {
-    PublicationOutcome::Published {
-        target_after: "source".into(),
-        observed_at: at(8).to_rfc3339(),
-    }
+    assert!(a.validate_publication(&ba, |_| Ok(())).is_ok());
+    assert!(b.validate_publication(&bb, |_| Ok(())).is_ok());
+    assert!(a.publications("W", "MR-a").unwrap().is_empty());
+    assert!(b.publications("W", "MR-b").unwrap().is_empty());
 }
 
 #[test]
-fn dispatch_claim_is_exact_and_unknown_result_never_admits_a_second_operation() {
+fn validation_is_current_and_does_not_persist_dispatch() {
     let (_dir, store) = fixture();
     open(&store);
     let b = binding(&store);
-    let (saved, dispatch) = store
-        .claim_publication(b.clone(), at(6), |_| Ok(()))
-        .unwrap();
-    assert!(dispatch);
-    assert_eq!(
-        store
-            .claim_publication(b.clone(), at(7), |_| Ok(()))
-            .unwrap(),
-        (saved, false)
-    );
-    let mut changed = b.clone();
-    changed.connection_id = "rebound".into();
-    assert!(store.claim_publication(changed, at(7), |_| Ok(())).is_err());
-    let mut duplicate = b.clone();
-    duplicate.operation_id = "second-push".into();
+    let digest = store.validate_publication(&b, |_| Ok(())).unwrap();
+    assert_eq!(store.validate_publication(&b, |_| Ok(())).unwrap(), digest);
     assert!(
         store
-            .claim_publication(duplicate, at(7), |_| Ok(()))
-            .is_err()
-    );
-    assert!(
-        store
-            .complete_publication("W", "publication", at(8))
-            .is_err()
-    );
-    assert!(
-        store
-            .claim_publication(b, at(7), |_| Err(MergeRequestError::Unauthorized(
+            .validate_publication(&b, |_| Err(MergeRequestError::Unauthorized(
                 "revoked".into()
             )))
             .is_err()
     );
+    assert!(store.publications("W", "MR").unwrap().is_empty());
+    assert!(!store.get_by_id("W", "MR").unwrap().state.is_completed());
 }
 
 #[test]
-fn provider_result_survives_owner_transfer_and_completion_never_reobserves_moved_target() {
+fn confirmed_completion_is_atomic_and_survives_owner_transfer() {
     let (dir, store) = fixture();
     open(&store);
     let b = binding(&store);
-    store
-        .claim_publication(b.clone(), at(6), |_| Ok(()))
-        .unwrap();
+    let digest = store.validate_publication(&b, |_| Ok(())).unwrap();
     store
         .set_worker(
             ownership::transfer(&store, "transfer", Some("successor")),
@@ -244,56 +170,65 @@ fn provider_result_survives_owner_transfer_and_completion_never_reobserves_moved
     let c = Connection::open(dir.path().join("db")).unwrap();
     c.execute("DELETE FROM ticket_current_worker_assignments", [])
         .unwrap();
-    let receipt = store.record_publication_outcome(&b, published()).unwrap();
-    assert_eq!(
-        store.record_publication_outcome(&b, published()).unwrap(),
-        receipt
-    );
-    assert!(
-        store
-            .record_publication_outcome(
-                &b,
-                PublicationOutcome::NotPublished {
-                    reason: "contradiction".into()
-                }
-            )
-            .is_err()
-    );
     let done = store
-        .complete_publication("W", "publication", at(9))
+        .record_confirmed_publication(&b, &digest, at(9))
         .unwrap();
     assert_eq!(done.approved_source_ref, "source");
     assert_eq!(done.target_ref_before, "before");
+    assert_eq!(done.target_ref_after, "source");
     assert_eq!(
         store
-            .complete_publication("W", "publication", at(10))
+            .record_confirmed_publication(&b, &digest, at(10))
             .unwrap(),
         done
     );
     assert!(store.get_by_id("W", "MR").unwrap().state.is_completed());
+    assert!(store.publications("W", "MR").unwrap().is_empty());
+}
+
+#[test]
+fn completion_replay_rejects_changed_owner_even_for_the_same_worker() {
+    let (_dir, store) = fixture();
+    open(&store);
+    let mut b = binding(&store);
+    let digest = store.validate_publication(&b, |_| Ok(())).unwrap();
+    let recorded = store
+        .record_confirmed_publication(&b, &digest, at(9))
+        .unwrap();
+    let owner = store
+        .set_worker(
+            ownership::transfer(&store, "same-worker-new-owner", Some("coder")),
+            |_| Ok(()),
+        )
+        .unwrap();
+    b.owner_operation_id = owner.operation_id;
+    assert!(matches!(
+        store.record_confirmed_publication(&b, &digest, at(10)),
+        Err(MergeRequestError::Conflict(_))
+    ));
     assert_eq!(
-        store.publication("W", "publication").unwrap().unwrap(),
-        receipt
+        store
+            .get_by_id("W", "MR")
+            .unwrap()
+            .thread
+            .iter()
+            .filter(|e| matches!(e, MergeRequestThreadEvent::Merge(_)))
+            .count(),
+        1
     );
-    assert!(
-        c.execute("UPDATE merge_request_publications SET confirmed=0", [])
-            .is_err()
-    );
-    assert!(
-        c.execute("DELETE FROM merge_request_publications", [])
-            .is_err()
+    assert_ne!(
+        recorded.owner_operation_id.as_deref(),
+        Some(b.owner_operation_id.as_str())
     );
 }
 
 #[test]
-fn canceled_or_rescoped_mr_retains_sent_publication_without_false_completion() {
+fn changed_requirements_or_cancellation_prevent_false_completion() {
     for cancel in [false, true] {
         let (dir, store) = fixture();
         open(&store);
         let b = binding(&store);
-        store
-            .claim_publication(b.clone(), at(6), |_| Ok(()))
-            .unwrap();
+        let digest = store.validate_publication(&b, |_| Ok(())).unwrap();
         let c = Connection::open(dir.path().join("db")).unwrap();
         if cancel {
             let mr = store.get_by_id("W", "MR").unwrap();
@@ -311,20 +246,20 @@ fn canceled_or_rescoped_mr_retains_sent_publication_without_false_completion() {
             c.execute("UPDATE typed_tickets SET title='changed requirements'", [])
                 .unwrap();
         }
-        store.record_publication_outcome(&b, published()).unwrap();
         assert!(
             store
-                .complete_publication("W", "publication", at(9))
+                .record_confirmed_publication(&b, &digest, at(9))
                 .is_err()
         );
-        assert_eq!(
-            store
-                .publication("W", "publication")
-                .unwrap()
-                .unwrap()
-                .outcome,
-            published()
-        );
+        let problem = store
+            .record_publication_problem(
+                "W",
+                "MR",
+                "Git succeeded, but current approval no longer permits completion",
+                at(10),
+            )
+            .unwrap();
+        assert!(problem.author.is_none());
         assert!(!store.get_by_id("W", "MR").unwrap().state.is_completed());
     }
 }
@@ -352,12 +287,12 @@ fn invalid_binding_stale_owner_and_requirements_are_rejected_before_dispatch() {
             ..b.clone()
         },
     ] {
-        assert!(store.claim_publication(invalid, at(6), |_| Ok(())).is_err());
+        assert!(store.validate_publication(&invalid, |_| Ok(())).is_err());
     }
     let c = Connection::open(dir.path().join("db")).unwrap();
     c.execute("UPDATE typed_tickets SET title='new requirements'", [])
         .unwrap();
-    assert!(store.claim_publication(b, at(6), |_| Ok(())).is_err());
+    assert!(store.validate_publication(&b, |_| Ok(())).is_err());
     assert!(store.publications("W", "MR").unwrap().is_empty());
 }
 

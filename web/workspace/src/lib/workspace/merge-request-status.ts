@@ -99,8 +99,11 @@ export function targetIntegrationStatus(
   if (mergeRequest.state.kind === "completed") {
     return "Target integration recorded in retained completion evidence.";
   }
-  if (!mergeRequest.target.ref) {
-    return "Target integration unavailable: selector_to is unresolved.";
+  if (mergeRequest.state.kind === "canceled") {
+    return "Merge Request canceled; cancellation is not evidence of target publication.";
   }
-  return `Target integration at ${mergeRequest.target.ref} is not yet recorded as complete. Backend publication and completion proceed automatically when approval and publication conditions are satisfied. Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.`;
+  if (mergeRequest.target.status !== "known" || !mergeRequest.target.ref) {
+    return "Target observation unavailable; MR completion has not been recorded.";
+  }
+  return `Observed target ${mergeRequest.target.ref}. MR completion has not been recorded.`;
 }

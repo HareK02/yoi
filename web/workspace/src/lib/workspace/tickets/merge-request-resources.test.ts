@@ -3,6 +3,9 @@ declare const Deno: {
   readTextFile(path: string | URL): Promise<string>;
 };
 
+import { mergeRequestDetailFixture } from "../merge-request.test-fixtures.ts";
+import { sourceReviewFreshness, targetIntegrationStatus } from "../merge-request-status.ts";
+
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
@@ -98,20 +101,18 @@ Deno.test("Merge Request UI separates source review freshness from target integr
       source.includes("Target integration"),
       "missing target-integration status",
     );
-    assert(
-      source.includes("Target-only movement") &&
-        source.includes("does not invalidate approval for an unchanged source"),
-      "source review and target integration semantics are conflated",
-    );
   }
   assert(
     statusProjection.includes("selector_from moved from"),
     "source ref mismatch is not explained",
   );
-  assert(
-    statusProjection.includes("retained completion evidence") &&
-      statusProjection.includes("Backend publication and completion proceed automatically"),
-    "target integration must describe evidence-bound automatic completion",
-  );
+  const mr = mergeRequestDetailFixture();
+  mr.summary.review_status = "approved";
+  const approved = sourceReviewFreshness(mr);
+  mr.target = { status: "known", ref: "moved-target", observed_at: mr.updated_at };
+  assert(sourceReviewFreshness(mr) === approved, "target-only movement invalidated source review");
+  assert(targetIntegrationStatus(mr).includes("completion has not been recorded"), "target observation implied completion");
+  mr.state = { kind: "completed", completion: { kind: "published", merge_event_id: "merge", started_by: "approval" } };
+  assert(targetIntegrationStatus(mr).includes("retained completion evidence"), "saved completion was not distinguished");
   assert(!statusProjection.includes("CompleteMergeRequest"), "removed tool must not be advertised");
 });

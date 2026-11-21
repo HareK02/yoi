@@ -30,8 +30,11 @@ impl MergeRequestStore {
         }) {
             if event.body != body
                 || event.owner_operation_id.as_deref() != Some(&auth.assignment_id)
-                || event.author.runtime_id != auth.runtime_id
-                || event.author.worker_id != auth.worker_id
+                || event.author.as_ref()
+                    != Some(&WorkerIdentity {
+                        runtime_id: auth.runtime_id.clone(),
+                        worker_id: auth.worker_id.clone(),
+                    })
             {
                 return Err(MergeRequestError::Conflict(
                     "comment operation fingerprint mismatch".into(),
@@ -45,10 +48,10 @@ impl MergeRequestStore {
             operation_id: Some(operation_id.into()),
             owner_operation_id: Some(auth.assignment_id.clone()),
             body: body.into(),
-            author: WorkerIdentity {
+            author: Some(WorkerIdentity {
                 runtime_id: auth.runtime_id.clone(),
                 worker_id: auth.worker_id.clone(),
-            },
+            }),
             created_at: now,
         };
         insert_event(

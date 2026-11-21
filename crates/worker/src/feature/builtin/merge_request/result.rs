@@ -133,7 +133,7 @@ pub(super) fn value(
             }
         }
         Kind::Review => snapshot_ids(&data, &mut merge_requests),
-        Kind::WorkerSet | Kind::Comment => {}
+        Kind::WorkerSet | Kind::Comment | Kind::Complete => {}
     }
     json_to_wip(&json!({
         "entry": if kind == Kind::Query { collection.to_owned() } else { format!("{collection}/{subject}") },

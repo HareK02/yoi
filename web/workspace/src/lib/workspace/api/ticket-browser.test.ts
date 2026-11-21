@@ -5,6 +5,7 @@ declare const Deno: {
 import type { TicketBrowseQueryResponse } from "#lib/generated/ticket-api.ts";
 import { loadJson } from "./http.ts";
 import { fixturePost } from "../home/dashboard.test-fixtures.ts";
+import { mergeRequestListFixture as currentMRListFixture, mergeRequestFindingsFixture } from "../merge-request.test-fixtures.ts";
 import {
   TICKET_BROWSER_API_LOAD_POLICY,
   parseTicketEvent,
@@ -444,9 +445,28 @@ const mergeRequestSummary = {
   review_excerpt: null,
 };
 
+Deno.test("MR list preserves current ownership without deriving phase", () => {
+  const item = currentMRListFixture();
+  const page = { items: [item], next_cursor: "next" };
+  const parsed = parseMergeRequestListResponse(page).items[0];
+  assertEquals(parsed.worker_assignment, item.worker_assignment);
+  assertEquals(parsed.worker_resource_key, "W-2");
+  assertEquals(parsed.summary.state.kind, "integration");
+  item.worker_assignment!.worker = null;
+  item.worker_resource_key = null;
+  const released = parseMergeRequestListResponse(page).items[0];
+  assertEquals(released.worker_assignment?.worker, null);
+  assertEquals(released.worker_resource_key, null);
+  for (const field of ["worker_assignment", "worker_resource_key"]) {
+    const missing = { ...item } as Record<string, unknown>;
+    delete missing[field];
+    assertThrows(() => parseMergeRequestListResponse({ items: [missing] }), field);
+  }
+});
+
 function mergeRequestListFixture(summary: unknown) {
   return {
-    items: [{ summary, ticket_ids: ["ticket-id"], thread_event_count: 2 }],
+    items: [{ summary, worker_assignment: null, worker_resource_key: null, ticket_ids: ["ticket-id"], thread_event_count: 2 }],
     next_cursor: null,
   };
 }
@@ -615,8 +635,9 @@ Deno.test("Ticket Browser parser accepts the generated Objective list shape", ()
 
 function mergeRequestDetailFixture() {
   return {
+    worker_resource_key: null,
     worker_assignment: null,
-    publications: [],
+
     view: "detail",
     summary: {
       review_status: "pending",
@@ -663,35 +684,24 @@ function mergeRequestDetailFixture() {
   };
 }
 
-Deno.test("MR show includes assignment CAS and saved publications without thread history", () => {
+Deno.test("MR show includes assignment CAS without thread history", () => {
   const worker = { runtime_id: "runtime-a", worker_id: "worker-a" };
   const assignment = {
     event_id: "owner-event", sequence: 3, operation_id: "owner-op",
     previous_operation_id: null, worker, assigned_by: worker,
     created_at: "2026-09-22T00:00:00Z",
   };
-  const publication = {
-    operation_id: "publication-op", merge_request_id: "mr-1", approval_event_id: "approval-event",
-    source_ref: "abc123", target_selector: "refs/heads/develop", target_ref_before: "def456",
-    outcome: { kind: "published", target_after: "abc123", observed_at: "2026-09-22T00:00:00Z" },
-  };
   for (const view of ["summary", "detail"]) {
     for (const worker_assignment of [null, assignment, { ...assignment, worker: null }]) {
-      for (const outcome of [publication.outcome, { kind: "unconfirmed" }, { kind: "not_published", reason: "target moved" }]) {
-        const input = { ...mergeRequestDetailFixture(), view, thread: [], worker_assignment, publications: [{ ...publication, outcome }] };
-        const parsed = parseMergeRequestDetailResponse(input);
-        assertEquals(parsed.worker_assignment, worker_assignment);
-        assertEquals(parsed.publications, input.publications);
-      }
+      const input = { ...mergeRequestDetailFixture(), view, thread: [], worker_assignment };
+      const parsed = parseMergeRequestDetailResponse(input);
+      assertEquals(parsed.worker_assignment, worker_assignment);
     }
   }
   for (const fields of [
     { worker_assignment: undefined },
     { worker_assignment: { ...assignment, operation_id: 7 } },
     { worker_assignment: { ...assignment, worker: undefined } },
-    { publications: undefined },
-    { publications: [{ ...publication, outcome: { kind: "invented" } }] },
-    { publications: [{ ...publication, outcome: { kind: "published" } }] },
   ]) {
     assertThrows(() => parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), ...fields }), "Merge Request detail");
   }
@@ -1111,4 +1121,58 @@ Deno.test("MR comment decoder retains replay and owner evidence without classify
     assertEquals(event.body, comment.body);
     assertThrows(() => parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), thread: [{ ...comment, operation_id: 7 }] }), "operation_id");
   }
+});
+
+Deno.test("MR comments accept Backend null authors and preserve Worker authors without inventing identity", () => {
+  const worker = { runtime_id: "runtime-a", worker_id: "worker-a" };
+  const comment = { kind: "comment", event_id: "failure-comment", sequence: 8,
+    created_at: "2026-11-21T00:00:00Z", body: "Push rejected: target moved.",
+    operation_id: null, owner_operation_id: null };
+  for (const author of [null, worker]) {
+    const input = { ...mergeRequestDetailFixture(), thread: [{ ...comment, author }] };
+    const parsed = parseMergeRequestDetailResponse(input).thread[0];
+    assertEquals(parsed.kind, "comment");
+    if (parsed.kind === "comment") {
+      assertEquals(parsed.author, author);
+      assertEquals(parsed.body, comment.body);
+    }
+  }
+  for (const author of [undefined, "Backend", {}, { worker_id: "invented" }]) {
+    assertThrows(() => parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), thread: [{ ...comment, author }] }), "author");
+  }
+});
+
+Deno.test("MR HTTP review findings retain empty summary bodies, ordered long findings and omitted locations", async () => {
+  const fixture = mergeRequestFindingsFixture();
+  const result = await loadJson(
+    async () => Response.json(fixture), "/merge-requests/MR-1", undefined,
+    parseMergeRequestDetailResponse, TICKET_BROWSER_API_LOAD_POLICY,
+  );
+  assertEquals(result.error, null);
+  const review = result.data?.thread[0];
+  const expected = fixture.thread[0];
+  if (review?.kind !== "review" || expected.kind !== "review") throw new Error("expected review");
+  assertEquals(review.body, "");
+  assertEquals(review.findings.length, expected.findings.length);
+  for (const [index, finding] of expected.findings.entries()) {
+    for (const key of ["severity", "body", "code", "path", "line"] as const) {
+      assertEquals(review.findings[index][key], finding[key]);
+    }
+  }
+  assertEquals(result.data?.event_page.next_after, 50);
+  for (const finding of [
+    { severity: "unknown", body: "invalid severity" },
+    { severity: "major", body: 7 },
+    { severity: "major", body: "invalid path", path: 7 },
+    { severity: "major", body: "invalid line", line: -1 },
+  ]) {
+    assertThrows(() => parseMergeRequestDetailResponse({
+      ...fixture, thread: [{ ...expected, findings: [finding] }],
+    }), "findings[0]");
+  }
+});
+
+Deno.test("MR public responses reject the removed publication receipt surface", () => {
+  assertThrows(() => parseMergeRequestDetailResponse({ ...mergeRequestDetailFixture(), publications: [] }), "unknown field");
+  assertThrows(() => parseMergeRequestListResponse({ items: [{ ...currentMRListFixture(), publications: [] }], next_cursor: null }), "unknown field");
 });

@@ -10,7 +10,7 @@
 //! | Assign, Answer, content and post edits, case, tags, tracking, release | Ticket transaction captures facts; `notification_routing` decides both recipients and non-notification reasons | Saved assignment/Worker requests and ACKs; mutation wakeup and periodic rounds |
 //! | Workspace startup, Orchestrator create/restore/replacement, idle | Wakeup only; never a new request or a second policy | Same saved pending decisions |
 //! | Backend Job result | Successful finalization captures source after resource release; checker supplies domain facts; common routing records result/suppression/failure | Fixed Worker request bytes, binding, ACK and legacy receipt; same recovery rounds |
-//! | MR review/request/revoke/cancel/merge and typed implementation result | Atomic business source capture; central policy | Same durable routing and periodic recovery; never inferred from comments |
+//! | MR review/owner/comment/source and publication facts, typed implementation result | Atomic business source capture; central policy; comments are attention, not inferred results | Same durable routing and periodic recovery; MR recipients reread current MR and publication evidence |
 //! | Explicit WorkerNotify/WorkerSendInput | Authenticated caller communication | Not automatic business routing |
 //! | Internal SubWorker result and Web subscription | Parent/child execution and UI synchronization respectively | Remain separate; no Ticket policy in Runtime |
 //!
@@ -158,6 +158,19 @@ fn authorize_worker_attention(
     api: &WorkspaceApi,
     input: &TicketWorkerNotification,
 ) -> ApiResult<()> {
+    if let Some(mr) = &input.merge_request_id {
+        subject_authorization::authorize(
+            api,
+            &input.worker,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: "merge_request.read".into(),
+                resource: server_api::authorization::PermissionResource::MergeRequest {
+                    workspace_id: api.workspace_id().into(),
+                    merge_request_id: mr.clone(),
+                },
+            },
+        )?;
+    }
     subject_authorization::authorize(
         api,
         &input.worker,
@@ -216,10 +229,16 @@ pub(super) fn dispatch_ticket_worker_notifications(api: &WorkspaceApi) {
         };
         // An attention notification grants no new assignment or execution authority.
         // The immutable source reference lets the recipient reread authoritative facts.
-        let content = format!(
-            "Ticket {resource_key} has committed activity (input {}). Reread the current Ticket and assignment before acting. This notification does not grant or extend execution authority.",
-            input.input_event_id,
-        );
+        let content = match &input.merge_request_id {
+            Some(mr) => format!(
+                "Merge Request {mr} for Ticket {resource_key} has committed activity (input {}). Reread the current MR, publication results, Ticket and assignments before acting. Comments are attention, not approval or completion; unconfirmed publication is not success. This notification does not grant or extend execution authority.",
+                input.input_event_id,
+            ),
+            None => format!(
+                "Ticket {resource_key} has committed activity (input {}). Reread the current Ticket and assignment before acting. This notification does not grant or extend execution authority.",
+                input.input_event_id,
+            ),
+        };
         if authorize_worker_attention(api, &input).is_err() {
             record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             continue;

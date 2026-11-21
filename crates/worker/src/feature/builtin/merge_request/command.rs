@@ -23,6 +23,11 @@ pub(super) enum Command {
         #[serde(flatten)]
         request: server_api::SetMergeRequestWorkerRequest,
     },
+    Complete {
+        merge_request_id: String,
+        #[serde(flatten)]
+        request: server_api::CompleteMergeRequestRequest,
+    },
     Comment {
         merge_request_id: String,
         operation_id: String,
@@ -69,6 +74,13 @@ impl Command {
                     request: v.request,
                 }
             }
+            Kind::Complete => {
+                let v: CompleteMergeRequestInput = parse(input)?;
+                Self::Complete {
+                    merge_request_id: v.merge_request_id,
+                    request: v.request,
+                }
+            }
             Kind::Comment => {
                 let v: CommentMergeRequestInput = parse(input)?;
                 Self::Comment {
@@ -105,6 +117,7 @@ impl Command {
             Self::Read { .. } => Kind::Show,
             Self::WorkerSet { .. } => Kind::WorkerSet,
             Self::Comment { .. } => Kind::Comment,
+            Self::Complete { .. } => Kind::Complete,
             Self::Open { .. } => Kind::Open,
             Self::Review { .. } => Kind::Review,
         }
@@ -134,7 +147,7 @@ pub(super) fn execute_value(
 ) -> Result<Value, ToolError> {
     let ownership_mutation = matches!(
         &command,
-        Command::WorkerSet { .. } | Command::Comment { .. }
+        Command::WorkerSet { .. } | Command::Comment { .. } | Command::Complete { .. }
     );
     let executor = Executor { client };
     let ws = executor.client.workspace_id().ok_or_else(|| {
@@ -193,6 +206,38 @@ pub(super) fn execute_value(
                 WorkspaceRequestMethod::Put,
                 format!(
                     "/api/w/{ws}/merge-requests/{}/worker",
+                    encode_path_segment(&merge_request_id)
+                ),
+                Some(json!(request)),
+            )
+        }
+        Command::Complete {
+            merge_request_id,
+            request,
+        } => {
+            nonempty_named("merge_request_id", &merge_request_id)?;
+            for (name, value) in [
+                ("operation_id", &request.operation_id),
+                (
+                    "expected_owner_operation_id",
+                    &request.expected_owner_operation_id,
+                ),
+                ("approval_event_id", &request.approval_event_id),
+                ("expected_source_ref", &request.expected_source_ref),
+            ] {
+                nonempty_named(name, value)?;
+            }
+            executor.authorize(
+                "merge_request.complete",
+                PermissionResource::MergeRequest {
+                    workspace_id: ws.into(),
+                    merge_request_id: merge_request_id.clone(),
+                },
+            )?;
+            (
+                WorkspaceRequestMethod::Post,
+                format!(
+                    "/api/w/{ws}/merge-requests/{}/complete",
                     encode_path_segment(&merge_request_id)
                 ),
                 Some(json!(request)),

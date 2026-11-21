@@ -4,6 +4,8 @@
 use super::*;
 #[path = "job_notification_routing.rs"]
 pub(super) mod jobs;
+#[path = "mr_notification_capture.rs"]
+pub(super) mod merge_requests;
 pub use jobs::{JobNotificationFacts, JobNotificationSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +54,11 @@ impl NotificationEventKind {
             | "mr_review_revoked"
             | "mr_review_cancelled"
             | "mr_merge"
+            | "mr_comment"
+            | "mr_worker_assigned"
+            | "mr_publication_unconfirmed"
+            | "mr_publication_not_published"
+            | "mr_publication_published"
             | "mr_source_changed" => Self::MergeRequest,
             _ => Self::Unknown,
         }
@@ -118,6 +125,7 @@ pub struct TicketWorkerNotification {
     pub request_id: String,
     pub worker: RuntimeWorkerRef,
     pub purpose: NotificationPurpose,
+    pub merge_request_id: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketWorkerNotificationTarget {
@@ -187,7 +195,7 @@ fn policy(
                 .as_deref()
                 .is_some_and(|id| !id.trim().is_empty())
     } else {
-        role == "worker" && facts.principal_kind.as_deref() == Some("worker")
+        matches!(role, "worker" | "mr_worker") && facts.principal_kind.as_deref() == Some("worker")
     };
     if !supported {
         return ("suppress", R::UnsupportedRecipient);
@@ -198,7 +206,7 @@ fn policy(
     if facts.released {
         return ("suppress", R::HistoricalOnly);
     }
-    if facts.case_state != "open" {
+    if role != "mr_worker" && facts.case_state != "open" {
         return ("suppress", R::CaseClosed);
     }
     if role == "orchestrator" {
@@ -749,6 +757,19 @@ pub(super) fn require_current(
     assignment: &str,
     role: &str,
 ) -> Result<()> {
+    if role == "mr_worker" {
+        let current: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM merge_request_thread_events owner JOIN merge_request_ticket_relations r ON r.workspace_id=owner.workspace_id AND r.merge_request_id=owner.merge_request_id JOIN typed_tickets t ON t.workspace_id=r.workspace_id AND t.ticket_id=r.ticket_id WHERE owner.workspace_id=?1 AND r.ticket_id=?2 AND owner.operation_id=?3 AND owner.kind='worker_assigned' AND json_extract(owner.payload_json,'$.worker.worker_id') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM merge_request_thread_events later WHERE later.workspace_id=owner.workspace_id AND later.merge_request_id=owner.merge_request_id AND later.kind='worker_assigned' AND later.sequence>owner.sequence))",
+            params![workspace, ticket, assignment], |r| r.get(0),
+        )?;
+        return if current {
+            Ok(())
+        } else {
+            Err(Error::TicketAssignmentConflict(
+                "MR notification owner changed".into(),
+            ))
+        };
+    }
     let facts_sql = subject_facts_sql();
     let facts:Option<String>=conn.query_row(&format!("SELECT {facts_sql} FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id JOIN typed_tickets t ON t.workspace_id=a.workspace_id AND t.ticket_id=a.ticket_id WHERE c.workspace_id=?1 AND c.ticket_id=?2 AND c.assignment_id=?3 AND c.role=?4"),params![workspace,ticket,assignment,role],|r|r.get(0)).optional()?;
     if let Some(facts) = facts {
@@ -788,7 +809,7 @@ pub(super) fn pending_sources_for_subject(
     subject_id: Option<&str>,
 ) -> Result<Vec<(String, String, String, String)>> {
     route_pending(conn, workspace)?;
-    let mut stmt=conn.prepare("SELECT s.ticket_id,s.assignment_id,s.input_event_id,d.delivery_id FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role=?2 AND d.disposition='deliver' AND (?4 IS NULL OR EXISTS(SELECT 1 FROM ticket_worker_assignments a WHERE a.workspace_id=s.workspace_id AND a.ticket_id=s.ticket_id AND a.assignment_id=s.assignment_id AND a.role=s.role AND a.principal_kind='subject' AND a.principal_id=?4)) AND NOT EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) AND NOT EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) ORDER BY d.last_offered,s.sequence LIMIT ?3")?;
+    let mut stmt=conn.prepare("SELECT s.ticket_id,s.assignment_id,s.input_event_id,d.delivery_id,s.role FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND (s.role=?2 OR (?2='worker' AND s.role='mr_worker')) AND d.disposition='deliver' AND (?4 IS NULL OR EXISTS(SELECT 1 FROM ticket_worker_assignments a WHERE a.workspace_id=s.workspace_id AND a.ticket_id=s.ticket_id AND a.assignment_id=s.assignment_id AND a.role=s.role AND a.principal_kind='subject' AND a.principal_id=?4)) AND NOT EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) AND NOT EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) ORDER BY d.last_offered,s.sequence LIMIT ?3")?;
     let candidates = stmt
         .query_map(
             params![workspace, role, limit.clamp(1, 100) as i64, subject_id],
@@ -798,6 +819,7 @@ pub(super) fn pending_sources_for_subject(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             },
         )?
@@ -810,8 +832,8 @@ pub(super) fn pending_sources_for_subject(
     let mut result = Vec::new();
     for row in candidates {
         conn.execute("UPDATE notification_decisions SET last_offered=?3 WHERE workspace_id=?1 AND delivery_id=?2",params![workspace,row.3,tick])?;
-        match require_current(conn, workspace, &row.0, &row.1, role) {
-            Ok(()) => result.push(row),
+        match require_current(conn, workspace, &row.0, &row.1, &row.4) {
+            Ok(()) => result.push((row.0, row.1, row.2, row.3)),
             Err(Error::TicketAssignmentConflict(_)) => {
                 save_failure(
                     conn,
@@ -863,8 +885,8 @@ pub(super) fn list_workers(
     store.with_conn_mut(|conn| {let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut result=Vec::new();
         for (ticket_id,assignment_id,input_event_id,delivery_id) in pending_sources(&tx,workspace,"worker",limit)? {
-            let (runtime,worker):(String,String)=tx.query_row("SELECT runtime_id,worker_id FROM ticket_worker_assignments WHERE workspace_id=?1 AND assignment_id=?2",params![workspace,assignment_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            result.push(TicketWorkerNotification{ticket_id,assignment_id,input_event_id,request_id:delivery_id.clone(),delivery_id,worker:RuntimeWorkerRef::new(runtime,worker),purpose:NotificationPurpose::Attention});
+            let (runtime,worker,merge_request_id):(String,String,Option<String>)=tx.query_row("SELECT json_extract(s.facts_json,'$.runtime_id'),json_extract(s.facts_json,'$.worker_id'),json_extract(s.facts_json,'$.merge_request_id') FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE d.workspace_id=?1 AND d.delivery_id=?2",params![workspace,delivery_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            result.push(TicketWorkerNotification{ticket_id,assignment_id,input_event_id,request_id:delivery_id.clone(),delivery_id,worker:RuntimeWorkerRef::new(runtime,worker),purpose:NotificationPurpose::Attention,merge_request_id});
         }
         tx.commit()?;Ok(result)
     })
@@ -875,8 +897,8 @@ fn worker_guard(
     id: &str,
     target: &TicketWorkerNotificationTarget,
 ) -> Result<()> {
-    let (ticket,assignment,runtime,worker):(String,String,String,String)=conn.query_row("SELECT s.ticket_id,s.assignment_id,json_extract(s.facts_json,'$.runtime_id'),json_extract(s.facts_json,'$.worker_id') FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE d.workspace_id=?1 AND d.delivery_id=?2 AND s.role='worker' AND d.disposition='deliver'",params![workspace,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    require_current(conn, workspace, &ticket, &assignment, "worker")?;
+    let (ticket,assignment,runtime,worker,role):(String,String,String,String,String)=conn.query_row("SELECT s.ticket_id,s.assignment_id,json_extract(s.facts_json,'$.runtime_id'),json_extract(s.facts_json,'$.worker_id'),s.role FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE d.workspace_id=?1 AND d.delivery_id=?2 AND s.role IN ('worker','mr_worker') AND d.disposition='deliver'",params![workspace,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    require_current(conn, workspace, &ticket, &assignment, &role)?;
     if target.worker != RuntimeWorkerRef::new(runtime, worker) {
         return Err(Error::WorkspacePermissionDenied(
             "Notification target differs from captured assignment".into(),

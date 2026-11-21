@@ -1,40 +1,11 @@
-//! Approval drives publication without a Subject stamp or a model follow-up.
-//! Claims and Runtime receipts separate new effects from recovery. Background
-//! rounds are bounded and target exclusion is owned by the MR transaction, not
-//! by a schedule, Worker liveness, or a process-local lock.
+//! Each approval makes one publication attempt. Failures return through ordinary
+//! MR comments and notifications, not a receipt or automatic retry loop.
 use super::*;
-use merge_request::{Publication, PublicationBinding, PublicationOutcome};
+use merge_request::PublicationBinding;
 use worker_runtime::catalog::{
-    RepositoryPublicationBinding, RepositoryPublicationOutcome, RepositoryPublicationReceipt,
-    RepositoryPublicationRequest,
+    RepositoryPublicationBinding, RepositoryPublicationOutcome, RepositoryPublicationRequest,
+    RepositoryPublicationResult,
 };
-
-pub(super) fn public(publication: Publication) -> server_api::MergeRequestPublication {
-    let b = publication.binding;
-    server_api::MergeRequestPublication {
-        operation_id: b.operation_id,
-        merge_request_id: b.merge_request_id,
-        approval_event_id: b.approval_event_id,
-        source_ref: b.source,
-        target_selector: b.target,
-        target_ref_before: b.target_before,
-        outcome: match publication.outcome {
-            PublicationOutcome::Unconfirmed {} => {
-                server_api::MergeRequestPublicationOutcome::Unconfirmed {}
-            }
-            PublicationOutcome::NotPublished { reason } => {
-                server_api::MergeRequestPublicationOutcome::NotPublished { reason }
-            }
-            PublicationOutcome::Published {
-                target_after,
-                observed_at,
-            } => server_api::MergeRequestPublicationOutcome::Published {
-                target_after,
-                observed_at,
-            },
-        },
-    }
-}
 
 fn runtime_binding(b: &PublicationBinding) -> ApiResult<RepositoryPublicationBinding> {
     Ok(RepositoryPublicationBinding {
@@ -147,108 +118,12 @@ fn authorize_dispatch(api: &WorkspaceApi, b: &PublicationBinding) -> ApiResult<(
     Ok(())
 }
 
-pub(super) fn accept_receipt(
-    api: &WorkspaceApi,
-    saved: &Publication,
-    receipt: RepositoryPublicationReceipt,
-) -> ApiResult<Publication> {
-    if receipt.binding != runtime_binding(&saved.binding)? {
-        return Err(Error::WorkspacePermissionDenied(
-            "Runtime publication receipt binding mismatch".into(),
-        )
-        .into());
-    }
-    let outcome = match receipt.outcome {
-        RepositoryPublicationOutcome::Unknown {} => return Ok(saved.clone()),
-        RepositoryPublicationOutcome::NotPublished { reason } => {
-            PublicationOutcome::NotPublished { reason }
-        }
-        RepositoryPublicationOutcome::Published {
-            target_after,
-            observed_at_epoch_seconds,
-        } => {
-            let observed = chrono::DateTime::<Utc>::from_timestamp(
-                i64::try_from(observed_at_epoch_seconds).map_err(|_| {
-                    Error::InvalidInput("invalid publication observation time".into())
-                })?,
-                0,
-            )
-            .ok_or_else(|| Error::InvalidInput("invalid publication observation time".into()))?;
-            PublicationOutcome::Published {
-                target_after,
-                observed_at: observed.to_rfc3339(),
-            }
-        }
-    };
-    let store = merge_request_store(api, api.workspace_id())?;
-    let saved = store.record_publication_outcome(&saved.binding, outcome)?;
-    if matches!(saved.outcome, PublicationOutcome::Published { .. }) {
-        // Publication remains recorded even if cancellation/rescope/revocation
-        // now prevents concluding the current MR.
-        if let Err(error) =
-            store.complete_publication(api.workspace_id(), &saved.binding.operation_id, Utc::now())
-        {
-            tracing::debug!(operation_id=%saved.binding.operation_id, %error, "publication recorded; MR completion deferred");
-        }
-    }
-    Ok(saved)
-}
-
-pub(super) fn reconcile(api: &WorkspaceApi, saved: Publication) -> ApiResult<Publication> {
-    match saved.outcome {
-        PublicationOutcome::Unconfirmed {} => {
-            // Read Runtime-owned immutable evidence before acquiring any current
-            // Repository access. Removing credentials/configuration or stopping
-            // the former owner cannot erase an already acknowledged publication.
-            let receipt = api
-                .runtime
-                .repository_publication_receipt(
-                    &saved.binding.worker.runtime_id,
-                    runtime_binding(&saved.binding)?,
-                )
-                .map_err(RuntimeRegistryError::into_error)?;
-            let Some(receipt) = receipt else {
-                // Absence cannot fence a delayed original dispatch. Never free
-                // the target claim or send a new push from this observation.
-                return Ok(saved);
-            };
-            let unresolved = matches!(receipt.outcome, RepositoryPublicationOutcome::Unknown {});
-            let saved = accept_receipt(api, &saved, receipt)?;
-            if !unresolved {
-                return Ok(saved);
-            }
-            let request = match request(api, &saved.binding) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::debug!(operation_id=%saved.binding.operation_id, %error, "publication remains unknown; current provider observation unavailable");
-                    return Ok(saved);
-                }
-            };
-            let receipt = api
-                .runtime
-                .reconcile_repository_publication(&saved.binding.worker.runtime_id, request)
-                .map_err(RuntimeRegistryError::into_error)?;
-            accept_receipt(api, &saved, receipt)
-        }
-        PublicationOutcome::Published { .. } => {
-            let store = merge_request_store(api, api.workspace_id())?;
-            let _ = store.complete_publication(
-                api.workspace_id(),
-                &saved.binding.operation_id,
-                Utc::now(),
-            );
-            Ok(saved)
-        }
-        PublicationOutcome::NotPublished { .. } => Ok(saved),
-    }
-}
-
 pub(super) fn publish(
     api: &WorkspaceApi,
     mr_id: &str,
     operation_id: String,
     approval_event_id: String,
-) -> ApiResult<Publication> {
+) -> ApiResult<()> {
     if operation_id.trim().is_empty() || operation_id.len() > 200 {
         return Err(Error::InvalidInput(
             "publication operation_id must be nonempty and at most 200 bytes".into(),
@@ -256,17 +131,6 @@ pub(super) fn publish(
         .into());
     }
     let store = merge_request_store(api, api.workspace_id())?;
-    if let Some(saved) = store.publication(api.workspace_id(), &operation_id)? {
-        if saved.binding.merge_request_id != mr_id
-            || saved.binding.approval_event_id != approval_event_id
-        {
-            return Err(merge_request::MergeRequestError::Conflict(
-                "publication request fingerprint mismatch".into(),
-            )
-            .into());
-        }
-        return reconcile(api, saved);
-    }
     let mr = store.get_by_id(api.workspace_id(), mr_id)?;
     let (owner, worker) = current_mr_worker(&store, api.workspace_id(), mr_id)?;
     require_mr_operation(api, &worker, mr_id, "merge_request.publish")?;
@@ -368,40 +232,228 @@ pub(super) fn publish(
         target_before: target.resolved_ref,
     };
     let runtime_request = request(api, &binding)?;
-    let (saved, acquired) = store.claim_publication(binding.clone(), Utc::now(), |_| {
+    let _target = TargetUse::acquire(api.workspace_id(), &binding.repository_id, &binding.target)?;
+    let digest = store.validate_publication(&binding, |_| {
         authorize_dispatch(api, &binding)
             .map_err(|e| merge_request::MergeRequestError::Unauthorized(e.error.to_string()))
     })?;
-    if !acquired {
-        return reconcile(api, saved);
-    }
-    // Only this claim owner can dispatch. Replays and recovery always take the
-    // receipt-only path, including after a timeout or owner/policy change.
-    if let Err(error) = authorize_dispatch(api, &binding) {
-        store.record_publication_outcome(
-            &binding,
-            PublicationOutcome::NotPublished {
-                reason: "authorization changed before Runtime dispatch".into(),
-            },
-        )?;
-        return Err(error);
-    }
-    let receipt = api
-        .runtime
+    let result: RepositoryPublicationResult = api.runtime
         .publish_repository_source(&worker.runtime_id, runtime_request)
-        .map_err(RuntimeRegistryError::into_error)?;
-    accept_receipt(api, &saved, receipt)
+        .map_err(|_| Error::InvalidInput("Git publication response was not received; success or non-publication cannot be confirmed. Inspect the remote before deciding the next action.".into()))?;
+    if result.binding != runtime_binding(&binding)? {
+        return Err(Error::InvalidInput(
+            "Git publication result binding mismatch; outcome cannot be confirmed".into(),
+        )
+        .into());
+    }
+    match result.outcome {
+        RepositoryPublicationOutcome::Published { target_after, .. } if target_after == binding.source => {
+            store.record_confirmed_publication(&binding, &digest, Utc::now())?;
+            Ok(())
+        }
+        RepositoryPublicationOutcome::NotPublished { reason } => Err(Error::InvalidInput(reason).into()),
+        _ => Err(Error::InvalidInput("Git publication outcome cannot be confirmed; MR remains incomplete. Inspect the remote before deciding the next action.".into()).into()),
+    }
+}
+
+/// Manual recovery records only a provider-confirmed result. It deliberately does
+/// not use Workdir commands, publication dispatch, or the old Subject-only gate.
+pub(super) fn complete(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    mr_id: &str,
+    request: server_api::CompleteMergeRequestRequest,
+) -> ApiResult<merge_request::MergeEvent> {
+    for value in [
+        &request.operation_id,
+        &request.expected_owner_operation_id,
+        &request.approval_event_id,
+        &request.expected_source_ref,
+    ] {
+        if value.trim().is_empty() || value.len() > 200 || value.chars().any(char::is_control) {
+            return Err(Error::InvalidInput(
+                "completion expectations must be nonempty, bounded identifiers".into(),
+            )
+            .into());
+        }
+    }
+    require_mr_operation(api, worker, mr_id, "merge_request.complete")?;
+    require_mr_operation(api, worker, mr_id, "merge_request.read")?;
+    let store = merge_request_store(api, api.workspace_id())?;
+    let mr = store.get_by_id(api.workspace_id(), mr_id)?;
+    let admit = |conn: &rusqlite::Connection, current: &merge_request::MergeRequest| {
+        require_mr_operation(api, worker, mr_id, "merge_request.complete")
+            .and_then(|_| require_mr_operation(api, worker, mr_id, "merge_request.read"))
+            .map_err(|e| merge_request::MergeRequestError::Unauthorized(e.error.to_string()))?;
+        if !current.current_worker().is_some_and(|owner| {
+            owner.operation_id == request.expected_owner_operation_id
+                && owner.worker.as_ref().is_some_and(|w| {
+                    w.runtime_id == worker.runtime_id && w.worker_id == worker.worker_id
+                })
+        }) {
+            return Err(merge_request::MergeRequestError::Unauthorized(
+                "completion requires the current MR Worker and observed ownership operation".into(),
+            ));
+        }
+        if !current.state.is_completed() {
+            validate_completion_source(conn, current, &request.expected_source_ref)?;
+        }
+        Ok(())
+    };
+    // Check ownership before any provider access as well as under the writer lock.
+    let (owner, assigned) = current_mr_worker(&store, api.workspace_id(), mr_id)?;
+    if assigned != *worker || owner.operation_id != request.expected_owner_operation_id {
+        return Err(
+            Error::WorkspacePermissionDenied("completion MR ownership changed".into()).into(),
+        );
+    }
+    let approval = mr
+        .thread
+        .iter()
+        .find_map(|event| match event {
+            merge_request::MergeRequestThreadEvent::Review(review)
+                if review.event_id == request.approval_event_id =>
+            {
+                Some(review)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::InvalidInput("completion approval was not found on this MR".into())
+        })?;
+    let replay = mr.thread.iter().find_map(|event| match event {
+        merge_request::MergeRequestThreadEvent::Merge(event)
+            if event.operation_id == request.operation_id =>
+        {
+            Some(event)
+        }
+        _ => None,
+    });
+    let (target_before, target_after) = if let Some(event) = replay {
+        (
+            event.target_ref_before.clone(),
+            event.target_ref_after.clone(),
+        )
+    } else {
+        if !matches!(
+            mr.state,
+            merge_request::MergeRequestState::Integration { .. }
+        ) {
+            return Err(merge_request::MergeRequestError::NotReady(
+                "MR is not in integration".into(),
+            )
+            .into());
+        }
+        let selector = mr
+            .selector_from
+            .as_deref()
+            .ok_or_else(|| Error::InvalidInput("MR source requires repair".into()))?;
+        let source = observe_published_source_ref(
+            api,
+            api.workspace_id(),
+            &worker.runtime_id,
+            &mr.repository_id,
+            selector,
+        )?;
+        let target = observe_published_ref_with_ancestor(
+            api,
+            api.workspace_id(),
+            &worker.runtime_id,
+            &mr.repository_id,
+            &mr.selector_to,
+            Some(&request.expected_source_ref),
+        )?;
+        if source.resolved_ref != request.expected_source_ref
+            || target.contained_commit.as_deref() != Some(request.expected_source_ref.as_str())
+            || target.repository_id != mr.repository_id
+            || source.source_fingerprint != target.source_fingerprint
+        {
+            return Err(merge_request::MergeRequestError::NotReady(
+                "provider did not confirm that the MR target contains the approved source".into(),
+            )
+            .into());
+        }
+        (target.resolved_ref.clone(), target.resolved_ref)
+    };
+    store
+        .record_verified_completion(
+            &merge_request::ConfirmedMergeRequestPublication {
+                workspace_id: api.workspace_id().into(),
+                merge_request_id: mr_id.into(),
+                operation_id: request.operation_id.clone(),
+                repository_id: mr.repository_id.clone(),
+                target: mr.selector_to.clone(),
+                source: request.expected_source_ref.clone(),
+                approval_event_id: request.approval_event_id.clone(),
+                owner_operation_id: request.expected_owner_operation_id.clone(),
+                worker: merge_request::WorkerIdentity {
+                    runtime_id: worker.runtime_id.clone(),
+                    worker_id: worker.worker_id.clone(),
+                },
+                target_before,
+                target_after,
+            },
+            &approval.ticket_content_digest,
+            Utc::now(),
+            admit,
+        )
+        .map_err(Error::from)
+        .map_err(Into::into)
+}
+
+// The provider and SQLite cannot commit together. Fence newer source evidence
+// already known to Backend under the same writer transaction as completion.
+pub(super) fn validate_completion_source(
+    conn: &rusqlite::Connection,
+    mr: &merge_request::MergeRequest,
+    expected: &str,
+) -> std::result::Result<(), merge_request::MergeRequestError> {
+    use rusqlite::OptionalExtension;
+    let current: Option<String> = conn.query_row(
+        "SELECT subject_ref FROM merge_request_source_observations WHERE workspace_id=?1 AND merge_request_id=?2 ORDER BY sequence DESC LIMIT 1",
+        rusqlite::params![mr.workspace_id, mr.merge_request_id],
+        |row| row.get(0),
+    ).optional()?;
+    if current.as_deref() != Some(expected) {
+        return Err(merge_request::MergeRequestError::NotReady(
+            "MR source evidence changed during completion verification".into(),
+        ));
+    }
+    Ok(())
+}
+
+// A guard exists only while the attempt runs; response loss never retains it.
+// Normal non-force Git updates also protect against external publishers.
+struct TargetUse((String, String, String));
+static TARGETS: std::sync::Mutex<Option<std::collections::HashSet<(String, String, String)>>> =
+    std::sync::Mutex::new(None);
+impl TargetUse {
+    fn acquire(workspace: &str, repository: &str, target: &str) -> ApiResult<Self> {
+        let key = (workspace.into(), repository.into(), target.into());
+        let mut targets = TARGETS
+            .lock()
+            .map_err(|_| Error::InvalidInput("publication safety lock unavailable".into()))?;
+        if !targets
+            .get_or_insert_with(Default::default)
+            .insert(key.clone())
+        {
+            return Err(Error::InvalidInput("another publication is currently using this Repository target; inspect the current MR and remote before retrying".into()).into());
+        }
+        Ok(Self(key))
+    }
+}
+impl Drop for TargetUse {
+    fn drop(&mut self) {
+        if let Ok(mut targets) = TARGETS.lock() {
+            if let Some(targets) = targets.as_mut() {
+                targets.remove(&self.0);
+            }
+        }
+    }
 }
 
 pub(super) fn advance(api: &WorkspaceApi, mr_id: &str) -> ApiResult<()> {
     let store = merge_request_store(api, api.workspace_id())?;
-    let saved = store.publications(api.workspace_id(), mr_id)?;
-    for publication in saved
-        .iter()
-        .filter(|p| !matches!(p.outcome, PublicationOutcome::NotPublished { .. }))
-    {
-        reconcile(api, publication.clone())?;
-    }
     let mr = store.get_by_id(api.workspace_id(), mr_id)?;
     if !matches!(
         mr.state,
@@ -422,61 +474,17 @@ pub(super) fn advance(api: &WorkspaceApi, mr_id: &str) -> ApiResult<()> {
     }) else {
         return Ok(());
     };
-    if saved.iter().any(|p| {
-        p.binding.approval_event_id == approval.event_id
-            && !matches!(p.outcome, PublicationOutcome::NotPublished { .. })
-    }) {
-        return Ok(());
-    }
-    publish(
+    if let Err(error) = publish(
         api,
         mr_id,
         format!("mr-publication-{}", Uuid::now_v7()),
         approval.event_id.clone(),
-    )?;
-    Ok(())
-}
-
-pub(super) async fn recovery_loop(api: WorkspaceApi) {
-    let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut cursor = None;
-    loop {
-        tokio::select! { _ = timer.tick() => {}, _ = api.mr_publication_wake.notified() => { cursor = None; } }
-        let stage = api.clone();
-        let after = cursor.clone();
-        let page = match api.host_executors.host() {
-            Ok(executor) => {
-                executor
-                    .run(move || -> ApiResult<_> {
-                        Ok(merge_request_store(&stage, stage.workspace_id())?.list(
-                            stage.workspace_id(),
-                            &merge_request::MergeRequestListQuery {
-                                cursor: after,
-                                limit: 16,
-                                ..Default::default()
-                            },
-                        )?)
-                    })
-                    .await
-            }
-            Err(error) => Err(error.into()),
-        };
-        let Ok(page) = page else {
-            continue;
-        };
-        cursor = page.next_cursor;
-        let mut attempts = tokio::task::JoinSet::new();
-        for mr in page.items {
-            let stage = api.clone();
-            attempts.spawn(async move {
-                if let Ok(executor) = stage.host_executors.host() {
-                    let _ = executor
-                        .run(move || advance(&stage, &mr.merge_request_id))
-                        .await;
-                }
-            });
-        }
-        while attempts.join_next().await.is_some() {}
+    ) {
+        let body = format!(
+            "Automatic Git publication did not complete the MR: {}\n\nNo automatic retry is scheduled. Reread the MR, current authority and remote target; the Subject decides the next action through the ordinary workflow.",
+            error.error
+        );
+        store.record_publication_problem(api.workspace_id(), mr_id, &body, Utc::now())?;
     }
+    Ok(())
 }

@@ -363,7 +363,7 @@ fn v12_migration_revokes_old_grants_preserves_integration_and_requires_fresh_con
             .query_row("SELECT version FROM merge_request_schema", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
 }
 
@@ -948,7 +948,7 @@ fn fresh_schema_reopens_as_current() {
             r.get::<_, i64>(0)
         })
         .unwrap(),
-        16
+        17
     );
     merge_request::migrate(&c).unwrap();
 }

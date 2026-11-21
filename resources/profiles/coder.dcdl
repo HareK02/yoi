@@ -21,6 +21,7 @@ import "./base.dcdl" // {
             query = true;
             show = true;
             comment = true;
+            complete = true;
             open = true;
             review = false;
         };

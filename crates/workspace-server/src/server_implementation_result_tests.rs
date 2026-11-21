@@ -369,23 +369,34 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
     assert_eq!(pending["source_checks"][0]["origin_present"], true);
     assert_eq!(pending["source_checks"][0]["captured"], true);
     recover_ticket_notifications(&api);
-    delivery_wait_idle(&api, &orchestrator, 3).await;
+    assert_eq!(delivery_receipts(&api, &orchestrator).len(), 1, "Ticket read permission alone must not supply MR activity");
+    extend_test_assignment_operations(&api, &ensure_test_assignment_subject(&api), &["merge_request.read"]);
+    recover_ticket_notifications(&api);
+    delivery_wait_idle(&api, &orchestrator, 4).await;
     let input = json!({"operation_key":"approved-handoff","kind":"handoff","body":"Implementation and validation complete; integration remains separate.","merge_request":{"merge_request_id":"result-mr","subject_ref":"source-a"}});
     let receipt =
         result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK).await;
-    delivery_wait_idle(&api, &orchestrator, 4).await;
+    delivery_wait_idle(&api, &orchestrator, 5).await;
     let commits = delivery_commits(&api, &orchestrator);
     assert!(
         commits
             .iter()
             .any(|s| s.contains(&requested.request_event.event_id))
     );
-    assert!(commits.iter().any(|s| s.contains(&approved.event_id)));
+    assert!(commits.iter().any(|s| s.contains(&approved.event_id) && s.contains("reread the current MR, ownership and publication results")));
     assert!(
         commits
             .iter()
             .any(|s| s.contains(receipt["result_id"].as_str().unwrap()))
     );
+    for (operation, body) in [("conflict-decision", "Need a conflict decision"), ("conflict-resolution", "Resolved; exact-source approval is still required")] {
+        let event = store.comment(&auth, "result-mr", operation, body, Utc::now(), |_| Ok(())).unwrap();
+        assert_eq!(store.comment(&auth, "result-mr", operation, body, Utc::now(), |_| Ok(())).unwrap(), event);
+    }
+    store.record_publication_problem(TEST_WORKSPACE_ID, "result-mr", "target moved; publication did not complete", Utc::now()).unwrap();
+    assert!(matches!(store.get_by_id(TEST_WORKSPACE_ID, "result-mr").unwrap().state, merge_request::MergeRequestState::Integration { .. }));
+    recover_ticket_notifications(&api);
+    delivery_wait_idle(&api, &orchestrator, 8).await;
     store
         .revoke_review(merge_request::RevokeMergeRequestReview {
             merge_request_id: "result-mr".into(),
@@ -413,7 +424,7 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
         )
         .unwrap();
     recover_ticket_notifications(&api);
-    delivery_wait_idle(&api, &orchestrator, 6).await;
+    delivery_wait_idle(&api, &orchestrator, 10).await;
     for (child, requested_source, observed_source) in [
         ("cancelled-reviewer", "source-b", "source-c"),
         ("changes-reviewer", "source-c", "source-c"),
@@ -457,12 +468,12 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
         assert_eq!(submitted.is_err(), requested_source != observed_source);
     }
     recover_ticket_notifications(&api);
-    delivery_wait_idle(&api, &orchestrator, 10).await;
+    delivery_wait_idle(&api, &orchestrator, 14).await;
     let attempts = execution.attempts.lock().unwrap().len();
     result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK).await;
     recover_ticket_notifications(&api);
     assert_eq!(execution.attempts.lock().unwrap().len(), attempts);
-    assert_eq!(delivery_receipts(&api, &orchestrator).len(), 10);
+    assert_eq!(delivery_receipts(&api, &orchestrator).len(), 14);
     assert_result_diagnostics(&api, &orchestrator, receipt["result_id"].as_str().unwrap()).await;
     let diagnostics = delivery_http(
         &api,
@@ -479,6 +490,8 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
         "mr_review_revoked",
         "mr_review_cancelled",
         "mr_source_changed",
+        "mr_worker_assigned",
+        "mr_comment",
     ] {
         let matching: Vec<_> = rows
             .iter()
@@ -493,7 +506,7 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
     }
     for kind in ["mr_review_requested", "mr_review_revoked"] {
         assert!(rows.iter().any(|r| r["event_kind"] == kind
-            && r["recipient_role"] == "worker"
+            && r["recipient_role"] == "mr_worker"
             && r["stage"] == "suppressed"
             && r["reason"] == "self_notification"));
     }

@@ -10,7 +10,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const MAX_BODY_BYTES: usize = 16 * 1024;
 const DOMAIN_TABLES: [&str; 5] = [
     "merge_requests",
@@ -143,7 +143,8 @@ pub struct CommentEvent {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub body: String,
-    pub author: WorkerIdentity,
+    /// None identifies a Backend-generated publication comment.
+    pub author: Option<WorkerIdentity>,
     pub created_at: DateTime<Utc>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -162,6 +163,9 @@ pub enum ConflictResolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeEvent {
     pub event_id: String,
+    /// Absent only on historical results predating completion owner fencing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_operation_id: Option<String>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub operation_id: String,
@@ -779,10 +783,10 @@ impl MergeRequestStore {
                 event_id: Uuid::now_v7().to_string(),
                 sequence: next_seq(&t, &i.auth.workspace_id, &i.merge_request_id)?,
                 body: i.summary,
-                author: WorkerIdentity {
+                author: Some(WorkerIdentity {
                     runtime_id: i.auth.runtime_id,
                     worker_id: i.auth.worker_id,
-                },
+                }),
                 created_at: i.now,
             };
             insert_event(
@@ -1374,6 +1378,7 @@ impl MergeRequestStore {
             )?;
         }
         let event = MergeEvent {
+            owner_operation_id: Some(i.auth.assignment_id.clone()),
             event_id: Uuid::now_v7().to_string(),
             sequence: next_seq(&transaction, &mr.workspace_id, &mr.merge_request_id)?,
             operation_id: i.operation_id,
@@ -1447,7 +1452,7 @@ impl MergeRequestStore {
             event_id: Uuid::now_v7().to_string(),
             sequence: next_seq(&t, &mr.workspace_id, &mr.merge_request_id)?,
             body: format!("selector_from repaired: {}", i.reason),
-            author: i.repaired_by,
+            author: Some(i.repaired_by),
             created_at: i.now,
         };
         insert_event(
@@ -1917,21 +1922,28 @@ pub fn migrate(c: &Connection) -> Result<(), MergeRequestError> {
             verify_lifecycle_schema(c)?;
             publication::verify(c)
         }
-        SchemaState::Current(15) => publication::migrate(c),
+        SchemaState::Current(16) => publication::migrate_history_only(c),
+        SchemaState::Current(15) => {
+            publication::migrate(c)?;
+            publication::migrate_history_only(c)
+        }
         SchemaState::Current(14) => {
             ownership::migrate_v14_worker_ownership(c)?;
-            publication::migrate(c)
+            publication::migrate(c)?;
+            publication::migrate_history_only(c)
         }
         SchemaState::Current(13) => {
             migrate_v13_lifecycle(c)?;
             ownership::migrate_v14_worker_ownership(c)?;
-            publication::migrate(c)
+            publication::migrate(c)?;
+            publication::migrate_history_only(c)
         }
         SchemaState::Current(12) => {
             migrate_v12_content_attestations(c)?;
             migrate_v13_lifecycle(c)?;
             ownership::migrate_v14_worker_ownership(c)?;
-            publication::migrate(c)
+            publication::migrate(c)?;
+            publication::migrate_history_only(c)
         }
         SchemaState::Current(v) => Err(MergeRequestError::Operation(format!(
             "unsupported schema {v}"
@@ -2053,6 +2065,7 @@ fn fresh(c: &Connection) -> Result<(), MergeRequestError> {
     tables(&t)?;
     ownership::worker_event_tables(&t)?;
     publication::tables(&t)?;
+    publication::install_history_only(&t)?;
     lifecycle::add_lifecycle_column(&t, "state")?;
     lifecycle::lifecycle_triggers(&t)?;
     t.execute(

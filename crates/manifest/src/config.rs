@@ -418,6 +418,7 @@ pub struct MergeRequestFeatureConfigPartial {
     pub review: Option<bool>,
     pub worker_set: Option<bool>,
     pub comment: Option<bool>,
+    pub complete: Option<bool>,
 }
 
 impl MergeRequestFeatureConfigPartial {
@@ -429,6 +430,7 @@ impl MergeRequestFeatureConfigPartial {
             review: other.review.or(self.review),
             worker_set: other.worker_set.or(self.worker_set),
             comment: other.comment.or(self.comment),
+            complete: other.complete.or(self.complete),
         }
     }
 }
@@ -668,6 +670,7 @@ impl From<MergeRequestFeatureConfigPartial> for MergeRequestFeatureConfig {
             review: value.review.unwrap_or_default(),
             worker_set: value.worker_set.unwrap_or_default(),
             comment: value.comment.unwrap_or_default(),
+            complete: value.complete.unwrap_or_default(),
         }
     }
 }
@@ -681,6 +684,7 @@ impl From<MergeRequestFeatureConfig> for MergeRequestFeatureConfigPartial {
             review: Some(value.review),
             worker_set: Some(value.worker_set),
             comment: Some(value.comment),
+            complete: Some(value.complete),
         }
     }
 }
@@ -2827,6 +2831,12 @@ enabled = true
         let set_only: MergeRequestFeatureConfig = toml::from_str("worker_set = true").unwrap();
         assert!(set_only.worker_set && set_only.any());
         assert!(!set_only.show);
+        let complete_only: MergeRequestFeatureConfig = toml::from_str("complete = true").unwrap();
+        assert!(complete_only.complete && complete_only.any());
+        assert_eq!(
+            MergeRequestFeatureConfig::from(MergeRequestFeatureConfigPartial::from(complete_only)),
+            complete_only
+        );
         let query_only: MergeRequestFeatureConfig = toml::from_str("query = true").unwrap();
         assert!(query_only.query && query_only.any());
         assert!(!query_only.show);
@@ -2836,13 +2846,7 @@ enabled = true
 
     #[test]
     fn merge_request_removed_operation_flags_are_rejected() {
-        for flag in [
-            "worker_query",
-            "publications",
-            "publish",
-            "complete",
-            "readiness_check",
-        ] {
+        for flag in ["worker_query", "publications", "publish", "readiness_check"] {
             let input = format!("{flag} = true");
             assert!(toml::from_str::<MergeRequestFeatureConfigPartial>(&input).is_err());
             assert!(toml::from_str::<MergeRequestFeatureConfig>(&input).is_err());

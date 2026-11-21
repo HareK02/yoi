@@ -1,11 +1,10 @@
-//! Publication has a durable no-retry boundary before dispatch. A provider
-//! acknowledgement is retained independently of subsequent ref positions. Ref
-//! equality alone cannot prove who published: recovery never manufactures a
-//! receipt from a moved branch and never sends a second push.
+//! Each publication runs current safety checks and a single non-force push.
+//! Results are ephemeral: neither old Runtime files nor ref equality authorize
+//! recovery or another push. The caller decides what to do after an unknown result.
 use super::*;
 use crate::catalog::{
     RepositoryPublicationBinding, RepositoryPublicationOutcome as Outcome,
-    RepositoryPublicationReceipt as Receipt, RepositoryPublicationRequest as Request,
+    RepositoryPublicationRequest as Request, RepositoryPublicationResult as PublicationResult,
 };
 
 fn denied(message: impl Into<String>) -> WorkingDirectoryDiagnostic {
@@ -46,69 +45,149 @@ fn publication_git_command(
     command
 }
 
-#[derive(Serialize, Deserialize)]
-struct Intent {
-    binding: RepositoryPublicationBinding,
-    repository: crate::catalog::WorkingDirectoryRepository,
+// The isolated object snapshot lives only for this execution. Leftovers after
+// process loss are never read as intent, evidence, or permission for another push.
+struct PublicationScratch(PathBuf);
+
+impl Drop for PublicationScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
-fn digest(parts: &[&str]) -> String {
-    let mut hash = Sha256::new();
-    for part in parts {
-        hash.update((part.len() as u64).to_be_bytes());
-        hash.update(part.as_bytes());
+// Only a complete single-ref porcelain response can settle a dispatched operation.
+// Remote failure is not rejection: the provider may have updated the ref before
+// losing its acknowledgement. Abbreviated OIDs cannot establish the exact before.
+fn publication_outcome(
+    binding: &RepositoryPublicationBinding,
+    output: &RepositoryGitOutput,
+) -> Option<Outcome> {
+    if output.status.code().is_none() || !output.stdout.complete {
+        return None;
     }
-    hash.finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-// Exclusive file creation is also a cross-process no-second-dispatch fence.
-// Partial/corrupt records fail closed; they are not treated as absent.
-fn persist_new(path: &Path, value: &impl Serialize) -> Result<(), WorkingDirectoryDiagnostic> {
-    let bytes =
-        serde_json::to_vec(value).map_err(|_| denied("publication evidence encoding failed"))?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|_| denied("publication evidence could not be created"))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .and_then(|_| fs::File::open(path.parent().unwrap())?.sync_all())
-        .map_err(|_| denied("publication evidence durability is unknown"))
-}
-
-fn read_publication_record(path: &Path) -> Result<Option<Vec<u8>>, WorkingDirectoryDiagnostic> {
-    const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
-    match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() <= MAX_RECORD_BYTES => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        _ => return Err(denied("publication record is invalid or unavailable")),
+    let stdout = std::str::from_utf8(&output.stdout.bytes).ok()?;
+    if !stdout.ends_with('\n') {
+        return None;
     }
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|_| denied("publication record could not be read"))?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(denied("publication record exceeds its storage bound"));
+    let mut lines = stdout.lines();
+    if lines.next()?.strip_prefix("To ")?.is_empty() {
+        return None;
     }
-    Ok(Some(bytes))
+    let mut fields = lines.next()?.split('\t');
+    let flag = fields.next()?;
+    let refspec = fields.next()?;
+    let summary = fields.next()?;
+    if fields.next().is_some()
+        || refspec != format!("{}:{}", binding.source, binding.target)
+        || lines.next() != Some("Done")
+        || lines.next().is_some()
+    {
+        return None;
+    }
+    match flag {
+        " " if output.status.success()
+            && summary == format!("{}..{}", binding.target_before, binding.source) => {}
+        "=" if output.status.success()
+            && binding.target_before == binding.source
+            && summary == "[up to date]" => {}
+        "!" if !output.status.success() => {
+            // Git distinguishes an explicit local/remote rejection from a remote
+            // failure (including missing report-status), even though all use '!'.
+            let reason = summary
+                .strip_prefix("[rejected] (")
+                .or_else(|| summary.strip_prefix("[remote rejected] ("))?
+                .strip_suffix(')')?;
+            if reason.is_empty() || reason.chars().any(char::is_control) {
+                return None;
+            }
+            return Some(Outcome::NotPublished {
+                reason: "Git rejected the exact publication ref".into(),
+            });
+        }
+        _ => return None,
+    }
+    Some(Outcome::Published {
+        target_after: binding.source.clone(),
+        observed_at_epoch_seconds: repository_access_now_epoch_seconds(),
+    })
 }
 
 impl RuntimeGitMaterializer {
-    fn publication_root(&self, request: &Request) -> PathBuf {
-        self.publication_binding_root(&request.binding)
-    }
-
-    fn publication_binding_root(&self, binding: &RepositoryPublicationBinding) -> PathBuf {
-        self.runtime_root
-            .join(".publications")
-            .join(digest(&[&binding.workspace_id, &binding.operation_id]))
+    pub(super) fn verify_provider_ancestor(
+        &self,
+        working: &WorkingDirectoryRequest,
+        access: Option<&RepositoryCommandAccess>,
+        selector: &str,
+        target: &str,
+        ancestor: &str,
+    ) -> Result<bool, WorkingDirectoryDiagnostic> {
+        if ancestor.len() != target.len()
+            || !ancestor
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(WorkingDirectoryDiagnostic::new(
+                WorkdirManagementReason::RefResponseInvalid,
+                "Repository containment requires a canonical commit ID",
+            ));
+        }
+        let root = self
+            .runtime_root
+            .join(format!(".ref-observation-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&self.runtime_root)
+            .map_err(|_| denied("observation directory unavailable"))?;
+        fs::create_dir(&root).map_err(|_| denied("observation scratch directory unavailable"))?;
+        let scratch = PublicationScratch(root);
+        set_directory_owner_only(&scratch.0)?;
+        let command = |args: &[&str]| {
+            let mut command = publication_git_command(working, access);
+            command.arg("-C").arg(&scratch.0).args(args);
+            run_repository_git_stdout(command, working.repository.source.kind)
+        };
+        command(&[
+            "init",
+            "--bare",
+            "--template=",
+            if target.len() == 64 {
+                "--object-format=sha256"
+            } else {
+                "--object-format=sha1"
+            },
+        ])?;
+        // Fetch only from the configured provider into an isolated object database;
+        // neither a Coder checkout nor replace refs can supply the ancestry proof.
+        command(&[
+            "fetch",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+            "--",
+            &working.repository.source.uri,
+            &format!("{selector}:refs/observation/target"),
+        ])?;
+        let fetched = command(&["rev-parse", "--verify", "refs/observation/target^{commit}"])?;
+        if fetched.trim() != target {
+            return Err(WorkingDirectoryDiagnostic::new(
+                WorkdirManagementReason::RefResponseInvalid,
+                "Repository target changed during containment observation",
+            ));
+        }
+        let mut ancestry = publication_git_command(working, access);
+        ancestry
+            .arg("-C")
+            .arg(&scratch.0)
+            .args(["merge-base", "--is-ancestor", ancestor, target]);
+        let output = run_repository_git_output(ancestry, REPOSITORY_COMMAND_TIMEOUT)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            // An unrelated or absent commit supplies no containment proof. The
+            // caller must not turn this observation into a successful completion.
+            Some(1 | 128) => Ok(false),
+            _ => Err(WorkingDirectoryDiagnostic::new(
+                WorkdirManagementReason::RefProviderUnavailable,
+                "Repository containment check could not be completed",
+            )),
+        }
     }
 
     fn publication_request(
@@ -166,177 +245,30 @@ impl RuntimeGitMaterializer {
         Ok(working)
     }
 
-    pub(super) fn saved_publication(
-        &self,
-        request: &Request,
-    ) -> Result<Option<Receipt>, WorkingDirectoryDiagnostic> {
-        Self::publication_request(request)?;
-        self.read_publication_receipt(&request.binding, Some(&request.repository))
-    }
-
-    pub(super) fn saved_publication_receipt(
-        &self,
-        binding: &RepositoryPublicationBinding,
-    ) -> Result<Option<Receipt>, WorkingDirectoryDiagnostic> {
-        // Lookup must not run even check-ref-format: current Git/provider and
-        // materialization authority are deliberately absent from this boundary.
-        self.read_publication_receipt(binding, None)
-    }
-
-    fn read_publication_receipt(
-        &self,
-        binding: &RepositoryPublicationBinding,
-        expected_repository: Option<&crate::catalog::WorkingDirectoryRepository>,
-    ) -> Result<Option<Receipt>, WorkingDirectoryDiagnostic> {
-        for field in [&binding.workspace_id, &binding.operation_id] {
-            if field.is_empty() || field.len() > 4096 || field.chars().any(char::is_control) {
-                return Err(denied("publication lookup identity is invalid"));
-            }
-        }
-        let root = self.publication_binding_root(binding);
-        // NotFound is absence only after the Runtime-owned storage namespace
-        // has been inspected. Permission/I/O errors, non-directories and broken
-        // symlinks must never turn retained evidence into an absent operation.
-        for directory in [
-            &self.runtime_root,
-            &self.runtime_root.join(".publications"),
-            &root,
-        ] {
-            match fs::symlink_metadata(directory) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && directory != &self.runtime_root =>
-                {
-                    return Ok(None);
-                }
-                _ => return Err(denied("publication evidence namespace is unavailable")),
-            }
-        }
-        let raw = read_publication_record(&root.join("intent.json"))?
-            .ok_or_else(|| denied("publication intent is incomplete; do not redispatch"))?;
-        let intent: Intent = serde_json::from_slice(&raw)
-            .map_err(|_| denied("publication intent is invalid; do not redispatch"))?;
-        if &intent.binding != binding
-            || intent.repository.id != binding.repository_id
-            || intent.repository.source_fingerprint != binding.repository_source_fingerprint
-            || expected_repository.is_some_and(|repository| repository != &intent.repository)
-        {
-            return Err(denied("publication operation fingerprint mismatch"));
-        }
-        match read_publication_record(&root.join("receipt.json"))? {
-            Some(raw) => {
-                let receipt: Receipt = serde_json::from_slice(&raw)
-                    .map_err(|_| denied("publication receipt is invalid"))?;
-                if &receipt.binding != binding
-                    || matches!(&receipt.outcome, Outcome::Published { target_after, .. } if target_after != &binding.source)
-                {
-                    return Err(denied("publication receipt binding mismatch"));
-                }
-                Ok(Some(receipt))
-            }
-            None => Ok(Some(Receipt {
-                binding: binding.clone(),
-                outcome: Outcome::Unknown {},
-            })),
-        }
-    }
-
-    fn finish_publication(
-        &self,
-        request: &Request,
-        outcome: Outcome,
-    ) -> Result<Receipt, WorkingDirectoryDiagnostic> {
-        let receipt = Receipt {
-            binding: request.binding.clone(),
-            outcome,
-        };
-        persist_new(
-            &self.publication_root(request).join("receipt.json"),
-            &receipt,
-        )?;
-        Ok(receipt)
-    }
-
-    pub(super) fn record_unpublished(
-        &self,
-        request: &Request,
-        reason: &str,
-    ) -> Result<Receipt, WorkingDirectoryDiagnostic> {
-        if let Some(saved) = self.saved_publication(request)? {
-            return Ok(saved);
-        }
-        let root = self.publication_root(request);
-        fs::create_dir_all(root.parent().unwrap())
-            .map_err(|_| denied("publication evidence root unavailable"))?;
-        if fs::create_dir(&root).is_err() {
-            return self
-                .saved_publication(request)?
-                .ok_or_else(|| denied("publication already reserved"));
-        }
-        // Persist both directory links before intent can authorize dispatch.
-        fs::File::open(root.parent().unwrap())
-            .and_then(|f| f.sync_all())
-            .and_then(|_| fs::File::open(&self.runtime_root)?.sync_all())
-            .map_err(|_| denied("publication evidence directory durability is unknown"))?;
-        persist_new(
-            &root.join("intent.json"),
-            &Intent {
-                binding: request.binding.clone(),
-                repository: request.repository.clone(),
-            },
-        )?;
-        self.finish_publication(
-            request,
-            Outcome::NotPublished {
-                reason: reason.chars().take(1024).collect(),
-            },
-        )
-    }
-
     pub(super) fn publish_fixed_source(
         &self,
         request: &Request,
-    ) -> Result<Receipt, WorkingDirectoryDiagnostic> {
+    ) -> Result<PublicationResult, WorkingDirectoryDiagnostic> {
         let working = Self::publication_request(request)?;
-        if let Some(saved) = self.saved_publication(request)? {
-            return Ok(saved);
-        }
-        let root = self.publication_root(request);
-        fs::create_dir_all(root.parent().unwrap())
-            .map_err(|_| denied("publication evidence root unavailable"))?;
-        if fs::create_dir(&root).is_err() {
-            return self
-                .saved_publication(request)?
-                .ok_or_else(|| denied("publication already reserved"));
-        }
-        // Persist both directory links before intent can authorize dispatch.
-        fs::File::open(root.parent().unwrap())
-            .and_then(|f| f.sync_all())
-            .and_then(|_| fs::File::open(&self.runtime_root)?.sync_all())
-            .map_err(|_| denied("publication evidence directory durability is unknown"))?;
-        persist_new(
-            &root.join("intent.json"),
-            &Intent {
-                binding: request.binding.clone(),
-                repository: request.repository.clone(),
-            },
-        )?;
-        // Everything before this closure returns is known not to have sent push.
-        let prepared = self.prepare_publication(request, &working, &root);
-        let (mut command, _access, _occupancy) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return self.finish_publication(
-                    request,
-                    Outcome::NotPublished {
-                        reason: error.message,
-                    },
-                );
-            }
-        };
-        // Persist the no-retry boundary before any provider receive-pack dispatch.
-        persist_new(&root.join("dispatch.json"), &request.binding)?;
+        let root = self
+            .runtime_root
+            .join(format!(".publication-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).map_err(|_| denied("publication scratch directory unavailable"))?;
+        let scratch = PublicationScratch(root);
+        set_directory_owner_only(&scratch.0)?;
+        // Everything before preparation returns is known not to have sent push.
+        let (mut command, _access, _occupancy) =
+            match self.prepare_publication(request, &working, &scratch.0) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return Ok(PublicationResult {
+                        binding: request.binding.clone(),
+                        outcome: Outcome::NotPublished {
+                            reason: error.message,
+                        },
+                    });
+                }
+            };
         command.args([
             "push",
             "--porcelain",
@@ -347,45 +279,16 @@ impl RuntimeGitMaterializer {
             &request.repository.source.uri,
             &format!("{}:{}", request.binding.source, request.binding.target),
         ]);
-        let result = run_repository_git_stdout(command, request.repository.source.kind);
-        let expected = format!("{}:{}", request.binding.source, request.binding.target);
-        if result.as_ref().is_ok_and(|output| {
-            output.lines().any(|line| {
-                let mut fields = line.split('\t');
-                let flag = fields.next();
-                let refspec = fields.next();
-                let summary = fields.next();
-                refspec == Some(expected.as_str())
-                    && match flag {
-                        Some(" ") => {
-                            summary
-                                == Some(
-                                    format!(
-                                        "{}..{}",
-                                        request.binding.target_before, request.binding.source
-                                    )
-                                    .as_str(),
-                                )
-                        }
-                        Some("=") => request.binding.target_before == request.binding.source,
-                        _ => false,
-                    }
-            })
-        }) {
-            // The successful receive-pack response itself confirms the exact update.
-            // Do not discard it if the target moves before a subsequent ls-remote.
-            return self.finish_publication(
-                request,
-                Outcome::Published {
-                    target_after: request.binding.source.clone(),
-                    observed_at_epoch_seconds: repository_access_now_epoch_seconds(),
-                },
-            );
-        }
+        let output = run_repository_git_output(command, REPOSITORY_COMMAND_TIMEOUT);
         // A nonzero exit/timeout after spawn is not evidence of no external effect.
-        Ok(Receipt {
+        let outcome = output
+            .as_ref()
+            .ok()
+            .and_then(|output| publication_outcome(&request.binding, output))
+            .unwrap_or(Outcome::Unknown {});
+        Ok(PublicationResult {
             binding: request.binding.clone(),
-            outcome: Outcome::Unknown {},
+            outcome,
         })
     }
 
@@ -522,7 +425,7 @@ impl RuntimeGitMaterializer {
         ]);
         run_repository_git_stdout(ancestor, working.repository.source.kind)
             .map_err(|_| denied("publication is not a fast-forward from expected target"))?;
-        let latest = self.observe_publication_target(request, working)?;
+        let latest = self.observe_publication_target(request, working, &staging)?;
         if latest != request.binding.target_before {
             return Err(denied("publication target changed from expected before"));
         }
@@ -541,7 +444,7 @@ impl RuntimeGitMaterializer {
             .map(|ssh| {
                 RepositoryCommandAccess::prepare_fixed_ssh(
                     &self.runtime_root,
-                    &request.binding.operation_id,
+                    &format!("publication-send-{}", uuid::Uuid::now_v7()),
                     &request.binding.repository_id,
                     ssh,
                     true,
@@ -564,14 +467,9 @@ impl RuntimeGitMaterializer {
         &self,
         request: &Request,
         working: &WorkingDirectoryRequest,
+        staging: &Path,
     ) -> Result<String, WorkingDirectoryDiagnostic> {
         Self::validate_request(working)?;
-        let staging = self.publication_root(request).join("objects.git");
-        if !staging.is_dir() {
-            return Err(denied("publication object snapshot is unavailable"));
-        }
-        // Reconciliation can run while send is in flight. Its temporary SSH
-        // resources must not replace/remove the sender's agent or wrapper.
         let access = working
             .materialization
             .as_ref()
@@ -610,29 +508,12 @@ impl RuntimeGitMaterializer {
         }
         Ok(oid.to_ascii_lowercase())
     }
-
-    pub(super) fn reconcile_fixed_source(
-        &self,
-        request: &Request,
-    ) -> Result<Receipt, WorkingDirectoryDiagnostic> {
-        let saved = self
-            .saved_publication(request)?
-            .ok_or_else(|| denied("publication operation was not found"))?;
-        if !matches!(saved.outcome, Outcome::Unknown {}) {
-            return Ok(saved);
-        }
-        // Observation is useful diagnostic evidence, never proof that this
-        // operation (rather than another publisher) performed the update.
-        let working = Self::publication_request(request)?;
-        let _observation = self.observe_publication_target(request, &working);
-        Ok(saved)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Real Git/bare-provider and Runtime-owned receipt storage; only crash windows
-    //! are injected by retaining the same intent without a receive-pack receipt.
+    //! Real Git/bare-provider and isolated snapshots. Provider hooks inject rejected
+    //! or missing acknowledgements; no live credentials or external service is used.
     use super::super::tests::{create_clean_repo, git, request};
     use super::*;
     use crate::catalog::RepositoryMaterializationContext;
@@ -719,44 +600,43 @@ mod tests {
                 request,
             }
         }
+        fn assert_no_publication_files(&self) {
+            assert!(!self.runtime.path().join(".publications").exists());
+            assert!(fs::read_dir(self.runtime.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".publication-")
+            }));
+        }
         fn assert_not_published(&self) {
-            let receipt = self
+            let result = self
                 .materializer
                 .publish_fixed_source(&self.request)
                 .unwrap();
             assert!(
-                matches!(receipt.outcome, Outcome::NotPublished { .. }),
-                "{receipt:?}"
+                matches!(result.outcome, Outcome::NotPublished { .. }),
+                "{result:?}"
             );
             assert_eq!(oid(self.remote.path()), self.request.binding.target_before);
-            assert!(
-                !self
-                    .materializer
-                    .publication_root(&self.request)
-                    .join("dispatch.json")
-                    .exists()
-            );
-            assert_eq!(
-                self.materializer
-                    .reconcile_fixed_source(&self.request)
-                    .unwrap(),
-                receipt
-            );
+            self.assert_no_publication_files();
         }
     }
 
     #[test]
-    fn fixed_source_ff_receipt_survives_target_movement_restart_and_replay() {
+    fn fixed_source_ff_result_is_ephemeral_and_reexecution_checks_current_source() {
         let fixture = Fixture::new();
-        let receipt = fixture
+        let result = fixture
             .materializer
             .publish_fixed_source(&fixture.request)
             .unwrap();
         assert!(
-            matches!(receipt.outcome, Outcome::Published { .. }),
-            "{receipt:?}"
+            matches!(result.outcome, Outcome::Published { .. }),
+            "{result:?}"
         );
         assert_eq!(oid(fixture.remote.path()), fixture.request.binding.source);
+        fixture.assert_no_publication_files();
         commit(&fixture.checkout, "later");
         git(
             &fixture.checkout,
@@ -768,15 +648,13 @@ mod tests {
         );
         let later = oid(fixture.remote.path());
         let restarted = RuntimeGitMaterializer::new(fixture.runtime.path());
-        assert_eq!(
-            restarted.publish_fixed_source(&fixture.request).unwrap(),
-            receipt
-        );
-        assert_eq!(
-            restarted.reconcile_fixed_source(&fixture.request).unwrap(),
-            receipt
+        let result = restarted.publish_fixed_source(&fixture.request).unwrap();
+        assert!(
+            matches!(result.outcome, Outcome::NotPublished { .. }),
+            "{result:?}"
         );
         assert_eq!(oid(fixture.remote.path()), later);
+        fixture.assert_no_publication_files();
     }
 
     #[test]
@@ -834,82 +712,96 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_dispatch_replay_and_recovery_never_push_or_infer_success() {
+    fn old_publication_files_neither_authorize_nor_block_new_execution() {
         let fixture = Fixture::new();
-        let root = fixture.materializer.publication_root(&fixture.request);
+        // Populate the former operation-keyed layout, including a forged success.
+        let mut hash = Sha256::new();
+        for part in [
+            &fixture.request.binding.workspace_id,
+            &fixture.request.binding.operation_id,
+        ] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+        let key = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let root = fixture.runtime.path().join(".publications").join(key);
         fs::create_dir_all(&root).unwrap();
-        persist_new(
-            &root.join("intent.json"),
-            &Intent {
-                binding: fixture.request.binding.clone(),
-                repository: fixture.request.repository.clone(),
-            },
+        fs::write(
+            root.join("intent.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "binding": fixture.request.binding, "repository": fixture.request.repository,
+            }))
+            .unwrap(),
         )
         .unwrap();
-        persist_new(&root.join("dispatch.json"), &fixture.request.binding).unwrap();
+        fs::write(
+            root.join("dispatch.json"),
+            serde_json::to_vec(&fixture.request.binding).unwrap(),
+        )
+        .unwrap();
+        let old = serde_json::to_vec(&PublicationResult {
+            binding: fixture.request.binding.clone(),
+            outcome: Outcome::Published {
+                target_after: fixture.request.binding.source.clone(),
+                observed_at_epoch_seconds: 1,
+            },
+        })
+        .unwrap();
+        fs::write(root.join("receipt.json"), &old).unwrap();
         let restarted = RuntimeGitMaterializer::new(fixture.runtime.path());
-        assert!(matches!(
-            restarted
-                .publish_fixed_source(&fixture.request)
-                .unwrap()
-                .outcome,
-            Outcome::Unknown {}
-        ));
+        fs::write(fixture.checkout.join("untracked"), "dirty").unwrap();
+        let rejected = restarted.publish_fixed_source(&fixture.request).unwrap();
+        assert!(matches!(rejected.outcome, Outcome::NotPublished { .. }));
         assert_eq!(
             oid(fixture.remote.path()),
             fixture.request.binding.target_before
         );
-        git(
-            &fixture.checkout,
-            &[
-                "push",
-                fixture.remote.path().to_str().unwrap(),
-                "HEAD:refs/heads/main",
-            ],
+        fs::remove_file(fixture.checkout.join("untracked")).unwrap();
+        // Even corrupt old files have no authority or reservation semantics.
+        fs::write(root.join("intent.json"), b"{").unwrap();
+        let result = restarted.publish_fixed_source(&fixture.request).unwrap();
+        assert!(
+            matches!(result.outcome, Outcome::Published { .. }),
+            "{result:?}"
         );
-        assert!(matches!(
-            restarted
-                .reconcile_fixed_source(&fixture.request)
-                .unwrap()
-                .outcome,
-            Outcome::Unknown {}
-        ));
-        assert!(!root.join("receipt.json").exists());
+        assert_eq!(oid(fixture.remote.path()), fixture.request.binding.source);
+        assert_eq!(fs::read(root.join("receipt.json")).unwrap(), old);
+        assert_eq!(fs::read(root.join("intent.json")).unwrap(), b"{");
     }
 
     #[test]
-    fn binding_and_repository_and_workspace_mismatches_fail_closed() {
+    fn binding_repository_and_workspace_mismatches_fail_closed() {
         let fixture = Fixture::new();
-        let receipt = fixture
-            .materializer
-            .publish_fixed_source(&fixture.request)
-            .unwrap();
-        let mut changed = fixture.request.clone();
-        changed.binding.connection_id = "replacement".into();
-        assert!(fixture.materializer.publish_fixed_source(&changed).is_err());
-        changed = fixture.request.clone();
-        changed.repository.source.uri = "/wrong/repository".into();
-        assert!(
-            fixture
-                .materializer
-                .reconcile_fixed_source(&changed)
-                .is_err()
-        );
-        changed = fixture.request.clone();
-        changed.materialization.workspace_id = "other".into();
-        assert!(
-            fixture
-                .materializer
-                .reconcile_fixed_source(&changed)
-                .is_err()
-        );
-        assert_eq!(
-            fixture
-                .materializer
-                .reconcile_fixed_source(&fixture.request)
-                .unwrap(),
-            receipt
-        );
+        for case in [
+            "repository",
+            "fingerprint",
+            "workspace",
+            "runtime",
+            "operation",
+        ] {
+            let mut changed = fixture.request.clone();
+            match case {
+                "repository" => changed.repository.id = "wrong".into(),
+                "fingerprint" => changed.repository.source_fingerprint = "wrong".into(),
+                "workspace" => changed.materialization.workspace_id = "wrong".into(),
+                "runtime" => changed.materialization.runtime_id = "wrong".into(),
+                "operation" => changed.materialization.operation_id = "wrong".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                fixture.materializer.publish_fixed_source(&changed).is_err(),
+                "{case}"
+            );
+            assert_eq!(
+                oid(fixture.remote.path()),
+                fixture.request.binding.target_before
+            );
+        }
+        fixture.assert_no_publication_files();
     }
 
     #[test]
@@ -927,198 +819,298 @@ mod tests {
             &fixture.checkout,
             &["config", "core.hooksPath", "/does-not-exist"],
         );
-        let receipt = fixture
+        let result = fixture
             .materializer
             .publish_fixed_source(&fixture.request)
             .unwrap();
         assert!(
-            matches!(receipt.outcome, Outcome::Published { .. }),
-            "{receipt:?}"
+            matches!(result.outcome, Outcome::Published { .. }),
+            "{result:?}"
         );
         assert_eq!(oid(fixture.remote.path()), fixture.request.binding.source);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn provider_reject_after_dispatch_remains_unknown() {
+    fn provider_reject_returns_not_published_without_persistent_reservation() {
+        use std::os::unix::fs::PermissionsExt;
         let fixture = Fixture::new();
-        // A real receive-pack rejection is intentionally not treated as proof
-        // of no effect; the same classification covers a lost acknowledgement.
-        git(
-            fixture.remote.path(),
-            &["config", "receive.denyCurrentBranch", "refuse"],
-        );
-        git(fixture.remote.path(), &["config", "core.bare", "false"]);
-        let receipt = fixture
+        let hook = fixture.remote.path().join("hooks/pre-receive");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let result = fixture
             .materializer
             .publish_fixed_source(&fixture.request)
             .unwrap();
         assert!(
-            matches!(receipt.outcome, Outcome::Unknown {}),
-            "{receipt:?}"
+            matches!(result.outcome, Outcome::NotPublished { .. }),
+            "{result:?}"
         );
+        assert_eq!(
+            oid(fixture.remote.path()),
+            fixture.request.binding.target_before
+        );
+        fixture.assert_no_publication_files();
+        fs::remove_file(hook).unwrap();
+        // An explicit caller decision executes fresh checks; no saved rejection is replayed.
+        let result = fixture
+            .materializer
+            .publish_fixed_source(&fixture.request)
+            .unwrap();
         assert!(
-            fixture
-                .materializer
-                .publication_root(&fixture.request)
-                .join("dispatch.json")
-                .exists()
+            matches!(result.outcome, Outcome::Published { .. }),
+            "{result:?}"
         );
-        git(fixture.remote.path(), &["config", "core.bare", "true"]);
+        assert_eq!(oid(fixture.remote.path()), fixture.request.binding.source);
+        fixture.assert_no_publication_files();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn porcelain_requires_complete_exact_ref_evidence_not_exit_status() {
+        use std::os::unix::process::ExitStatusExt;
+        let fixture = Fixture::new();
+        let b = &fixture.request.binding;
+        let response = |line: &str| format!("To provider\n{line}\nDone\n");
+        let rejected = format!(
+            "!\t{}:{}\t[remote rejected] (pre-receive hook declined)",
+            b.source, b.target
+        );
+        let local_rejected = format!("!\t{}:{}\t[rejected] (fetch first)", b.source, b.target);
+        let success = format!(
+            " \t{}:{}\t{}..{}",
+            b.source, b.target, b.target_before, b.source
+        );
+        let output = |code, text: String| RepositoryGitOutput {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: BoundedCommandOutput {
+                bytes: text.into_bytes(),
+                complete: true,
+            },
+            stderr: BoundedCommandOutput::default(),
+        };
+        for line in [&rejected, &local_rejected] {
+            assert!(matches!(
+                publication_outcome(b, &output(1, response(line))),
+                Some(Outcome::NotPublished { .. })
+            ));
+        }
         assert!(matches!(
-            fixture
-                .materializer
-                .publish_fixed_source(&fixture.request)
-                .unwrap()
-                .outcome,
-            Outcome::Unknown {}
+            publication_outcome(b, &output(0, response(&success))),
+            Some(Outcome::Published { .. })
         ));
-        assert_eq!(
-            oid(fixture.remote.path()),
-            fixture.request.binding.target_before
-        );
-    }
-    #[test]
-    fn pre_dispatch_resource_rejection_is_durable_and_cannot_be_retried_as_push() {
-        let fixture = Fixture::new();
-        let receipt = fixture
-            .materializer
-            .record_unpublished(&fixture.request, "Workdir conflict")
-            .unwrap();
-        assert!(matches!(receipt.outcome, Outcome::NotPublished { .. }));
-        let restarted = RuntimeGitMaterializer::new(fixture.runtime.path());
-        assert_eq!(
-            restarted.publish_fixed_source(&fixture.request).unwrap(),
-            receipt
-        );
-        assert_eq!(
-            oid(fixture.remote.path()),
-            fixture.request.binding.target_before
-        );
-    }
-    #[test]
-    fn binding_only_receipt_lookup_needs_no_provider_checkout_or_credentials() {
-        let fixture = Fixture::new();
-        let receipt = fixture
-            .materializer
-            .publish_fixed_source(&fixture.request)
-            .unwrap();
-        let binding = fixture.request.binding.clone();
-        drop(fixture.request);
-        fixture.remote.close().unwrap();
-        fs::remove_dir_all(&fixture.checkout).unwrap();
-        let restarted = RuntimeGitMaterializer::new(fixture.runtime.path());
-        let calls = test_repository_git_invocation_count();
-        assert_eq!(
-            restarted.saved_publication_receipt(&binding).unwrap(),
-            Some(receipt)
-        );
-        assert_eq!(
-            test_repository_git_invocation_count(),
-            calls,
-            "lookup must not invoke Git or contact the provider"
-        );
+        for (code, text) in [
+            (1, String::new()),
+            (0, String::new()),
+            (0, response(&rejected)),
+            (1, response(&success)),
+            (
+                1,
+                response(&rejected.replace(&b.target, "refs/heads/other")),
+            ),
+            (1, response(&rejected.replace(&b.source, &"0".repeat(40)))),
+            (
+                1,
+                response(&rejected.replace("[remote rejected]", "[remote failure]")),
+            ),
+            (
+                1,
+                response(&rejected.replace("[remote rejected]", "[unknown]")),
+            ),
+            (1, response(&rejected).replace("Done\n", "")),
+            (1, response(&rejected).trim_end().to_string()),
+            (1, response(&format!("{rejected}\n{rejected}"))),
+            (1, response(&format!("{rejected}\n{success}"))),
+            (1, response(&format!("{rejected}\textra"))),
+            (
+                0,
+                response(&success.replace(
+                    &format!("{}..{}", b.target_before, b.source),
+                    "1234567..abcdef0",
+                )),
+            ),
+            (
+                0,
+                response(&success.replace(&b.target_before, &"0".repeat(40))),
+            ),
+            (
+                0,
+                response(&format!("=\t{}:{}\t[up to date]", b.source, b.target)),
+            ),
+        ] {
+            assert!(
+                publication_outcome(b, &output(code, text.clone())).is_none(),
+                "code={code} text={text:?}"
+            );
+        }
+        let mut incomplete = output(1, response(&rejected));
+        incomplete.stdout.complete = false;
+        assert!(publication_outcome(b, &incomplete).is_none());
+        incomplete.stdout.complete = true;
+        incomplete.status = std::process::ExitStatus::from_raw(9);
+        assert!(publication_outcome(b, &incomplete).is_none());
+        incomplete.status = std::process::ExitStatus::from_raw(256);
+        incomplete.stdout.bytes.push(0xff);
+        assert!(publication_outcome(b, &incomplete).is_none());
+        let mut unchanged = b.clone();
+        unchanged.target_before = unchanged.source.clone();
+        assert!(matches!(
+            publication_outcome(
+                &unchanged,
+                &output(
+                    0,
+                    response(&format!("=\t{}:{}\t[up to date]", b.source, b.target))
+                )
+            ),
+            Some(Outcome::Published { .. })
+        ));
     }
 
     #[test]
-    fn binding_only_receipt_lookup_distinguishes_absence_unknown_and_corruption() {
-        let fixture = Fixture::new();
-        let b = &fixture.request.binding;
-        let root = fixture.materializer.publication_binding_root(b);
-        let calls = test_repository_git_invocation_count();
-        assert_eq!(
-            fixture.materializer.saved_publication_receipt(b).unwrap(),
-            None
-        );
-        fs::create_dir_all(&root).unwrap();
-        assert!(
-            fixture.materializer.saved_publication_receipt(b).is_err(),
-            "an incomplete reservation is not absence"
-        );
-        fs::write(root.join("intent.json"), b"{").unwrap();
-        assert!(fixture.materializer.saved_publication_receipt(b).is_err());
-        fs::write(
-            root.join("intent.json"),
-            serde_json::to_vec(&Intent {
-                binding: b.clone(),
-                repository: fixture.request.repository.clone(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(
-            fixture
-                .materializer
-                .saved_publication_receipt(b)
-                .unwrap()
-                .unwrap()
-                .outcome,
-            Outcome::Unknown {}
-        ));
-        let mut wrong = b.clone();
-        wrong.target = "refs/heads/other".into();
-        assert!(
-            fixture
-                .materializer
-                .saved_publication_receipt(&wrong)
-                .is_err()
-        );
-        wrong = b.clone();
-        wrong.worker.worker_id = WorkerId::now_v7().to_string();
-        assert!(
-            fixture
-                .materializer
-                .saved_publication_receipt(&wrong)
-                .is_err()
-        );
-        wrong = b.clone();
-        wrong.repository_source_fingerprint = "changed-source".into();
-        assert!(
-            fixture
-                .materializer
-                .saved_publication_receipt(&wrong)
-                .is_err()
-        );
-        fs::write(root.join("receipt.json"), b"{}").unwrap();
-        assert!(fixture.materializer.saved_publication_receipt(b).is_err());
-        fs::write(
-            root.join("receipt.json"),
-            serde_json::to_vec(&Receipt {
-                binding: b.clone(),
-                outcome: Outcome::Published {
-                    target_after: "0".repeat(40),
-                    observed_at_epoch_seconds: 1,
-                },
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(fixture.materializer.saved_publication_receipt(b).is_err());
-        assert_eq!(test_repository_git_invocation_count(), calls);
+    fn real_git_success_requires_full_oid_summary_not_abbreviations() {
+        for abbrev in [7, 40] {
+            let fixture = Fixture::new();
+            let b = &fixture.request.binding;
+            let mut command = isolated_git_command();
+            command.current_dir(&fixture.checkout).args([
+                "-c",
+                &format!("core.abbrev={abbrev}"),
+                "push",
+                "--porcelain",
+                "--",
+                fixture.remote.path().to_str().unwrap(),
+                &format!("{}:{}", b.source, b.target),
+            ]);
+            let output = run_repository_git_output(command, REPOSITORY_COMMAND_TIMEOUT).unwrap();
+            assert!(output.status.success());
+            assert!(output.stdout.complete);
+            assert_eq!(oid(fixture.remote.path()), b.source);
+            let outcome = publication_outcome(b, &output);
+            assert_eq!(
+                matches!(outcome, Some(Outcome::Published { .. })),
+                abbrev == 40,
+                "{}",
+                String::from_utf8_lossy(&output.stdout.bytes)
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn binding_only_receipt_lookup_rejects_unavailable_or_symlinked_namespace() {
-        let fixture = Fixture::new();
-        let binding = &fixture.request.binding;
-        let namespace = fixture.runtime.path().join(".publications");
-        fs::write(&namespace, "not a directory").unwrap();
-        assert!(
-            fixture
+    fn provider_missing_ack_returns_unknown_without_retry_or_persistent_occupancy() {
+        use std::os::unix::fs::PermissionsExt;
+        // The same missing acknowledgement can occur before or after an actual update.
+        for hook_name in ["pre-receive", "post-receive"] {
+            let fixture = Fixture::new();
+            let hook = fixture.remote.path().join("hooks").join(hook_name);
+            fs::write(&hook, "#!/bin/sh\nkill -KILL \"$PPID\"\nexit 1\n").unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+            let result = fixture
                 .materializer
-                .saved_publication_receipt(binding)
-                .is_err()
+                .publish_fixed_source(&fixture.request)
+                .unwrap();
+            assert!(
+                matches!(result.outcome, Outcome::Unknown {}),
+                "{hook_name}: {result:?}"
+            );
+            let expected = if hook_name == "pre-receive" {
+                &fixture.request.binding.target_before
+            } else {
+                &fixture.request.binding.source
+            };
+            assert_eq!(&oid(fixture.remote.path()), expected);
+            fixture.assert_no_publication_files();
+            fs::remove_file(hook).unwrap();
+            // A fresh, explicitly requested execution still has to match current target.
+            let restarted = RuntimeGitMaterializer::new(fixture.runtime.path());
+            let next = restarted.publish_fixed_source(&fixture.request).unwrap();
+            assert_eq!(
+                matches!(next.outcome, Outcome::Published { .. }),
+                hook_name == "pre-receive",
+                "{next:?}"
+            );
+            if hook_name == "post-receive" {
+                assert!(matches!(next.outcome, Outcome::NotPublished { .. }));
+            }
+            assert_eq!(oid(fixture.remote.path()), fixture.request.binding.source);
+            fixture.assert_no_publication_files();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_output_preserves_nonzero_stdout_and_existing_caller_errors() {
+        let command = |script: &str| {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        let output = run_repository_git_output(
+            command("printf response; printf diagnostic >&2; exit 1"),
+            REPOSITORY_COMMAND_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.stdout.bytes, b"response");
+        assert!(output.stdout.complete);
+        assert_eq!(output.stderr.bytes, b"diagnostic");
+        assert!(output.stderr.complete);
+        let kind = server_api::RepositorySourceKind::LocalPath;
+        assert!(run_repository_git_stdout(command("printf response; exit 1"), kind).is_err());
+        assert_eq!(
+            run_repository_git_stdout(command("printf response"), kind).unwrap(),
+            "response"
         );
-        fs::remove_file(&namespace).unwrap();
-        fs::create_dir(&namespace).unwrap();
-        let operation = fixture.materializer.publication_binding_root(binding);
-        std::os::unix::fs::symlink(namespace.join("missing"), &operation).unwrap();
-        assert!(
-            fixture
-                .materializer
-                .saved_publication_receipt(binding)
-                .is_err(),
-            "broken symlinks are not absent operations"
+        assert_eq!(
+            run_repository_git_stdout(command("exit 2"), kind)
+                .unwrap_err()
+                .code,
+            WorkdirManagementReason::RefNotFound.as_str()
         );
+        for (kind, expected) in [
+            (
+                server_api::RepositorySourceKind::Https,
+                WorkdirManagementReason::RefProviderAuthFailed,
+            ),
+            (
+                server_api::RepositorySourceKind::LocalPath,
+                WorkdirManagementReason::RefProviderUnavailable,
+            ),
+        ] {
+            let error =
+                run_repository_git_stdout(command("printf 'permission denied' >&2; exit 1"), kind)
+                    .unwrap_err();
+            assert_eq!(error.code, expected.as_str());
+            assert!(!error.message.contains("permission denied"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_cannot_supply_completed_porcelain_evidence() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'To provider\\n!\\tref\\t[remote rejected] (reason)\\nDone\\n'; while :; do :; done"]);
+        let error = run_repository_git_output(command, Duration::from_millis(50))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.code,
+            WorkdirManagementReason::RefProviderTimeout.as_str()
+        );
+    }
+
+    #[test]
+    fn bounded_capture_distinguishes_eof_truncation_and_read_failure() {
+        for size in [8191, 8192, 8193, 16384] {
+            let output = capture_bounded_command_output(std::io::Cursor::new(vec![b'x'; size]));
+            assert_eq!(output.bytes.len(), size.min(8192));
+            assert_eq!(output.complete, size <= 8192);
+        }
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        assert!(!capture_bounded_command_output(Broken).complete);
     }
 }

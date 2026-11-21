@@ -73,13 +73,14 @@ fn workflow_instruction() -> FeatureInstructionDeclaration {
     .expect("static Merge Request workflow instruction declaration is valid")
 }
 
-const ALL_KINDS: [Kind; 6] = [
+const ALL_KINDS: [Kind; 7] = [
     Kind::Query,
     Kind::Show,
     Kind::Open,
     Kind::Review,
     Kind::WorkerSet,
     Kind::Comment,
+    Kind::Complete,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +91,7 @@ enum Kind {
     Review,
     WorkerSet,
     Comment,
+    Complete,
 }
 #[derive(Clone)]
 struct MergeRequestTool {
@@ -102,6 +104,12 @@ struct SetMergeRequestWorkerInput {
     merge_request_id: String,
     #[serde(flatten)]
     request: server_api::SetMergeRequestWorkerRequest,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CompleteMergeRequestInput {
+    merge_request_id: String,
+    #[serde(flatten)]
+    request: server_api::CompleteMergeRequestRequest,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CommentMergeRequestInput {
@@ -172,6 +180,7 @@ impl Kind {
             Self::Review => config.review,
             Self::WorkerSet => config.worker_set,
             Self::Comment => config.comment,
+            Self::Complete => config.complete,
         }
     }
 
@@ -183,6 +192,7 @@ impl Kind {
             Self::Review => "ReviewMergeRequest",
             Self::WorkerSet => "SetMergeRequestWorker",
             Self::Comment => "CommentMergeRequest",
+            Self::Complete => "CompleteMergeRequest",
         }
     }
     fn schema(self) -> serde_json::Value {
@@ -191,6 +201,7 @@ impl Kind {
             Self::Show => json!(schemars::schema_for!(ShowMergeRequestInput)),
             Self::WorkerSet => json!(schemars::schema_for!(SetMergeRequestWorkerInput)),
             Self::Comment => json!(schemars::schema_for!(CommentMergeRequestInput)),
+            Self::Complete => json!(schemars::schema_for!(CompleteMergeRequestInput)),
             Self::Open => json!(schemars::schema_for!(OpenMergeRequestInput)),
             Self::Review => json!(schemars::schema_for!(ReviewMergeRequestInput)),
         }
@@ -199,7 +210,7 @@ impl Kind {
     fn mutating(self) -> bool {
         matches!(
             self,
-            Self::Open | Self::Review | Self::WorkerSet | Self::Comment
+            Self::Open | Self::Review | Self::WorkerSet | Self::Comment | Self::Complete
         )
     }
 }
@@ -366,10 +377,12 @@ struct NativeMergeRequestOperation {
 
 fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
     match kind {
-        Kind::Show | Kind::WorkerSet | Kind::Comment => NativeMergeRequestOperation {
-            surface: NativeMergeRequestSurface::Item,
-            identity_field: Some("merge_request_id"),
-        },
+        Kind::Show | Kind::WorkerSet | Kind::Comment | Kind::Complete => {
+            NativeMergeRequestOperation {
+                surface: NativeMergeRequestSurface::Item,
+                identity_field: Some("merge_request_id"),
+            }
+        }
         Kind::Query | Kind::Open => NativeMergeRequestOperation {
             surface: NativeMergeRequestSurface::Collection,
             identity_field: None,
@@ -866,10 +879,13 @@ pub fn description(n: &str) -> Option<&'static str> {
             "Query a bounded MR collection page by repository_key, selector_to (branch shorthand or refs/heads/...), exact phase, legacy state, linked ticket_ref and source selector. phase=integration includes stale reviews, conflicts and waiting MRs, not only currently approved candidates. assigned_to_self=true matches the authenticated current MR Worker, not the Ticket assigned Subject or historical owners. Omitted/false means no assignment filter. Continue with next_cursor and unchanged filters; null next_cursor ends the listing. Query permission does not grant individual MR reads. Use ShowMergeRequest on selected results before acting. Does not assign, publish, approve, or establish execution order.",
         ),
         "ShowMergeRequest" => Some(
-            "Read an authoritative compact MR summary by default: source/target observations, full-evidence review status/readiness and stable event references, worker_assignment (operation_id and worker), and saved publications, without review bodies/history. Both summary and detail include worker_assignment and publications. worker_assignment=null means never assigned; worker=null in a retained assignment is a release that retains its operation_id. Ownership is not resource authority, Worker liveness, or Ticket assignment. Resume implementation or integration from the saved MR phase, current worker, source, review and publication reasons rather than a prior Session or Flow state. Publication outcomes are evidence only; this read never sends or retries publication. Pending/unknown outcomes are not failure; yield without polling and reconcile before source mutation or a new push. Use view=detail with bounded after/limit for exact reviews/findings and history; continue with event_page.next_after. Status is never inferred from a history page. Summary is not approval or integration authority.",
+            "Read an authoritative compact MR summary by default: source/target observations, full-evidence review status/readiness and stable event references, worker_assignment (operation_id and worker), and saved completion evidence, without review bodies/history. Both summary and detail include worker_assignment. Publication failure reasons are thread comments: after a failure notification use view=detail and bounded paging to read them; review readiness alone does not establish publication success. worker_assignment=null means never assigned; worker=null in a retained assignment is a release that retains its operation_id. Ownership is not resource authority, Worker liveness, or Ticket assignment. Resume implementation or integration from the saved MR phase, current worker, source, review and publication reasons rather than a prior Session or Flow state. Publication outcomes are evidence only; this read never sends or retries publication. Pending/unknown outcomes are not failure; yield without polling and reconcile before source mutation or a new push. Use view=detail with bounded after/limit for exact reviews/findings and history; continue with event_page.next_after. Status is never inferred from a history page. Summary is not approval or integration authority.",
         ),
         "SetMergeRequestWorker" => Some(
             "Set, replace, or release this MR's Worker after reading ShowMergeRequest view=summary and its worker_assignment. Use worker_assignment.operation_id as expected_operation_id; worker_assignment=null means never assigned, while worker=null in a retained assignment is a release with a retained operation_id. Supply a stable operation_id, required expected_operation_id (explicit null only when never assigned), and required worker {runtime_id,worker_id} or explicit null to release. Exact retries retain the same key and full input. On conflict reread and reconcile; unknown outcomes require reconciliation, never a new key or automatic retry. Does not reassign the Ticket, grant authority, start/stop Workers, change MR phase or approval, or publish code.",
+        ),
+        "CompleteMergeRequest" => Some(
+            "Record manual publication after ordinary Git recovery directed by the Subject. This Tool never pushes and is not another approval. Reread the MR; pass its current owner operation, exact approved source and approval event with a stable operation_id. Backend checks current authority, approval, requirements and provider target. Unproven target ancestry is rejected. On unknown outcome retain the exact request/key; do not push or create another operation automatically.",
         ),
         "CommentMergeRequest" => Some(
             "Append a Markdown comment to the MR thread as its current Worker. Use the observed Worker assignment operation_id as expected_owner_operation_id and a stable comment operation_id. Replays must retain the same full input; stale-owner writes fail. Record conflicts, questions and resolutions here without manufacturing approval or publication evidence. No state change, Git operation or Ticket conclusion.",

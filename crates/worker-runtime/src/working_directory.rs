@@ -305,45 +305,14 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
         request: &RepositoryRefObservationRequest,
     ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic>;
 
-    fn reject_repository_publication(
-        &self,
-        _request: &crate::catalog::RepositoryPublicationRequest,
-        _reason: &str,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
-        Err(WorkingDirectoryDiagnostic::rejected(
-            "repository_publication_unsupported",
-            "Publication rejection receipts are unavailable",
-        ))
-    }
-
-    fn repository_publication_receipt(
-        &self,
-        _binding: &crate::catalog::RepositoryPublicationBinding,
-    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
-    {
-        Err(WorkingDirectoryDiagnostic::rejected(
-            "repository_publication_unsupported",
-            "Publication receipts are unavailable",
-        ))
-    }
-
+    /// Errors are pre-dispatch failures; uncertain external effects must return Unknown.
     fn publish_repository_source(
         &self,
         _request: &crate::catalog::RepositoryPublicationRequest,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+    ) -> Result<crate::catalog::RepositoryPublicationResult, WorkingDirectoryDiagnostic> {
         Err(WorkingDirectoryDiagnostic::rejected(
             "repository_publication_unsupported",
             "Repository publication is unavailable",
-        ))
-    }
-
-    fn reconcile_repository_publication(
-        &self,
-        _request: &crate::catalog::RepositoryPublicationRequest,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
-        Err(WorkingDirectoryDiagnostic::rejected(
-            "repository_publication_unsupported",
-            "Publication recovery is unavailable",
         ))
     }
 
@@ -1227,34 +1196,12 @@ impl RuntimeGitMaterializer {
 }
 
 impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
-    fn reject_repository_publication(
-        &self,
-        request: &crate::catalog::RepositoryPublicationRequest,
-        reason: &str,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
-        self.record_unpublished(request, reason)
-    }
-
-    fn repository_publication_receipt(
-        &self,
-        binding: &crate::catalog::RepositoryPublicationBinding,
-    ) -> Result<Option<crate::catalog::RepositoryPublicationReceipt>, WorkingDirectoryDiagnostic>
-    {
-        self.saved_publication_receipt(binding)
-    }
     fn publish_repository_source(
         &self,
         request: &crate::catalog::RepositoryPublicationRequest,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
+    ) -> Result<crate::catalog::RepositoryPublicationResult, WorkingDirectoryDiagnostic> {
         self.publish_fixed_source(request)
     }
-    fn reconcile_repository_publication(
-        &self,
-        request: &crate::catalog::RepositoryPublicationRequest,
-    ) -> Result<crate::catalog::RepositoryPublicationReceipt, WorkingDirectoryDiagnostic> {
-        self.reconcile_fixed_source(request)
-    }
-
     fn materialize(
         &self,
         worker_ref: &WorkerRef,
@@ -1388,11 +1335,26 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
             ));
         }
 
+        let contained_commit = match &request.required_ancestor {
+            Some(ancestor)
+                if self.verify_provider_ancestor(
+                    &working_request,
+                    access.as_ref(),
+                    selector,
+                    resolved_ref,
+                    ancestor,
+                )? =>
+            {
+                Some(ancestor.clone())
+            }
+            _ => None,
+        };
         Ok(RepositoryRefObservation {
             repository_id: request.repository.id.clone(),
             source_fingerprint: request.repository.source_fingerprint.clone(),
             selector: selector.to_string(),
             resolved_ref: resolved_ref.to_ascii_lowercase(),
+            contained_commit,
             observed_at_epoch_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -2667,20 +2629,47 @@ fn validate_exact_branch_selector(selector: &str) -> Result<(), WorkingDirectory
     Ok(())
 }
 
-fn read_bounded_command_output(mut reader: impl Read) -> Vec<u8> {
+#[derive(Default)]
+struct BoundedCommandOutput {
+    bytes: Vec<u8>,
+    complete: bool,
+}
+
+fn capture_bounded_command_output(mut reader: impl Read) -> BoundedCommandOutput {
     const MAX_CAPTURE_BYTES: usize = 8192;
-    let mut captured = Vec::new();
+    let mut captured = BoundedCommandOutput {
+        bytes: Vec::new(),
+        complete: true,
+    };
     let mut chunk = [0_u8; 4096];
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                captured.complete = false;
+                break;
+            }
             Ok(read) => {
-                let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
-                captured.extend_from_slice(&chunk[..read.min(remaining)]);
+                let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.bytes.len());
+                captured
+                    .bytes
+                    .extend_from_slice(&chunk[..read.min(remaining)]);
+                captured.complete &= read <= remaining;
             }
         }
     }
     captured
+}
+
+fn read_bounded_command_output(reader: impl Read) -> Vec<u8> {
+    capture_bounded_command_output(reader).bytes
+}
+
+struct RepositoryGitOutput {
+    status: std::process::ExitStatus,
+    stdout: BoundedCommandOutput,
+    stderr: BoundedCommandOutput,
 }
 
 #[cfg(test)]
@@ -2693,10 +2682,10 @@ fn test_repository_git_invocation_count() -> usize {
     TEST_REPOSITORY_GIT_INVOCATIONS.with(std::cell::Cell::get)
 }
 
-fn run_repository_git_stdout(
+fn run_repository_git_output(
     mut command: Command,
-    source_kind: server_api::RepositorySourceKind,
-) -> Result<String, WorkingDirectoryDiagnostic> {
+    timeout: Duration,
+) -> Result<RepositoryGitOutput, WorkingDirectoryDiagnostic> {
     #[cfg(test)]
     TEST_REPOSITORY_GIT_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
 
@@ -2722,8 +2711,8 @@ fn run_repository_git_stdout(
             "Repository provider diagnostic could not be captured",
         )
     })?;
-    let stdout_reader = std::thread::spawn(move || read_bounded_command_output(stdout));
-    let stderr_reader = std::thread::spawn(move || read_bounded_command_output(stderr));
+    let stdout_reader = std::thread::spawn(move || capture_bounded_command_output(stdout));
+    let stderr_reader = std::thread::spawn(move || capture_bounded_command_output(stderr));
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|_| {
@@ -2734,7 +2723,7 @@ fn run_repository_git_stdout(
         })? {
             break status;
         }
-        if started.elapsed() >= REPOSITORY_COMMAND_TIMEOUT {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             let _ = stdout_reader.join();
@@ -2746,10 +2735,22 @@ fn run_repository_git_stdout(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(RepositoryGitOutput {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    })
+}
+
+fn run_repository_git_stdout(
+    command: Command,
+    source_kind: server_api::RepositorySourceKind,
+) -> Result<String, WorkingDirectoryDiagnostic> {
+    // Existing observation callers retain their success-only/error mapping contract.
+    let output = run_repository_git_output(command, REPOSITORY_COMMAND_TIMEOUT)?;
+    let status = output.status;
     if status.success() {
-        return String::from_utf8(stdout).map_err(|_| {
+        return String::from_utf8(output.stdout.bytes).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 WorkdirManagementReason::RefResponseInvalid,
                 "Repository provider returned a non-UTF-8 ref observation",
@@ -2762,7 +2763,7 @@ fn run_repository_git_stdout(
             "Repository provider did not return the requested ref",
         ));
     }
-    let diagnostic = String::from_utf8_lossy(&stderr).to_ascii_lowercase();
+    let diagnostic = String::from_utf8_lossy(&output.stderr.bytes).to_ascii_lowercase();
     let auth_failed = source_kind.is_remote()
         && [
             "authentication failed",
@@ -3472,6 +3473,7 @@ mod tests {
         let materializer = RuntimeGitMaterializer::new(runtime_root.path());
         let repository = request(repo.path()).repository;
         let observation_request = RepositoryRefObservationRequest {
+            required_ancestor: None,
             repository,
             selector: "refs/heads/published".to_string(),
             materialization: None,
@@ -3538,6 +3540,7 @@ mod tests {
         let materializer = RuntimeGitMaterializer::new(runtime_root.path());
         let repository = request(&provider).repository;
         let observation_request = RepositoryRefObservationRequest {
+            required_ancestor: None,
             repository,
             selector: "refs/heads/published-source".to_string(),
             materialization: None,
@@ -3583,6 +3586,58 @@ mod tests {
     }
 
     #[test]
+    fn repository_ref_observation_proves_containment_from_fresh_provider_graph() {
+        let seed = create_clean_repo();
+        let base = git_stdout(seed.path(), ["rev-parse", "HEAD"]).unwrap();
+        git(seed.path(), &["branch", "published"]);
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let mut observation = RepositoryRefObservationRequest {
+            repository: request(seed.path()).repository,
+            selector: "refs/heads/published".into(),
+            required_ancestor: Some(base.clone()),
+            materialization: None,
+        };
+        assert_eq!(
+            materializer
+                .observe_repository_ref(&observation)
+                .unwrap()
+                .contained_commit,
+            Some(base.clone())
+        );
+        fs::write(seed.path().join("later.txt"), "later\n").unwrap();
+        git(seed.path(), &["add", "later.txt"]);
+        git(
+            seed.path(),
+            &["commit", "-m", "feat: advance provider target"],
+        );
+        let later = git_stdout(seed.path(), ["rev-parse", "HEAD"]).unwrap();
+        observation.required_ancestor = Some(later.clone());
+        assert!(
+            materializer
+                .observe_repository_ref(&observation)
+                .unwrap()
+                .contained_commit
+                .is_none(),
+            "unpublished descendant must not count as containment"
+        );
+        git(seed.path(), &["branch", "-f", "published"]);
+        observation.required_ancestor = Some(base);
+        let result = materializer.observe_repository_ref(&observation).unwrap();
+        assert_eq!(result.resolved_ref, later);
+        assert_eq!(result.contained_commit, observation.required_ancestor);
+        observation.required_ancestor = Some("HEAD".into());
+        assert!(
+            materializer.observe_repository_ref(&observation).is_err(),
+            "symbolic local ref is not an exact commit ID"
+        );
+        assert!(
+            fs::read_dir(runtime_root.path()).unwrap().next().is_none(),
+            "observation retains no execution record or object snapshot"
+        );
+    }
+
+    #[test]
     fn repository_ref_observation_rejects_missing_and_non_branch_selectors() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();
@@ -3591,6 +3646,7 @@ mod tests {
 
         let missing = materializer
             .observe_repository_ref(&RepositoryRefObservationRequest {
+                required_ancestor: None,
                 repository: repository.clone(),
                 selector: "refs/heads/not-published".to_string(),
                 materialization: None,
@@ -3599,6 +3655,7 @@ mod tests {
         assert_eq!(missing.code, "repository_ref_not_found");
         let non_branch = materializer
             .observe_repository_ref(&RepositoryRefObservationRequest {
+                required_ancestor: None,
                 repository: repository.clone(),
                 selector: "HEAD".to_string(),
                 materialization: None,
@@ -3607,6 +3664,7 @@ mod tests {
         assert_eq!(non_branch.code, "repository_ref_selector_invalid");
         let wildcard = materializer
             .observe_repository_ref(&RepositoryRefObservationRequest {
+                required_ancestor: None,
                 repository,
                 selector: "refs/heads/release/*".to_string(),
                 materialization: None,

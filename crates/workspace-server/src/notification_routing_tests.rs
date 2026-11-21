@@ -1243,3 +1243,168 @@ async fn notification_routing_cached_worker_attention_stops_after_ack_not_after_
         Ok(())
     }).unwrap();
 }
+
+fn mr_notification_fixture(store: &SqliteWorkspaceStore) {
+    store.with_conn(|conn| {
+        conn.execute_batch("INSERT INTO merge_requests(workspace_id,merge_request_id,repository_id,state,selector_to,created_at,updated_at) VALUES('w','notify-mr','main',json_object('kind','implementation'),'develop','1','1');
+            INSERT INTO merge_request_ticket_relations VALUES('w','notify-mr','tracking','implements','1');")?;
+        Ok(())
+    }).unwrap();
+    mr_notification_event(store, "owner", "worker_assigned", serde_json::json!({"operation_id":"owner", "worker":{"runtime_id":"r","worker_id":"replacement"},"assigned_by":{"runtime_id":"r","worker_id":"replacement"}}));
+}
+
+fn mr_notification_event(store: &SqliteWorkspaceStore, id: &str, kind: &str, payload: serde_json::Value) {
+    store.with_conn(|conn| {
+        conn.execute("INSERT INTO merge_request_thread_events(workspace_id,merge_request_id,event_id,sequence,kind,payload_json,operation_id,created_at) SELECT 'w','notify-mr',?1,COALESCE(MAX(sequence),0)+1,?2,?3,?1,'2' FROM merge_request_thread_events WHERE workspace_id='w' AND merge_request_id='notify-mr'", params![id,kind,payload.to_string()])?;
+        Ok(())
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn mr_notification_comments_recover_once_and_fence_owner_changes_and_revocation() {
+    let (dir, store) = delivery_tracking_fixture().await;
+    delivery_tracking_assign(&store, "subject-delegation", "assign-subject");
+    mr_notification_fixture(&store);
+    // No Ticket implementation assignment: the MR owner is an independent recipient.
+    for (id, body) in [("decision", "Need a conflict decision"), ("resolved", "Conflict resolved; rereview required")] {
+        mr_notification_event(&store, id, "comment", serde_json::json!({"body":body,"author":{"runtime_id":"r","worker_id":"reviewer"}}));
+    }
+    let store = SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db")).unwrap();
+    let target = TicketWorkerNotificationTarget { worker: RuntimeWorkerRef::new("r", "replacement"), authentication_binding_id: "tracking-binding".into() };
+    let inputs = store.list_pending_ticket_worker_notifications("w", 100).unwrap();
+    assert_eq!(inputs.len(), 2);
+    let input = &inputs[0];
+    assert_eq!(input.merge_request_id.as_deref(), Some("notify-mr"));
+    assert_eq!(input.assignment_id, "owner");
+    assert_eq!(input.worker, target.worker);
+    store.prepare_ticket_worker_notification_content("w", &input.delivery_id, "reread MR", &target).unwrap();
+    // Missing ACK preserves bytes and request identity, not a fresh notification.
+    assert_eq!(store.prepare_ticket_worker_notification_content("w", &input.delivery_id, "changed rendering", &target).unwrap(), "reread MR");
+    assert_eq!(store.admit_ticket_worker_notification_send("w", &input.delivery_id, &target).unwrap().as_deref(), Some("reread MR"));
+    store.ack_ticket_worker_notification("w", &input.delivery_id, &target).unwrap();
+    assert!(store.admit_ticket_worker_notification_send("w", &input.delivery_id, &target).unwrap().is_none());
+    assert_eq!(store.list_pending_ticket_worker_notifications("w", 100).unwrap().len(), 1);
+    let second = &inputs[1];
+    store.prepare_ticket_worker_notification_content("w", &second.delivery_id, "resolution", &target).unwrap();
+    store.with_conn(|conn| {conn.execute("UPDATE workspace_runtime_bindings SET revoked_at='3' WHERE workspace_id='w'", [])?; Ok(())}).unwrap();
+    assert!(store.admit_ticket_worker_notification_send("w", &second.delivery_id, &target).is_err());
+    store.with_conn(|conn| {conn.execute("UPDATE workspace_runtime_bindings SET revoked_at=NULL WHERE workspace_id='w'", [])?; Ok(())}).unwrap();
+    // Release and reassignment to the SAME Worker cannot resurrect the old owner operation.
+    mr_notification_event(&store, "released", "worker_assigned", serde_json::json!({"worker":null}));
+    mr_notification_event(&store, "new-owner", "worker_assigned", serde_json::json!({"worker":{"runtime_id":"r","worker_id":"replacement"},"assigned_by":{"runtime_id":"r","worker_id":"replacement"}}));
+    assert!(store.admit_ticket_worker_notification_send("w", &second.delivery_id, &target).is_err());
+    assert!(!store.list_pending_ticket_worker_notifications("w", 100).unwrap().iter().any(|i| i.delivery_id==second.delivery_id));
+    let page = store.notification_diagnostics("w", &server_api::NotificationDiagnosticsQuery { merge_request_id: Some("notify-mr".into()), ..Default::default() }).unwrap();
+    assert!(page.items.iter().any(|i| i.delivery_id.as_deref()==Some(&second.delivery_id) && i.recipient_current==Some(false) && !i.retry_candidate));
+    let subject = store.list_pending_ticket_assignment_deliveries("w", 100).unwrap();
+    assert!(subject.iter().any(|i| i.input_event_id=="mr-event:notify-mr:decision"));
+    assert!(subject.iter().any(|i| i.input_event_id=="mr-event:notify-mr:resolved"));
+}
+
+#[tokio::test]
+async fn mr_notification_publication_problem_comment_and_merge_have_distinct_delivery_evidence() {
+    let (_dir, store) = delivery_tracking_fixture().await;
+    delivery_tracking_assign(&store, "subject-delegation", "assign-subject");
+    mr_notification_fixture(&store);
+    // Seed the committed event boundary, not historical publication receipts.
+    // Provider execution and completion validation are outside this routing suite.
+    mr_notification_event(
+        &store,
+        "publication-failed",
+        "comment",
+        serde_json::json!({
+            "body": "Automatic Git publication did not complete the MR; inspect the remote before deciding the next action.",
+            "author": null
+        }),
+    );
+    let failed = store
+        .list_pending_ticket_worker_notifications("w", 100)
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].input_event_id, "mr-event:notify-mr:publication-failed");
+    assert_eq!(failed[0].purpose, NotificationPurpose::Attention);
+    mr_notification_event(&store, "completed", "merge", serde_json::json!({}));
+    let target = TicketWorkerNotificationTarget {
+        worker: RuntimeWorkerRef::new("r", "replacement"),
+        authentication_binding_id: "tracking-binding".into(),
+    };
+    let pending = store
+        .list_pending_ticket_worker_notifications("w", 100)
+        .unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.contains(&failed[0]));
+    let completed = pending
+        .iter()
+        .find(|input| input.input_event_id == "mr-event:notify-mr:completed")
+        .unwrap();
+    assert_ne!(completed.request_id, failed[0].request_id);
+    routing_ack_worker_pending(&store, &target);
+    assert!(
+        store
+            .list_pending_ticket_worker_notifications("w", 100)
+            .unwrap()
+            .is_empty()
+    );
+    let subject = store
+        .list_pending_ticket_assignment_deliveries("w", 100)
+        .unwrap();
+    for event in ["publication-failed", "completed"] {
+        assert!(subject.iter().any(|input| {
+            input.input_event_id == format!("mr-event:notify-mr:{event}")
+        }));
+    }
+    let page = store
+        .notification_diagnostics(
+            "w",
+            &server_api::NotificationDiagnosticsQuery {
+                merge_request_id: Some("notify-mr".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for kind in ["mr_comment", "mr_merge"] {
+        let rows: Vec<_> = page.items.iter().filter(|i| i.event_kind == kind).collect();
+        assert_eq!(rows.len(), 2, "{kind}");
+        assert!(rows.iter().any(|i| {
+            i.recipient_role == "orchestrator" && i.disposition.as_deref() == Some("deliver")
+        }));
+        assert!(rows.iter().any(|i| {
+            i.recipient_role == "mr_worker"
+                && i.stage == server_api::NotificationDiagnosticStage::RuntimeAccepted
+                && !i.model_processing_confirmed
+                && !i.retry_candidate
+        }));
+    }
+    store
+        .with_conn(|conn| {
+            assert!(stored_fixture_rows(conn, "merge_request_publications").is_empty());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mr_notification_closed_ticket_preserves_owner_requests_but_suppresses_ticket_assignment() {
+    let (dir, store) = delivery_tracking_fixture().await;
+    delivery_tracking_assign(&store, "subject-delegation", "assign-subject");
+    mr_notification_fixture(&store);
+    mr_notification_event(&store, "before-close", "comment", serde_json::json!({"body":"Resolve conflict", "author":{"runtime_id":"r","worker_id":"reviewer"}}));
+    let target = TicketWorkerNotificationTarget { worker: RuntimeWorkerRef::new("r", "replacement"), authentication_binding_id: "tracking-binding".into() };
+    let pending = store.list_pending_ticket_worker_notifications("w", 100).unwrap();
+    assert_eq!(pending.len(), 1);
+    let input = &pending[0];
+    store.prepare_ticket_worker_notification_content("w", &input.delivery_id, "frozen MR attention", &target).unwrap();
+    store.with_conn(|conn| {
+        conn.execute("UPDATE typed_tickets SET workflow_state='closed' WHERE workspace_id='w' AND ticket_id='tracking'", [])?;
+        Ok(())
+    }).unwrap();
+    let store = SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db")).unwrap();
+    assert_eq!(store.admit_ticket_worker_notification_send("w", &input.delivery_id, &target).unwrap().as_deref(), Some("frozen MR attention"));
+    mr_notification_event(&store, "after-close", "comment", serde_json::json!({"body":"Resolution is ready", "author":{"runtime_id":"r","worker_id":"reviewer"}}));
+    let pending = store.list_pending_ticket_worker_notifications("w", 100).unwrap();
+    assert_eq!(pending.len(), 2, "closed Ticket must not suppress current MR owner activity");
+    assert!(store.list_pending_ticket_assignment_deliveries("w", 100).unwrap().is_empty());
+    mr_notification_event(&store, "released-after-close", "worker_assigned", serde_json::json!({"worker":null}));
+    assert!(store.admit_ticket_worker_notification_send("w", &input.delivery_id, &target).is_err());
+    assert!(store.list_pending_ticket_worker_notifications("w", 100).unwrap().is_empty());
+}

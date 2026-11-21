@@ -5919,13 +5919,6 @@
           "merge_request_id": {
             "type": "string"
           },
-          "publications": {
-            "description": "Latest publication operations, newest first, bounded to 100 (not a complete history).\nReading these saved facts never dispatches or retries publication.",
-            "items": {
-              "$ref": "#/components/schemas/MergeRequestPublication"
-            },
-            "type": "array"
-          },
           "repository_key": {
             "type": "string"
           },
@@ -5979,6 +5972,13 @@
             ],
             "description": "Current assignment, including its CAS operation ID, independent of the thread page.\nNull means never assigned; a released assignment retains its operation ID and null Worker."
           },
+          "worker_resource_key": {
+            "description": "Canonical Workspace Worker reference when retained; never an internal-ID fallback.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "workspace_id": {
             "type": "string"
           }
@@ -5998,7 +5998,6 @@
           "linked_tickets",
           "view",
           "summary",
-          "publications",
           "event_page"
         ],
         "type": "object"
@@ -6097,6 +6096,24 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "worker_assignment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeRequestWorkerAssignedEvent"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current MR ownership, including a retained release operation with null Worker."
+          },
+          "worker_resource_key": {
+            "description": "Canonical Workspace Worker reference when retained; never an internal-ID fallback.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -6204,96 +6221,6 @@
           "canceled"
         ],
         "type": "string"
-      },
-      "MergeRequestPublication": {
-        "properties": {
-          "approval_event_id": {
-            "type": "string"
-          },
-          "merge_request_id": {
-            "type": "string"
-          },
-          "operation_id": {
-            "type": "string"
-          },
-          "outcome": {
-            "$ref": "#/components/schemas/MergeRequestPublicationOutcome"
-          },
-          "source_ref": {
-            "type": "string"
-          },
-          "target_ref_before": {
-            "type": "string"
-          },
-          "target_selector": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "operation_id",
-          "merge_request_id",
-          "approval_event_id",
-          "source_ref",
-          "target_selector",
-          "target_ref_before",
-          "outcome"
-        ],
-        "type": "object"
-      },
-      "MergeRequestPublicationOutcome": {
-        "oneOf": [
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "const": "unconfirmed",
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
-          },
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "const": "not_published",
-                "type": "string"
-              },
-              "reason": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "reason"
-            ],
-            "type": "object"
-          },
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "const": "published",
-                "type": "string"
-              },
-              "observed_at": {
-                "type": "string"
-              },
-              "target_after": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "target_after",
-              "observed_at"
-            ],
-            "type": "object"
-          }
-        ]
       },
       "MergeRequestReadView": {
         "enum": [
@@ -6764,7 +6691,14 @@
             "additionalProperties": false,
             "properties": {
               "author": {
-                "$ref": "#/components/schemas/MergeRequestWorkerIdentity"
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/MergeRequestWorkerIdentity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "body": {
                 "type": "string"
@@ -6803,7 +6737,6 @@
               "event_id",
               "sequence",
               "body",
-              "author",
               "created_at"
             ],
             "type": "object"
@@ -27160,7 +27093,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:8c02ac49ad97aab8d6368fde823b2442efd18b99a29d2687e55412b90f579d39"
+    "x-yoi-source-digest": "sha256:6ff29dfb1d85f5410164c252b9e5ddaefe33d85aeba979ab58fae4363d079801"
   },
   "openapi": "3.1.0",
   "paths": {

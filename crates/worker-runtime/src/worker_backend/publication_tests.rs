@@ -1,7 +1,7 @@
 // Integration boundary: real Runtime, Controller/router, Git materializer and
 // bare Git provider. Only model inference is replaced by the existing MockFactory.
 #[test]
-fn publication_fences_real_controller_workdir_and_recovers_after_worker_stop() {
+fn publication_fences_live_workdir_and_requires_current_worker_on_each_execution() {
     use crate::catalog::{
         LogicalWorkdirAttachment, RepositoryMaterializationContext, RepositoryPublicationBinding,
         RepositoryPublicationOutcome, RepositoryPublicationRequest,
@@ -97,7 +97,7 @@ fn publication_fences_real_controller_workdir_and_recovers_after_worker_stop() {
         ],
     );
     let source = oid(&checkout);
-    let mut request = RepositoryPublicationRequest {
+    let request = RepositoryPublicationRequest {
         binding: RepositoryPublicationBinding {
             workspace_id: "publication-workspace".into(),
             merge_request_id: "mr".into(),
@@ -126,12 +126,6 @@ fn publication_fences_real_controller_workdir_and_recovers_after_worker_stop() {
             ssh: None,
         },
     };
-    assert!(
-        runtime
-            .repository_publication_receipt(request.binding.clone())
-            .unwrap()
-            .is_none()
-    );
     let handle = backend
         .workers
         .lock()
@@ -158,13 +152,7 @@ fn publication_fences_real_controller_workdir_and_recovers_after_worker_stop() {
     );
     assert_eq!(oid(remote.path()), before);
     drop(exclusion);
-    assert_eq!(
-        runtime.publish_repository_source(request.clone()).unwrap(),
-        busy
-    );
-    // This is a deliberate new request, not automatic retry of the rejected one.
-    request.binding.operation_id = "new-publication".into();
-    request.materialization.operation_id = request.binding.operation_id.clone();
+    // The caller explicitly requests execution again after the conflict is gone.
     let published = runtime.publish_repository_source(request.clone()).unwrap();
     assert!(
         matches!(
@@ -175,50 +163,17 @@ fn publication_fences_real_controller_workdir_and_recovers_after_worker_stop() {
     );
     assert_eq!(oid(remote.path()), source);
     runtime.stop_worker(&detail.worker_ref, None).unwrap();
-    assert_eq!(
-        runtime
-            .reconcile_repository_publication(request.clone())
-            .unwrap(),
-        published
-    );
-    let saved_binding = request.binding.clone();
-    assert_eq!(
-        runtime.publish_repository_source(request).unwrap(),
-        published
-    );
+    let stopped = runtime.publish_repository_source(request.clone()).unwrap();
+    assert!(matches!(
+        stopped.outcome,
+        RepositoryPublicationOutcome::NotPublished { .. }
+    ));
+    assert_eq!(oid(remote.path()), source);
     runtime.delete_worker(&detail.worker_ref).unwrap();
-    // Neither a live Worker nor accessible Repository/checkout/config/credentials
-    // can be reconstructed here. The lookup input is only the original binding.
-    remote.close().unwrap();
-    fs::remove_dir_all(&checkout).unwrap();
-    assert_eq!(
-        runtime
-            .repository_publication_receipt(saved_binding.clone())
-            .unwrap(),
-        Some(published)
-    );
-    assert_eq!(
-        runtime
-            .repository_publication_receipt(busy.binding.clone())
-            .unwrap(),
-        Some(busy)
-    );
-    let mut wrong = saved_binding.clone();
-    wrong.connection_id = "replacement".into();
-    assert!(runtime.repository_publication_receipt(wrong).is_err());
-    let mut wrong_runtime = saved_binding.clone();
-    wrong_runtime.worker.runtime_id = "another-runtime".into();
-    assert!(
-        runtime
-            .repository_publication_receipt(wrong_runtime)
-            .is_err()
-    );
-    let mut absent = saved_binding;
-    absent.operation_id = "never-dispatched".into();
-    assert!(
-        runtime
-            .repository_publication_receipt(absent)
-            .unwrap()
-            .is_none()
-    );
+    let deleted = runtime.publish_repository_source(request).unwrap();
+    assert!(matches!(
+        deleted.outcome,
+        RepositoryPublicationOutcome::NotPublished { .. }
+    ));
+    assert!(!runtime_base.path().join(".publications").exists());
 }

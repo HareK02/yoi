@@ -143,7 +143,7 @@ pub(super) fn contract(kind: Kind) -> Contract {
         ),
         Kind::Show => (
             "read",
-            "Read this route-bound MR. Summary and detail include worker_assignment (operation_id and worker) and saved publications. worker_assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. Ownership is not authority, Worker liveness or Ticket assignment. This read never sends or retries publication. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
+            "Read this route-bound MR. Summary and detail include worker_assignment (operation_id and worker) and saved completion evidence. Read view=detail with bounded paging for publication failure comments; summary/readiness does not include those reasons or prove publication success. worker_assignment=null means never assigned; worker=null in a retained assignment is a release with a retained operation_id. Ownership is not authority, Worker liveness or Ticket assignment. This read never sends or retries publication. Default summary omits bodies/history; view=detail returns a bounded thread page. Supplying page fields without view selects detail. page.after is exclusive (0..9007199254740991); page.limit is 1..200. Summary cannot be combined with page fields. Optional page fields use null/value unions when explicitly present.",
             vec![
                 field("view", false, Shape::Enum(vec!["summary", "detail"])),
                 flattened(
@@ -170,6 +170,16 @@ pub(super) fn contract(kind: Kind) -> Contract {
                         field("worker_id", true, Shape::String),
                     ])),
                 ),
+            ],
+        ),
+        Kind::Complete => (
+            "complete",
+            "Record manual publication without pushing or additional approval. Backend verifies current MR ownership, authority, exact approved source/requirements and provider target. Unproven ancestry is rejected. Keep the exact input and operation_id on unknown outcome; no automatic push or new operation.",
+            vec![
+                field("operation_id", true, Shape::String),
+                field("expected_owner_operation_id", true, Shape::String),
+                field("approval_event_id", true, Shape::String),
+                field("expected_source_ref", true, Shape::String),
             ],
         ),
         Kind::Comment => (

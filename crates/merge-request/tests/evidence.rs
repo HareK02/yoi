@@ -96,6 +96,7 @@ fn merged_requests() -> Vec<MergeRequest> {
             request
                 .thread
                 .push(MergeRequestThreadEvent::Merge(MergeEvent {
+                    owner_operation_id: None,
                     event_id: format!("merge-{}", subject.merge_request_id),
                     sequence: 3,
                     operation_id: format!("operation-{}", subject.merge_request_id),

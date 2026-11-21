@@ -425,6 +425,10 @@ impl FailureTail {
         tail.push((135, super::subject_release_recording_store::MIGRATION_NAME));
         tail.push((136, super::launch_policy_identity_migration::MIGRATION_NAME));
         tail.push((137, super::worker_lifecycle_notifications::MIGRATION_NAME));
+        tail.push((
+            138,
+            super::notification_routing::merge_requests::MIGRATION_NAME,
+        ));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -1473,8 +1477,41 @@ mod failure_format_tests {
 
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
-        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137,
+        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138,
     ];
+
+    #[test]
+    fn mr_notification_upgrade_rolls_back_capture_and_preserves_existing_evidence() {
+        let conn = fixture_123(Stage::Base);
+        for version in CURRENT_TAIL.iter().copied().filter(|v| *v < 138) {
+            apply(&conn, version).unwrap();
+        }
+        conn.execute_batch("CREATE TRIGGER reject_mr_notification_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=138 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+        let before = snapshot(&conn).unwrap();
+        let cols = columns(&conn);
+        let data = values(&conn, &cols);
+        assert!(apply(&conn, 138).is_err());
+        assert_eq!(snapshot(&conn).unwrap(), before);
+        assert_eq!(values(&conn, &cols), data);
+        conn.execute_batch("DROP TRIGGER reject_mr_notification_receipt")
+            .unwrap();
+        apply(&conn, 138).unwrap();
+        verify_history(&conn, 138).unwrap();
+        let trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='notification_mr_event'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(trigger.contains("mr_worker"));
+        assert!(!trigger.contains("NEW.kind!='comment'"));
+        assert!(
+            !snapshot(&conn)
+                .unwrap()
+                .contains_key("notification_mr_publication_update")
+        );
+    }
 
     fn apply(conn: &Connection, version: i64) -> Result<()> {
         let migration = store::MIGRATIONS

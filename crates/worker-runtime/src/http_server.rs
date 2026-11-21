@@ -18,10 +18,10 @@ mod workdir_close_tests;
 
 use crate::auth::{RuntimeAuthContext, unix_now_seconds};
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, RepositoryPublicationBinding,
-    RepositoryPublicationReceipt, RepositoryPublicationRequest, RepositoryRefObservationRequest,
-    WorkerDetail, WorkerLifecycleAck, WorkerSummary, WorkingDirectoryRepositoryAccessRequest,
-    WorkingDirectoryRequest, WorkingDirectoryStatus, WorkspaceApiRef,
+    ConfigBundleRef, CreateWorkerRequest, RepositoryPublicationRequest,
+    RepositoryPublicationResult, RepositoryRefObservationRequest, WorkerDetail, WorkerLifecycleAck,
+    WorkerSummary, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
+    WorkingDirectoryStatus, WorkspaceApiRef,
 };
 use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
@@ -312,20 +312,6 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
                 &["POST"],
             ),
             post(publish_repository_source),
-        )
-        .route(
-            remaining_route(
-                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE,
-                &["POST"],
-            ),
-            post(reconcile_repository_publication),
-        )
-        .route(
-            remaining_route(
-                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT,
-                &["POST"],
-            ),
-            post(repository_publication_receipt),
         )
         .route(
             remaining_route(runtime_api::RUNTIME_ROUTE_WORKDIR_SESSIONS, &["POST"]),
@@ -909,51 +895,15 @@ async fn publish_repository_source(
     State(state): State<RuntimeHttpState>,
     Extension(auth): Extension<RuntimeAuthContext>,
     body: Result<Json<RepositoryPublicationRequest>, JsonRejection>,
-) -> RestResult<RepositoryPublicationReceipt> {
+) -> RestResult<RepositoryPublicationResult> {
     let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
     authorize_repository_publication_workspace(&auth, &request)?;
-    let receipt = state
+    let result = state
         .runtime
         .publish_repository_source_from_resource(request)
         .await
         .map_err(RuntimeHttpRestError::runtime)?;
-    Ok(Json(receipt))
-}
-
-async fn reconcile_repository_publication(
-    State(state): State<RuntimeHttpState>,
-    Extension(auth): Extension<RuntimeAuthContext>,
-    body: Result<Json<RepositoryPublicationRequest>, JsonRejection>,
-) -> RestResult<RepositoryPublicationReceipt> {
-    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
-    authorize_repository_publication_workspace(&auth, &request)?;
-    let receipt = state
-        .runtime
-        .reconcile_repository_publication_from_resource(request)
-        .await
-        .map_err(RuntimeHttpRestError::runtime)?;
-    Ok(Json(receipt))
-}
-
-async fn repository_publication_receipt(
-    State(state): State<RuntimeHttpState>,
-    Extension(auth): Extension<RuntimeAuthContext>,
-    body: Result<Json<RepositoryPublicationBinding>, JsonRejection>,
-) -> RestResult<Option<RepositoryPublicationReceipt>> {
-    let Json(binding) = body.map_err(RuntimeHttpRestError::json_rejection)?;
-    if binding.workspace_id != auth.workspace_id {
-        return Err(RuntimeHttpRestError::new(
-            StatusCode::FORBIDDEN,
-            "repository_publication_workspace_mismatch",
-            "Repository publication authority does not match the authenticated Workspace",
-        ));
-    }
-    let receipt =
-        tokio::task::spawn_blocking(move || state.runtime.repository_publication_receipt(binding))
-            .await
-            .map_err(RuntimeHttpRestError::working_directory_join)?
-            .map_err(RuntimeHttpRestError::runtime)?;
-    Ok(Json(receipt))
+    Ok(Json(result))
 }
 
 async fn list_working_directories(
@@ -2307,8 +2257,6 @@ async fn require_runtime_auth(
     if matches!(
         request.uri().path(),
         runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH
-            | runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE
-            | runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT
     ) {
         return RuntimeHttpRestError::new(
             StatusCode::UNAUTHORIZED,
@@ -2413,15 +2361,6 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH && *method == Method::POST
     {
         return Some("repository-publications:publish");
-    }
-    if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE
-        && *method == Method::POST
-    {
-        return Some("repository-publications:reconcile");
-    }
-    if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT && *method == Method::POST
-    {
-        return Some("repository-publications:receipt");
     }
     if (path == runtime_api::RUNTIME_ROUTE_WORKING_DIRECTORY_REPOSITORY_ACCESS
         || path == runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE
@@ -3104,8 +3043,6 @@ mod tests {
             runtime_api::RUNTIME_ROUTE_SSH_PROBE,
             runtime_api::RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE,
             runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH,
-            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE,
-            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT,
             runtime_api::RUNTIME_ROUTE_WORKDIR_SESSIONS,
             runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS,
             runtime_api::RUNTIME_ROUTE_WORKDIR_SESSION,
@@ -3256,10 +3193,7 @@ mod tests {
             Some("local-token".into()),
             workspace_test_auth(vec![trust.clone()]),
         );
-        for path in [
-            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH,
-            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE,
-        ] {
+        for path in [runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH] {
             for case in [
                 "observe_permission",
                 "broad_publication_permission",
@@ -3290,23 +3224,18 @@ mod tests {
                     "broad_publication_permission" => {
                         claims.operation = workspace_runtime_operation(&Method::POST, path).into();
                     }
-                    "other_operation" | "other_action" => {
-                        let permission_path = if case == "other_operation" {
-                            request.binding.operation_id = "another-operation".into();
-                            path
-                        } else if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH
-                        {
-                            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE
-                        } else {
-                            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH
-                        };
+                    "other_operation" => {
+                        request.binding.operation_id = "another-operation".into();
                         claims.operation = crate::auth::repository_publication_request_permission(
                             "POST",
-                            permission_path,
+                            path,
                             &serde_json::to_vec(&request).unwrap(),
                         )
                         .unwrap()
                         .unwrap();
+                    }
+                    "other_action" => {
+                        claims.operation = claims.operation.replace(":publish:", ":reconcile:");
                     }
                     "changed_body" => {
                         request.binding.source = "c".repeat(40);
@@ -3356,248 +3285,34 @@ mod tests {
         }
     }
 
-    // Real router, signed capability middleware and Runtime receipt lookup. Only
-    // retained receipt storage is substituted; no Worker, provider or credentials exist.
-    struct SavedPublicationBackend {
-        receipt: RepositoryPublicationReceipt,
-        reads: std::sync::atomic::AtomicUsize,
-    }
-
-    impl WorkerExecutionBackend for SavedPublicationBackend {
-        fn backend_id(&self) -> &str {
-            "saved-publication-test"
-        }
-
-        fn spawn_worker(&self, _: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
-            panic!("receipt lookup must not start a Worker")
-        }
-
-        fn dispatch_input(&self, _: &WorkerRef, _: WorkerInput) -> WorkerExecutionResult {
-            panic!("receipt lookup must not contact a Worker")
-        }
-
-        fn repository_publication_receipt(
-            &self,
-            binding: &RepositoryPublicationBinding,
-        ) -> Result<
-            Option<RepositoryPublicationReceipt>,
-            crate::working_directory::WorkingDirectoryDiagnostic,
-        > {
-            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if binding.operation_id != self.receipt.binding.operation_id {
-                return Ok(None);
-            }
-            if binding != &self.receipt.binding {
-                return Err(
-                    crate::working_directory::WorkingDirectoryDiagnostic::rejected(
-                        "repository_publication_binding_mismatch",
-                        "Saved publication binding differs",
-                    ),
-                );
-            }
-            Ok(Some(self.receipt.clone()))
-        }
-    }
-
-    fn saved_publication_app(
-        trust: WorkspaceIssuerTrustRecord,
-        receipt: RepositoryPublicationReceipt,
-    ) -> (Router, Arc<SavedPublicationBackend>) {
-        let backend = Arc::new(SavedPublicationBackend {
-            receipt,
-            reads: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let runtime =
-            Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap();
-        runtime.bind_runtime_identity("runtime-test").unwrap();
-        let app = runtime_http_router_with_workspace_auth(
-            runtime,
-            Some("local-token".into()),
-            workspace_test_auth(vec![trust]),
-        );
-        (app, backend)
-    }
-
     #[tokio::test]
-    async fn repository_publication_receipt_returns_saved_or_absent_without_live_resources() {
-        let identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
-        let trust = workspace_trust(&identity);
-        let binding = repository_publication_request_fixture().binding;
-        let path = runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT;
-        for outcome in [
-            crate::catalog::RepositoryPublicationOutcome::Unknown {},
-            crate::catalog::RepositoryPublicationOutcome::NotPublished {
-                reason: "not_ff".into(),
-            },
-            crate::catalog::RepositoryPublicationOutcome::Published {
-                target_after: binding.source.clone(),
-                observed_at_epoch_seconds: 42,
-            },
-        ] {
-            let receipt = RepositoryPublicationReceipt {
-                binding: binding.clone(),
-                outcome,
-            };
-            let (app, backend) = saved_publication_app(trust.clone(), receipt.clone());
-            for present in [true, false] {
-                let mut lookup = binding.clone();
-                if !present {
-                    lookup.operation_id = "absent-operation".into();
-                }
-                let body = serde_json::to_vec(&lookup).unwrap();
-                let mut claims = signed_claims(&trust, "POST", path, &body);
-                claims.operation =
-                    crate::auth::repository_publication_request_permission("POST", path, &body)
-                        .unwrap()
-                        .unwrap();
-                let response =
-                    signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
-                assert_eq!(response.status(), StatusCode::OK);
-                let actual: Option<RepositoryPublicationReceipt> = read_json(response).await;
-                assert_eq!(actual, present.then(|| receipt.clone()));
-            }
-            assert_eq!(backend.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
-        }
-    }
-
-    #[tokio::test]
-    async fn repository_publication_receipt_rejects_wrong_authority_before_storage() {
-        let identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
-        let trust = workspace_trust(&identity);
-        let binding = repository_publication_request_fixture().binding;
-        let (app, backend) = saved_publication_app(
-            trust.clone(),
-            RepositoryPublicationReceipt {
-                binding: binding.clone(),
-                outcome: crate::catalog::RepositoryPublicationOutcome::Unknown {},
-            },
-        );
-        let path = runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT;
-        for case in [
-            "broad_action",
-            "publish_action",
-            "reconcile_action",
-            "operation",
-            "workspace",
-            "runtime_claim",
-            "runtime_binding",
-            "changed_binding",
-            "local_token",
-            "unsigned",
-            "request_wrapper",
-        ] {
-            let mut lookup = binding.clone();
-            if case == "workspace" {
-                lookup.workspace_id = "workspace-b".into();
-            }
-            if case == "runtime_binding" {
-                lookup.worker.runtime_id = "runtime-other".into();
-            }
-            let mut body = serde_json::to_vec(&lookup).unwrap();
-            let mut claims = signed_claims(&trust, "POST", path, &body);
-            claims.operation =
-                crate::auth::repository_publication_request_permission("POST", path, &body)
-                    .unwrap()
-                    .unwrap();
-            match case {
-                "broad_action" => claims.operation = "repository-publications:receipt".into(),
-                "publish_action" | "reconcile_action" => {
-                    claims.operation = claims.operation.replace(
-                        ":receipt:",
-                        if case == "publish_action" {
-                            ":publish:"
-                        } else {
-                            ":reconcile:"
-                        },
-                    );
-                }
-                "operation" => {
-                    lookup.operation_id = "other-operation".into();
-                    claims.operation = crate::auth::repository_publication_request_permission(
-                        "POST",
-                        path,
-                        &serde_json::to_vec(&lookup).unwrap(),
-                    )
-                    .unwrap()
-                    .unwrap();
-                }
-                "runtime_claim" => claims.runtime_id = "runtime-other".into(),
-                "changed_binding" => {
-                    lookup.source = "c".repeat(40);
-                    body = serde_json::to_vec(&lookup).unwrap();
-                }
-                "request_wrapper" => {
-                    body = serde_json::to_vec(&repository_publication_request_fixture()).unwrap();
-                    claims.body_digest = workspace_request_body_digest(&body);
-                }
-                _ => {}
-            }
-            let response = if matches!(case, "local_token" | "unsigned") {
-                let mut builder = Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header(header::CONTENT_TYPE, "application/json");
-                if case == "local_token" {
-                    builder = builder.header(header::AUTHORIZATION, "Bearer local-token");
-                }
-                app.clone()
-                    .oneshot(builder.body(Body::from(body)).unwrap())
-                    .await
-                    .unwrap()
-            } else {
-                signed_request(app.clone(), &identity, &claims, body, "workspace-a").await
-            };
-            let (status, code) = match case {
-                "workspace" => (
-                    StatusCode::FORBIDDEN,
-                    "repository_publication_workspace_mismatch",
-                ),
-                "runtime_binding" => (StatusCode::BAD_REQUEST, "invalid_request"),
-                "request_wrapper" => (
-                    StatusCode::BAD_REQUEST,
-                    "repository_publication_invalid_request",
-                ),
-                _ => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            };
-            assert_eq!(response.status(), status, "{case}");
-            if case == "runtime_binding" {
-                assert_eq!(
-                    read_control_cause(response).await,
-                    protocol::control_failure::RuntimeControlCause::InvalidRequest
-                );
-            } else {
-                let error: RuntimeHttpErrorResponse = read_json(response).await;
-                assert_eq!(error.error.code, code, "{case}");
-            }
-        }
-        assert_eq!(backend.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn repository_publication_receipt_rejects_signed_binding_different_from_saved() {
-        let identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
-        let trust = workspace_trust(&identity);
-        let mut binding = repository_publication_request_fixture().binding;
-        let (app, backend) = saved_publication_app(
-            trust.clone(),
-            RepositoryPublicationReceipt {
-                binding: binding.clone(),
-                outcome: crate::catalog::RepositoryPublicationOutcome::Unknown {},
-            },
-        );
-        binding.connection_id = "another-connection".into();
-        let path = runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT;
-        let body = serde_json::to_vec(&binding).unwrap();
-        let mut claims = signed_claims(&trust, "POST", path, &body);
-        claims.operation =
-            crate::auth::repository_publication_request_permission("POST", path, &body)
-                .unwrap()
+    async fn repository_publication_removed_recovery_routes_are_not_found() {
+        let app = runtime_http_router(Runtime::new_memory(), "local-token".into());
+        let (prefix, _) = runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH
+            .rsplit_once('/')
+            .unwrap();
+        for action in ["receipt", "reconcile"] {
+            let path = format!("{prefix}/{action}");
+            assert_eq!(
+                crate::auth::repository_publication_request_permission("POST", &path, b"{}")
+                    .unwrap(),
+                None
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(&path)
+                        .header(header::AUTHORIZATION, "Bearer local-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
                 .unwrap();
-        let response = signed_request(app, &identity, &claims, body, "workspace-a").await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "repository_publication_binding_mismatch");
-        assert_eq!(backend.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     // Generated management routes and real Workspace capability middleware stay

@@ -49,6 +49,7 @@ pub(super) fn source_resource(
             // Persisted ownership always wins: legacy Job IDs may look like MR IDs.
             let mr = source_event_id.strip_prefix("mr-event:")
                 .or_else(|| source_event_id.strip_prefix("mr-source:"))
+                .or_else(|| source_event_id.strip_prefix("mr-publication:"))
                 .and_then(|value| value.split_once(':'))
                 .map(|(mr, _)| mr);
             if let Some(mr) = mr {
@@ -118,6 +119,15 @@ fn source_checks(
             id.strip_prefix("mr-event:").and_then(|v| v.split_once(':'))
         {
             Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_thread_events WHERE workspace_id=?1 AND merge_request_id=?2 AND event_id=?3)",params![workspace,mr,event],|r|r.get(0))?)
+        } else if let Some((mr, rest)) = id
+            .strip_prefix("mr-publication:")
+            .and_then(|v| v.split_once(':'))
+        {
+            if let Some((operation, outcome)) = rest.rsplit_once(':') {
+                Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_publications WHERE workspace_id=?1 AND merge_request_id=?2 AND operation_id=?3 AND (?4='unconfirmed' OR json_extract(payload_json,'$.outcome.kind')=?4))", params![workspace,mr,operation,outcome], |r| r.get(0))?)
+            } else {
+                None
+            }
         } else if let Some(result) = id.strip_prefix("implementation-result:") {
             Some(conn.query_row("SELECT EXISTS(SELECT 1 FROM ticket_implementation_results WHERE workspace_id=?1 AND result_id=?2)",params![workspace,result],|r|r.get(0))?)
         } else if let Some((mr, sequence)) = id
@@ -240,7 +250,7 @@ pub(super) fn page_with_connection(
         COALESCE(json_extract(a.target_json,'$.worker.runtime_id'),json_extract(aa.source_json,'$.runtime_id'),json_extract(r.target_json,'$.worker.runtime_id'),json_extract(r.target_json,'$.runtime_id'),json_extract(ar.reserved_source_json,'$.runtime_id')),
         COALESCE(json_extract(a.target_json,'$.worker.worker_id'),json_extract(aa.source_json,'$.worker_id'),json_extract(r.target_json,'$.worker.worker_id'),json_extract(r.target_json,'$.worker_id'),json_extract(ar.reserved_source_json,'$.worker_id')),
         COALESCE(f.code,pf.code),COALESCE(f.recorded_at,pf.recorded_at),
-        CASE WHEN s.role IN ('orchestrator','worker') AND s.assignment_id!='' THEN EXISTS(SELECT 1 FROM ticket_current_worker_assignments c WHERE c.workspace_id=s.workspace_id AND c.ticket_id=s.ticket_id AND c.role=s.role AND c.assignment_id=s.assignment_id) END,
+        CASE WHEN s.role IN ('orchestrator','worker') AND s.assignment_id!='' THEN EXISTS(SELECT 1 FROM ticket_current_worker_assignments c WHERE c.workspace_id=s.workspace_id AND c.ticket_id=s.ticket_id AND c.role=s.role AND c.assignment_id=s.assignment_id) WHEN s.role='mr_worker' AND s.assignment_id!='' THEN EXISTS(SELECT 1 FROM merge_request_thread_events owner WHERE owner.workspace_id=s.workspace_id AND owner.merge_request_id=json_extract(s.facts_json,'$.merge_request_id') AND owner.operation_id=s.assignment_id AND owner.kind='worker_assigned' AND json_extract(owner.payload_json,'$.worker.worker_id') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM merge_request_thread_events later WHERE later.workspace_id=owner.workspace_id AND later.merge_request_id=owner.merge_request_id AND later.kind='worker_assigned' AND later.sequence>owner.sequence)) END,
         EXISTS(SELECT 1 FROM notification_failures uf WHERE uf.workspace_id=s.workspace_id AND uf.delivery_id=d.delivery_id AND uf.code IN ('acceptance_unknown','acknowledgement_failed')),
         (SELECT COUNT(*) FROM (SELECT DISTINCT at.runtime_id,at.worker_id FROM notification_assignment_targets at WHERE at.workspace_id=s.workspace_id AND at.delivery_id=d.delivery_id)),
         pf.sequence IS NOT NULL

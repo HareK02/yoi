@@ -46,8 +46,8 @@ use workdir::{
 use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
-    ProfileSourceArchiveSource, RepositoryPublicationBinding, RepositoryPublicationReceipt,
-    RepositoryPublicationRequest, RepositoryRefObservation, RepositoryRefObservationRequest,
+    ProfileSourceArchiveSource, RepositoryPublicationRequest, RepositoryPublicationResult,
+    RepositoryRefObservation, RepositoryRefObservationRequest,
     WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
     WorkingDirectoryAttachmentClaim, WorkingDirectoryAttachmentRequest,
     WorkingDirectoryAttachmentStatus, WorkingDirectoryRepositoryAccessRequest,
@@ -1434,33 +1434,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn publish_repository_source(
         &self,
         _request: RepositoryPublicationRequest,
-    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+    ) -> std::result::Result<RepositoryPublicationResult, Error> {
         Err(Error::RuntimeOperationFailed {
             runtime_id: self.runtime_id().to_string(),
             code: "repository_publication_provider_unavailable".to_string(),
             message: "Runtime does not support Repository publication publish".to_string(),
-        })
-    }
-
-    fn reconcile_repository_publication(
-        &self,
-        _request: RepositoryPublicationRequest,
-    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
-        Err(Error::RuntimeOperationFailed {
-            runtime_id: self.runtime_id().to_string(),
-            code: "repository_publication_provider_unavailable".to_string(),
-            message: "Runtime does not support Repository publication reconcile".to_string(),
-        })
-    }
-
-    fn repository_publication_receipt(
-        &self,
-        _binding: RepositoryPublicationBinding,
-    ) -> std::result::Result<Option<RepositoryPublicationReceipt>, Error> {
-        Err(Error::RuntimeOperationFailed {
-            runtime_id: self.runtime_id().to_string(),
-            code: "repository_publication_provider_unavailable".to_string(),
-            message: "Runtime does not support saved Repository publication receipts".to_string(),
         })
     }
 
@@ -2520,61 +2498,11 @@ impl RuntimeRegistry {
         &self,
         runtime_id: &str,
         request: RepositoryPublicationRequest,
-    ) -> Result<RepositoryPublicationReceipt, RuntimeRegistryError> {
+    ) -> Result<RepositoryPublicationResult, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         runtime
             .publish_repository_source(request)
-            .map_err(|error| match error {
-                Error::RuntimeOperationFailed { code, message, .. } => {
-                    RuntimeRegistryError::RuntimeOperationFailed {
-                        runtime_id: runtime_id.to_string(),
-                        code,
-                        message,
-                    }
-                }
-                other => RuntimeRegistryError::RuntimeOperationFailed {
-                    runtime_id: runtime_id.to_string(),
-                    code: "repository_publication_provider_unavailable".to_string(),
-                    message: other.to_string(),
-                },
-            })
-    }
-
-    pub fn reconcile_repository_publication(
-        &self,
-        runtime_id: &str,
-        request: RepositoryPublicationRequest,
-    ) -> Result<RepositoryPublicationReceipt, RuntimeRegistryError> {
-        validate_backend_identifier("runtime_id", runtime_id)?;
-        let runtime = self.runtime(runtime_id)?;
-        runtime
-            .reconcile_repository_publication(request)
-            .map_err(|error| match error {
-                Error::RuntimeOperationFailed { code, message, .. } => {
-                    RuntimeRegistryError::RuntimeOperationFailed {
-                        runtime_id: runtime_id.to_string(),
-                        code,
-                        message,
-                    }
-                }
-                other => RuntimeRegistryError::RuntimeOperationFailed {
-                    runtime_id: runtime_id.to_string(),
-                    code: "repository_publication_provider_unavailable".to_string(),
-                    message: other.to_string(),
-                },
-            })
-    }
-
-    pub fn repository_publication_receipt(
-        &self,
-        runtime_id: &str,
-        binding: RepositoryPublicationBinding,
-    ) -> Result<Option<RepositoryPublicationReceipt>, RuntimeRegistryError> {
-        validate_backend_identifier("runtime_id", runtime_id)?;
-        let runtime = self.runtime(runtime_id)?;
-        runtime
-            .repository_publication_receipt(binding)
             .map_err(|error| match error {
                 Error::RuntimeOperationFailed { code, message, .. } => {
                     RuntimeRegistryError::RuntimeOperationFailed {
@@ -3418,28 +3346,6 @@ impl RuntimeRegistry {
     }
 }
 
-fn validate_repository_publication_binding(
-    binding: &RepositoryPublicationBinding,
-    workspace_id: &str,
-    runtime_id: &str,
-) -> Result<(), Error> {
-    if binding.workspace_id != workspace_id {
-        return Err(Error::RuntimeOperationFailed {
-            runtime_id: runtime_id.to_string(),
-            code: "repository_publication_workspace_mismatch".to_string(),
-            message: "Repository publication is outside the selected Workspace".to_string(),
-        });
-    }
-    if binding.worker.runtime_id != runtime_id {
-        return Err(Error::RuntimeOperationFailed {
-            runtime_id: runtime_id.to_string(),
-            code: "repository_publication_runtime_mismatch".to_string(),
-            message: "Repository publication is outside the selected Runtime".to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn validate_repository_publication_workspace(
     request: &RepositoryPublicationRequest,
     workspace_id: &str,
@@ -4038,56 +3944,10 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn publish_repository_source(
         &self,
         request: RepositoryPublicationRequest,
-    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+    ) -> std::result::Result<RepositoryPublicationResult, Error> {
         validate_repository_publication_workspace(&request, &self.workspace_id, &self.runtime_id)?;
         self.runtime
             .publish_repository_source(request)
-            .map_err(|error| match error {
-                worker_runtime::error::RuntimeError::WorkingDirectory(diagnostic) => {
-                    Error::RuntimeOperationFailed {
-                        runtime_id: self.runtime_id.clone(),
-                        code: diagnostic.code,
-                        message: diagnostic.message,
-                    }
-                }
-                error => Error::RuntimeOperationFailed {
-                    runtime_id: self.runtime_id.clone(),
-                    code: "repository_publication_provider_unavailable".to_string(),
-                    message: error.to_string(),
-                },
-            })
-    }
-
-    fn reconcile_repository_publication(
-        &self,
-        request: RepositoryPublicationRequest,
-    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
-        validate_repository_publication_workspace(&request, &self.workspace_id, &self.runtime_id)?;
-        self.runtime
-            .reconcile_repository_publication(request)
-            .map_err(|error| match error {
-                worker_runtime::error::RuntimeError::WorkingDirectory(diagnostic) => {
-                    Error::RuntimeOperationFailed {
-                        runtime_id: self.runtime_id.clone(),
-                        code: diagnostic.code,
-                        message: diagnostic.message,
-                    }
-                }
-                error => Error::RuntimeOperationFailed {
-                    runtime_id: self.runtime_id.clone(),
-                    code: "repository_publication_provider_unavailable".to_string(),
-                    message: error.to_string(),
-                },
-            })
-    }
-
-    fn repository_publication_receipt(
-        &self,
-        binding: RepositoryPublicationBinding,
-    ) -> std::result::Result<Option<RepositoryPublicationReceipt>, Error> {
-        validate_repository_publication_binding(&binding, &self.workspace_id, &self.runtime_id)?;
-        self.runtime
-            .repository_publication_receipt(binding)
             .map_err(|error| match error {
                 worker_runtime::error::RuntimeError::WorkingDirectory(diagnostic) => {
                     Error::RuntimeOperationFailed {
@@ -5663,9 +5523,6 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH && method == "POST" {
         return "repository-publications:publish";
     }
-    if path == runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE && method == "POST" {
-        return "repository-publications:reconcile";
-    }
     if (path == "/v1/working-directories/repository-access"
         || path == "/v1/repository-refs/observe"
         || path == SSH_HOST_KEY_PROBE_PATH)
@@ -6234,10 +6091,10 @@ impl RemoteWorkerRuntime {
         &self,
         path: &str,
         request: RepositoryPublicationRequest,
-    ) -> Result<RepositoryPublicationReceipt, Error> {
+    ) -> Result<RepositoryPublicationResult, Error> {
         validate_repository_publication_workspace(&request, &self.workspace_id, &self.runtime_id)?;
         let receipt = self
-            .post_json::<_, RepositoryPublicationReceipt>(path, &request)
+            .post_json::<_, RepositoryPublicationResult>(path, &request)
             .map_err(|diagnostic| Error::RuntimeOperationFailed {
                 runtime_id: self.runtime_id.clone(),
                 code: diagnostic.code,
@@ -6246,8 +6103,8 @@ impl RemoteWorkerRuntime {
         if receipt.binding != request.binding {
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: self.runtime_id.clone(),
-                code: "repository_publication_receipt_mismatch".to_string(),
-                message: "Runtime publication receipt does not match the requested binding"
+                code: "repository_publication_result_mismatch".to_string(),
+                message: "Runtime publication result does not match the requested binding"
                     .to_string(),
             });
         }
@@ -7153,50 +7010,11 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     fn publish_repository_source(
         &self,
         request: RepositoryPublicationRequest,
-    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
+    ) -> std::result::Result<RepositoryPublicationResult, Error> {
         self.post_repository_publication(
             runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH,
             request,
         )
-    }
-
-    fn reconcile_repository_publication(
-        &self,
-        request: RepositoryPublicationRequest,
-    ) -> std::result::Result<RepositoryPublicationReceipt, Error> {
-        self.post_repository_publication(
-            runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE,
-            request,
-        )
-    }
-
-    fn repository_publication_receipt(
-        &self,
-        binding: RepositoryPublicationBinding,
-    ) -> std::result::Result<Option<RepositoryPublicationReceipt>, Error> {
-        validate_repository_publication_binding(&binding, &self.workspace_id, &self.runtime_id)?;
-        let receipt = self
-            .post_json::<_, Option<RepositoryPublicationReceipt>>(
-                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT,
-                &binding,
-            )
-            .map_err(|diagnostic| Error::RuntimeOperationFailed {
-                runtime_id: self.runtime_id.clone(),
-                code: diagnostic.code,
-                message: diagnostic.message,
-            })?;
-        if receipt
-            .as_ref()
-            .is_some_and(|receipt| receipt.binding != binding)
-        {
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: self.runtime_id.clone(),
-                code: "repository_publication_receipt_mismatch".to_string(),
-                message: "Runtime publication receipt does not match the requested binding"
-                    .to_string(),
-            });
-        }
-        Ok(receipt)
     }
 
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
@@ -10913,6 +10731,7 @@ mod tests {
             source_fingerprint: "sha256:source".to_string(),
             selector: "refs/heads/published".to_string(),
             resolved_ref: "0123456789012345678901234567890123456789".to_string(),
+            contained_commit: None,
             observed_at_epoch_seconds: 42,
         };
         let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
@@ -10924,6 +10743,7 @@ mod tests {
         )
         .unwrap();
         let request = RepositoryRefObservationRequest {
+            required_ancestor: None,
             repository: worker_runtime::catalog::WorkingDirectoryRepository {
                 id: "repository-1".to_string(),
                 provider: "git".to_string(),
@@ -12181,21 +12001,13 @@ mod tests {
             "test Worker",
         ))]);
         let request = repository_publication_request_fixture();
-        for result in [
-            registry.publish_repository_source("runtime-test", request.clone()),
-            registry.reconcile_repository_publication("runtime-test", request.clone()),
-        ] {
+        for result in [registry.publish_repository_source("runtime-test", request.clone())] {
             assert!(matches!(
                 result,
                 Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
                     if code == "repository_publication_provider_unavailable"
             ));
         }
-        assert!(matches!(
-            registry.repository_publication_receipt("runtime-test", request.binding),
-            Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
-                if code == "repository_publication_provider_unavailable"
-        ));
     }
 
     // Registry and remote HTTP serialization are real; only the remote peer is a
@@ -12204,24 +12016,20 @@ mod tests {
     fn repository_publication_remote_preserves_outcomes_and_rejects_other_binding() {
         use worker_runtime::catalog::RepositoryPublicationOutcome;
         let request = repository_publication_request_fixture();
-        for reconcile in [false, true] {
-            let path = if reconcile {
-                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE
-            } else {
-                runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH
-            };
+        {
+            let path = runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH;
             let receipts = [
-                RepositoryPublicationReceipt {
+                RepositoryPublicationResult {
                     binding: request.binding.clone(),
                     outcome: RepositoryPublicationOutcome::Unknown {},
                 },
-                RepositoryPublicationReceipt {
+                RepositoryPublicationResult {
                     binding: request.binding.clone(),
                     outcome: RepositoryPublicationOutcome::NotPublished {
                         reason: "not_ff".into(),
                     },
                 },
-                RepositoryPublicationReceipt {
+                RepositoryPublicationResult {
                     binding: request.binding.clone(),
                     outcome: RepositoryPublicationOutcome::Published {
                         target_after: request.binding.source.clone(),
@@ -12260,123 +12068,16 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let call = || {
-                if reconcile {
-                    registry.reconcile_repository_publication("runtime-test", request.clone())
-                } else {
-                    registry.publish_repository_source("runtime-test", request.clone())
-                }
-            };
+            let call = || registry.publish_repository_source("runtime-test", request.clone());
             for receipt in receipts {
                 assert_eq!(call().unwrap(), receipt);
             }
             assert!(
                 matches!(call(), Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
-                if code == "repository_publication_receipt_mismatch")
+                if code == "repository_publication_result_mismatch")
             );
             server.join().unwrap();
         }
-    }
-
-    #[test]
-    fn repository_publication_receipt_remote_preserves_optional_outcomes_and_checks_binding() {
-        use worker_runtime::catalog::RepositoryPublicationOutcome;
-        let binding = repository_publication_request_fixture().binding;
-        let path = runtime_api::RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT;
-        let receipts = vec![
-            None,
-            Some(RepositoryPublicationReceipt {
-                binding: binding.clone(),
-                outcome: RepositoryPublicationOutcome::Unknown {},
-            }),
-            Some(RepositoryPublicationReceipt {
-                binding: binding.clone(),
-                outcome: RepositoryPublicationOutcome::NotPublished {
-                    reason: "not_ff".into(),
-                },
-            }),
-            Some(RepositoryPublicationReceipt {
-                binding: binding.clone(),
-                outcome: RepositoryPublicationOutcome::Published {
-                    target_after: binding.source.clone(),
-                    observed_at_epoch_seconds: 42,
-                },
-            }),
-        ];
-        let mismatched = ["operation", "workspace", "runtime", "connection", "source"]
-            .into_iter()
-            .map(|field| {
-                let mut receipt = receipts[3].clone().unwrap();
-                match field {
-                    "operation" => receipt.binding.operation_id = "other-operation".into(),
-                    "workspace" => receipt.binding.workspace_id = "other-workspace".into(),
-                    "runtime" => receipt.binding.worker.runtime_id = "other-runtime".into(),
-                    "connection" => receipt.binding.connection_id = "other-connection".into(),
-                    "source" => receipt.binding.source = "c".repeat(40),
-                    _ => unreachable!(),
-                }
-                Some(receipt)
-            })
-            .collect::<Vec<_>>();
-        let responses = receipts
-            .iter()
-            .chain(&mismatched)
-            .map(|receipt| MockResponse {
-                request_body: Some(serde_json::to_value(&binding).unwrap()),
-                ..mock_response(
-                    "POST",
-                    path,
-                    true,
-                    200,
-                    serde_json::to_string(receipt).unwrap(),
-                )
-            })
-            .collect();
-        let (base_url, server) = serve_mock_http(responses);
-        let registry = RuntimeRegistry::new(Vec::new());
-        registry.register(
-            RemoteWorkerRuntime::new(
-                RemoteRuntimeConfig::new(
-                    "runtime-test",
-                    "Publication Runtime",
-                    base_url,
-                    Some("secret-token".into()),
-                ),
-                "workspace-a".into(),
-                "http://127.0.0.1:8787".into(),
-            )
-            .unwrap(),
-        );
-        for field in ["workspace", "runtime"] {
-            let mut wrong = binding.clone();
-            let expected = if field == "workspace" {
-                wrong.workspace_id = "other-workspace".into();
-                "repository_publication_workspace_mismatch"
-            } else {
-                wrong.worker.runtime_id = "other-runtime".into();
-                "repository_publication_runtime_mismatch"
-            };
-            assert!(
-                matches!(registry.repository_publication_receipt("runtime-test", wrong),
-                Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. }) if code == expected)
-            );
-        }
-        for receipt in receipts {
-            assert_eq!(
-                registry
-                    .repository_publication_receipt("runtime-test", binding.clone())
-                    .unwrap(),
-                receipt
-            );
-        }
-        for _ in mismatched {
-            assert!(
-                matches!(registry.repository_publication_receipt("runtime-test", binding.clone()),
-                Err(RuntimeRegistryError::RuntimeOperationFailed { code, .. })
-                    if code == "repository_publication_receipt_mismatch")
-            );
-        }
-        server.join().unwrap();
     }
 
     #[test]

@@ -1,76 +1,32 @@
 use super::*;
 use crate::catalog::{
-    RepositoryPublicationBinding, RepositoryPublicationReceipt, RepositoryPublicationRequest,
+    RepositoryPublicationBinding, RepositoryPublicationRequest, RepositoryPublicationResult,
 };
 
 impl Runtime {
     pub async fn publish_repository_source_from_resource(
         &self,
         mut request: RepositoryPublicationRequest,
-    ) -> Result<RepositoryPublicationReceipt, RuntimeError> {
-        let backend = self.publication_backend(&request)?;
-        if let Some(saved) = backend.repository_publication_receipt(&request.binding)? {
-            return Ok(saved);
-        }
+    ) -> Result<RepositoryPublicationResult, RuntimeError> {
+        self.publication_backend(&request)?;
         if let Some(ssh) = request.materialization.ssh.as_mut() {
             if self.resolve_repository_access_resource(ssh).await.is_err() {
-                return backend
-                    .reject_repository_publication(
-                        &request,
-                        "Current Repository credentials could not be resolved",
-                    )
-                    .map_err(RuntimeError::from);
+                return Ok(not_published(
+                    &request,
+                    "Current Repository credentials could not be resolved",
+                ));
             }
         }
         let runtime = self.clone();
+        let binding = request.binding.clone();
         tokio::task::spawn_blocking(move || runtime.publish_repository_source(request))
             .await
-            .map_err(|_| {
-                RuntimeError::InvalidRequest(
-                    "publication task outcome unavailable; reconcile operation".into(),
-                )
-            })?
-    }
-
-    pub async fn reconcile_repository_publication_from_resource(
-        &self,
-        mut request: RepositoryPublicationRequest,
-    ) -> Result<RepositoryPublicationReceipt, RuntimeError> {
-        // Recovery is authorized by the saved operation, not the former Worker.
-        let backend = self.publication_backend(&request)?;
-        let saved = backend
-            .repository_publication_receipt(&request.binding)?
-            .ok_or_else(|| {
-                RuntimeError::InvalidRequest("publication operation was not found".into())
-            })?;
-        if !matches!(
-            saved.outcome,
-            crate::catalog::RepositoryPublicationOutcome::Unknown {}
-        ) {
-            return Ok(saved);
-        }
-        if let Some(ssh) = request.materialization.ssh.as_mut() {
-            if self.resolve_repository_access_resource(ssh).await.is_err() {
-                return Ok(saved);
-            }
-        }
-        let runtime = self.clone();
-        tokio::task::spawn_blocking(move || runtime.reconcile_repository_publication(request))
-            .await
-            .map_err(|_| {
-                RuntimeError::InvalidRequest("publication recovery task unavailable".into())
-            })?
-    }
-
-    /// Read retained provider evidence without current Repository configuration,
-    /// credentials, Workdir access, or the former Worker's live authority.
-    pub fn repository_publication_receipt(
-        &self,
-        binding: RepositoryPublicationBinding,
-    ) -> Result<Option<RepositoryPublicationReceipt>, RuntimeError> {
-        self.publication_binding_backend(&binding)?
-            .repository_publication_receipt(&binding)
-            .map_err(RuntimeError::from)
+            .unwrap_or_else(|_| {
+                Ok(RepositoryPublicationResult {
+                    binding,
+                    outcome: crate::catalog::RepositoryPublicationOutcome::Unknown {},
+                })
+            })
     }
 
     fn publication_binding_backend(
@@ -116,12 +72,9 @@ impl Runtime {
     pub fn publish_repository_source(
         &self,
         request: RepositoryPublicationRequest,
-    ) -> Result<RepositoryPublicationReceipt, RuntimeError> {
+    ) -> Result<RepositoryPublicationResult, RuntimeError> {
         let backend = self.publication_backend(&request)?;
-        if let Some(saved) = backend.repository_publication_receipt(&request.binding)? {
-            return Ok(saved);
-        }
-        let publish = || -> Result<RepositoryPublicationReceipt, RuntimeError> {
+        let publish = || -> Result<RepositoryPublicationResult, RuntimeError> {
             let worker = WorkerRef::try_from(&request.binding.worker).map_err(|_| {
                 RuntimeError::InvalidRequest("publication Worker identity invalid".into())
             })?;
@@ -170,22 +123,23 @@ impl Runtime {
                 .map_err(RuntimeError::from)
         };
         match publish() {
-            Ok(receipt) => Ok(receipt),
-            Err(_) => backend
-                .reject_repository_publication(
-                    &request,
-                    "Publication preflight or required Worker/Workdir resource unavailable",
-                )
-                .map_err(RuntimeError::from),
+            Ok(result) => Ok(result),
+            Err(_) => Ok(not_published(
+                &request,
+                "Publication preflight or required Worker/Workdir resource unavailable",
+            )),
         }
     }
+}
 
-    pub fn reconcile_repository_publication(
-        &self,
-        request: RepositoryPublicationRequest,
-    ) -> Result<RepositoryPublicationReceipt, RuntimeError> {
-        self.publication_backend(&request)?
-            .reconcile_repository_publication(&request)
-            .map_err(RuntimeError::from)
+fn not_published(
+    request: &RepositoryPublicationRequest,
+    reason: &str,
+) -> RepositoryPublicationResult {
+    RepositoryPublicationResult {
+        binding: request.binding.clone(),
+        outcome: crate::catalog::RepositoryPublicationOutcome::NotPublished {
+            reason: reason.into(),
+        },
     }
 }

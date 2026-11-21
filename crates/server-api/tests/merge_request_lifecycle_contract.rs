@@ -30,6 +30,34 @@ fn generated_mr_contract_exposes_lifecycle_without_mr_aggregation() {
             assert!(properties.get(field).is_none(), "{name}.{field}");
         }
     }
+    for field in ["worker_assignment", "worker_resource_key"] {
+        assert!(
+            schemas["MergeRequestListItem"]["properties"]
+                .get(field)
+                .is_some(),
+            "list.{field}"
+        );
+        assert!(
+            schemas["MergeRequestDetailResponse"]["properties"]
+                .get(field)
+                .is_some(),
+            "detail.{field}"
+        );
+        assert!(
+            schemas["TicketMergeRequestSummary"]["properties"]
+                .get(field)
+                .is_none(),
+            "Ticket summary must not grow {field}"
+        );
+    }
+    for name in ["MergeRequestListItem", "MergeRequestDetailResponse"] {
+        assert!(schemas[name]["properties"].get("publications").is_none());
+    }
+    assert!(
+        schemas["MergeRequestListItem"]["properties"]
+            .get("readiness")
+            .is_none()
+    );
     for name in ["ReviewEvent", "MergeRequestReviewSummary"] {
         assert!(
             schemas[name]["properties"]

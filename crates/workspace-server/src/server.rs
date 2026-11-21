@@ -2204,7 +2204,6 @@ pub struct WorkspaceApi {
     orchestrator_attention:
         Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<Mutex<OrchestratorAttentionState>>>>>,
     notification_delivery_lifecycle: Arc<notification_delivery::NotificationDeliveryLifecycle>,
-    mr_publication_wake: Arc<tokio::sync::Notify>,
     backend_job_drain_requests: Arc<AtomicU64>,
     backend_job_recovery: Arc<backend_job_recovery::RecoveryOwners>,
     journal_lifecycle: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -5139,7 +5138,6 @@ impl WorkspaceApi {
             companion,
             orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
             notification_delivery_lifecycle: Arc::new(Default::default()),
-            mr_publication_wake: Arc::new(tokio::sync::Notify::new()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
             #[cfg(not(test))]
@@ -8312,6 +8310,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::merge_request_review_revoke(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_complete(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::merge_request_comment(
@@ -13194,6 +13195,36 @@ impl server_api::ServerApi for ServerApiContractService {
             .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn merge_request_complete(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::CompleteMergeRequestRequest,
+    ) -> std::result::Result<server_api::MergeEvent, server_api::RepositoryApiError> {
+        let api = self.workspace_api()?.clone();
+        let headers = current_worker_contract_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(|e| ApiError::from(e).into_repository_api_error())?
+            .run(move || {
+                require_workspace_access(&workspace_id, &api)?;
+                let worker = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+                let event = mr_publication::complete(&api, &worker, &id, request)?;
+                drop(enqueue_ticket_notification_recovery(&api));
+                let server_api::MergeRequestThreadEvent::Merge(event) =
+                    public_merge_request_thread_event(
+                        merge_request::MergeRequestThreadEvent::Merge(event),
+                    )
+                else {
+                    unreachable!()
+                };
+                Ok(event)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn merge_request_comment(
         &self,
         context: server_api::ServerRequestContext,
@@ -13232,6 +13263,7 @@ impl server_api::ServerApi for ServerApiContractService {
                         )
                     },
                 )?;
+                drop(enqueue_ticket_notification_recovery(&api));
                 let server_api::MergeRequestThreadEvent::Comment(event) =
                     public_merge_request_thread_event(
                         merge_request::MergeRequestThreadEvent::Comment(event),
@@ -19779,6 +19811,24 @@ fn observe_published_merge_ref(
     repository_id: &str,
     selector: &str,
 ) -> ApiResult<RepositoryRefObservation> {
+    observe_published_ref_with_ancestor(
+        api,
+        workspace_id,
+        runtime_id,
+        repository_id,
+        selector,
+        None,
+    )
+}
+
+fn observe_published_ref_with_ancestor(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    runtime_id: &str,
+    repository_id: &str,
+    selector: &str,
+    required_ancestor: Option<&str>,
+) -> ApiResult<RepositoryRefObservation> {
     let canonical_selector =
         crate::repositories::normalize_target_branch_selector(repository_id, selector)
             .map_err(repository_merge_evidence_error)?;
@@ -19806,6 +19856,7 @@ fn observe_published_merge_ref(
             RepositoryRefObservationRequest {
                 repository: materialization_request.repository,
                 selector: canonical_selector,
+                required_ancestor: required_ancestor.map(str::to_owned),
                 materialization: materialization_request.materialization,
             },
         )
@@ -20332,6 +20383,31 @@ fn public_mr_worker_assignment(
     }
 }
 
+fn current_mr_worker_projection(
+    api: &WorkspaceApi,
+    mr: &merge_request::MergeRequest,
+) -> ApiResult<(
+    Option<server_api::MergeRequestWorkerAssignedEvent>,
+    Option<String>,
+)> {
+    let assignment = mr
+        .current_worker()
+        .cloned()
+        .map(public_mr_worker_assignment);
+    let key = assignment
+        .as_ref()
+        .and_then(|event| event.worker.as_ref())
+        .map(|worker| {
+            api.store.worker_resource_key(
+                &mr.workspace_id,
+                &RuntimeWorkerRef::new(&worker.runtime_id, &worker.worker_id),
+            )
+        })
+        .transpose()?
+        .flatten();
+    Ok((assignment, key))
+}
+
 fn public_merge_request_thread_event(
     event: merge_request::MergeRequestThreadEvent,
 ) -> server_api::MergeRequestThreadEvent {
@@ -20378,7 +20454,7 @@ fn public_merge_request_thread_event(
                 event_id: event.event_id,
                 sequence: event.sequence,
                 body: event.body,
-                author: public_merge_request_worker_identity(event.author),
+                author: event.author.map(public_merge_request_worker_identity),
                 created_at: event.created_at.to_rfc3339(),
             })
         }
@@ -20500,15 +20576,15 @@ async fn scoped_list_merge_requests(
         .items
         .into_iter()
         .map(|merge_request| -> ApiResult<MergeRequestListItem> {
+            let (worker_assignment, worker_resource_key) = current_mr_worker_projection(&api, &merge_request)?;
             let (current_subject_ref, ref_diagnostics) =
                 if merge_request.state.is_open() {
                     match (
                         merge_request.selector_from.as_deref(),
                         merge_request.ticket_ids.first(),
                     ) {
-                        (Some(selector), Some(_ticket_id)) => match store
-                            .current_worker(&workspace_id, &merge_request.merge_request_id)?
-                            .and_then(|assignment| assignment.worker)
+                        (Some(selector), Some(_ticket_id)) => match worker_assignment
+                            .as_ref().and_then(|assignment| assignment.worker.as_ref())
                         {
                             Some(assignment) => match observe_published_source_ref(
                                 &api,
@@ -20552,6 +20628,8 @@ async fn scoped_list_merge_requests(
                     })
                 })),
                 ticket_ids,
+                worker_assignment,
+                worker_resource_key,
                 thread_event_count,
                 ref_diagnostics,
             })
@@ -20818,18 +20896,10 @@ async fn scoped_show_merge_request(
                     "Merge Request has no linked Ticket".into(),
                 ))
             })?;
-            let worker_assignment = mr
-                .current_worker()
-                .cloned()
-                .map(public_mr_worker_assignment);
+            let (worker_assignment, worker_resource_key) = current_mr_worker_projection(&api, &mr)?;
             let assignment = worker_assignment
                 .as_ref()
                 .and_then(|assignment| assignment.worker.as_ref());
-            let publications = store
-                .publications(&workspace_id, &merge_request_id)?
-                .into_iter()
-                .map(mr_publication::public)
-                .collect();
             let (source, target) = if let Some(refs) = integrated_refs {
                 refs
             } else {
@@ -20930,7 +21000,7 @@ async fn scoped_show_merge_request(
                 view: query.view.unwrap_or_default(),
                 summary,
                 worker_assignment,
-                publications,
+                worker_resource_key,
                 event_page,
             }))
         })
@@ -21292,7 +21362,7 @@ async fn scoped_submit_merge_request_review(
                 .map(internal_review_finding)
                 .collect();
             let event = store.submit_review(merge_request::SubmitMergeRequestReview {
-                merge_request_id,
+                merge_request_id: merge_request_id.clone(),
                 ticket_id,
                 current_subject_ref,
                 capability_token: input.capability_token,
@@ -21301,9 +21371,13 @@ async fn scoped_submit_merge_request_review(
                 findings,
                 now: Utc::now(),
             })?;
-            if event.decision == merge_request::ReviewDecision::Approve {
-                api.mr_publication_wake.notify_one();
-            }
+            let publication = if event.decision == merge_request::ReviewDecision::Approve {
+                mr_publication::advance(&api, &merge_request_id)
+            } else {
+                Ok(())
+            };
+            drop(enqueue_ticket_notification_recovery(&api));
+            publication?;
             Ok(Json(public_review_event(event)))
         })
         .await
@@ -23873,10 +23947,7 @@ async fn execute_workdir_session_operation(
 }
 
 async fn run_orchestrator_turn_end_hook(api: WorkspaceApi) {
-    tokio::join!(
-        run_notification_recovery_hook(api.clone()),
-        mr_publication::recovery_loop(api)
-    );
+    run_notification_recovery_hook(api).await;
 }
 
 async fn run_notification_recovery_hook(api: WorkspaceApi) {
@@ -24101,6 +24172,28 @@ fn assigned_subject_body(
         .map(|lease| lease.worker))
 }
 
+fn authorize_assignment_input(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    input: &crate::store::TicketAssignmentDelivery,
+) -> Result<()> {
+    if let Some(resource @ server_api::authorization::PermissionResource::MergeRequest { .. }) = api
+        .store
+        .notification_source_resource(api.workspace_id(), &input.input_event_id)?
+    {
+        subject_authorization::authorize(
+            api,
+            worker,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: "merge_request.read".into(),
+                resource,
+            },
+        )
+        .map_err(|error| error.error)?;
+    }
+    authorize_assignment_delivery(api, worker, &input.ticket_id)
+}
+
 fn authorize_assignment_delivery(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -24214,7 +24307,7 @@ fn check_orchestrator_assignment_attention(
             continue;
         }
         let key = assignment_delivery_key(&input);
-        if authorize_assignment_delivery(api, worker, &input.ticket_id).is_err() {
+        if authorize_assignment_input(api, worker, &input).is_err() {
             record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             continue;
         }
@@ -24268,7 +24361,7 @@ fn check_orchestrator_assignment_attention(
                 continue;
             }
         };
-        if authorize_assignment_delivery(api, worker, &input.ticket_id).is_err() {
+        if authorize_assignment_input(api, worker, &input).is_err() {
             record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             continue;
         }
@@ -24296,7 +24389,7 @@ fn check_orchestrator_assignment_attention(
                 input.waiting_reason.as_deref(),
                 input.next_action.as_deref(),
             )]);
-        let content = match catalog.orchestrator_queue_attention(
+        let mut content = match catalog.orchestrator_queue_attention(
             worker::OrchestratorQueueAttentionPrompt::Server,
             &context,
         ) {
@@ -24306,9 +24399,25 @@ fn check_orchestrator_assignment_attention(
                 continue;
             }
         };
-        if authorize_assignment_delivery(api, worker, &input.ticket_id).is_err() {
+        if authorize_assignment_input(api, worker, &input).is_err() {
             record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             continue;
+        }
+        match api
+            .store
+            .notification_source_resource(api.workspace_id(), &input.input_event_id)
+        {
+            Ok(Some(server_api::authorization::PermissionResource::MergeRequest {
+                merge_request_id,
+                ..
+            })) => {
+                content.push_str(&format!("\nMerge Request {merge_request_id}: reread the current MR, ownership and publication results before acting. Comments request attention, not approval or completion. Unconfirmed publication is not success; notification acceptance is not execution authority.\n"));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                record_notification_failure(api, &key, NotificationFailureCode::SourceLookupFailed);
+                continue;
+            }
         }
         let _content = match api.store.prepare_ticket_assignment_delivery_content(
             &api.config.workspace_id,
@@ -24348,7 +24457,7 @@ fn send_orchestrator_attention(
         if api.notification_delivery_lifecycle.stopped() {
             return;
         }
-        if authorize_assignment_delivery(api, worker, &delivery.input.ticket_id).is_err() {
+        if authorize_assignment_input(api, worker, &delivery.input).is_err() {
             record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             return;
         }
@@ -24388,7 +24497,7 @@ fn send_orchestrator_attention(
                 return;
             }
         };
-        if authorize_assignment_delivery(api, worker, &delivery.input.ticket_id).is_err() {
+        if authorize_assignment_input(api, worker, &delivery.input).is_err() {
             record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             return;
         }
@@ -45057,8 +45166,8 @@ mod tests {
             assert!(!handler.contains("repository_reader()"));
         }
         let publication = include_str!("server/mr_publication.rs");
-        assert!(publication.contains(".complete_publication("));
-        assert!(publication.contains(".repository_publication_receipt("));
+        assert!(publication.contains(".record_confirmed_publication("));
+        assert!(publication.contains(".publish_repository_source("));
         let submit = handler_source(source, "scoped_submit_merge_request_review");
         assert!(
             submit
@@ -47492,6 +47601,7 @@ mod tests {
     #[test]
     fn recorded_completion_replay_is_identified_before_later_target_observation() {
         let event = merge_request::MergeEvent {
+            owner_operation_id: None,
             event_id: "merge-event".into(),
             sequence: 1,
             operation_id: "operation".into(),
@@ -54108,17 +54218,31 @@ mod tests {
 
         fn cancel_worker(
             &self,
-            _worker_ref: &worker_runtime::identity::WorkerRef,
+            worker_ref: &worker_runtime::identity::WorkerRef,
         ) -> worker_runtime::execution::WorkerExecutionResult {
+            use worker_runtime::execution::{WorkerExecutionOperation, WorkerExecutionResult};
             if let Some(message) = self.cancel_failure.lock().unwrap().clone() {
-                return worker_runtime::execution::WorkerExecutionResult::rejected(
-                    worker_runtime::execution::WorkerExecutionOperation::Cancel,
-                    message,
-                );
+                return WorkerExecutionResult::rejected(WorkerExecutionOperation::Cancel, message);
             }
-            worker_runtime::execution::WorkerExecutionResult::accepted(
-                worker_runtime::execution::WorkerExecutionOperation::Cancel,
-            )
+            let Some(execution) = self.contexts.lock().unwrap().get(worker_ref).cloned() else {
+                return WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Cancel,
+                    "deterministic test backend has no live Worker",
+                );
+            };
+            let mut state = execution.state.lock().unwrap();
+            state.last_command_id += 1;
+            let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Cancel)
+                .with_worker_state(state.clone());
+            result.command = Some(protocol::WorkerCommandResult::Acknowledged {
+                acknowledgement: protocol::WorkerCommandAcknowledgement {
+                    command_id: state.last_command_id,
+                    command: protocol::WorkerCommandKind::Cancel,
+                    disposition: protocol::WorkerCommandDisposition::Accepted,
+                    state: state.clone(),
+                },
+            });
+            result
         }
 
         fn dispatch_input(

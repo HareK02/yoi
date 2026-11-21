@@ -181,6 +181,9 @@ pub struct WorkingDirectoryRequest {
 pub struct RepositoryRefObservationRequest {
     pub repository: WorkingDirectoryRepository,
     pub selector: String,
+    /// When present, require the provider's commit graph to contain this exact commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_ancestor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialization: Option<RepositoryMaterializationContext>,
 }
@@ -192,11 +195,13 @@ pub struct RepositoryRefObservation {
     pub source_fingerprint: String,
     pub selector: String,
     pub resolved_ref: String,
+    /// Present only after checking the freshly fetched provider graph, not local refs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contained_commit: Option<String>,
     pub observed_at_epoch_seconds: u64,
 }
 
-/// Fixed publication identity. Credentials are refreshed separately from replay identity.
-/// Saved-receipt lookup takes this binding alone and never acquires Repository access.
+/// Fixed publication input. Each execution requires current authority; this is not a replay key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryPublicationBinding {
@@ -237,9 +242,10 @@ pub enum RepositoryPublicationOutcome {
     },
 }
 
+/// Ephemeral execution result. Unknown never authorizes an automatic retry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RepositoryPublicationReceipt {
+pub struct RepositoryPublicationResult {
     pub binding: RepositoryPublicationBinding,
     pub outcome: RepositoryPublicationOutcome,
 }

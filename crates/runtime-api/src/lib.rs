@@ -1918,10 +1918,6 @@ pub const RUNTIME_ROUTE_SSH_PROBE: &str = "/v1/repositories/ssh/probe";
 pub const RUNTIME_ROUTE_REPOSITORY_REFS_OBSERVE: &str = "/v1/repository-refs/observe";
 pub const RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH: &str =
     "/v1/repository-publications/publish";
-pub const RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE: &str =
-    "/v1/repository-publications/reconcile";
-pub const RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT: &str =
-    "/v1/repository-publications/receipt";
 pub const RUNTIME_ROUTE_WORKDIR_SESSIONS: &str =
     "/v1/working-directories/{working_directory_id}/sessions";
 pub const RUNTIME_ROUTE_WORKDIR_SESSION_OPERATIONS: &str =
@@ -1988,16 +1984,6 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
         method: "POST",
         path: RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_PUBLISH,
         reason: "Repository publication transport",
-    },
-    RemainingRuntimeRoute {
-        method: "POST",
-        path: RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECONCILE,
-        reason: "Repository publication recovery transport",
-    },
-    RemainingRuntimeRoute {
-        method: "POST",
-        path: RUNTIME_ROUTE_REPOSITORY_PUBLICATIONS_RECEIPT,
-        reason: "Saved Repository publication receipt transport",
     },
     RemainingRuntimeRoute {
         method: "POST",

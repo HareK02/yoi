@@ -198,7 +198,7 @@ impl MrModel {
             "explicit coder-review implement instructions missing"
         );
         assert!(
-            !request
+            request
                 .tools
                 .iter()
                 .any(|tool| tool.name == "CompleteMergeRequest")
@@ -638,7 +638,7 @@ async fn ordinary_subject_explicit_coder_review_publishes_mr_and_preserves_unrev
     let original_body = source;
     let published = evaluation["source"].as_str().unwrap();
 
-    // A caller cannot force completion of an unreviewed MR: the public route is gone.
+    // The Subject cannot turn an unreviewed MR into a completed one.
     let complete_path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr_id}/complete");
     let (status, error) = connected_authorization_post(
         &h.backend_url,
@@ -646,16 +646,14 @@ async fn ordinary_subject_explicit_coder_review_publishes_mr_and_preserves_unrev
         &original_body,
         &complete_path,
         &json!({"operation_id":"fabricated-completion","approval_event_id":"absent",
-            "target_ref_before":before,"target_ref_after":published,
-            "strategy":"fast_forward","resolution":"none"}),
+            "expected_owner_operation_id":mr.current_worker().unwrap().operation_id,
+            "expected_source_ref":published}),
     )
     .await;
-    assert!(
-        matches!(
-            status,
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-        ),
-        "removed completion route: {status} {error}"
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "completion requires current Coder authority: {error}"
     );
     // Nor does a Backend advance invent approval or move the target.
     mr_publication::advance(&h.api, mr_id).unwrap();
@@ -854,7 +852,7 @@ impl FullModel {
             "integrate" => (
                 "ShowMergeRequest",
                 "\"kind\":\"completed\"",
-                "publications",
+                "merge_event_id",
                 "complete",
             ),
             "complete" => (
@@ -1113,12 +1111,13 @@ impl FullModel {
         };
         assert_eq!(mr["state"]["kind"], "integration");
         assert!(
-            mr["publications"]
+            mr["thread"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|p| p["outcome"]["kind"] == "not_published"),
-            "only confirmed non-publication permits source mutation: {mr}"
+                .any(|e| e["kind"] == "comment"
+                    && e["body"].as_str().unwrap_or("").contains("publication")),
+            "publication blocker must be visible: {mr}"
         );
         Some(call(
             request,
@@ -1140,7 +1139,7 @@ impl FullModel {
             );
         };
         assert!(
-            !request
+            request
                 .tools
                 .iter()
                 .any(|tool| tool.name == "CompleteMergeRequest")
@@ -1198,7 +1197,13 @@ impl FullModel {
                 .or_else(|| success(request, "full-coder-integration-observed"))
                 .unwrap();
             assert_eq!(mr["state"]["kind"], "completed", "{mr}");
-            assert!(!mr["publications"].as_array().unwrap().is_empty());
+            assert!(
+                mr["thread"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["kind"] == "merge")
+            );
             assert_approved(&mr, &requirements);
             return call(
                 request,
@@ -1245,6 +1250,29 @@ impl FullModel {
                 if let Some(events) = self.integrated_review(request, ticket, &original) {
                     return events;
                 }
+            }
+            if text(request).contains("full-r2-manual-recovery")
+                && success(request, "manual-complete").is_none()
+            {
+                if checked_command(request, "manual-push").is_none() {
+                    return call(
+                        request,
+                        "manual-push",
+                        "Bash",
+                        json!({"target_workdir":"checkout","cwd":".","timeout":10000,
+                        "command":format!("git push origin HEAD:refs/heads/{FULL_TARGET} && later=$(printf 'later target publication\\n' | git -c user.name=Test -c user.email=test@example.invalid commit-tree HEAD^{{tree}} -p HEAD) && git push origin $later:refs/heads/{FULL_TARGET}")}),
+                    );
+                }
+                return call(
+                    request,
+                    "manual-complete",
+                    "CompleteMergeRequest",
+                    json!({
+                    "merge_request_id":original["merge_request_id"],"operation_id":"manual-completion",
+                    "expected_owner_operation_id":original["worker_assignment"]["operation_id"],
+                    "approval_event_id":event(&original,"review")["event_id"],
+                    "expected_source_ref":original["source"]["ref"]}),
+                );
             }
             let resumed = text(request).contains("full-r2-publication-resume");
             let id = if resumed {
@@ -1581,6 +1609,22 @@ impl agen::llm_client::LlmClient for FullModel {
                 return live.stream(request).await;
             }
         }
+        if let Some(Item::ToolResult {
+            call_id,
+            is_error,
+            summary,
+            ..
+        }) = request
+            .items
+            .iter()
+            .rev()
+            .find(|item| matches!(item, Item::ToolResult { .. }))
+        {
+            eprintln!(
+                "MR scenario tool result: {call_id} error={is_error} {}",
+                summary.chars().take(400).collect::<String>()
+            );
+        }
         let events = if request
             .tools
             .iter()
@@ -1781,18 +1825,18 @@ async fn replace_idle_body(h: &ConnectedWorkerHarness, subject: &str) -> Runtime
 }
 
 async fn full_mr_scenario(replace_body: bool, integrate_target: bool) {
-    full_mr_run(replace_body, integrate_target, None, false, false).await;
+    full_mr_run(replace_body, integrate_target, None, false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn stopped_coder_continues_on_another_worker_without_replacing_ticket_assignment() {
-    full_mr_run(false, true, None, true, false).await;
+    full_mr_run(false, true, None, true, false, false).await;
 }
 
 // Explicit provider access only; the normal suite never contacts a model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn integration_scope_conflict_returns_question_without_mutation_or_publication() {
-    full_mr_run(false, true, None, false, true).await;
+    full_mr_run(false, true, None, false, true, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "opt-in live Codex OAuth, isolated Git/Backend/Runtime; requires existing authorized provider login"]
@@ -1801,7 +1845,12 @@ async fn live_coder_reviewer_and_flow_verifier_complete_isolated_mr() {
         serde_json::from_value(json!({"ref":"codex-oauth/gpt-6.1-sol"})).unwrap();
     let live = worker::model_client::build_client(&manifest)
         .expect("configured real model client; no scripted fallback");
-    full_mr_run(false, false, Some(Arc::from(live)), false, false).await;
+    full_mr_run(false, false, Some(Arc::from(live)), false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rejected_publication_recovers_with_ordinary_git_and_verified_completion() {
+    full_mr_run(false, false, None, false, false, true).await;
 }
 
 async fn full_mr_run(
@@ -1810,6 +1859,7 @@ async fn full_mr_run(
     live: Option<Arc<dyn agen::llm_client::LlmClient>>,
     handoff: bool,
     scope_decision: bool,
+    manual_recovery: bool,
 ) {
     crate::restore_test_environment::require_restore_test_environment();
     let is_live = live.is_some();
@@ -1837,6 +1887,12 @@ async fn full_mr_run(
         .unwrap();
     let before = git(h._dir.path(), &["rev-parse", "HEAD"]);
     git(h._dir.path(), &["branch", FULL_TARGET]);
+    let reject_hook = h._dir.path().join(".git/hooks/update");
+    if manual_recovery {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&reject_hook, format!("#!/bin/sh\nif [ \"$1\" = refs/heads/{FULL_TARGET} ]; then echo explicit-test-rejection >&2; exit 1; fi\nexit 0\n")).unwrap();
+        fs::set_permissions(&reject_hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let (mut coder_wd, mut coder_root) = temp_workdir(&h, "full-r2-coder-workdir").await;
     let target_before = if integrate_target {
         // Independent target publication after the source base was selected.
@@ -1908,7 +1964,7 @@ async fn full_mr_run(
             { namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; },
             { namespace = "bash"; keys = ["bash.execute"]; },
             { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; },
-            { namespace = "merge_request"; keys = ["merge_request.open", "merge_request.read", "merge_request.readiness", "merge_request.review", "merge_request.publish", "merge_request.comment"]; },
+            { namespace = "merge_request"; keys = ["merge_request.open", "merge_request.read", "merge_request.readiness", "merge_request.review", "merge_request.publish", "merge_request.comment", "merge_request.complete"]; },
             { namespace = "worker"; keys = ["worker.list"]; }
         ]; }"#,
     );
@@ -1921,12 +1977,6 @@ async fn full_mr_run(
         "Flow belongs to post-assignment input"
     );
     let input = json!({"subject":subject,"ticket":ticket,"spawn":spawn});
-    // The shared harness serves routers; explicitly own the production background
-    // loop here. Dropping the JoinSet aborts it even if an assertion fails.
-    let mut publication_tasks = tokio::task::JoinSet::new();
-    if is_live || integrate_target || replace_body {
-        publication_tasks.spawn(mr_publication::recovery_loop(h.api.clone()));
-    }
     let sent = ok(
         &h,
         "POST",
@@ -1947,6 +1997,7 @@ async fn full_mr_run(
             .all(|stage| observed.contains_key(*stage))
         {
             let value = events.recv().await.expect("real model stages");
+            eprintln!("MR scenario stage: {}", value["stage"]);
             if value["stage"] == "handoff" {
                 let mr_id = value["mr"]["merge_request_id"].as_str().unwrap();
                 let old = &value["mr"]["worker_assignment"]["worker"];
@@ -1978,9 +2029,44 @@ async fn full_mr_run(
                 let worker = &value["mr"]["worker_assignment"]["worker"];
                 let coder = RuntimeWorkerRef::new(worker["runtime_id"].as_str().unwrap(), worker["worker_id"].as_str().unwrap());
                 body_idle_now(&h, &coder).await;
-                if publication_tasks.is_empty() {
-                    assert_eq!(git(h._dir.path(), &["rev-parse", &format!("refs/heads/{FULL_TARGET}")]), target_before);
-                    publication_tasks.spawn(mr_publication::recovery_loop(h.api.clone()));
+                if manual_recovery {
+                    let mr_id = value["mr"]["merge_request_id"].as_str().unwrap();
+                    let source = value["mr"]["source"]["ref"].as_str().unwrap();
+                    let store = merge_request_store(&h.api, TEST_WORKSPACE_ID).unwrap();
+                    let mut ticks = tokio::time::interval(Duration::from_millis(50));
+                    let problem = loop {
+                        ticks.tick().await;
+                        let mr = store.get_by_id(TEST_WORKSPACE_ID, mr_id).unwrap();
+                        assert!(!mr.state.is_completed());
+                        if let Some(c) = mr.thread.iter().find_map(|e| match e {
+                            merge_request::MergeRequestThreadEvent::Comment(c) if c.body.contains("Automatic Git publication did not complete") => Some(c), _ => None,
+                        }) { break c.clone(); }
+                    };
+                    eprintln!("MR scenario rejected publication comment observed");
+                    let notice = format!("mr-event:{mr_id}:{}", problem.event_id);
+                    let delivered = tokio::time::timeout(Duration::from_secs(15), async {
+                        loop {
+                            ticks.tick().await;
+                            let snapshot = h.factory.retained_session_snapshot(&worker_runtime::identity::WorkerRef::try_from(&owner_worker).unwrap()).unwrap();
+                            if notifications(&snapshot.snapshot).iter().any(|n| n.contains(&notice)) { break; }
+                        }
+                    }).await;
+                    assert!(delivered.is_ok(), "publication problem notification missing: {:?}", h.api.store.notification_diagnostics(TEST_WORKSPACE_ID, &server_api::NotificationDiagnosticsQuery { source_event_id: Some(notice.clone()), ..Default::default() }).unwrap());
+                    let path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr_id}/complete");
+                    let completion = json!({"operation_id":"manual-completion", "expected_owner_operation_id":value["mr"]["worker_assignment"]["operation_id"], "approval_event_id":event(&value["mr"],"review")["event_id"], "expected_source_ref":source});
+                    for bad in [completion.clone(), { let mut bad = completion.clone(); bad["expected_owner_operation_id"] = json!("stale-owner"); bad }, { let mut bad = completion.clone(); bad["approval_event_id"] = json!("other-MR-approval"); bad }] {
+                        let (status, error) = connected_authorization_post(&h.backend_url, &h.identity, &coder, &path, &bad).await;
+                        assert!(status.is_client_error(), "unpublished/stale/foreign approval must be rejected: {status} {error}");
+                        assert!(!store.get_by_id(TEST_WORKSPACE_ID, mr_id).unwrap().state.is_completed());
+                    }
+                    assert_eq!(git(h._dir.path(), &["rev-parse", &format!("refs/heads/{FULL_TARGET}")]), before, "Complete never pushed");
+                    fs::remove_file(&reject_hook).unwrap();
+                    // Explicit test-driver recovery direction after actual Subject delivery;
+                    // the Coder uses production Bash and Complete tools, not fixture inserts.
+                    ok(&h, "POST", &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/{}/workers/{}/input", coder.runtime_id, coder.worker_id),
+                        json!({"content":"full-r2-manual-recovery full-r2-publication-resume: rejection cause removed; use ordinary non-force Git push then CompleteMergeRequest, reuse unchanged approval"})).await;
+                    observed.insert(value["stage"].as_str().unwrap().to_owned(), value);
+                    continue;
                 }
                 // Test-driver observation of the real background result, not model polling.
                 let store = merge_request_store(&h.api, TEST_WORKSPACE_ID).unwrap();
@@ -1997,12 +2083,6 @@ async fn full_mr_run(
     })
     .await
     .expect("independent review and saved result reach the Subject");
-    if !is_live && !integrate_target && !replace_body {
-        assert!(
-            observed.contains_key("publication_wait"),
-            "pending publication must yield before explicit resumption"
-        );
-    }
     let ready = &observed["body_result"];
     let mr_id = ready["mr"]["merge_request_id"].as_str().unwrap();
     let source = ready["mr"]["source"]["ref"].as_str().unwrap();
@@ -2033,8 +2113,6 @@ async fn full_mr_run(
         );
         assert_eq!(git(&coder_root, &["rev-parse", "HEAD"]), source);
         assert!(git(&coder_root, &["status", "--porcelain"]).is_empty());
-        publication_tasks.abort_all();
-        while publication_tasks.join_next().await.is_some() {}
         return;
     }
     let final_mr = tokio::time::timeout(LIMIT, async {
@@ -2049,25 +2127,13 @@ async fn full_mr_run(
     })
     .await
     .expect("approve must drive actual signed Runtime publication and MR completion");
-    let publications = mr_store.publications(TEST_WORKSPACE_ID, mr_id).unwrap();
-    assert_eq!(publications.len(), if integrate_target { 2 } else { 1 });
-    let published: Vec<_> = publications
-        .iter()
-        .filter(|p| {
-            matches!(
-                p.outcome,
-                merge_request::PublicationOutcome::Published { .. }
-            )
-        })
-        .collect();
-    assert_eq!(published.len(), 1, "exactly one confirmed publication");
-    let publication = published[0];
-    assert!(matches!(
-        publication.outcome,
-        merge_request::PublicationOutcome::Published { .. }
-    ));
-    assert_eq!(publication.binding.source, source);
-    assert_eq!(publication.binding.target_before, target_before);
+    assert!(
+        mr_store
+            .publications(TEST_WORKSPACE_ID, mr_id)
+            .unwrap()
+            .is_empty(),
+        "new publication writes no execution ledger"
+    );
     let reviews: Vec<_> = final_mr
         .thread
         .iter()
@@ -2097,8 +2163,6 @@ async fn full_mr_run(
         ready["coder"]["runtime_id"].as_str().unwrap(),
         ready["coder"]["worker_id"].as_str().unwrap(),
     );
-    assert_eq!(publication.binding.worker.worker_id, coder.worker_id);
-    assert_eq!(publication.binding.working_directory_id, coder_wd);
     let merges: Vec<_> = final_mr
         .thread
         .iter()
@@ -2111,54 +2175,60 @@ async fn full_mr_run(
     assert_eq!(merges[0].merged_by.worker_id, coder.worker_id);
     assert_eq!(merges[0].approved_source_ref, source);
     assert_eq!(git(&coder_root, &["rev-parse", "HEAD"]), source);
-    assert_eq!(
+    let published_target = git(
+        h._dir.path(),
+        &["rev-parse", &format!("refs/heads/{FULL_TARGET}")],
+    );
+    assert_eq!(merges[0].target_ref_after, published_target);
+    if manual_recovery {
+        assert_ne!(
+            published_target, source,
+            "later publication must not prevent delayed completion"
+        );
+        assert_eq!(
+            merges[0].target_ref_before, published_target,
+            "manual recording observes no ref update itself"
+        );
         git(
             h._dir.path(),
-            &["rev-parse", &format!("refs/heads/{FULL_TARGET}")]
-        ),
-        source
-    );
+            &["merge-base", "--is-ancestor", source, &published_target],
+        );
+    } else {
+        assert_eq!(published_target, source);
+    }
     assert_eq!(git(h._dir.path(), &["rev-parse", "HEAD"]), before);
     assert!(git(&coder_root, &["status", "--porcelain"]).is_empty());
     body_idle_now(&h, &coder).await;
     body_idle_now(&h, &owner_worker).await;
-    // Recovery is Backend-owned; no model completion operation or Subject stamp remains.
-    for _ in 0..2 {
-        let recovered = mr_publication::reconcile(&h.api, publication.clone()).unwrap();
-        assert_eq!(recovered, *publication);
-    }
-    assert!(
-        mr_store
-            .complete_publication(TEST_WORKSPACE_ID, "not-a-publication", Utc::now())
-            .is_err()
-    );
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{mr_id}/complete");
     let recorder = replacement.as_ref().unwrap_or(&other_worker);
+    let completion = json!({"operation_id":if manual_recovery {"manual-completion"} else {"different-completion"},
+        "expected_owner_operation_id":final_mr.current_worker().unwrap().operation_id,
+        "approval_event_id":merges[0].approval_event_id,"expected_source_ref":source});
     for worker in [&owner_worker, &coder, recorder] {
-        let (status, error) = connected_authorization_post(
-            &h.backend_url,
-            &h.identity,
-            worker,
-            &path,
-            &json!({"operation_id":publication.binding.operation_id,
-                "approval_event_id":publication.binding.approval_event_id,
-                "target_ref_before":before,"target_ref_after":source,
-                "strategy":"fast_forward","resolution":"none"}),
-        )
-        .await;
-        assert!(
-            matches!(
-                status,
-                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-            ),
-            "no completion route even with valid evidence: {status} {error}"
-        );
+        let (status, result) =
+            connected_authorization_post(&h.backend_url, &h.identity, worker, &path, &completion)
+                .await;
+        if manual_recovery && worker == &coder {
+            assert_eq!(status, StatusCode::OK, "exact completion replay: {result}");
+            assert_eq!(result["event_id"], merges[0].event_id);
+        } else {
+            assert!(
+                status.is_client_error(),
+                "no new completion or Subject stamp: {status} {result}"
+            );
+        }
     }
     super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject, "{}", "{}").await;
-    assert_eq!(
-        mr_publication::reconcile(&h.api, publication.clone()).unwrap(),
-        *publication
-    );
+    if manual_recovery {
+        let (status, error) =
+            connected_authorization_post(&h.backend_url, &h.identity, &coder, &path, &completion)
+                .await;
+        assert!(
+            status.is_client_error(),
+            "revoked authority must reject even replay: {status} {error}"
+        );
+    }
     if replace_body {
         let (status, error) = connected_authorization_post(
             &h.backend_url,
@@ -2197,6 +2267,4 @@ async fn full_mr_run(
             "live model=codex-oauth/gpt-6.1-sol; Coder/Reviewer/verifier=live; Subject=scripted; confirmed_publications=1; source={source}"
         );
     }
-    publication_tasks.abort_all();
-    while publication_tasks.join_next().await.is_some() {}
 }
