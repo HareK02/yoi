@@ -877,6 +877,209 @@ mod tests {
         }
     }
 
+    // Integration through Tool execution, real saved log rereads, public projection and capture.
+    // Only the Host observation provider/grant is substituted; no live Worker is started.
+    struct SavedLogProvider {
+        _directory: tempfile::TempDir,
+        store: session_store::FsStore,
+        session_id: session_store::SessionId,
+        segment_id: session_store::SegmentId,
+        readable: std::sync::atomic::AtomicBool,
+    }
+
+    impl SavedLogProvider {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = session_store::FsStore::new(directory.path()).unwrap();
+            let (session_id, segment_id) = session_store::create_segment(
+                &store,
+                session_store::SegmentStartState {
+                    system_prompt: Some("private system prompt"),
+                    config: &Default::default(),
+                    history: Vec::new(),
+                    user_segments: Vec::new(),
+                },
+            )
+            .unwrap();
+            Self {
+                _directory: directory,
+                store,
+                session_id,
+                segment_id,
+                readable: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+
+        fn save_error(&self, message: &str) -> String {
+            use session_store::Store;
+            session_store::save_run_errored(
+                &self.store,
+                self.session_id,
+                self.segment_id,
+                message.into(),
+                false,
+            )
+            .unwrap();
+            let log = self
+                .store
+                .read_all(self.session_id, self.segment_id)
+                .unwrap();
+            let session_store::LogEntry::RunErrored {
+                entry_id: Some(id), ..
+            } = log.last().unwrap()
+            else {
+                panic!("saved RunErrored must retain its entry identity");
+            };
+            format!("E{}", id.0)
+        }
+    }
+
+    #[async_trait]
+    impl WorkerObservationProvider for SavedLogProvider {
+        async fn list_worker_sessions(
+            &self,
+        ) -> Result<Vec<WorkerObservationSubject>, WorkerObservationError> {
+            Ok(Vec::new())
+        }
+
+        async fn capture_worker_session(
+            &self,
+            subject: &WorkerObservationSubjectRef,
+        ) -> Result<WorkerSessionCapture, WorkerObservationError> {
+            use session_store::Store;
+            let child = WorkerObservationSubjectRef::SubWorker {
+                name: "child".into(),
+            };
+            if !self.readable.load(std::sync::atomic::Ordering::SeqCst)
+                || (subject != &granted_subject() && subject != &child)
+            {
+                return Err(WorkerObservationError::NotFound);
+            }
+            let entries = self
+                .store
+                .read_all(self.session_id, self.segment_id)
+                .unwrap();
+            Ok(WorkerSessionCapture {
+                segment_id: self.segment_id.to_string(),
+                session: session_store::public_snapshot::project_current_session_snapshot(&entries),
+            })
+        }
+    }
+
+    async fn execute_json(tool: &Arc<dyn Tool>, input: serde_json::Value) -> serde_json::Value {
+        let output = tool
+            .execute(
+                &input.to_string(),
+                agen::tool::ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(output.content.as_deref().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn saved_run_error_is_observable_through_worker_tools_with_stable_refs_and_bounded_reads()
+    {
+        let provider = Arc::new(SavedLogProvider::new());
+        let message = "SSE error: overloaded_error: retry later";
+        let entry_ref = provider.save_error(message);
+        let overview = overview_definition(provider.clone(), None)().1;
+        let search = search_definition(provider.clone(), None)().1;
+        let read = read_definition(provider.clone(), None)().1;
+        for target in [
+            serde_json::json!({"kind":"runtime_worker", "runtime_id":"runtime-1", "worker_id":"granted"}),
+            serde_json::json!({"kind":"sub_worker", "name":"child"}),
+        ] {
+            let output = execute_json(&overview, serde_json::json!({"target":target})).await;
+            assert_eq!(output["entries"][0]["entry_ref"], entry_ref);
+            assert_eq!(output["entries"][0]["kind"], "run_error");
+            assert!(!output.to_string().contains("private system prompt"));
+            let output = execute_json(&search, serde_json::json!({"target":target, "kind":"run_error", "query":"overloaded_error"})).await;
+            assert_eq!(output["entries"].as_array().unwrap().len(), 1);
+            assert_eq!(output["entries"][0]["entry_ref"], entry_ref);
+            for mode in ["compact", "full"] {
+                let output = execute_json(
+                    &read,
+                    serde_json::json!({"target":target, "entry_ref":entry_ref, "mode":mode}),
+                )
+                .await;
+                assert_eq!(output["entries"][0]["kind"], "run_error");
+                assert!(
+                    output["entries"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(message)
+                );
+                assert_eq!(output["truncated"], false);
+            }
+        }
+
+        let target = serde_json::json!({"kind":"sub_worker", "name":"child"});
+        let long_ref = provider.save_error(&format!("overload {}", "負荷".repeat(MAX_READ_BYTES)));
+        let output = execute_json(
+            &overview,
+            serde_json::json!({"target":target, "offset":1, "limit":1}),
+        )
+        .await;
+        assert_eq!(output["entries"][0]["entry_ref"], long_ref);
+        assert!(
+            output["entries"][0]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                < 260
+        );
+        let output = execute_json(&search, serde_json::json!({"target":target, "from":entry_ref, "through":long_ref, "kind":"run_error"})).await;
+        assert_eq!(output["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(output["entries"][0]["entry_ref"], entry_ref);
+        for mode in ["compact", "full"] {
+            let output = execute_json(
+                &read,
+                serde_json::json!({"target":target, "entry_ref":long_ref, "mode":mode}),
+            )
+            .await;
+            assert_eq!(output["truncated"], true);
+            assert!(output["entries"][0]["text"].as_str().unwrap().len() <= MAX_READ_BYTES);
+        }
+        let output = execute_json(
+            &read,
+            serde_json::json!({"target":target, "entry_ref":entry_ref}),
+        )
+        .await;
+        assert!(
+            output["entries"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(message)
+        );
+
+        provider
+            .readable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for (tool, input) in [
+            (&overview, serde_json::json!({"target":target})),
+            (
+                &search,
+                serde_json::json!({"target":target,"kind":"run_error"}),
+            ),
+            (
+                &read,
+                serde_json::json!({"target":target,"entry_ref":entry_ref}),
+            ),
+        ] {
+            let error = tool
+                .execute(
+                    &input.to_string(),
+                    agen::tool::ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{error:?}").contains("not found or is not accessible"));
+            assert!(!format!("{error:?}").contains(message));
+        }
+    }
+
     fn message(_id: &str, role: Role, content: &str) -> Item {
         match role {
             Role::User => Item::user_message(content),

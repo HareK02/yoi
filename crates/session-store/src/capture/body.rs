@@ -99,6 +99,11 @@ pub enum CaptureBody {
     PublicSystem {
         text: String,
     },
+    // Saved diagnostics are observation data, never provider messages or evidence inputs.
+    RunError {
+        message: String,
+        failure: Option<protocol::RunFailureKind>,
+    },
     ToolCall {
         call_id: String,
         name: String,
@@ -184,8 +189,9 @@ impl CaptureBody {
         }
     }
 
-    pub(super) fn to_item(&self) -> Item {
-        match self {
+    pub(super) fn to_item(&self) -> Option<Item> {
+        Some(match self {
+            Self::RunError { .. } => return None,
             Self::CanonicalPublic { text, .. } => Item::system_message(text.clone()),
             Self::Message { role, content } => Item::Message {
                 id: None,
@@ -221,7 +227,7 @@ impl CaptureBody {
             } => {
                 Item::tool_result_item(call_id.clone(), summary.clone(), content.clone(), *is_error)
             }
-        }
+        })
     }
 
     fn fields(&self) -> Vec<(RawField, &str)> {
@@ -233,6 +239,7 @@ impl CaptureBody {
                 .map(|(i, p)| (RawField::MessagePart(i), p.text()))
                 .collect(),
             Self::PublicSystem { text } => vec![(RawField::PublicSystem, text)],
+            Self::RunError { message, .. } => vec![(RawField::RunErrorMessage, message)],
             Self::ToolCall { arguments, .. } => vec![(RawField::ToolArguments, arguments)],
             Self::ToolResult {
                 summary, content, ..
@@ -263,6 +270,7 @@ impl CaptureBody {
                 refusal: matches!(field, RawField::MessagePart(i) if matches!(content.get(i), Some(CaptureContentPart::Refusal { .. }))),
             },
             Self::PublicSystem { .. } => CaptureBodyMetadata::PublicSystem,
+            Self::RunError { failure, .. } => CaptureBodyMetadata::RunError { failure: *failure },
             Self::ToolCall { call_id, name, .. } => CaptureBodyMetadata::ToolCall {
                 call_id: call_id.clone(),
                 name: name.clone(),
@@ -552,6 +560,11 @@ impl CaptureDto {
                         }
                     }
                 }
+                CaptureBody::RunError { .. }
+                    if entry.policy.memory_evidence || entry.policy.recording_material =>
+                {
+                    return Err(CaptureError::Invalid("run error must be observation-only"));
+                }
                 CaptureBody::Message { content, .. } if content.is_empty() => {
                     return Err(CaptureError::Invalid("empty message parts"));
                 }
@@ -602,6 +615,7 @@ pub struct ScopedSessionEntryRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawField {
+    RunErrorMessage,
     CanonicalPublic,
     MessagePart(usize),
     PublicSystem,
@@ -625,6 +639,9 @@ pub struct RawRead {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureBodyMetadata {
+    RunError {
+        failure: Option<protocol::RunFailureKind>,
+    },
     CanonicalPublic {
         descriptor: crate::public_material::PublicMaterialDescriptor,
         byte_offset: u64,

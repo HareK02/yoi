@@ -88,6 +88,7 @@ pub enum ReferenceKind {
     Assistant,
     System,
     Tool,
+    RunError,
 }
 
 impl ReferenceKind {
@@ -97,6 +98,7 @@ impl ReferenceKind {
             Self::Assistant => "assistant",
             Self::System => "system",
             Self::Tool => "tool",
+            Self::RunError => "run_error",
         }
     }
 
@@ -106,6 +108,7 @@ impl ReferenceKind {
             "assistant" | "agent" => Some(Self::Assistant),
             "system" => Some(Self::System),
             "tool" => Some(Self::Tool),
+            "run_error" => Some(Self::RunError),
             _ => None,
         }
     }
@@ -260,7 +263,7 @@ pub struct SessionEntryEvidence {
 #[derive(Debug, Clone)]
 struct CapturedHistoryEntry {
     use_policy: Option<protocol::SessionEntryUsePolicy>,
-    item: Item,
+    item: Option<Item>,
     entry_id: crate::LoggedSessionHistoryEntryId,
     origin: SessionEntryProvenance,
     dto: CaptureEntryDto,
@@ -290,53 +293,61 @@ impl SessionCapture {
             .into_iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let policy = CaptureUsePolicy {
+                let mut policy = CaptureUsePolicy {
                     recording_material: false,
                     memory_evidence: entry.use_policy.is_none_or(|p| p.memory_evidence),
                     observation_readable: entry.use_policy.is_none_or(|p| p.observation_readable),
                 };
                 let explicit = entry.use_policy.is_some();
-                let item = match entry.data {
-                    SessionSnapshotEntryData::UserInput { segments } => {
-                        Item::user_message(protocol::Segment::flatten_to_text(&segments))
+                let body = match entry.data {
+                    SessionSnapshotEntryData::RunError { message, failure } => {
+                        policy.memory_evidence = false;
+                        CaptureBody::RunError { message, failure }
                     }
-                    SessionSnapshotEntryData::Message { role, content } => Item::Message {
-                        id: None,
-                        status: None,
-                        role: match role {
-                            SessionMessageRole::User => Role::User,
-                            SessionMessageRole::Assistant => Role::Assistant,
-                        },
-                        content: content
-                            .into_iter()
-                            .map(|part| match part {
-                                SessionContentPart::Text { text } => {
-                                    agen::ContentPart::Text { text }
-                                }
-                                SessionContentPart::Refusal { refusal } => {
-                                    agen::ContentPart::Refusal { refusal }
-                                }
-                            })
-                            .collect(),
-                    },
-                    SessionSnapshotEntryData::ToolCall {
-                        call_id,
-                        name,
-                        arguments,
-                    } => Item::tool_call(call_id, name, arguments),
-                    SessionSnapshotEntryData::ToolResult {
-                        call_id,
-                        summary,
-                        content,
-                        is_error,
-                        ..
-                    } => Item::tool_result_item(call_id, summary, content, is_error),
-                    SessionSnapshotEntryData::SystemItem { content, .. } if explicit => {
-                        Item::system_message(content)
+                    data => {
+                        let item = match data {
+                            SessionSnapshotEntryData::UserInput { segments } => {
+                                Item::user_message(protocol::Segment::flatten_to_text(&segments))
+                            }
+                            SessionSnapshotEntryData::Message { role, content } => Item::Message {
+                                id: None,
+                                status: None,
+                                role: match role {
+                                    SessionMessageRole::User => Role::User,
+                                    SessionMessageRole::Assistant => Role::Assistant,
+                                },
+                                content: content
+                                    .into_iter()
+                                    .map(|part| match part {
+                                        SessionContentPart::Text { text } => {
+                                            agen::ContentPart::Text { text }
+                                        }
+                                        SessionContentPart::Refusal { refusal } => {
+                                            agen::ContentPart::Refusal { refusal }
+                                        }
+                                    })
+                                    .collect(),
+                            },
+                            SessionSnapshotEntryData::ToolCall {
+                                call_id,
+                                name,
+                                arguments,
+                            } => Item::tool_call(call_id, name, arguments),
+                            SessionSnapshotEntryData::ToolResult {
+                                call_id,
+                                summary,
+                                content,
+                                is_error,
+                                ..
+                            } => Item::tool_result_item(call_id, summary, content, is_error),
+                            SessionSnapshotEntryData::SystemItem { content, .. } if explicit => {
+                                Item::system_message(content)
+                            }
+                            _ => return None,
+                        };
+                        CaptureBody::project(&item, &entry.provenance, explicit)?
                     }
-                    _ => return None,
                 };
-                let body = CaptureBody::project(&item, &entry.provenance, explicit)?;
                 if !policy.any() {
                     return None;
                 }
@@ -486,7 +497,37 @@ impl SessionCapture {
         let mut index = Vec::new();
 
         for entry in &entries {
-            let item = &entry.item;
+            if let CaptureBody::RunError { message, .. } = &entry.dto.body {
+                let id = SessionEntryRef::from_history_entry_id(&entry.entry_id);
+                let summary = truncate_chars(message, 240);
+                let label = "run error".to_string();
+                index.push(ReferenceEntry {
+                    use_policy: entry.use_policy,
+                    attachment_count: 0,
+                    id: id.clone(),
+                    origin: entry.origin.clone(),
+                    entry_range: [entry.dto.order; 2],
+                    kind: ReferenceKind::RunError,
+                    tool_part: None,
+                    tool_name: None,
+                    label: label.clone(),
+                    summary: summary.clone(),
+                    search_text: message.clone(),
+                });
+                if entry.dto.policy.observation_readable {
+                    overview.push(OverviewItem {
+                        id,
+                        origin: entry.origin.clone(),
+                        entry_range: [entry.dto.order; 2],
+                        kind: ReferenceKind::RunError,
+                        label,
+                        text: summary,
+                        intervening_entries: 0,
+                    });
+                }
+                continue;
+            }
+            let Some(item) = &entry.item else { continue };
             let entry_range = [entry.dto.order; 2];
             let attachment_count = match entry.dto.body {
                 CaptureBody::ToolResult {
@@ -592,7 +633,10 @@ impl SessionCapture {
                 .into_iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
-                    (index == 0 || index == last || index % OVERVIEW_ANCHOR_STRIDE == 0)
+                    (entry.kind == ReferenceKind::RunError
+                        || index == 0
+                        || index == last
+                        || index % OVERVIEW_ANCHOR_STRIDE == 0)
                         .then_some(entry)
                 })
                 .collect();
@@ -752,11 +796,10 @@ impl SessionCapture {
                     }
                 }
             }
-            let Some(item) = self
+            let Some(captured) = self
                 .entries
                 .iter()
                 .find(|captured| captured.dto.order == entry.entry_range[0])
-                .map(|entry| &entry.item)
             else {
                 continue;
             };
@@ -765,7 +808,15 @@ impl SessionCapture {
                 truncated = true;
                 break;
             }
-            let rendered = render_item(item, entry, options.detail, usize::MAX);
+            let rendered = match &captured.dto.body {
+                CaptureBody::RunError { message, failure } => {
+                    format!("[{} RunError]\nfailure: {failure:?}\n{message}", entry.id)
+                }
+                _ => {
+                    let Some(item) = &captured.item else { continue };
+                    render_item(item, entry, options.detail, usize::MAX)
+                }
+            };
             truncated |= rendered.len() > remaining;
             let text = truncate_bytes(&rendered, remaining);
             bytes = bytes.saturating_add(text.len());
@@ -794,11 +845,11 @@ impl SessionCapture {
     pub fn evidence_for_tool_call(&self, call_id: &str) -> Option<SessionEntryEvidence> {
         let captured = self.entries.iter().find(|entry| {
             matches!(
-                &entry.item,
-                Item::ToolCall {
+                entry.item.as_ref(),
+                Some(Item::ToolCall {
                     call_id: stored_call_id,
                     ..
-                } if stored_call_id == call_id
+                }) if stored_call_id == call_id
             )
         })?;
         let reference = self.index.iter().find(|entry| {
@@ -818,7 +869,12 @@ impl SessionCapture {
             .entries
             .iter()
             .find(|captured| captured.dto.order == entry.entry_range[0])?;
-        let excerpt = render_item(&captured.item, entry, ReadDetail::Compact, 2 * 1024);
+        let excerpt = render_item(
+            captured.item.as_ref()?,
+            entry,
+            ReadDetail::Compact,
+            2 * 1024,
+        );
         Some(SessionEntryEvidence {
             segment_id: captured.dto.source.segment_id.clone(),
             entry_ref: entry.id.clone(),
@@ -965,3 +1021,6 @@ fn truncate_bytes(text: &str, max_bytes: usize) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests;
