@@ -440,9 +440,24 @@ pub(crate) fn parse_sse(
 
         "response.failed" | "response.incomplete" => {
             let ev: ResponseFailed = from_json(data)?;
+            let retry = if event_type == "response.failed" {
+                ev.response.error.as_ref().and_then(|error| {
+                    super::retry::classify(
+                        error.code.as_deref(),
+                        error.extra.get("headers"),
+                        ev.extra.get("headers"),
+                    )
+                })
+            } else {
+                None
+            };
             let (code, message) = response_failure_diagnostic(event_type, ev);
             Ok(vec![
-                Event::Error(ErrorEvent { code, message }),
+                Event::Error(ErrorEvent {
+                    code,
+                    message,
+                    retry,
+                }),
                 Event::Status(StatusEvent {
                     status: ResponseStatus::Failed,
                 }),
@@ -779,8 +794,17 @@ pub(crate) fn parse_sse(
                     },
                     extra: BTreeMap::new(),
                 });
+            let retry = super::retry::classify(
+                ev.error.code.as_deref(),
+                ev.error.extra.get("headers"),
+                ev.extra.get("headers"),
+            );
             let (code, message) = top_level_error_diagnostic(ev);
-            Ok(vec![Event::Error(ErrorEvent { code, message })])
+            Ok(vec![Event::Error(ErrorEvent {
+                code,
+                message,
+                retry,
+            })])
         }
 
         // Ignore unsupported / informational event types for generation semantics, but retain them in traces.
@@ -1137,6 +1161,10 @@ fn from_json<T: for<'de> Deserialize<'de>>(data: &str) -> Result<T, ClientError>
         retry_after: None,
     })
 }
+
+#[cfg(test)]
+#[path = "events_retry_tests.rs"]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {

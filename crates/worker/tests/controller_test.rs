@@ -2048,6 +2048,7 @@ async fn provider_stream_error_records_run_errored() {
     let client = MockClient::new(vec![LlmEvent::Error(ErrorEvent {
         code: Some("context_length_exceeded".into()),
         message: "request too large".into(),
+        retry: None,
     })]);
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;

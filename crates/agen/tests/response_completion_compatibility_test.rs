@@ -1,3 +1,6 @@
+#[path = "response_completion/overload.rs"]
+mod overload;
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

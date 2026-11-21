@@ -106,6 +106,17 @@ pub enum ResponseStatus {
 pub struct ErrorEvent {
     pub code: Option<String>,
     pub message: String,
+    /// Classified by the provider adapter, never inferred from diagnostic text.
+    /// Missing advice in retained event traces must not authorize replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryAdvice>,
+}
+
+/// Provider permission to retry, subject to the Engine's budget and replay safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryAdvice {
+    /// Minimum delay. `None` uses local backoff; a supplied delay is never capped.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl ErrorEvent {

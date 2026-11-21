@@ -526,6 +526,14 @@ impl ToolExecutionAttemptFence {
 
 const MAX_STREAM_CONTINUATIONS: u32 = 3;
 
+// Shared by HTTP opens, streamed overloads and continuations of one response.
+// A successful stream open alone must not reset the transient failure budget.
+#[derive(Default)]
+struct StreamRetryState {
+    started: Option<Instant>,
+    failed_attempts: u32,
+}
+
 /// Central component for managing LLM interactions
 ///
 /// Receives input from the user, sends requests to the LLM, and
@@ -2548,6 +2556,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         }
 
         let mut stream_continuations: u32 = 0;
+        let mut retry_state = StreamRetryState::default();
         let mut continuing_stream = false;
         loop {
             if self.try_cancelled() {
@@ -2795,6 +2804,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     history,
                     annotate,
                     early_dispatch,
+                    &mut retry_state,
                 )
                 .await?;
 
@@ -2878,6 +2888,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             }
 
             stream_continuations = 0;
+            retry_state = StreamRetryState::default();
             continuing_stream = false;
 
             for cb in &self.turn_end_cbs {
@@ -3075,13 +3086,12 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         request: Request,
         turn: usize,
         llm_call: usize,
+        retry: &mut StreamRetryState,
     ) -> Result<ResponseStream, EngineError> {
-        let policy = self.retry_policy.clone();
-        let started = Instant::now();
-        let mut failed_attempt: u32 = 0;
+        retry.started.get_or_insert_with(Instant::now);
 
         loop {
-            let attempt = failed_attempt + 1;
+            let attempt = retry.failed_attempts + 1;
             self.emit_lifecycle_trace(
                 turn,
                 llm_call,
@@ -3192,57 +3202,64 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 }
             };
 
-            let next_failed_attempt = failed_attempt + 1;
-            if next_failed_attempt >= policy.max_attempts || !is_retryable(&err) {
+            if !is_retryable(&err) {
                 return Err(EngineError::Client(err));
             }
-
-            let wait = err
-                .retry_after()
-                .unwrap_or_else(|| policy.backoff(failed_attempt));
-            let elapsed = started.elapsed();
-            if elapsed + wait > policy.total_timeout {
-                return Err(EngineError::Client(err));
-            }
-
-            warn!(
-                error = %err,
-                failed_attempt = next_failed_attempt,
-                wait_ms = wait.as_millis() as u64,
-                "transient LLM request error, retrying"
-            );
-            let notice = LlmRetryNotice {
-                failed_attempt: next_failed_attempt,
-                max_attempts: policy.max_attempts,
-                wait,
-                elapsed,
-                status: err.status(),
-                error: err.to_string(),
-            };
-            for cb in &self.llm_retry_cbs {
-                cb(llm_call, &notice);
-            }
-
-            tokio::select! {
-                _ = tokio::time::sleep(wait) => {}
-                pause = self.pause_rx.recv() => {
-                    if pause.is_some() {
-                        info!("Paused during LLM retry backoff");
-                    }
-                    self.timeline.abort_current_block();
-                    return Err(EngineError::PauseRequested);
-                }
-                cancel = self.cancel_rx.recv() => {
-                    if cancel.is_some() {
-                        info!("Cancelled during LLM retry backoff");
-                    }
-                    self.timeline.abort_current_block();
-                    return Err(EngineError::Cancelled);
-                }
-            }
-
-            failed_attempt = next_failed_attempt;
+            self.wait_for_stream_retry(err, llm_call, retry).await?;
         }
+    }
+
+    // Callers establish the failure classification and replay safety before
+    // waiting. Exhaustion retains the provider diagnostic, without a new request.
+    async fn wait_for_stream_retry(
+        &mut self,
+        error: ClientError,
+        llm_call: usize,
+        retry: &mut StreamRetryState,
+    ) -> Result<(), EngineError> {
+        let policy = &self.retry_policy;
+        let failed_attempt = retry.failed_attempts + 1;
+        let wait = error
+            .retry_after()
+            .unwrap_or_else(|| policy.backoff(retry.failed_attempts));
+        let elapsed = retry.started.get_or_insert_with(Instant::now).elapsed();
+        if failed_attempt >= policy.max_attempts
+            || elapsed.saturating_add(wait) > policy.total_timeout
+        {
+            return Err(EngineError::Client(error));
+        }
+        warn!(error = %error, failed_attempt, wait_ms = wait.as_millis() as u64,
+            "transient LLM request error, retrying");
+        let notice = LlmRetryNotice {
+            failed_attempt,
+            max_attempts: policy.max_attempts,
+            wait,
+            elapsed,
+            status: error.status(),
+            error: error.to_string(),
+        };
+        for cb in &self.llm_retry_cbs {
+            cb(llm_call, &notice);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            pause = self.pause_rx.recv() => {
+                if pause.is_some() {
+                    info!("Paused during LLM retry backoff");
+                }
+                self.timeline.abort_current_block();
+                return Err(EngineError::PauseRequested);
+            }
+            cancel = self.cancel_rx.recv() => {
+                if cancel.is_some() {
+                    info!("Cancelled during LLM retry backoff");
+                }
+                self.timeline.abort_current_block();
+                return Err(EngineError::Cancelled);
+            }
+        }
+        retry.failed_attempts = failed_attempt;
+        Ok(())
     }
 
     /// Correct one candidate actually sent in the rejected request. Commit the
@@ -3277,10 +3294,11 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         turn: usize,
         llm_call: usize,
         history: &mut History<A>,
+        retry: &mut StreamRetryState,
     ) -> Result<ResponseStream, EngineError> {
         loop {
             match self
-                .open_stream_with_retry(request.clone(), turn, llm_call)
+                .open_stream_with_retry(request.clone(), turn, llm_call, retry)
                 .await
             {
                 Ok(stream) => return Ok(stream),
@@ -3303,6 +3321,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         history: &mut History<A>,
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
         early_dispatch: bool,
+        retry: &mut StreamRetryState,
     ) -> Result<StreamResponseOutput, EngineError> {
         debug!(
             item_count = request.items.len(),
@@ -3313,7 +3332,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
 
         let mut request = request;
         let stream = self
-            .open_stream_with_image_recovery(&mut request, turn, llm_call, history)
+            .open_stream_with_image_recovery(&mut request, turn, llm_call, history, retry)
             .await?;
         self.tool_call_collector.begin_response();
         let mut stream = ResponseStreamPump::start(stream);
@@ -3370,6 +3389,37 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 _ => response_progress = true,
                             }
                             if let Event::Error(error) = &event {
+                                if let Some(advice) = error.retry
+                                    && !response_completed
+                                    && !early_tools.as_ref().is_some_and(|batch| batch.dispatched_any)
+                                {
+                                    let error = ClientError::Api {
+                                        status: None,
+                                        code: error.code.clone(),
+                                        message: error.message.clone(),
+                                        retry_after: advice.retry_after,
+                                    };
+                                    let reason = error.to_string();
+                                    // No tool has run. Replay before output, otherwise
+                                    // retain partial output via the existing continuation
+                                    // path; never regenerate executed side effects.
+                                    drop(stream);
+                                    self.timeline.abort_current_block();
+                                    self.timeline.flush_usage();
+                                    self.wait_for_stream_retry(error, llm_call, retry).await?;
+                                    if response_progress {
+                                        return Ok(StreamResponseOutput {
+                                            completion: StreamCompletion::Interrupted { reason },
+                                            early_tools,
+                                        });
+                                    }
+                                    stream = ResponseStreamPump::start(self.open_stream_with_image_recovery(
+                                        &mut request, turn, llm_call, history, retry,
+                                    ).await?);
+                                    self.tool_call_collector.begin_response();
+                                    event_count = 0;
+                                    continue;
+                                }
                                 if !response_progress && error.is_image_size_rejection() {
                                     self.timeline.flush_usage();
                                     if self.recover_rejected_image(history, &mut request)? {
@@ -3378,7 +3428,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                         // tool state exists for this pre-output attempt.
                                         drop(stream);
                                         stream = ResponseStreamPump::start(self.open_stream_with_image_recovery(
-                                            &mut request, turn, llm_call, history,
+                                            &mut request, turn, llm_call, history, retry,
                                         ).await?);
                                         self.tool_call_collector.begin_response();
                                         event_count = 0;

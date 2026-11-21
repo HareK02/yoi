@@ -233,7 +233,10 @@ impl AnthropicScheme {
             AnthropicEventType::Ping => Ok(Some(Event::Ping(PingEvent { timestamp: None }))),
             AnthropicEventType::Error => {
                 let event: ErrorEventData = serde_json::from_str(data)?;
+                let retry = (event.error.error_type == "overloaded_error")
+                    .then_some(crate::llm_client::event::RetryAdvice { retry_after: None });
                 Ok(Some(Event::Error(ErrorEvent {
+                    retry,
                     code: Some(event.error.error_type),
                     message: event.error.message,
                 })))
@@ -428,6 +431,32 @@ impl AnthropicScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_anthropic_overload_type_supplies_retry_advice() {
+        for error_type in [
+            "overloaded_error",
+            "server_is_overloaded",
+            "authentication_error",
+            "unknown",
+        ] {
+            let data = serde_json::json!({"type":"error", "error": {
+                "type": error_type, "message": "overloaded_error server_is_overloaded"
+            }});
+            let Event::Error(error) = AnthropicScheme::new()
+                .parse_event("error", &data.to_string())
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected error event");
+            };
+            assert_eq!(error.retry.is_some(), error_type == "overloaded_error");
+            if let Some(advice) = error.retry {
+                assert_eq!(advice.retry_after, None);
+            }
+            assert_eq!(error.code.as_deref(), Some(error_type));
+        }
+    }
 
     #[test]
     fn test_parse_message_start() {

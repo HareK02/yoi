@@ -1,8 +1,7 @@
-//! Retry policy for transient errors before opening an LLM response stream.
+//! Shared retry budget for stream-open failures and provider-classified SSE errors.
 //!
-//! Uses `is_retryable` on `LlmClient::stream` open errors to manage retries,
-//! backoff, and cancellation together. Failures after SSE reading begins
-//! are excluded.
+//! The Engine checks replay safety separately; unclassified stream failures do
+//! not gain retry permission from this policy.
 
 use std::time::Duration;
 
@@ -15,11 +14,12 @@ pub struct RetryPolicy {
     /// Exponential base. Full jitter samples the actual wait from an upper bound
     /// of `base * 2^attempt`, capped at `cap`.
     pub base: Duration,
-    /// Maximum wait per attempt.
+    /// Maximum local backoff per attempt; provider minimum delays are not capped.
     pub cap: Duration,
     /// Total attempts (initial attempt + retries). `1` disables retries.
     pub max_attempts: u32,
-    /// Cumulative timeout from the first send. Waits exceeding it are cut short.
+    /// Cumulative timeout from the first send. A wait exceeding it ends retries;
+    /// it is never shortened to issue a request before the provider allows it.
     pub total_timeout: Duration,
 }
 

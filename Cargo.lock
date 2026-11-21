@@ -73,6 +73,7 @@ dependencies = [
  "dotenv",
  "eventsource-stream",
  "futures",
+ "httpdate",
  "imagesize",
  "reqwest",
  "schemars",

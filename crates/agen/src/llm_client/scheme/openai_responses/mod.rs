@@ -10,6 +10,7 @@
 mod capability;
 mod events;
 mod request;
+mod retry;
 mod scheme_impl;
 
 pub use scheme_impl::OpenAIResponsesState;
