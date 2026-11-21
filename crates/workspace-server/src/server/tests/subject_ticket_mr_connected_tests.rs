@@ -1005,14 +1005,14 @@ impl FullModel {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|v| v["subject"]["name"] == "integration-reviewer")
+                .find(|v| v["target"]["name"] == "integration-reviewer")
                 .unwrap();
             let Some(found) = success(request, "integration-review-search") else {
                 return Some(call(
                     request,
                     "integration-review-search",
                     "SearchSessionEntries",
-                    json!({"subject":child["subject"],"query":"Scripted independent Reviewer inspected","tool_part":"output","limit":4}),
+                    json!({"target":child["target"],"query":"Scripted independent Reviewer inspected","tool_part":"output","limit":4}),
                 ));
             };
             let entry = found["entries"].as_array().unwrap().last().unwrap();
@@ -1021,7 +1021,7 @@ impl FullModel {
                     request,
                     "integration-review-read",
                     "ReadSessionEntry",
-                    json!({"subject":child["subject"],"entry_ref":entry["entry_ref"],"mode":"full"}),
+                    json!({"target":child["target"],"entry_ref":entry["entry_ref"],"mode":"full"}),
                 ));
             };
             let rendered = read["entries"][0]["text"].as_str().unwrap();
@@ -1038,7 +1038,7 @@ impl FullModel {
                 request,
                 "integration-reviewer-stop",
                 "WorkerStop",
-                json!({"subject":child["subject"],"reason":"Fresh formal integration-source verdict observed"}),
+                json!({"target":child["target"],"reason":"Fresh formal integration-source verdict observed"}),
             ));
         }
         if let Some(mr) = success(request, "integration-verdict") {
