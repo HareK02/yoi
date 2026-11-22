@@ -65,6 +65,7 @@ server-api = { path = "../server-api" }
 workdir.workspace = true
 
 [dev-dependencies]
+worker = { workspace = true, features = ["test-support"] }
 tools.workspace = true
 workdir = { workspace = true, features = ["http-client"] }
 futures.workspace = true

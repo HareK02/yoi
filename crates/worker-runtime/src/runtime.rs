@@ -8026,6 +8026,7 @@ impl RuntimeState {
         activity.workers.insert(
             snapshot.worker.session_id.clone(),
             InternalWorkerActivity {
+                observation_unavailable: snapshot.state.is_none(),
                 status: snapshot
                     .state
                     .as_ref()
@@ -8108,10 +8109,24 @@ impl RuntimeState {
             .entry(worker.session_id.clone())
             .and_modify(|activity| activity.parent_session_id = worker.parent_session_id.clone())
             .or_insert_with(|| InternalWorkerActivity {
+                observation_unavailable: false,
                 status: None,
                 state_sequence: None,
                 parent_session_id: worker.parent_session_id.clone(),
             });
+    }
+
+    fn invalidate_internal_worker_observation(
+        activity: &mut InternalWorkerActivityProjection,
+        worker: &protocol::InternalWorkerRef,
+    ) {
+        Self::touch_internal_worker_activity(activity, worker);
+        for session in Self::internal_worker_subtree_ids(activity, &worker.session_id) {
+            if let Some(current) = activity.workers.get_mut(&session) {
+                current.observation_unavailable = true;
+                current.status = None;
+            }
+        }
     }
 
     fn project_internal_worker_event(
@@ -8119,10 +8134,21 @@ impl RuntimeState {
         worker: &protocol::InternalWorkerRef,
         event: &protocol::Event,
     ) {
-        if activity.removed_workers.contains_key(&worker.session_id) {
+        if activity.removed_workers.contains_key(&worker.session_id)
+            || activity
+                .workers
+                .get(&worker.session_id)
+                .is_some_and(|state| state.observation_unavailable)
+        {
             return;
         }
         match event {
+            protocol::Event::Shutdown => {
+                Self::invalidate_internal_worker_observation(activity, worker)
+            }
+            protocol::Event::InternalWorkerObservationUnavailable { worker: child } => {
+                Self::invalidate_internal_worker_observation(activity, child)
+            }
             protocol::Event::Snapshot {
                 state,
                 internal_workers,
@@ -8133,6 +8159,7 @@ impl RuntimeState {
                 activity.workers.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
+                        observation_unavailable: false,
                         status: Some(state.catalog_status()),
                         state_sequence: Some(state.state_sequence),
                         parent_session_id: worker.parent_session_id.clone(),
@@ -8168,6 +8195,7 @@ impl RuntimeState {
                 activity.workers.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
+                        observation_unavailable: false,
                         status: Some(snapshot.catalog_status()),
                         state_sequence: Some(snapshot.state_sequence),
                         parent_session_id: worker.parent_session_id.clone(),
@@ -8183,12 +8211,20 @@ impl RuntimeState {
         previous: &InternalWorkerActivityProjection,
     ) {
         for (session, current) in &mut activity.workers {
+            if let Some(old) = previous.workers.get(session) {
+                if current.observation_unavailable {
+                    current.state_sequence = old.state_sequence;
+                }
+            }
             if let Some(old) = previous.workers.get(session)
                 && let (Some(old_sequence), Some(current_sequence)) =
                     (old.state_sequence, current.state_sequence)
                 && old_sequence > current_sequence
             {
-                current.status = old.status;
+                if !current.observation_unavailable {
+                    current.status = old.status;
+                    current.observation_unavailable = old.observation_unavailable;
+                }
                 current.state_sequence = old.state_sequence;
             }
         }
@@ -8200,6 +8236,9 @@ impl RuntimeState {
     ) -> bool {
         let was_running = activity.has_running_worker();
         match event {
+            protocol::Event::InternalWorkerObservationUnavailable { worker } => {
+                Self::invalidate_internal_worker_observation(activity, worker)
+            }
             protocol::Event::Snapshot {
                 internal_workers, ..
             } => {
@@ -8428,6 +8467,7 @@ struct WorkerObservationChange {
 
 #[derive(Debug, Clone)]
 struct InternalWorkerActivity {
+    observation_unavailable: bool,
     status: Option<protocol::WorkerStatus>,
     state_sequence: Option<u64>,
     parent_session_id: Option<String>,

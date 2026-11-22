@@ -49,7 +49,99 @@ mod observation_sync_tests {
             &parent_snapshot(vec![unavailable]),
         );
         assert_eq!(activity.workers["child"].status, None);
-        assert_eq!(activity.workers["child"].state_sequence, None);
+        assert_eq!(activity.workers["child"].state_sequence, Some(4));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn internal_registry_loss_reaches_runtime_and_fences_queued_overlap() {
+        use worker::spawn::registry::observation_fixture::{self, Loss};
+        for service in [false, true] {
+            for loss in [Loss::Lagged, Loss::Closed, Loss::Shutdown] {
+                let root = tempfile::tempdir().unwrap();
+                let (runtime, backend) = runtime_and_backend();
+                let created = runtime
+                    .create_worker(task_request("registry consumer"))
+                    .unwrap();
+                let owner = context(&backend, &created.worker_ref);
+                let cursor = runtime
+                    .worker_observation_cursor_now(&created.worker_ref)
+                    .unwrap();
+                let (lost, fresh) = observation_fixture::exercise(root.path(), service, loss, |event| {
+                    let is_running = matches!(&event, protocol::Event::InternalWorker { event, .. }
+                        if matches!(&**event, protocol::Event::WorkerState { snapshot } if snapshot.catalog_status() == protocol::WorkerStatus::Running));
+                    let ordinary_error = matches!(&event, protocol::Event::InternalWorker { event, .. } if matches!(&**event, protocol::Event::Error { message, .. } if message == "ordinary diagnostic"));
+                    let _ = owner.publish_protocol_event(event).unwrap();
+                    if is_running || ordinary_error { assert!(runtime.lock().unwrap().worker(&created.worker_ref).unwrap().active_execution().unwrap().internal_workers.has_running_worker()); }
+                }).await;
+                assert!(
+                    !runtime
+                        .lock()
+                        .unwrap()
+                        .worker(&created.worker_ref)
+                        .unwrap()
+                        .active_execution()
+                        .unwrap()
+                        .internal_workers
+                        .has_running_worker()
+                );
+                assert!(runtime.read_worker_observation_events(&created.worker_ref, cursor).unwrap().iter().any(|event|
+                    matches!(event.payload, protocol::Event::InternalWorkerObservationUnavailable { .. })
+                    || matches!(&event.payload, protocol::Event::InternalWorker { event, .. } if matches!(**event, protocol::Event::Shutdown))));
+                let _ = owner
+                    .publish_protocol_event(parent_snapshot(vec![lost.clone()]))
+                    .unwrap();
+                for sequence in [1, 2] {
+                    let _ = owner
+                        .publish_protocol_event(protocol::Event::InternalWorker {
+                            worker: lost.worker.clone(),
+                            event: Box::new(protocol::Event::WorkerState {
+                                snapshot: running(sequence),
+                            }),
+                        })
+                        .unwrap();
+                }
+                let _ = owner
+                    .publish_protocol_event(protocol::Event::InternalWorker {
+                        worker: lost.worker.clone(),
+                        event: Box::new(protocol::Event::Snapshot {
+                            session: lost.session.clone(),
+                            greeting: lost.greeting.clone().unwrap(),
+                            state: running(1),
+                            in_flight: lost.in_flight.clone(),
+                            internal_workers: vec![],
+                        }),
+                    })
+                    .unwrap();
+                assert!(
+                    !runtime
+                        .lock()
+                        .unwrap()
+                        .worker(&created.worker_ref)
+                        .unwrap()
+                        .active_execution()
+                        .unwrap()
+                        .internal_workers
+                        .has_running_worker()
+                );
+                if let Some(fresh) = fresh {
+                    assert!(fresh.state.is_some());
+                    let _ = owner
+                        .publish_protocol_event(parent_snapshot(vec![fresh]))
+                        .unwrap();
+                    assert!(
+                        runtime
+                            .lock()
+                            .unwrap()
+                            .worker(&created.worker_ref)
+                            .unwrap()
+                            .active_execution()
+                            .unwrap()
+                            .internal_workers
+                            .has_running_worker()
+                    );
+                }
+            }
+        }
     }
 
     fn running(state_sequence: u64) -> protocol::WorkerStateSnapshot {

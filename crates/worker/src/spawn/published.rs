@@ -35,11 +35,37 @@ impl PublishedProtocol {
     }
 }
 
+pub(super) fn invalidate(snapshot: &mut InternalWorkerSnapshot) {
+    snapshot.state = None;
+    for child in &mut snapshot.internal_workers {
+        invalidate(child);
+    }
+}
+
 pub(super) fn apply(
     snapshot: &mut InternalWorkerSnapshot,
     event: &Event,
     source: &InternalWorkerSessionHandle,
 ) {
+    // A closed observation cannot be revived by events queued on its old
+    // subscription. Only a new paired registry snapshot can recover it.
+    if snapshot.state.is_none()
+        && matches!(
+            event,
+            Event::Snapshot { .. } | Event::WorkerState { .. } | Event::InternalWorker { .. }
+        )
+    {
+        return;
+    }
+    let incoming = match event {
+        Event::Snapshot { state, .. } | Event::WorkerState { snapshot: state } => Some(state),
+        _ => None,
+    };
+    if let (Some(current), Some(incoming)) = (&snapshot.state, incoming)
+        && incoming.state_sequence < current.state_sequence
+    {
+        return;
+    }
     match event {
         Event::Snapshot {
             session,
@@ -66,7 +92,7 @@ pub(super) fn apply(
         }
         Event::Shutdown => {
             snapshot.status = protocol::WorkerStatus::Stopped;
-            snapshot.state = None;
+            invalidate(snapshot);
             snapshot.in_flight = Default::default();
         }
         Event::Error { message, .. } => snapshot.error = Some(message.clone()),
@@ -295,6 +321,15 @@ pub(super) fn apply(
                     in_flight: in_flight.clone(),
                     internal_workers: internal_workers.clone(),
                 });
+            }
+        }
+        Event::InternalWorkerObservationUnavailable { worker } => {
+            if let Some(child) = snapshot
+                .internal_workers
+                .iter_mut()
+                .find(|child| child.worker.session_id == worker.session_id)
+            {
+                invalidate(child);
             }
         }
         Event::InternalWorkerRemoved { worker } => snapshot

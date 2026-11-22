@@ -704,7 +704,7 @@ impl InternalWorkerSessionHandle {
         self.last_outcome.lock().unwrap().clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn force_status(&self, status: InternalWorkerSessionStatus) {
         self.state
             .lock()
@@ -1449,14 +1449,14 @@ impl session_store::WorkerMetadataStore for EphemeralSessionStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_internal_worker_session(
     visibility: InternalWorkerVisibility,
 ) -> (InternalWorkerSessionHandle, broadcast::Sender<Event>) {
     test_internal_worker_session_with_greeting(visibility, None)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_internal_worker_session_with_greeting(
     visibility: InternalWorkerVisibility,
     greeting: Option<protocol::Greeting>,
@@ -1494,6 +1494,7 @@ pub(crate) fn test_internal_worker_session_with_greeting(
         greeting: greeting.map(|greeting| Arc::new(RwLock::new(greeting))),
         child_registry: None,
         sink,
+        #[cfg(test)]
         fail_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (handle, event_tx)

@@ -182,7 +182,7 @@ try {
                   state: observation,
                   worker_state: observation === "stopped"
                     ? null
-                    : { last_command_id: 1, state: { kind: "idle" } },
+                    : { state_sequence: 0, last_command_id: 1, state: { kind: "idle" } },
                   restore_observation_token: observationToken(),
                 },
               },

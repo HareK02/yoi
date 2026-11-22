@@ -24709,9 +24709,17 @@
           },
           "state": {
             "$ref": "#/components/schemas/WorkerState"
+          },
+          "state_sequence": {
+            "description": "Source-authored ordering within one Worker execution. Snapshot and live\ndelivery may overlap; receivers compare source sequences only within that execution.\nAdvances on changes to any snapshot field, independently of command IDs.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
+          "state_sequence",
           "last_command_id",
           "state"
         ],
@@ -27149,7 +27157,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:334fdb96edb11345145604b8c000bfa27b0fe72b7a3315320ae953a93be38f94"
+    "x-yoi-source-digest": "sha256:e5ea21a20d4f5f396ba27c08ba5d40a1d5a094271aaa4892b015b72f0423e0af"
   },
   "openapi": "3.1.0",
   "paths": {

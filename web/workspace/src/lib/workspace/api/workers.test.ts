@@ -163,7 +163,7 @@ Deno.test("Worker summary parser enforces observation freshness", () => {
       parseWorkerSummary({
         ...unavailable,
         worker_state: {
-          last_command_id: 0,
+          state_sequence: 0, last_command_id: 0,
           state: { kind: "idle" },
         },
       }),
@@ -198,7 +198,7 @@ Deno.test("Worker summary parser preserves the optional submission completion fe
         { last_finished_submission_request_id: "completed-submit" },
       ]
     ) {
-      const snapshot = { last_command_id: 7, ...completion, state };
+      const snapshot = { state_sequence: 0, last_command_id: 7, ...completion, state };
       const parsed = parseWorkerSummary({
         ...worker,
         resource_key: "W-1",
@@ -220,7 +220,7 @@ Deno.test("Worker summary parser validates submission completion fences without 
             resource_key: "W-1",
             availability: "observed",
             worker_state: {
-              last_command_id: 7,
+              state_sequence: 0, last_command_id: 7,
               last_finished_submission_request_id: invalid,
               state,
             },
@@ -236,7 +236,7 @@ Deno.test("Worker summary parser validates submission completion fences without 
           resource_key: "W-1",
           availability: "observed",
           worker_state: {
-            last_command_id: 7,
+            state_sequence: 0, last_command_id: 7,
             last_finished_submission_request_id: "completed-submit",
             state,
             unexpected: true,
@@ -250,7 +250,7 @@ Deno.test("Worker summary parser validates submission completion fences without 
 
 Deno.test("Console Worker API loading accepts a completed submission snapshot", async () => {
   const snapshot = {
-    last_command_id: 0,
+    state_sequence: 0, last_command_id: 0,
     last_finished_submission_request_id: "completed-submit",
     state: { kind: "idle" },
   };
