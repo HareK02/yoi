@@ -127,6 +127,7 @@ async fn backend_delegation_reaches_external_provider_resolution() {
                 generation: 1,
                 expires_at: None,
                 capabilities,
+                access_fenced: std::sync::atomic::AtomicBool::new(false),
                 admission: Arc::new(tokio::sync::Semaphore::new(16)),
                 shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 sender,

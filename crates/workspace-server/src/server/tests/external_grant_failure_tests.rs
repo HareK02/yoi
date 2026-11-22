@@ -96,6 +96,10 @@ async fn client(
         reqwest::header::AUTHORIZATION,
         format!("Bearer {token}").parse().unwrap(),
     );
+    headers.insert(
+        workdir::external::EXTERNAL_WORKDIR_SESSION_KEY_HEADER,
+        "a".repeat(64).parse().unwrap(),
+    );
     let http = reqwest::Client::builder()
         .default_headers(headers)
         .timeout(std::time::Duration::from_secs(10))
@@ -158,6 +162,30 @@ async fn register_provider(
     base: &str,
     grant: &ExternalWorkdirGrantResponse,
 ) -> ProviderSocket {
+    register_provider_as(base, grant, provider_registration(grant)).await
+}
+
+fn provider_registration(
+    grant: &ExternalWorkdirGrantResponse,
+) -> workdir::external::ExternalWorkdirProviderRegistration {
+    workdir::external::ExternalWorkdirProviderRegistration {
+        provider_instance_id: ExternalProviderInstanceId::new(grant.provider_instance_id.clone())
+            .unwrap(),
+        grant_id: workdir::external::ExternalWorkdirGrantId::new(grant.grant_id.clone()).unwrap(),
+        workdir_id: workdir::Workdir::new(&grant.working_directory_id)
+            .id()
+            .clone(),
+        generation: grant.generation,
+        capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+        read_limits: workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
+    }
+}
+
+async fn register_provider_as(
+    base: &str,
+    grant: &ExternalWorkdirGrantResponse,
+    registration: workdir::external::ExternalWorkdirProviderRegistration,
+) -> ProviderSocket {
     use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
     // Reuse the existing client account/user, not a second user with that account.
     let token = format!("api-token-{TEST_WORKSPACE_ID}");
@@ -170,23 +198,20 @@ async fn register_provider(
     request
         .headers_mut()
         .insert("Authorization", format!("Bearer {token}").parse().unwrap());
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    request.headers_mut().insert(
+        workdir::external::EXTERNAL_WORKDIR_SESSION_KEY_HEADER,
+        "a".repeat(64).parse().unwrap(),
+    );
+    let (mut socket, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let registration =
         ExternalWorkdirProviderFrame::current(ExternalWorkdirProviderMessage::Register {
-            registration: workdir::external::ExternalWorkdirProviderRegistration {
-                provider_instance_id: ExternalProviderInstanceId::new(
-                    grant.provider_instance_id.clone(),
-                )
-                .unwrap(),
-                grant_id: workdir::external::ExternalWorkdirGrantId::new(grant.grant_id.clone())
-                    .unwrap(),
-                workdir_id: workdir::Workdir::new(&grant.working_directory_id)
-                    .id()
-                    .clone(),
-                generation: grant.generation,
-                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
-                read_limits: workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
-            },
+            registration,
         });
     socket
         .send(Message::Text(
@@ -268,6 +293,689 @@ fn connection_reasons(response: &ExternalWorkdirGrantResponse) -> Vec<Reason> {
             failure.details().reason
         })
         .collect()
+}
+
+// These clients intentionally have no default session header. Keep missing-header
+// checks separate from client(), which supplies the fixture's valid credential.
+#[tokio::test]
+async fn external_grant_session_create_requires_credential_and_creator_without_secret_echo() {
+    use workdir::external::EXTERNAL_WORKDIR_SESSION_KEY_HEADER as KEY;
+    let dir = tempfile::tempdir().unwrap();
+    init_clean_git_workspace(dir.path());
+    let api = test_api(dir.path()).await;
+    let (client, _tasks, base, _) = client(&api).await;
+    let raw = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let secret = "a".repeat(64);
+    for (authenticate, keys) in [
+        (true, vec![]),
+        (true, vec!["a".repeat(63)]),
+        (true, vec!["a".repeat(65)]),
+        (true, vec!["A".repeat(64)]),
+        (true, vec!["g".repeat(64)]),
+        (true, vec![secret.clone(), secret.clone()]),
+        (false, vec![secret.clone()]),
+    ] {
+        let mut request = raw
+            .post(format!(
+                "{base}/api/w/{TEST_WORKSPACE_ID}/external-workdir-grants"
+            ))
+            .json(&request());
+        if authenticate {
+            request = request.bearer_auth(format!("api-token-{TEST_WORKSPACE_ID}"));
+        }
+        for key in &keys {
+            request = request.header(KEY, key.as_str());
+        }
+        let response = request.send().await.unwrap();
+        assert!(matches!(response.status().as_u16(), 401 | 403));
+        let body = response.text().await.unwrap();
+        for key in keys {
+            assert!(!body.contains(&key));
+        }
+        assert!(!body.contains(&secret));
+        assert!(!body.contains(&"A".repeat(64)));
+        assert!(!body.contains(&"g".repeat(64)));
+        assert!(!body.contains("api-token-"));
+        assert!(
+            api.store
+                .list_external_workdir_grants(TEST_WORKSPACE_ID)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let grant = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    let stored = api
+        .store
+        .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+        .unwrap()
+        .unwrap();
+    let digest = crate::auth::token_hash(&secret);
+    assert_eq!(
+        stored.session_credential_digest.as_deref(),
+        Some(digest.as_str())
+    );
+    let json = serde_json::to_string(&grant).unwrap();
+    for private in [&secret, &digest] {
+        assert!(!json.contains(private));
+    }
+    assert!(!json.contains("session_credential_digest"));
+}
+
+#[tokio::test]
+async fn external_grant_session_handshake_rejects_public_ids_wrong_keys_and_workspace() {
+    use workdir::external::EXTERNAL_WORKDIR_SESSION_KEY_HEADER as KEY;
+    let dir = tempfile::tempdir().unwrap();
+    init_clean_git_workspace(dir.path());
+    let api = test_api(dir.path()).await;
+    let (client, _tasks, base, _) = client(&api).await;
+    let grant = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    let raw = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let secret = "a".repeat(64);
+    for (workspace, authenticate, keys) in [
+        // The original authenticated creator with every public ID is insufficient.
+        (TEST_WORKSPACE_ID, true, vec![]),
+        (TEST_WORKSPACE_ID, true, vec!["b".repeat(64)]),
+        (TEST_WORKSPACE_ID, true, vec!["A".repeat(64)]),
+        (
+            TEST_WORKSPACE_ID,
+            true,
+            vec![secret.clone(), secret.clone()],
+        ),
+        (TEST_WORKSPACE_ID, false, vec![secret.clone()]),
+        ("another-workspace", true, vec![secret.clone()]),
+    ] {
+        let mut request = raw
+            .get(format!(
+                "{base}/api/w/{workspace}/external-workdir-grants/{}/provider",
+                grant.grant_id
+            ))
+            .header("Connection", "upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if authenticate {
+            request = request.bearer_auth(format!("api-token-{TEST_WORKSPACE_ID}"));
+        }
+        for key in keys {
+            request = request.header(KEY, key);
+        }
+        let response = request.send().await.unwrap();
+        assert!(response.status().is_client_error());
+        let body = response.text().await.unwrap();
+        for private in [&secret, &"b".repeat(64), &"A".repeat(64)] {
+            assert!(!body.contains(private));
+        }
+        assert!(!body.contains("api-token-"));
+        let current = client
+            .external_workdir_grant_get(TEST_WORKSPACE_ID.into(), grant.grant_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(current.status, "pending");
+        assert_eq!(current.generation, grant.generation);
+        assert!(current.connection_observations.is_empty());
+        assert!(
+            api.external_workdir_providers
+                .lock()
+                .unwrap()
+                .connection(&grant.grant_id)
+                .is_none()
+        );
+    }
+    // The share credential also must not replace the creator's identity check.
+    api.config_store
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE external_workdir_grants SET created_by='another-account' WHERE grant_id=?1",
+                [&grant.grant_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let response = raw
+        .get(format!(
+            "{base}/api/w/{TEST_WORKSPACE_ID}/external-workdir-grants/{}/provider",
+            grant.grant_id
+        ))
+        .bearer_auth(format!("api-token-{TEST_WORKSPACE_ID}"))
+        .header(KEY, &secret)
+        .header("Connection", "upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+    assert!(!response.text().await.unwrap().contains(&secret));
+}
+
+async fn provider_refused(socket: &mut ProviderSocket) {
+    use tokio_tungstenite::tungstenite::Message;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("rejected provider must close promptly");
+    assert!(
+        matches!(message, Some(Ok(Message::Close(_))) | Some(Err(_)) | None),
+        "rejected provider received a data frame: {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn external_grant_session_registration_cannot_change_provider_root_or_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    init_clean_git_workspace(dir.path());
+    let api = test_api(dir.path()).await;
+    let (client, _tasks, base, _) = client(&api).await;
+    let grant = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    let other = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    for mismatch in [
+        "provider",
+        "grant",
+        "root",
+        "permissions",
+        "zero_generation",
+    ] {
+        let mut registration = provider_registration(&grant);
+        match mismatch {
+            "provider" => {
+                registration.provider_instance_id =
+                    ExternalProviderInstanceId::new("another-provider").unwrap()
+            }
+            "grant" => {
+                registration.grant_id =
+                    workdir::external::ExternalWorkdirGrantId::new(other.grant_id.clone()).unwrap()
+            }
+            "root" => {
+                registration.workdir_id = workdir::Workdir::new(&other.working_directory_id)
+                    .id()
+                    .clone()
+            }
+            "permissions" => {
+                registration.capabilities = workdir::WorkdirSessionCapabilities::READ_WRITE
+            }
+            _ => registration.generation = 0,
+        }
+        let mut socket = register_provider_as(&base, &grant, registration).await;
+        provider_refused(&mut socket).await;
+        let current = client
+            .external_workdir_grant_get(TEST_WORKSPACE_ID.into(), grant.grant_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(current.status, "pending", "{mismatch}");
+        assert_eq!(current.generation, grant.generation, "{mismatch}");
+        assert!(
+            api.external_workdir_providers
+                .lock()
+                .unwrap()
+                .connection(&grant.grant_id)
+                .is_none()
+        );
+    }
+    // Rejections must not poison the valid registration or create another Workdir.
+    let mut socket = register_provider(&api, &base, &grant).await;
+    registered(&mut socket).await;
+    assert_eq!(
+        api.store
+            .list_external_workdir_grants(TEST_WORKSPACE_ID)
+            .unwrap()
+            .len(),
+        2
+    );
+    let _ = socket.close(None).await;
+}
+
+async fn observed_status(
+    client: &ServerApiClient,
+    grant: &str,
+    status: &str,
+) -> ExternalWorkdirGrantResponse {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = client
+                .external_workdir_grant_get(TEST_WORKSPACE_ID.into(), grant.into())
+                .await
+                .unwrap();
+            if current.status == status {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("grant did not reach expected status")
+}
+
+#[tokio::test]
+async fn external_grant_session_reconnect_has_one_generation_and_preserves_attachment_identity() {
+    use tokio_tungstenite::tungstenite::Message;
+    let fixture = grant_cleanup_fixture().await;
+    let api = &fixture.api;
+    let (client, _tasks, base, _) = client(api).await;
+    let grant = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    let link = api
+        .store
+        .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            worker: fixture.worker.clone(),
+            workdir_id: grant.working_directory_id.clone(),
+            alias: "reconnecting-session".into(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            linked_at: Utc::now().to_rfc3339(),
+            unlinked_at: None,
+        })
+        .unwrap();
+    let mut first = register_provider(api, &base, &grant).await;
+    registered(&mut first).await;
+    assert!(
+        api.store
+            .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+            .unwrap()
+            .unwrap()
+            .reconnect_deadline_at
+            .is_none()
+    );
+    let mut duplicate = register_provider(api, &base, &grant).await;
+    provider_refused(&mut duplicate).await;
+    first.close(None).await.unwrap();
+    let offline = observed_status(&client, &grant.grant_id, "offline").await;
+    let deadline = api
+        .store
+        .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+        .unwrap()
+        .unwrap()
+        .reconnect_deadline_at
+        .unwrap();
+    let remaining = chrono::DateTime::parse_from_rfc3339(&deadline)
+        .unwrap()
+        .with_timezone(&Utc)
+        - Utc::now();
+    assert!(remaining > Duration::zero());
+    assert!(
+        remaining
+            <= Duration::seconds(workdir::external::EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS as i64)
+    );
+    let mut reconnect = offline;
+    reconnect.generation += 1;
+    // Both authenticated handshakes may succeed, but activation is a single CAS.
+    let (mut left, mut right) = tokio::join!(
+        register_provider(api, &base, &reconnect),
+        register_provider(api, &base, &reconnect),
+    );
+    let (left_frame, right_frame) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(left.next(), right.next())
+        })
+        .await
+        .unwrap();
+    let accepted = |frame| match frame {
+        Some(Ok(Message::Text(text))) => {
+            let frame: ExternalWorkdirServerFrame = serde_json::from_str(&text).unwrap();
+            assert!(
+                matches!(frame.message, ExternalWorkdirServerMessage::Registered { generation, .. } if generation == reconnect.generation)
+            );
+            true
+        }
+        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => false,
+        other => panic!("unexpected reconnect response: {other:?}"),
+    };
+    let left_won = accepted(left_frame);
+    assert_ne!(
+        left_won,
+        accepted(right_frame),
+        "exactly one reconnect may activate"
+    );
+    let current = observed_status(&client, &grant.grant_id, "online").await;
+    assert_eq!(current.generation, reconnect.generation);
+    assert_eq!(current.working_directory_id, grant.working_directory_id);
+    assert_eq!(
+        api.store
+            .list_external_workdir_grants(TEST_WORKSPACE_ID)
+            .unwrap()
+            .len(),
+        1
+    );
+    let retained = api
+        .store
+        .latest_workdir_worker_link(TEST_WORKSPACE_ID, &grant.working_directory_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.connection_id, link.connection_id);
+    assert!(retained.unlinked_at.is_none());
+    let mut stale = register_provider(api, &base, &grant).await;
+    provider_refused(&mut stale).await;
+    assert_eq!(
+        api.external_workdir_providers
+            .lock()
+            .unwrap()
+            .connection(&grant.grant_id)
+            .unwrap()
+            .generation,
+        reconnect.generation
+    );
+    assert!(
+        api.store
+            .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+            .unwrap()
+            .unwrap()
+            .reconnect_deadline_at
+            .is_none()
+    );
+    // Full stale response/operation fencing is also exercised by the parent's
+    // production CLI pump test; here the real router owns admission and CAS.
+    let revoked = client
+        .external_workdir_grant_revoke(TEST_WORKSPACE_ID.into(), grant.grant_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(revoked.status, "revoked");
+    assert_eq!(revoked.cleanup_state, "completed");
+    assert!(
+        api.external_workdir_providers
+            .lock()
+            .unwrap()
+            .connection(&grant.grant_id)
+            .is_none()
+    );
+    let _ = left.close(None).await;
+    let _ = right.close(None).await;
+}
+
+fn set_session_deadline(api: &WorkspaceApi, grant: &str, deadline: &str) {
+    api.config_store.with_conn(|conn| {
+        assert_eq!(conn.execute(
+            "UPDATE external_workdir_grants SET reconnect_deadline_at=?3 WHERE workspace_id=?1 AND grant_id=?2",
+            rusqlite::params![TEST_WORKSPACE_ID, grant, deadline],
+        )?, 1);
+        Ok(())
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn external_grant_session_grace_expiry_hides_pending_cleanup_then_releases_runtime_link() {
+    let fixture = grant_cleanup_fixture().await;
+    let api = &fixture.api;
+    let (client, _tasks, base, _) = client(api).await;
+    let grant = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    api.store
+        .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            worker: fixture.worker.clone(),
+            workdir_id: grant.working_directory_id.clone(),
+            alias: "grace-expiry".into(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            linked_at: Utc::now().to_rfc3339(),
+            unlinked_at: None,
+        })
+        .unwrap();
+    let mut socket = register_provider(api, &base, &grant).await;
+    registered(&mut socket).await;
+    socket.close(None).await.unwrap();
+    observed_status(&client, &grant.grant_id, "offline").await;
+    let saved = api
+        .store
+        .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        api.store
+            .update_external_workdir_grant_state(
+                TEST_WORKSPACE_ID,
+                &grant.grant_id,
+                &grant.provider_instance_id,
+                grant.generation,
+                "offline",
+                &Utc::now().to_rfc3339()
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        api.store
+            .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+            .unwrap()
+            .unwrap()
+            .reconnect_deadline_at,
+        saved.reconnect_deadline_at,
+        "repeated offline observations must not extend grace"
+    );
+    assert!(
+        client
+            .workspace_workdir_list(TEST_WORKSPACE_ID.into())
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.working_directory_id == grant.working_directory_id)
+    );
+    // Exercise the production fence without a 120-second sleep or an async timer
+    // race. Cleanup is deliberately separate to inspect the pending state.
+    set_session_deadline(
+        api,
+        &grant.grant_id,
+        &(Utc::now() - Duration::seconds(1)).to_rfc3339(),
+    );
+    let (expired, audit) = fence_external_workdir_grant_expired(api, &grant.grant_id)
+        .await
+        .unwrap();
+    assert_eq!(expired.status, "expired");
+    assert!(audit.is_none());
+    let pending = client
+        .external_workdir_grant_get(TEST_WORKSPACE_ID.into(), grant.grant_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(pending.status, "expired");
+    assert_eq!(pending.cleanup_state, "pending");
+    assert!(
+        client
+            .workspace_workdir_list(TEST_WORKSPACE_ID.into())
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.working_directory_id != grant.working_directory_id)
+    );
+    assert!(
+        api.store
+            .latest_workdir_worker_link(TEST_WORKSPACE_ID, &grant.working_directory_id)
+            .unwrap()
+            .unwrap()
+            .unlinked_at
+            .is_none(),
+        "pending is not proof of release"
+    );
+    assert!(
+        !api.store
+            .activate_external_workdir_grant(
+                TEST_WORKSPACE_ID,
+                &grant.grant_id,
+                &grant.provider_instance_id,
+                grant.generation + 1,
+                &Utc::now().to_rfc3339()
+            )
+            .unwrap()
+    );
+    cleanup_external_workdir_attachments(api, &grant.working_directory_id)
+        .await
+        .unwrap();
+    assert!(
+        api.store
+            .latest_workdir_worker_link(TEST_WORKSPACE_ID, &grant.working_directory_id)
+            .unwrap()
+            .unwrap()
+            .unlinked_at
+            .is_some()
+    );
+    let completed = client
+        .external_workdir_grant_get(TEST_WORKSPACE_ID.into(), grant.grant_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(completed.status, "expired");
+    assert_eq!(completed.cleanup_state, "completed");
+    assert_eq!(
+        api.store
+            .external_workdir_cleanup_operation(TEST_WORKSPACE_ID, &grant.grant_id)
+            .unwrap()
+            .unwrap()
+            .operation()
+            .runtime_status,
+        Some(crate::hosts::RuntimeOperationStatus::Accepted)
+    );
+}
+
+#[tokio::test]
+async fn external_grant_session_workspace_restart_preserves_deadlines_and_expires_elapsed_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    init_clean_git_workspace(dir.path());
+    let api = test_api(dir.path()).await;
+    let (client, server, ..) = client(&api).await;
+    let online = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    let offline = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    let elapsed = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    // Durable pre-crash rows: no provider task survives to manufacture a clean
+    // disconnect. All grants were created through the authenticated router.
+    for grant in [&online, &offline, &elapsed] {
+        assert!(
+            api.store
+                .activate_external_workdir_grant(
+                    TEST_WORKSPACE_ID,
+                    &grant.grant_id,
+                    &grant.provider_instance_id,
+                    grant.generation,
+                    &Utc::now().to_rfc3339()
+                )
+                .unwrap()
+        );
+        if grant.grant_id != online.grant_id {
+            assert!(
+                api.store
+                    .update_external_workdir_grant_state(
+                        TEST_WORKSPACE_ID,
+                        &grant.grant_id,
+                        &grant.provider_instance_id,
+                        grant.generation,
+                        "offline",
+                        &Utc::now().to_rfc3339()
+                    )
+                    .unwrap()
+            );
+        }
+        cancel_external_workdir_expiry(&api, &grant.grant_id);
+    }
+    let preserved = (Utc::now() + Duration::seconds(90)).to_rfc3339();
+    set_session_deadline(&api, &offline.grant_id, &preserved);
+    set_session_deadline(
+        &api,
+        &elapsed.grant_id,
+        &(Utc::now() - Duration::seconds(1)).to_rfc3339(),
+    );
+    let config = api
+        .config
+        .clone()
+        .with_embedded_runtime_store_root(dir.path().join("session-restart-runtime"));
+    drop(client);
+    drop(server);
+    drop(api);
+    let before = Utc::now();
+    let store = Arc::new(crate::SqliteWorkspaceStore::open(&config.database_path).unwrap());
+    let reopened = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        WorkspaceApi::new_for_test(config, store),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let read = |id: &str| {
+        reopened
+            .store
+            .get_external_workdir_grant(TEST_WORKSPACE_ID, id)
+            .unwrap()
+            .unwrap()
+    };
+    let from_online = read(&online.grant_id);
+    assert_eq!(from_online.status, "offline");
+    let first_deadline = from_online.reconnect_deadline_at.unwrap();
+    let parsed = chrono::DateTime::parse_from_rfc3339(&first_deadline)
+        .unwrap()
+        .with_timezone(&Utc);
+    let grace = Duration::seconds(workdir::external::EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS as i64);
+    assert!(parsed >= before + grace);
+    assert!(parsed <= Utc::now() + grace);
+    assert_eq!(
+        read(&offline.grant_id).reconnect_deadline_at.as_deref(),
+        Some(preserved.as_str())
+    );
+    assert_eq!(read(&elapsed.grant_id).status, "expired");
+    // A second recovery observation must not restart either offline clock.
+    reopened
+        .store
+        .reconcile_external_workdir_grants_after_restart(
+            TEST_WORKSPACE_ID,
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+    assert_eq!(
+        read(&online.grant_id).reconnect_deadline_at.as_deref(),
+        Some(first_deadline.as_str())
+    );
+    assert_eq!(
+        read(&offline.grant_id).reconnect_deadline_at.as_deref(),
+        Some(preserved.as_str())
+    );
+    let (client, _tasks, base, _) = self::client(&reopened).await;
+    let terminal = client
+        .external_workdir_grant_get(TEST_WORKSPACE_ID.into(), elapsed.grant_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(terminal.status, "expired");
+    assert_eq!(terminal.cleanup_state, "completed");
+    assert!(
+        client
+            .workspace_workdir_list(TEST_WORKSPACE_ID.into())
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.working_directory_id != elapsed.working_directory_id)
+    );
+    let mut reconnect = online;
+    reconnect.generation += 1;
+    let mut socket = register_provider(&reopened, &base, &reconnect).await;
+    registered(&mut socket).await;
+    assert!(read(&reconnect.grant_id).reconnect_deadline_at.is_none());
+    let _ = socket.close(None).await;
 }
 
 #[tokio::test]
@@ -1655,6 +2363,7 @@ async fn external_grant_failure_registered_send_retains_transport_state_and_save
             generation: grant.generation,
             expires_at: None,
             capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            access_fenced: std::sync::atomic::AtomicBool::new(false),
             admission: Arc::new(tokio::sync::Semaphore::new(16)),
             shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,
@@ -2724,6 +3433,68 @@ async fn external_grant_unknown_child_does_not_block_workspace_reopen_or_authori
             .0,
         "pending"
     );
+    // Unknown Runtime release remains diagnostic-only after restart. Re-sharing
+    // the same provider/display identity is new authority, not an alias for its
+    // old attachment, cleanup operation, or terminal grant.
+    let (client, _server, base, _) = client(&reopened).await;
+    assert!(
+        client
+            .workspace_workdir_list(TEST_WORKSPACE_ID.into())
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.working_directory_id != workdir_id)
+    );
+    let fresh = client
+        .external_workdir_grant_create(TEST_WORKSPACE_ID.into(), request())
+        .await
+        .unwrap();
+    assert_ne!(fresh.grant_id, grant_id);
+    assert_ne!(fresh.working_directory_id, workdir_id);
+    assert_eq!(fresh.status, "pending");
+    assert_eq!(fresh.cleanup_state, "not_required");
+    assert!(
+        reopened
+            .store
+            .list_workdir_worker_links(TEST_WORKSPACE_ID, &fresh.working_directory_id)
+            .unwrap()
+            .is_empty()
+    );
+    let mut socket = register_provider(&reopened, &base, &fresh).await;
+    registered(&mut socket).await;
+    let inventory = client
+        .workspace_workdir_list(TEST_WORKSPACE_ID.into())
+        .await
+        .unwrap();
+    assert!(
+        inventory
+            .items
+            .iter()
+            .any(|item| item.working_directory_id == fresh.working_directory_id)
+    );
+    assert!(
+        inventory
+            .items
+            .iter()
+            .all(|item| item.working_directory_id != workdir_id)
+    );
+    let retained = reopened
+        .store
+        .external_workdir_cleanup_operation(TEST_WORKSPACE_ID, &grant_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.operation().request, frozen);
+    assert_eq!(
+        retained.operation().runtime_status,
+        Some(crate::hosts::RuntimeOperationStatus::Unknown)
+    );
+    assert!(!retained.operation().settled);
+    assert_eq!(
+        external_workdir_cleanup_reconciliation_count(&workdir_id),
+        0
+    );
+    let _ = socket.close(None).await;
 }
 
 #[tokio::test]

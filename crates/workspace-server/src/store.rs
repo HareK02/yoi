@@ -166,7 +166,7 @@ pub(crate) use subject_release_recording_store::{
 
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
-const LATEST_SCHEMA_VERSION: i64 = 138;
+const LATEST_SCHEMA_VERSION: i64 = 139;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -204,6 +204,8 @@ const WORKER_REGISTRY_PROJECTION_MIGRATION_NAME: &str =
     "durable Runtime-backed Worker registry projection";
 const MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME: &str =
     "multiple Worker Workdir attachments and Workdir display names";
+const EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME: &str =
+    "authenticated External Workdir sessions and durable reconnect deadlines";
 const EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME: &str = "typed client-hosted External Workdir grants";
 const EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME: &str =
     "durable External Workdir expiry cleanup state";
@@ -632,6 +634,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 138,
         name: notification_routing::merge_requests::MIGRATION_NAME,
         apply: notification_routing::merge_requests::migrate,
+    },
+    Migration {
+        version: 139,
+        name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME,
+        apply: migrate_external_workdir_sessions_v138_to_v139,
     },
 ];
 
@@ -1354,6 +1361,8 @@ pub struct ExternalWorkdirGrantRecord {
     pub created_by: String,
     pub created_at: String,
     pub expires_at: Option<String>,
+    pub session_credential_digest: Option<String>,
+    pub reconnect_deadline_at: Option<String>,
     pub generation: u64,
     pub status: String,
     pub updated_at: String,
@@ -11769,7 +11778,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkdirRegistryRecord>> {
         self.with_conn(|conn| {
             let sql = workdir_registry_select_sql(
-                "WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                "WHERE workspace_id = ?1 AND (source_kind != 'external_grant' OR EXISTS (
+                    SELECT 1 FROM external_workdir_grants g
+                    WHERE g.workspace_id = workdir_registry.workspace_id
+                      AND g.grant_id = workdir_registry.external_grant_id
+                      AND g.status NOT IN ('revoked', 'expired')
+                )) ORDER BY updated_at DESC LIMIT ?2",
             );
             let mut stmt = conn.prepare(sql.as_str())?;
             let rows = stmt.query_map(
@@ -12019,8 +12033,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO external_workdir_grants (
                     grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
-                    permissions, created_by, created_at, expires_at, generation, status, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                    permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                    session_credential_digest, reconnect_deadline_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
                 params![
                     grant.grant_id,
                     grant.workspace_id,
@@ -12034,6 +12049,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     grant.generation as i64,
                     grant.status,
                     grant.updated_at,
+                    grant.session_credential_digest,
+                    grant.reconnect_deadline_at,
                 ],
             )?;
             tx.execute(
@@ -12086,7 +12103,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 r#"SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
-                          permissions, created_by, created_at, expires_at, generation, status, updated_at
+                          permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                          session_credential_digest, reconnect_deadline_at
                    FROM external_workdir_grants WHERE workspace_id = ?1 AND grant_id = ?2"#,
                 params![workspace_id, grant_id],
                 |row| {
@@ -12103,6 +12121,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         generation: row.get::<_, i64>(9)? as u64,
                         status: row.get(10)?,
                         updated_at: row.get(11)?,
+                        session_credential_digest: row.get(12)?,
+                        reconnect_deadline_at: row.get(13)?,
                     })
                 },
             )
@@ -12118,7 +12138,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
                 r#"SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
-                          permissions, created_by, created_at, expires_at, generation, status, updated_at
+                          permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                          session_credential_digest, reconnect_deadline_at
                    FROM external_workdir_grants WHERE workspace_id = ?1 ORDER BY grant_id"#,
             )?;
             statement
@@ -12136,6 +12157,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         generation: row.get::<_, i64>(9)? as u64,
                         status: row.get(10)?,
                         updated_at: row.get(11)?,
+                        session_credential_digest: row.get(12)?,
+                        reconnect_deadline_at: row.get(13)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -12307,11 +12330,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = tx.execute(
                 r#"UPDATE external_workdir_grants
-                   SET generation = ?4, status = 'online', updated_at = ?5
+                   SET generation = ?4, status = 'online', updated_at = ?5, reconnect_deadline_at = NULL
                    WHERE workspace_id = ?1 AND grant_id = ?2 AND provider_instance_id = ?3
                      AND ((status = 'pending' AND generation = ?4)
                        OR (status = 'offline' AND generation + 1 = ?4))
-                     AND (expires_at IS NULL OR expires_at > ?5)"#,
+                     AND session_credential_digest IS NOT NULL AND session_credential_digest != ''
+                     AND julianday(reconnect_deadline_at) > julianday(?5)
+                     AND (expires_at IS NULL OR julianday(expires_at) > julianday(?5))"#,
                 params![
                     workspace_id,
                     grant_id,
@@ -12340,11 +12365,23 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         status: &str,
         updated_at: &str,
     ) -> Result<bool> {
+        if !matches!(status, "offline" | "revoked" | "expired") {
+            return Err(Error::InvalidInput(
+                "External Workdir state update requires offline, revoked or expired".into(),
+            ));
+        }
+        let reconnect_deadline = if status == "offline" {
+            Some(external_workdir_reconnect_deadline(updated_at)?)
+        } else {
+            None
+        };
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = tx.execute(
                 r#"UPDATE external_workdir_grants
                    SET status = ?5, updated_at = ?6,
+                       reconnect_deadline_at = CASE WHEN ?5 = 'offline' AND status = 'online'
+                           THEN COALESCE(reconnect_deadline_at, ?7) ELSE reconnect_deadline_at END,
                        cleanup_state = CASE WHEN ?5 IN ('revoked', 'expired') THEN 'pending' ELSE cleanup_state END,
                        cleanup_error = CASE WHEN ?5 IN ('revoked', 'expired') THEN NULL ELSE cleanup_error END,
                        cleanup_updated_at = CASE WHEN ?5 IN ('revoked', 'expired') THEN ?6 ELSE cleanup_updated_at END
@@ -12357,6 +12394,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     generation as i64,
                     status,
                     updated_at,
+                    reconnect_deadline,
                 ],
             )?;
             if changed > 0 {
@@ -12368,7 +12406,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     params![
                         workspace_id,
                         grant_id,
-                        if status == "online" { "present" } else { "unknown" },
+                        "unknown",
                         updated_at,
                     ],
                 )?;
@@ -12383,13 +12421,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         now: &str,
     ) -> Result<Vec<String>> {
+        let reconnect_deadline = external_workdir_reconnect_deadline(now)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let newly_expired = {
                 let mut statement = tx.prepare(
                     "UPDATE external_workdir_grants
                      SET status='expired',updated_at=?2,cleanup_state='pending',cleanup_error=NULL,cleanup_updated_at=?2
-                     WHERE workspace_id=?1 AND status IN ('pending','online','offline') AND expires_at IS NOT NULL AND expires_at<=?2
+                     WHERE workspace_id=?1 AND status IN ('pending','online','offline')
+                       AND (session_credential_digest IS NULL OR session_credential_digest = ''
+                         OR (expires_at IS NOT NULL AND julianday(expires_at)<=julianday(?2))
+                         OR (reconnect_deadline_at IS NOT NULL AND julianday(reconnect_deadline_at)<=julianday(?2)))
                      RETURNING grant_id",
                 )?;
                 statement.query_map(params![workspace_id,now], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
@@ -12398,10 +12440,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 crate::grant_cleanup_operation::install_fresh_fence_intent(&tx, workspace_id, &grant, now)?;
             }
             tx.execute(
-                "UPDATE external_workdir_grants SET status = 'offline', updated_at = ?2
-                 WHERE workspace_id = ?1 AND status = 'online'
-                   AND (expires_at IS NULL OR expires_at > ?2)",
-                params![workspace_id, now],
+                "UPDATE external_workdir_grants
+                 SET status = 'offline', updated_at = ?2, reconnect_deadline_at = COALESCE(reconnect_deadline_at, ?3)
+                 WHERE workspace_id = ?1 AND status = 'online'",
+                params![workspace_id, now, reconnect_deadline],
             )?;
             tx.execute(
                 "UPDATE workdir_registry SET materialization_status = 'unknown', updated_at = ?2
@@ -15475,7 +15517,12 @@ fn workdir_catalog_select_sql() -> String {
              ORDER BY linked_at DESC, rowid DESC LIMIT 1
          )
          LEFT JOIN worker_registry w ON w.workspace_id = l.workspace_id AND w.runtime_id = l.runtime_id AND w.worker_id = l.worker_id",
-        workdir_registry_select_sql("")
+        workdir_registry_select_sql("WHERE source_kind != 'external_grant' OR EXISTS (
+            SELECT 1 FROM external_workdir_grants g
+            WHERE g.workspace_id = workdir_registry.workspace_id
+              AND g.grant_id = workdir_registry.external_grant_id
+              AND g.status NOT IN ('revoked', 'expired')
+        )")
     )
 }
 
@@ -17535,6 +17582,65 @@ fn migrate_subject_permission_domain_to_v133(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn install_external_workdir_session_columns(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE external_workdir_grants ADD COLUMN session_credential_digest TEXT;
+         ALTER TABLE external_workdir_grants ADD COLUMN reconnect_deadline_at TEXT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_external_workdir_sessions_v138_to_v139(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    install_external_workdir_session_columns(&tx)?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let legacy = {
+        let mut statement = tx.prepare(
+            "UPDATE external_workdir_grants
+             SET status='expired', updated_at=?1, cleanup_state='pending', cleanup_error=NULL, cleanup_updated_at=?1
+             WHERE session_credential_digest IS NULL AND status IN ('pending','online','offline')
+             RETURNING workspace_id, grant_id",
+        )?;
+        statement
+            .query_map([&now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (workspace, grant) in legacy {
+        crate::grant_cleanup_operation::install_fresh_fence_intent(&tx, &workspace, &grant, &now)?;
+    }
+    tx.execute(
+        "UPDATE workdir_registry SET materialization_status='unknown', updated_at=?1
+         WHERE source_kind='external_grant' AND EXISTS (
+             SELECT 1 FROM external_workdir_grants g
+             WHERE g.workspace_id=workdir_registry.workspace_id AND g.grant_id=workdir_registry.external_grant_id
+               AND g.status IN ('revoked','expired')
+         )",
+        [&now],
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(139,?1)",
+        [EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn external_workdir_reconnect_deadline(now: &str) -> Result<String> {
+    let now = chrono::DateTime::parse_from_rfc3339(now).map_err(|error| {
+        Error::InvalidInput(format!("invalid External Workdir timestamp: {error}"))
+    })?;
+    let grace =
+        chrono::Duration::seconds(workdir::external::EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS as i64);
+    let deadline = now
+        .checked_add_signed(grace)
+        .ok_or_else(|| Error::InvalidInput("External Workdir deadline overflow".into()))?;
+    Ok(deadline
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_prefix(conn, include_str!("latest_schema.sql"), true)?;
     conn.execute_batch(content_history_store::SCHEMA)?;
@@ -17554,6 +17660,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
     worker_lifecycle_notifications::install(conn)?;
     notification_routing::merge_requests::install(conn)?;
+    install_external_workdir_session_columns(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!("fresh Ticket schema verification failed: {error}"))
     })?;
@@ -19348,6 +19455,8 @@ mod tests {
             created_by: "owner".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             expires_at: None,
+            session_credential_digest: Some("sha256:fixture".into()),
+            reconnect_deadline_at: Some("2026-01-01T00:02:00Z".into()),
             generation: 1,
             status: "pending".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -19610,6 +19719,8 @@ mod tests {
                             created_by: "cleanup-owner".into(),
                             created_at: "1".into(),
                             expires_at: None,
+                            session_credential_digest: Some("sha256:fixture".into()),
+                            reconnect_deadline_at: Some("2026-01-01T00:02:00Z".into()),
                             generation: 1,
                             status: "pending".into(),
                             updated_at: "1".into(),
@@ -19719,6 +19830,593 @@ mod tests {
                     "5",
                 )
                 .unwrap();
+        }
+    }
+
+    mod external_workdir_sessions {
+        use super::*;
+
+        const START: &str = "2026-01-01T00:00:00Z";
+        const PENDING_DEADLINE: &str = "2026-01-01T00:02:00Z";
+
+        fn grant(store: &SqliteWorkspaceStore) -> ExternalWorkdirGrantRecord {
+            store
+                .get_external_workdir_grant("cleanup-ws", "grant-b")
+                .unwrap()
+                .unwrap()
+        }
+
+        fn activate(store: &SqliteWorkspaceStore, generation: u64, now: &str) -> bool {
+            store
+                .activate_external_workdir_grant(
+                    "cleanup-ws",
+                    "grant-b",
+                    "provider-a",
+                    generation,
+                    now,
+                )
+                .unwrap()
+        }
+
+        fn cleanup_snapshot(
+            store: &SqliteWorkspaceStore,
+            id: &str,
+        ) -> (String, Option<String>, Option<String>) {
+            store.with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT cleanup_state,cleanup_error,cleanup_updated_at FROM external_workdir_grants
+                     WHERE workspace_id='cleanup-ws' AND grant_id=?1",
+                    [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                )?)
+            }).unwrap()
+        }
+
+        #[test]
+        fn activation_requires_credential_live_deadline_and_generation_then_disconnect_preserves_deadline()
+         {
+            let fixture = CleanupStoreFixture::new();
+            let store = &fixture.store;
+            for (digest, deadline, ttl) in [
+                (None, Some(PENDING_DEADLINE), None),
+                (Some(""), Some(PENDING_DEADLINE), None),
+                (Some("sha256:fixture"), None, None),
+                (Some("sha256:fixture"), Some(START), None),
+                (Some("sha256:fixture"), Some(PENDING_DEADLINE), Some(START)),
+            ] {
+                store
+                    .with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE external_workdir_grants
+                        SET session_credential_digest=?1,reconnect_deadline_at=?2,expires_at=?3
+                        WHERE grant_id='grant-b'",
+                            params![digest, deadline, ttl],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(!activate(store, 1, START));
+                let saved = grant(store);
+                assert_eq!((saved.status.as_str(), saved.generation), ("pending", 1));
+            }
+            store.with_conn(|conn| {
+                conn.execute("UPDATE external_workdir_grants SET session_credential_digest='sha256:fixture',
+                    reconnect_deadline_at=?1,expires_at=NULL WHERE grant_id='grant-b'", [PENDING_DEADLINE])?;
+                Ok(())
+            }).unwrap();
+            assert!(!activate(store, 2, START));
+            assert!(
+                !store
+                    .activate_external_workdir_grant(
+                        "cleanup-ws",
+                        "grant-b",
+                        "wrong-provider",
+                        1,
+                        START
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .activate_external_workdir_grant(
+                        "wrong-workspace",
+                        "grant-b",
+                        "provider-a",
+                        1,
+                        START
+                    )
+                    .unwrap()
+            );
+            assert!(activate(store, 1, START));
+            assert_eq!(grant(store).reconnect_deadline_at, None);
+            assert!(!activate(store, 1, START));
+            assert!(
+                store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-b",
+                        "provider-a",
+                        1,
+                        "offline",
+                        "2026-01-01T00:00:10Z"
+                    )
+                    .unwrap()
+            );
+            let deadline = grant(store).reconnect_deadline_at;
+            assert_eq!(deadline.as_deref(), Some("2026-01-01T00:02:10.000000000Z"));
+            assert!(
+                store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-b",
+                        "provider-a",
+                        1,
+                        "offline",
+                        "2026-01-01T00:01:00Z"
+                    )
+                    .unwrap()
+            );
+            assert_eq!(grant(store).reconnect_deadline_at, deadline);
+            assert!(
+                store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-b",
+                        "provider-a",
+                        1,
+                        "online",
+                        "2026-01-01T00:01:01Z"
+                    )
+                    .is_err()
+            );
+            assert!(!activate(store, 1, "2026-01-01T00:01:01Z"));
+            assert!(!activate(store, 2, "2026-01-01T00:02:10Z"));
+            assert!(activate(store, 2, "2026-01-01T00:02:09Z"));
+            assert!(!activate(store, 2, "2026-01-01T00:02:09Z"));
+            assert_eq!(grant(store).reconnect_deadline_at, None);
+            assert!(
+                !store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-b",
+                        "provider-a",
+                        1,
+                        "offline",
+                        "2026-01-01T00:02:09Z"
+                    )
+                    .unwrap()
+            );
+            assert_eq!(grant(store).status, "online");
+            assert!(
+                store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-b",
+                        "provider-a",
+                        2,
+                        "revoked",
+                        "2026-01-01T00:02:10Z"
+                    )
+                    .unwrap()
+            );
+            assert!(!activate(store, 3, "2026-01-01T00:02:11Z"));
+            assert!(
+                !store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-b",
+                        "provider-a",
+                        2,
+                        "offline",
+                        "2026-01-01T00:02:11Z"
+                    )
+                    .unwrap()
+            );
+            store
+                .with_conn(|conn| {
+                    assert!(
+                        crate::grant_cleanup_operation::read_intent(conn, "cleanup-ws", "grant-b")?
+                            .is_some()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        #[test]
+        fn restart_deadline_survives_database_reopen_and_expiry_preserves_existing_cleanup() {
+            let fixture = CleanupStoreFixture::new();
+            assert!(activate(&fixture.store, 1, START));
+            let old_cleanup = cleanup_snapshot(&fixture.store, "grant-a");
+            let temp = tempfile::tempdir_in(".").unwrap();
+            let path = temp.path().join("external-session.db");
+            fixture
+                .store
+                .with_conn(|conn| {
+                    let mut file = Connection::open(&path)?;
+                    Backup::new(conn, &mut file)?.run_to_completion(
+                        128,
+                        Duration::from_millis(1),
+                        None,
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            drop(fixture);
+            let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+            assert_eq!(
+                store
+                    .reconcile_external_workdir_grants_after_restart(
+                        "cleanup-ws",
+                        "2026-01-01T00:00:10Z"
+                    )
+                    .unwrap(),
+                vec!["external-a"]
+            );
+            let offline = grant(&store);
+            assert_eq!(offline.status, "offline");
+            assert_eq!(
+                offline.reconnect_deadline_at.as_deref(),
+                Some("2026-01-01T00:02:10.000000000Z")
+            );
+            drop(store);
+            let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+            store
+                .reconcile_external_workdir_grants_after_restart(
+                    "cleanup-ws",
+                    "2026-01-01T00:01:10Z",
+                )
+                .unwrap();
+            assert_eq!(
+                grant(&store).reconnect_deadline_at,
+                offline.reconnect_deadline_at
+            );
+            assert_eq!(cleanup_snapshot(&store, "grant-a"), old_cleanup);
+            assert_eq!(
+                store
+                    .reconcile_external_workdir_grants_after_restart(
+                        "cleanup-ws",
+                        "2026-01-01T00:02:10Z"
+                    )
+                    .unwrap(),
+                vec!["external-a", "external-b"]
+            );
+            assert_eq!(grant(&store).status, "expired");
+            assert_eq!(
+                grant(&store).reconnect_deadline_at,
+                offline.reconnect_deadline_at
+            );
+            assert!(!activate(&store, 2, "2026-01-01T00:02:11Z"));
+            let cleanup = cleanup_snapshot(&store, "grant-b");
+            assert_eq!(cleanup.0, "pending");
+            store
+                .with_conn(|conn| {
+                    assert!(
+                        crate::grant_cleanup_operation::read_intent(conn, "cleanup-ws", "grant-b")?
+                            .is_some()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            store
+                .reconcile_external_workdir_grants_after_restart(
+                    "cleanup-ws",
+                    "2026-01-01T00:03:00Z",
+                )
+                .unwrap();
+            assert_eq!(cleanup_snapshot(&store, "grant-b"), cleanup);
+            assert_eq!(cleanup_snapshot(&store, "grant-a"), old_cleanup);
+        }
+
+        #[test]
+        fn restart_retains_pending_and_offline_deadlines_and_expires_deadline_or_ttl() {
+            for (status, deadline, ttl, expired) in [
+                ("pending", PENDING_DEADLINE, None, false),
+                ("offline", PENDING_DEADLINE, None, false),
+                ("pending", START, None, true),
+                ("offline", START, None, true),
+                ("online", START, None, true),
+                ("pending", PENDING_DEADLINE, Some(START), true),
+                ("offline", PENDING_DEADLINE, Some(START), true),
+                ("online", PENDING_DEADLINE, Some(START), true),
+            ] {
+                let fixture = CleanupStoreFixture::new();
+                let store = &fixture.store;
+                store.with_conn(|conn| {
+                    conn.execute("UPDATE external_workdir_grants SET status=?1,reconnect_deadline_at=?2,expires_at=?3
+                        WHERE grant_id='grant-b'", params![status, deadline, ttl])?;
+                    Ok(())
+                }).unwrap();
+                let cleanup = store
+                    .reconcile_external_workdir_grants_after_restart("cleanup-ws", START)
+                    .unwrap();
+                let saved = grant(store);
+                assert_eq!(saved.reconnect_deadline_at.as_deref(), Some(deadline));
+                assert_eq!(saved.expires_at.as_deref(), ttl);
+                assert_eq!(saved.status, if expired { "expired" } else { status });
+                assert_eq!(cleanup.contains(&"external-b".to_string()), expired);
+                if expired {
+                    let snapshot = cleanup_snapshot(store, "grant-b");
+                    assert_eq!(snapshot.0, "pending");
+                    store
+                        .reconcile_external_workdir_grants_after_restart(
+                            "cleanup-ws",
+                            "2026-01-01T00:00:01Z",
+                        )
+                        .unwrap();
+                    assert_eq!(cleanup_snapshot(store, "grant-b"), snapshot);
+                }
+            }
+        }
+
+        fn legacy_database() -> (tempfile::TempDir, std::path::PathBuf) {
+            let temp = tempfile::tempdir_in(".").unwrap();
+            let path = temp.path().join("legacy-external.db");
+            prepare_retained_schema(&path, 138);
+            let conn = Connection::open(&path).unwrap();
+            configure_sqlite(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
+                 VALUES('legacy-owner','user','legacy-owner','Owner','1','1');
+                 INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+                 VALUES('legacy-ws','legacy-owner','Legacy','active','1','1');
+                 INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at)
+                 VALUES('legacy-ws','runtime-a','00000000-0000-7000-8000-000000000001','Worker','normal','1','1');",
+            ).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for (id, status, cleanup) in [
+                ("legacy-pending", "pending", "not_required"),
+                ("legacy-online", "online", "not_required"),
+                ("legacy-offline", "offline", "not_required"),
+                ("legacy-revoked", "revoked", "pending"),
+                ("legacy-expired", "expired", "completed"),
+            ] {
+                tx.execute(
+                    "INSERT INTO workdir_registry(workspace_id,workdir_id,source_kind,external_grant_id,
+                        materialization_status,cleanliness,created_at,updated_at)
+                     VALUES('legacy-ws',?1,'external_grant',?1,'present','unknown','1','1')", [id],
+                ).unwrap();
+                tx.execute(
+                    "INSERT INTO external_workdir_grants(grant_id,workspace_id,workdir_id,provider_instance_id,
+                        display_name,permissions,created_by,created_at,expires_at,generation,status,updated_at,
+                        cleanup_state,cleanup_updated_at)
+                     VALUES(?1,'legacy-ws',?1,'provider-old','Legacy','read_write','legacy-owner','1',NULL,7,?2,'1',?3,'2')",
+                    params![id,status,cleanup],
+                ).unwrap();
+            }
+            crate::grant_cleanup_operation::install_fresh_fence_intent(
+                &tx,
+                "legacy-ws",
+                "legacy-revoked",
+                "2",
+            )
+            .unwrap();
+            tx.execute("INSERT INTO worker_workdir_links(workspace_id,runtime_id,worker_id,workdir_id,alias,
+                capabilities,linked_at,connection_id)
+                VALUES('legacy-ws','runtime-a','00000000-0000-7000-8000-000000000001','legacy-online','external',
+                    'read_only','1','connection-legacy')", []).unwrap();
+            tx.commit().unwrap();
+            (temp, path)
+        }
+
+        #[test]
+        fn legacy_migration_expires_uncredentialed_sessions_with_real_intents_and_preserves_cleanup_and_links()
+         {
+            let (_temp, path) = legacy_database();
+            let conn = Connection::open(&path).unwrap();
+            let terminal_cleanup = fixture_query_rows(&conn,
+                "SELECT grant_id,status,cleanup_state,cleanup_error,cleanup_updated_at FROM external_workdir_grants
+                 WHERE status IN ('revoked','expired') ORDER BY grant_id");
+            let links = stored_fixture_rows(&conn, "worker_workdir_links");
+            let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+            assert_eq!(
+                plan.migrations,
+                vec![WorkspaceSchemaMigrationStep {
+                    version: 139,
+                    name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
+                }]
+            );
+            assert!(
+                !column_exists(
+                    &conn,
+                    "external_workdir_grants",
+                    "session_credential_digest"
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT status FROM external_workdir_grants WHERE grant_id='legacy-online'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "online"
+            );
+            drop(conn);
+            SqliteWorkspaceStore::migrate_database(&path).unwrap();
+            let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+            for id in ["legacy-pending", "legacy-online", "legacy-offline"] {
+                let saved = store
+                    .get_external_workdir_grant("legacy-ws", id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.status, "expired");
+                assert_eq!(saved.session_credential_digest, None);
+                assert_eq!(saved.reconnect_deadline_at, None);
+                assert_eq!(saved.generation, 7);
+                assert_eq!(saved.provider_instance_id, "provider-old");
+                assert_eq!(saved.permissions, "read_write");
+                assert_eq!(saved.created_at, "1");
+                assert_eq!(saved.expires_at, None);
+                assert!(
+                    !store
+                        .activate_external_workdir_grant("legacy-ws", id, "provider-old", 8, START)
+                        .unwrap()
+                );
+                store
+                    .with_conn(|conn| {
+                        assert!(
+                            crate::grant_cleanup_operation::read_intent(conn, "legacy-ws", id)?
+                                .is_some()
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .list_workdir_registry("legacy-ws", 10)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .workdir_catalog_page("legacy-ws", 10, None)
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .list_external_workdir_grants("legacy-ws")
+                    .unwrap()
+                    .len(),
+                5
+            );
+            let fresh = SqliteWorkspaceStore::in_memory_fixture().unwrap();
+            let fresh_schema = fresh
+                .with_conn(|conn| {
+                    Ok(state_contract_schema_signature(
+                        conn,
+                        "external_workdir_grants",
+                    ))
+                })
+                .unwrap();
+            store.with_conn(|conn| {
+                assert_eq!(stored_fixture_rows(conn, "worker_workdir_links"), links);
+                assert_eq!(fixture_query_rows(conn,
+                    "SELECT grant_id,status,cleanup_state,cleanup_error,cleanup_updated_at FROM external_workdir_grants
+                     WHERE grant_id IN ('legacy-revoked','legacy-expired') ORDER BY grant_id"), terminal_cleanup);
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM workdir_registry WHERE workspace_id='legacy-ws'", [], |r| r.get::<_, i64>(0))?, 5);
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0))?, 0);
+                assert_eq!(state_contract_schema_signature(conn, "external_workdir_grants"), fresh_schema);
+                Ok(())
+            }).unwrap();
+            assert_eq!(
+                store
+                    .reconcile_external_workdir_grants_after_restart("legacy-ws", START)
+                    .unwrap(),
+                vec![
+                    "legacy-offline",
+                    "legacy-online",
+                    "legacy-pending",
+                    "legacy-revoked"
+                ]
+            );
+        }
+
+        #[test]
+        fn legacy_migration_fence_failure_rolls_back_columns_statuses_and_receipt_then_retries() {
+            let (_temp, path) = legacy_database();
+            let conn = Connection::open(&path).unwrap();
+            configure_sqlite(&conn).unwrap();
+            let grants = stored_fixture_rows(&conn, "external_workdir_grants");
+            let registry = stored_fixture_rows(&conn, "workdir_registry");
+            let links = stored_fixture_rows(&conn, "worker_workdir_links");
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER reject_session_cleanup_fence
+                BEFORE UPDATE OF cleanup_error ON external_workdir_grants
+                WHEN NEW.cleanup_error IS NOT NULL AND NEW.grant_id='legacy-online'
+                BEGIN SELECT RAISE(ABORT, 'injected fence failure'); END;",
+            )
+            .unwrap();
+            assert!(apply_migrations(&conn).is_err());
+            assert_eq!(current_schema_version(&conn).unwrap(), 138);
+            assert!(
+                !column_exists(
+                    &conn,
+                    "external_workdir_grants",
+                    "session_credential_digest"
+                )
+                .unwrap()
+            );
+            assert!(
+                !column_exists(&conn, "external_workdir_grants", "reconnect_deadline_at").unwrap()
+            );
+            assert_eq!(
+                stored_fixture_rows(&conn, "external_workdir_grants"),
+                grants
+            );
+            assert_eq!(stored_fixture_rows(&conn, "workdir_registry"), registry);
+            assert_eq!(stored_fixture_rows(&conn, "worker_workdir_links"), links);
+            conn.execute_batch("DROP TRIGGER reject_session_cleanup_fence;")
+                .unwrap();
+            apply_migrations(&conn).unwrap();
+            assert_eq!(current_schema_version(&conn).unwrap(), 139);
+            assert!(
+                crate::grant_cleanup_operation::read_intent(&conn, "legacy-ws", "legacy-online")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn terminal_grants_leave_normal_inventory_but_retain_registry_audit_and_unconfirmed_links()
+        {
+            let fixture = CleanupStoreFixture::new();
+            let store = &fixture.store;
+            let records = store.list_workdir_registry("cleanup-ws", 10).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|r| r.workdir_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["external-b"]
+            );
+            let page = store.workdir_catalog_page("cleanup-ws", 1, None).unwrap();
+            assert_eq!(page.entries.len(), 1);
+            assert_eq!(page.entries[0].record.workdir_id, "external-b");
+            assert!(page.next_cursor.is_none());
+            assert!(
+                store
+                    .get_workdir_registry("cleanup-ws", "external-a")
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                store
+                    .list_external_workdir_grants("cleanup-ws")
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(
+                store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-b",
+                        "provider-a",
+                        1,
+                        "expired",
+                        START
+                    )
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .list_workdir_registry("cleanup-ws", 10)
+                    .unwrap()
+                    .is_empty()
+            );
+            let empty = store.workdir_catalog_page("cleanup-ws", 1, None).unwrap();
+            assert!(empty.entries.is_empty());
+            assert_ne!(empty.catalog_digest, page.catalog_digest);
+            store.with_conn(|conn| {
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM workdir_registry WHERE workspace_id='cleanup-ws'", [], |r| r.get::<_, i64>(0))?, 2);
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM worker_workdir_links WHERE workspace_id='cleanup-ws' AND unlinked_at IS NULL", [], |r| r.get::<_, i64>(0))?, 1);
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM audit_events WHERE workspace_id='cleanup-ws' AND action='external_workdir_grant_created'", [], |r| r.get::<_, i64>(0))?, 2);
+                Ok(())
+            }).unwrap();
         }
     }
 
@@ -22243,6 +22941,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 138,
                 name: notification_routing::merge_requests::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 139,
+                name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -22393,6 +23095,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
                     (137, worker_lifecycle_notifications::MIGRATION_NAME.into()),
                     (138, notification_routing::merge_requests::MIGRATION_NAME.into()),
+                    (139, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);

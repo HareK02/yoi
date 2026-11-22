@@ -1128,6 +1128,8 @@ fn add_offline_restore_workdir(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
                 workspace_id: api.workspace_id().into(),
                 workdir_id: record.workdir_id.clone(),
                 provider_instance_id: "offline-provider".into(),
+        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+        reconnect_deadline_at: None,
                 display_name: "Offline grant".into(),
                 permissions: "read_only".into(),
                 created_by: "owner-account".into(),

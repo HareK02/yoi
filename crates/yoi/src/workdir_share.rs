@@ -16,6 +16,7 @@ use server_api::{
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use workdir::external::{
+    EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS, EXTERNAL_WORKDIR_SESSION_KEY_HEADER,
     ExternalProviderInstanceId, ExternalWorkdirGrantId, ExternalWorkdirOperationError,
     ExternalWorkdirOperationId, ExternalWorkdirOperationOutcome, ExternalWorkdirProviderFrame,
     ExternalWorkdirProviderMessage, ExternalWorkdirProviderRegistration,
@@ -44,6 +45,77 @@ pub struct WorkdirShareOptions {
 }
 
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Deliberately no Debug/Serialize implementation or persistence path. The
+// sensitive flag survives header clones in both HTTP transports.
+struct SessionCredential(reqwest::header::HeaderValue);
+
+impl SessionCredential {
+    fn generate() -> Self {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ))
+        .expect("UUID hex is a valid HTTP header value");
+        value.set_sensitive(true);
+        Self(value)
+    }
+
+    fn apply(&self, headers: &mut reqwest::header::HeaderMap) {
+        headers.insert(EXTERNAL_WORKDIR_SESSION_KEY_HEADER, self.0.clone());
+        if let Some(authorization) = headers.get_mut(reqwest::header::AUTHORIZATION) {
+            authorization.set_sensitive(true);
+        }
+    }
+}
+
+struct ReconnectWindow {
+    disconnected_deadline: Option<Instant>,
+    ttl_deadline: Option<Instant>,
+}
+
+impl ReconnectWindow {
+    fn new(now: Instant, ttl_remaining: Option<Duration>) -> Self {
+        Self {
+            // Bound first registration too: a new grant must not leave the CLI
+            // retrying forever when the Backend disappears before upgrade.
+            disconnected_deadline: Some(
+                now + Duration::from_secs(EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS),
+            ),
+            ttl_deadline: ttl_remaining.map(|remaining| now + remaining),
+        }
+    }
+
+    fn connected(&mut self) {
+        self.disconnected_deadline = None;
+    }
+
+    fn disconnected(&mut self, now: Instant) {
+        self.disconnected_deadline.get_or_insert_with(|| {
+            now + Duration::from_secs(EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS)
+        });
+    }
+
+    fn deadline(&self, now: Instant) -> Result<Instant, ShareError> {
+        if self.ttl_deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(
+                "External Workdir grant expired; start a new share to continue"
+                    .to_string()
+                    .into(),
+            );
+        }
+        let grace = self
+            .disconnected_deadline
+            .expect("connection attempts require a disconnect window");
+        if now >= grace {
+            return Err(format!(
+                "External Workdir reconnect grace of {EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS}s ended; start a new share to continue"
+            ).into());
+        }
+        Ok(self.ttl_deadline.map_or(grace, |ttl| ttl.min(grace)))
+    }
+}
 
 /// CLI-local carriers: received errors, settlements and secondary failures are
 /// retained until the outer display boundary. None of these authorize replay.
@@ -479,6 +551,7 @@ fn pin_selected_root_from(
 fn authenticated_server_api_client(
     backend_client: &BackendApiClient,
     backend_url: &str,
+    session_credential: Option<&SessionCredential>,
 ) -> Result<ServerApiClient, String> {
     // BackendApiClient remains the stored-credential authority used by the
     // manual provider WebSocket. Reuse that transport's Authorization header
@@ -492,17 +565,30 @@ fn authenticated_server_api_client(
         .get(reqwest::header::AUTHORIZATION)
         .cloned()
         .ok_or_else(|| "stored Backend credential did not provide Authorization".to_string())?;
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::AUTHORIZATION, authorization);
-    let http_client = reqwest::Client::builder()
-        .default_headers(headers)
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| format!("failed to configure Backend client: {error}"))?;
+    let http_client = share_http_client(authorization, session_credential)?;
     let base_url = backend_url
         .try_into()
         .map_err(|error| format!("invalid Backend URL: {error}"))?;
     Ok(ServerApiClient::with_client(base_url, http_client))
+}
+
+fn share_http_client(
+    mut authorization: reqwest::header::HeaderValue,
+    session_credential: Option<&SessionCredential>,
+) -> Result<reqwest::Client, String> {
+    authorization.set_sensitive(true);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    if let Some(credential) = session_credential {
+        credential.apply(&mut headers);
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        // A continuity header must never follow a redirect to another origin.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "failed to configure authenticated Backend client".to_string())
 }
 
 fn permissions_label(permissions: server_api::ExternalWorkdirPermissions) -> &'static str {
@@ -578,9 +664,15 @@ pub fn parse_ttl(value: &str) -> Result<Option<Duration>, String> {
     Ok(Some(Duration::from_secs(seconds)))
 }
 
+fn share_continuity_notice() -> String {
+    format!(
+        "Continuity is process-local: reconnect within {EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS}s after disconnect (TTL still applies). After this sharing process ends, start a new share; previous attachments and permissions are not restored."
+    )
+}
+
 fn ttl_label(ttl: Option<Duration>) -> String {
     match ttl {
-        None => "unlimited (ends on stop, disconnect, or revoke)".to_string(),
+        None => "unlimited TTL (ends on stop, revoke, or reconnect-grace expiry)".to_string(),
         Some(ttl) => format!("{}s", ttl.as_secs()),
     }
 }
@@ -717,6 +809,7 @@ fn configure_interactively(
             )
         })
         .and_then(|()| writeln!(output, "  TTL: {}", ttl_label(options.ttl)))
+        .and_then(|()| writeln!(output, "  {}", share_continuity_notice()))
         .map_err(|error| format!("failed to write confirmation: {error}"))?;
     let Some(confirm) = read_prompt_line(input, output, "Connect and create grant? [y/N]: ")?
     else {
@@ -822,7 +915,7 @@ async fn resolve_share_options(
     }
     let backend_client = BackendApiClient::from_stored_token(&options.backend_url)
         .map_err(|error| error.to_string())?;
-    let api = authenticated_server_api_client(&backend_client, &options.backend_url)?;
+    let api = authenticated_server_api_client(&backend_client, &options.backend_url, None)?;
     let workspaces = load_share_workspaces(&api).await?;
     if options.non_interactive {
         return configure_non_interactively(options, &workspaces).map(Some);
@@ -869,9 +962,16 @@ async fn run_typed(
 
     let backend_client = BackendApiClient::from_stored_token(&options.backend_url)
         .map_err(|error| error.to_string())?;
-    let server_api_client = authenticated_server_api_client(&backend_client, &options.backend_url)?;
+    let server_api_client =
+        authenticated_server_api_client(&backend_client, &options.backend_url, None)?;
+    let session_credential = SessionCredential::generate();
+    let grant_api_client = authenticated_server_api_client(
+        &backend_client,
+        &options.backend_url,
+        Some(&session_credential),
+    )?;
     let provider_instance_id = format!("cli-{}", uuid::Uuid::now_v7());
-    let grant = server_api_client
+    let grant = grant_api_client
         .external_workdir_grant_create(
             options.workspace_id.clone(),
             ExternalWorkdirGrantCreateRequest {
@@ -899,6 +999,7 @@ async fn run_typed(
     println!("Logical Workdir: {}", grant.working_directory_id);
     println!("Display name: {}", grant.display_name);
     println!("Permissions: {}", permissions_label(grant.permissions));
+    println!("{}", share_continuity_notice());
     if grant.permissions.command {
         println!(
             "COMMAND executes with this sharing CLI user's host authority; it is not sandboxed."
@@ -921,8 +1022,13 @@ async fn run_typed(
                 .map_err(|_| "Backend returned an invalid External Workdir expiry".to_string())
         })
         .transpose()?;
+    let now = Instant::now();
+    let ttl_remaining =
+        expires_at.map(|expiry| (expiry - Utc::now()).to_std().unwrap_or(Duration::ZERO));
+    let mut reconnect = ReconnectWindow::new(now, ttl_remaining);
     let mut generation = grant.generation;
     loop {
+        reconnect.deadline(Instant::now())?;
         // Command handles and results are generation-owned. A reconnect always
         // gets a fresh LocalWorkdirSession, and closing the old one kills and
         // reaps every process before the next generation can register.
@@ -939,11 +1045,14 @@ async fn run_typed(
             &options,
             &grant,
             &provider_instance_id,
+            &session_credential,
             &session,
             generation,
             evidence,
+            &mut reconnect,
         )
         .await;
+        reconnect.disconnected(Instant::now());
         let close_result = session
             .close()
             .await
@@ -959,121 +1068,86 @@ async fn run_typed(
         {
             return outcome.map(|_| ());
         }
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(connection_error) => {
-                evidence.retain_failure(connection_error);
-                if expires_at.is_some_and(|expires_at| Utc::now() >= expires_at) {
-                    return Err(
-                        "External Workdir grant expired after provider connection failure"
-                            .to_string()
-                            .into(),
-                    );
-                }
-                let refresh =
-                    fetch_grant(&server_api_client, &options.workspace_id, &grant.grant_id);
-                let refreshed = tokio::select! {
-                    signal = tokio::signal::ctrl_c() => {
-                        signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-                        evidence.retain_grant(revoke(&server_api_client, &options.workspace_id, &grant.grant_id).await?);
-                        println!("External Workdir revocation response received; see retained grant status.");
-                        return Ok(());
-                    }
-                    refreshed = refresh => refreshed,
-                };
-                let current = match refreshed {
-                    Ok(current) => current,
-                    Err(refresh_error) => {
-                        evidence.retain_failure(refresh_error);
-                        if wait_to_reconnect(
-                            &server_api_client,
-                            &options.workspace_id,
-                            &grant.grant_id,
-                            evidence,
-                        )
-                        .await?
-                        {
-                            println!(
-                                "External Workdir revocation response received; see retained grant status."
-                            );
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                };
-                evidence.retain_grant(current.clone());
-                match current.status.as_str() {
-                    "pending" => generation = current.generation,
-                    "offline" => {
-                        generation = current.generation.checked_add(1).ok_or_else(|| {
-                            "External Workdir provider generation overflow".to_string()
-                        })?;
-                    }
-                    "online" => {
-                        // The Backend may still be observing the old socket close.
-                        // Wait for its durable offline fence before reconnecting.
-                    }
-                    "revoked" | "expired" => {
-                        println!("External Workdir grant is no longer active.");
-                        return Ok(());
-                    }
-                    _ => {
-                        return Err("Backend returned an unknown External Workdir grant status"
-                            .to_string()
-                            .into());
-                    }
-                }
-                println!("Connection: reconnecting");
-                if wait_to_reconnect(
-                    &server_api_client,
-                    &options.workspace_id,
-                    &grant.grant_id,
-                    evidence,
-                )
-                .await?
-                {
-                    println!(
-                        "External Workdir revocation response received; see retained grant status."
-                    );
-                    return Ok(());
-                }
-                continue;
-            }
-        };
         match outcome {
-            ProviderEnd::Interrupted => {
+            Ok(ProviderEnd::Interrupted) => {
                 println!(
                     "External Workdir revocation response received; see retained grant status."
                 );
                 return Ok(());
             }
-            ProviderEnd::Revoked => {
+            Ok(ProviderEnd::Revoked) => {
                 println!("External Workdir grant is no longer active.");
                 return Ok(());
             }
-            ProviderEnd::Disconnected => {
-                if expires_at.is_some_and(|expires_at| Utc::now() >= expires_at) {
-                    return Err("External Workdir grant expired while disconnected"
-                        .to_string()
-                        .into());
-                }
-                generation = generation
-                    .checked_add(1)
-                    .ok_or_else(|| "External Workdir provider generation overflow".to_string())?;
-                println!("Connection: reconnecting");
-                if wait_to_reconnect(
-                    &server_api_client,
-                    &options.workspace_id,
-                    &grant.grant_id,
-                    evidence,
-                )
-                .await?
-                {
-                    println!(
-                        "External Workdir revocation response received; see retained grant status."
-                    );
+            Ok(ProviderEnd::Disconnected) => {}
+            Err(connection_error) => evidence.retain_failure(connection_error),
+        }
+        println!("Connection: reconnecting (bounded process-local grace)");
+        // Refresh only observations. Never replay grant creation, revocation,
+        // filesystem mutations, or operations from the previous generation.
+        loop {
+            let deadline = reconnect.deadline(Instant::now())?;
+            let refreshed = tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
+                    evidence.retain_grant(revoke(&server_api_client, &options.workspace_id, &grant.grant_id).await?);
+                    println!("External Workdir revocation response received; see retained grant status.");
                     return Ok(());
                 }
+                refreshed = tokio::time::timeout_at(deadline.into(), fetch_grant(
+                    &server_api_client, &options.workspace_id, &grant.grant_id,
+                )) => refreshed.map_err(|_| ShareError::from(
+                    "External Workdir reconnect deadline reached; start a new share to continue".to_string()
+                ))?,
+            };
+            let mut may_connect = false;
+            match refreshed {
+                Ok(current) => {
+                    evidence.retain_grant(current.clone());
+                    match current.status.as_str() {
+                        "pending" => {
+                            generation = current.generation;
+                            may_connect = true;
+                        }
+                        "offline" => {
+                            generation = current.generation.checked_add(1).ok_or_else(|| {
+                                "External Workdir provider generation overflow".to_string()
+                            })?;
+                            may_connect = true;
+                        }
+                        // Do not race the old socket's durable disconnect fence.
+                        "online" => {}
+                        "revoked" | "expired" => {
+                            println!("External Workdir grant is no longer active.");
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(
+                                "Backend returned an unknown External Workdir grant status"
+                                    .to_string()
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Err(refresh_error) => evidence.retain_failure(refresh_error),
+            }
+            if wait_to_reconnect(
+                &server_api_client,
+                &options.workspace_id,
+                &grant.grant_id,
+                evidence,
+                &reconnect,
+            )
+            .await?
+            {
+                println!(
+                    "External Workdir revocation response received; see retained grant status."
+                );
+                return Ok(());
+            }
+            if may_connect {
+                break;
             }
         }
     }
@@ -1085,18 +1159,22 @@ async fn serve_provider_connection(
     options: &ResolvedWorkdirShareOptions,
     grant: &ExternalWorkdirGrantResponse,
     provider_instance_id: &str,
+    session_credential: &SessionCredential,
     session: &LocalWorkdirSession,
     generation: u64,
     evidence: &mut ShareEvidence,
+    reconnect: &mut ReconnectWindow,
 ) -> Result<ProviderEnd, ShareError> {
     let provider_path = format!(
         "/api/w/{}/external-workdir-grants/{}/provider",
         encode_path_segment(&options.workspace_id),
         encode_path_segment(&grant.grant_id)
     );
-    let request = backend_client
+    let mut request = backend_client
         .websocket_request(&provider_path)
         .map_err(|error| error.to_string())?;
+    session_credential.apply(request.headers_mut());
+    let deadline = reconnect.deadline(Instant::now())?;
     let websocket_config = WebSocketConfig::default()
         .max_message_size(Some(workdir::external::MAX_EXTERNAL_SERVER_FRAME_BYTES))
         .max_frame_size(Some(workdir::external::MAX_EXTERNAL_SERVER_FRAME_BYTES));
@@ -1107,7 +1185,8 @@ async fn serve_provider_connection(
             evidence.retain_grant(revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?);
             return Ok(ProviderEnd::Interrupted);
         }
-        connection = connection => connection
+        connection = tokio::time::timeout_at(deadline.into(), connection) => connection
+            .map_err(|_| "External Workdir reconnect deadline reached during provider handshake".to_string())?
             .map_err(provider_connection_error)?,
     };
     let registration =
@@ -1134,6 +1213,7 @@ async fn serve_provider_connection(
                 .await
                 .map_err(|error| format!("failed to wait for Ctrl-C: {error}"))
         },
+        reconnect,
     )
     .await;
     let interrupted = matches!(&outcome, Ok(ProviderEnd::Interrupted))
@@ -1176,12 +1256,14 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     I: std::future::Future<Output = Result<(), String>>,
 {
+    let mut reconnect = ReconnectWindow::new(Instant::now(), None);
     serve_external_workdir_provider_socket_typed(
         socket,
         registration,
         session,
         generation,
         interrupt,
+        &mut reconnect,
     )
     .await
     .map_err(|error| error.render())
@@ -1193,19 +1275,27 @@ async fn serve_external_workdir_provider_socket_typed<S, I>(
     session: &LocalWorkdirSession,
     generation: u64,
     interrupt: I,
+    reconnect: &mut ReconnectWindow,
 ) -> Result<ProviderEnd, ShareError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     I: std::future::Future<Output = Result<(), String>>,
 {
     tokio::pin!(interrupt);
-    send_provider_frame(&mut socket, &registration).await?;
+    let deadline = reconnect.deadline(Instant::now())?;
+    tokio::time::timeout_at(
+        deadline.into(),
+        send_provider_frame(&mut socket, &registration),
+    )
+    .await
+    .map_err(|_| "External Workdir reconnect deadline reached during registration".to_string())??;
+    let registration_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
     let registered = tokio::select! {
         signal = &mut interrupt => {
             signal?;
             return Ok(ProviderEnd::Interrupted);
         }
-        registered = tokio::time::timeout(Duration::from_secs(10), socket.next()) => {
+        registered = tokio::time::timeout_at(registration_deadline.into(), socket.next()) => {
             registered
                 .map_err(|_| "Backend timed out External Workdir provider registration".to_string())?
                 .ok_or_else(|| "Backend closed the External Workdir provider connection".to_string())?
@@ -1213,6 +1303,8 @@ where
         }
     };
     validate_provider_registration(registered, generation)?;
+    reconnect.deadline(Instant::now())?;
+    reconnect.connected();
     println!("Connection: online (generation {generation})");
 
     let (completion_sender, mut completions) =
@@ -1385,6 +1477,8 @@ where
             }
         }
     };
+    // Start grace at the disconnect observation, not after executor cleanup.
+    reconnect.disconnected(Instant::now());
     let outcome = retain_provider_cleanup(
         outcome,
         stop_provider_operations(session, &mut operations, &mut completions).await,
@@ -1532,14 +1626,21 @@ async fn wait_to_reconnect(
     workspace_id: &str,
     grant_id: &str,
     evidence: &mut ShareEvidence,
+    reconnect: &ReconnectWindow,
 ) -> Result<bool, ShareError> {
+    let now = Instant::now();
+    let deadline = reconnect.deadline(now)?;
+    let delay = Duration::from_millis(250).min(deadline.saturating_duration_since(now));
     tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
             evidence.retain_grant(revoke(client, workspace_id, grant_id).await?);
             Ok(true)
         }
-        _ = tokio::time::sleep(Duration::from_millis(250)) => Ok(false),
+        _ = tokio::time::sleep(delay) => {
+            reconnect.deadline(Instant::now())?;
+            Ok(false)
+        },
     }
 }
 
@@ -1606,6 +1707,118 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn sharing_credentials_are_fresh_lowercase_hex_and_sensitive_in_upgrade_debug() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let credential = SessionCredential::generate();
+        let another_process = SessionCredential::generate();
+        let value = credential.0.to_str().unwrap();
+        assert!(value.len() == 64);
+        assert!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert!(credential.0 != another_process.0);
+        let mut request =
+            "ws://backend.example/api/w/workspace-a/external-workdir-grants/grant-a/provider"
+                .into_client_request()
+                .unwrap();
+        request.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer fixture-auth"),
+        );
+        credential.apply(request.headers_mut());
+        let header = request
+            .headers()
+            .get(EXTERNAL_WORKDIR_SESSION_KEY_HEADER)
+            .unwrap();
+        assert!(header.is_sensitive());
+        assert!(header.to_str().unwrap() == value);
+        assert!(request.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(value));
+        assert!(!debug.contains("fixture-auth"));
+        assert!(!request.uri().to_string().contains(value));
+    }
+
+    #[test]
+    fn retry_failures_do_not_extend_grace_and_only_registered_continuity_resets_it() {
+        let start = Instant::now();
+        let mut window = ReconnectWindow::new(start, None);
+        let deadline = start + Duration::from_secs(120);
+        for seconds in [0, 1, 30, 119] {
+            let now = start + Duration::from_secs(seconds);
+            window.disconnected(now);
+            assert_eq!(window.deadline(now).unwrap(), deadline);
+        }
+        assert!(
+            window
+                .deadline(deadline)
+                .unwrap_err()
+                .render()
+                .contains("reconnect grace")
+        );
+        // A successful registration (not just an HTTP response) starts a new
+        // outage window when that established connection later disconnects.
+        window.connected();
+        let later_disconnect = start + Duration::from_secs(500);
+        window.disconnected(later_disconnect);
+        assert_eq!(
+            window.deadline(later_disconnect).unwrap(),
+            later_disconnect + Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn reconnect_uses_earlier_ttl_without_allowing_unlimited_ttl_to_disable_grace() {
+        let start = Instant::now();
+        for (ttl, expected_seconds) in [(None, 120), (Some(600), 120), (Some(30), 30)] {
+            let window = ReconnectWindow::new(start, ttl.map(Duration::from_secs));
+            let deadline = start + Duration::from_secs(expected_seconds);
+            assert_eq!(window.deadline(start).unwrap(), deadline);
+            assert!(window.deadline(deadline).is_err());
+        }
+        let mut window = ReconnectWindow::new(start, Some(Duration::from_secs(60)));
+        window.connected();
+        window.disconnected(start + Duration::from_secs(50));
+        assert_eq!(
+            window.deadline(start + Duration::from_secs(50)).unwrap(),
+            start + Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_reconnect_window_fails_before_another_wait_or_backend_request() {
+        let start = Instant::now() - Duration::from_secs(121);
+        let window = ReconnectWindow::new(start, None);
+        let client = test_server_api_client("http://127.0.0.1:1");
+        let error = wait_to_reconnect(
+            &client,
+            "workspace-a",
+            "grant-a",
+            &mut ShareEvidence::default(),
+            &window,
+        )
+        .await
+        .unwrap_err()
+        .render();
+        assert!(error.contains("120s"));
+        assert!(error.contains("new share"));
+    }
+
+    #[test]
+    fn continuity_notice_distinguishes_process_end_grace_and_ttl_without_a_root_or_key() {
+        let notice = share_continuity_notice();
+        assert!(notice.contains("process-local"));
+        assert!(notice.contains("120s"));
+        assert!(notice.contains("TTL still applies"));
+        assert!(notice.contains("start a new share"));
+        assert!(notice.contains("not restored"));
+        assert!(!notice.contains(EXTERNAL_WORKDIR_SESSION_KEY_HEADER));
     }
 
     #[test]
@@ -1928,16 +2141,18 @@ mod tests {
     }
 
     fn test_server_api_client(base_url: &str) -> ServerApiClient {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
+        test_server_api_client_with_credential(base_url, None)
+    }
+
+    fn test_server_api_client_with_credential(
+        base_url: &str,
+        credential: Option<&SessionCredential>,
+    ) -> ServerApiClient {
+        let http_client = share_http_client(
             reqwest::header::HeaderValue::from_static("Bearer test-token"),
-        );
-        let http_client = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
+            credential,
+        )
+        .unwrap();
         ServerApiClient::with_client(base_url.try_into().unwrap(), http_client)
     }
 
@@ -1968,7 +2183,7 @@ mod tests {
                 break;
             }
         }
-        String::from_utf8(request).unwrap()
+        String::from_utf8(request).unwrap_or_else(|_| panic!("HTTP request was not valid UTF-8"))
     }
 
     fn spawn_json_server(
@@ -1996,7 +2211,7 @@ mod tests {
                 } else {
                     "200 OK"
                 });
-                sender.send(request).unwrap();
+                assert!(sender.send(request).is_ok(), "HTTP request observer closed");
                 write!(
                     stream,
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2406,8 +2621,10 @@ mod tests {
     async fn generated_grant_operations_preserve_auth_and_encode_contract_paths() {
         let (base_url, requests, server) = spawn_json_server(grant_response_json(), 3);
         let client = test_server_api_client(&base_url);
+        let credential = SessionCredential::generate();
+        let create_client = test_server_api_client_with_credential(&base_url, Some(&credential));
 
-        let created = client
+        let created = create_client
             .external_workdir_grant_create(
                 "workspace/a b".to_string(),
                 ExternalWorkdirGrantCreateRequest {
@@ -2451,6 +2668,24 @@ mod tests {
         }
         assert!(requests[0].contains("\"provider_instance_id\":\"provider-a\""));
         assert!(requests[0].contains("\"ttl_seconds\":600"));
+        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let header_value = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(EXTERNAL_WORKDIR_SESSION_KEY_HEADER)
+                    .then_some(value.trim())
+            })
+            .unwrap();
+        assert!(header_value == credential.0.to_str().unwrap());
+        assert!(!body.contains(credential.0.to_str().unwrap()));
+        assert!(!body.contains("session_key"));
+        for request in &requests[1..] {
+            assert!(!request.contains(EXTERNAL_WORKDIR_SESSION_KEY_HEADER));
+            assert!(!request.contains(credential.0.to_str().unwrap()));
+        }
+        let returned = serde_json::to_string(&created).unwrap();
+        assert!(!returned.contains(credential.0.to_str().unwrap()));
     }
 
     #[tokio::test]
@@ -2484,6 +2719,68 @@ mod tests {
         assert_eq!(
             pinned.canonical_path(),
             directory.path().canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reconnect_sessions_keep_the_pinned_tree_and_fixed_capabilities_after_path_replacement()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = directory.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("marker"), b"approved tree").unwrap();
+        let pinned =
+            pin_selected_root_from(std::path::Path::new("selected"), directory.path()).unwrap();
+        let capabilities = workdir_capabilities(server_api::ExternalWorkdirPermissions::READ);
+        let first = LocalWorkdirSession::external_with_capabilities_pinned(
+            Workdir::new("shared-workdir"),
+            pinned.clone(),
+            BoundedReadLimits::EXTERNAL_DEFAULT,
+            capabilities,
+        )
+        .unwrap();
+        first.close().await.unwrap();
+        std::fs::rename(&selected, directory.path().join("original")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("marker"), b"replacement tree").unwrap();
+        let reconnected = LocalWorkdirSession::external_with_capabilities_pinned(
+            Workdir::new("shared-workdir"),
+            pinned,
+            BoundedReadLimits::EXTERNAL_DEFAULT,
+            capabilities,
+        )
+        .unwrap();
+        let read = reconnected
+            .read(workdir::ReadRequest {
+                path: workdir::WorkdirPath::new("marker").unwrap(),
+                offset: 0,
+                limit: 10,
+                max_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.bytes, b"approved tree");
+        assert_eq!(reconnected.workdir().id(), first.workdir().id());
+        assert_eq!(reconnected.capabilities(), first.capabilities());
+        assert!(
+            reconnected
+                .write(workdir::WriteRequest {
+                    path: workdir::WorkdirPath::new("marker").unwrap(),
+                    content: b"must not write".to_vec(),
+                    expected_hash: None,
+                })
+                .await
+                .is_err()
+        );
+        reconnected.close().await.unwrap();
+        assert_eq!(
+            std::fs::read(selected.join("marker")).unwrap(),
+            b"replacement tree"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("original/marker")).unwrap(),
+            b"approved tree"
         );
     }
 

@@ -16,6 +16,7 @@ fn command_fixture() -> (
             generation: 1,
             expires_at: None,
             capabilities: workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
+            access_fenced: std::sync::atomic::AtomicBool::new(false),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,

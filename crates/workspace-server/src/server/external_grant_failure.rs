@@ -312,7 +312,10 @@ pub(super) fn registration_failed(
         connection.generation,
         "offline",
         &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-    ) {
+    ).and_then(|updated| {
+        if updated { refresh_external_workdir_expiry(api, &grant.grant_id)?; }
+        Ok(())
+    }) {
         primary = combine(
             primary,
             connection_error(error, Reason::GrantConnectionStateFailed),
