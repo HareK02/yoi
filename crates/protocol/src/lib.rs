@@ -1494,6 +1494,12 @@ pub enum Event {
         worker: InternalWorkerRef,
         event: Box<Event>,
     },
+    /// The parent-owned forwarding stream can no longer attest this session or
+    /// its descendants. Retain identity/history, but reject queued live state
+    /// until a fresh parent snapshot explicitly restores observation.
+    InternalWorkerObservationUnavailable {
+        worker: InternalWorkerRef,
+    },
     /// Terminal removal fence for one parent-owned Internal Worker session.
     ///
     /// Clients discard the matching child and descendants, then ignore later

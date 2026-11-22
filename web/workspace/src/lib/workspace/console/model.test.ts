@@ -54,7 +54,7 @@ Deno.test("restored run stats replace live estimates in both Console modes", () 
 
 function workerState(status: WorkerStatus): WorkerStateSnapshot {
   return {
-    last_command_id: 0,
+    state_sequence: 0, last_command_id: 0,
     state: status === "idle" ? { kind: "idle" } : {
       kind: "busy",
       state: {
@@ -394,15 +394,15 @@ Deno.test("console routing projects live errors but not completion replies", () 
 Deno.test("Worker state events replace state while acknowledgement replay does not", () => {
   const projector = createConsoleProjector();
   const running: WorkerStateSnapshot = {
-    last_command_id: 2,
+    state_sequence: 0, last_command_id: 2,
     state: { kind: "busy", state: { kind: "run", state: "running" } },
   };
   const freshIdle: WorkerStateSnapshot = {
-    last_command_id: 0,
+    state_sequence: 0, last_command_id: 0,
     state: { kind: "idle" },
   };
   const paused: WorkerStateSnapshot = {
-    last_command_id: 3,
+    state_sequence: 0, last_command_id: 3,
     state: { kind: "busy", state: { kind: "run", state: "paused" } },
   };
   let projection = projector.append([
@@ -4241,4 +4241,82 @@ Deno.test("typed Feature invocations remain visible in live and restored user me
     arguments: [{ name: "path", value: { kind: "string" as const, value: "資料/a b" } }],
   } };
   assertEquals(segmentsToText([segment]), '/run(path="資料/a b")');
+});
+
+Deno.test("internal observation loss fences queued states until a paired parent snapshot", () => {
+  for (const shutdown of [false, true]) {
+    const projector = createConsoleProjector();
+    const worker = {
+      session_id: "child",
+      name: "child",
+      parent_session_id: "parent",
+      kind: "sub_worker",
+    } as const;
+    const state: WorkerStateSnapshot = {
+      state_sequence: 4,
+      last_command_id: 0,
+      state: { kind: "busy", state: { kind: "run", state: "running" } },
+    };
+    const event = {
+      event: "internal_worker",
+      data: {
+        worker,
+        event: { event: "worker_state", data: { snapshot: state } },
+      },
+    } as const;
+    const before = projector.append([{ eventId: "running", event }]);
+    assertEquals(before.internalWorkers[0].console.status, "running");
+    const ordinary = projector.append([{
+      eventId: "diagnostic",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          event: {
+            event: "error",
+            data: { code: "internal", message: "ordinary diagnostic" },
+          },
+        },
+      },
+    }]);
+    assertEquals(ordinary.internalWorkers[0].console.status, "running");
+    const invalidation: Event = shutdown
+      ? {
+        event: "internal_worker",
+        data: { worker, event: { event: "shutdown" } },
+      }
+      : { event: "internal_worker_observation_unavailable", data: { worker } };
+    let projection = projector.append([{
+      eventId: "lost",
+      event: invalidation,
+    }]);
+    assertEquals(projection.internalWorkers[0].console.status, shutdown ? "shutdown" : null);
+    assertEquals(before.internalWorkers[0].console.status, "running");
+    projection = projector.append([{ eventId: "queued", event }]);
+    assertEquals(projection.internalWorkers[0].console.workerState, null);
+    const snapshot = snapshotEvent("/repo");
+    if (snapshot.event !== "snapshot") {
+      throw new Error("snapshot fixture expected");
+    }
+    snapshot.data.internal_workers = [{
+      worker,
+      state: null,
+      status: "running",
+      session: canonicalSession([]),
+      in_flight: { blocks: [] },
+      internal_workers: [],
+    }];
+    projector.append([{ eventId: "reconnect-unavailable", event: snapshot }]);
+    projection = projector.append([{
+      eventId: "queued-after-reconnect",
+      event,
+    }]);
+    assertEquals(projection.internalWorkers[0].console.status, null);
+    snapshot.data.internal_workers[0].state = state;
+    projection = projector.append([{
+      eventId: "reconnect-current",
+      event: snapshot,
+    }]);
+    assertEquals(projection.internalWorkers[0].console.status, "running");
+  }
 });

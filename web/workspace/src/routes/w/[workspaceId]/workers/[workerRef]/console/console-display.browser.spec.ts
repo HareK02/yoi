@@ -189,7 +189,7 @@ function snapshotEvent(session = emptySession()): ProtocolEvent {
         context_window: 0,
         context_tokens: 0,
       },
-      state: { last_command_id: 0, state: { kind: "idle" } },
+      state: { state_sequence: 0, last_command_id: 0, state: { kind: "idle" } },
       in_flight: { blocks: [], commands: [], compaction: null },
       internal_workers: [],
     },
@@ -275,7 +275,7 @@ test("a completed live run displays its stats below the answer", async () => {
   } });
   protocolEvent({ event: "run_end", data: { result: "finished" } });
   protocolEvent({ event: "worker_state", data: {
-    snapshot: { last_command_id: 0, state: { kind: "idle" } },
+    snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "idle" } },
   } });
   await waitFor(() => {
     const rows = view.container.querySelectorAll(".console-line");
@@ -321,7 +321,7 @@ test("reopening Console keeps the Composer run clock and cumulative traffic", as
     await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(visit));
     const snapshot = snapshotEvent();
     if (snapshot.event !== "snapshot") throw new Error("expected snapshot");
-    snapshot.data.state = { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } };
+    snapshot.data.state = { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } };
     snapshot.data.session.entries = [
       { kind: "invoke", trigger: "user_send", timestamp: startedAt, entry_id: "invoke", provenance: "legacy_unknown", derived_from: [] },
       { kind: "usage", timestamp: startedAt + 1000, entry_id: "usage", provenance: "legacy_unknown", derived_from: [], input_tokens: 25_000, cache_read_input_tokens: 20_000, output_tokens: 300 },
@@ -399,7 +399,7 @@ test("Feature and argument completion correlate same-prefix ABA, context and oth
 
 test.each(["running", "paused"] as const)("Composer edits remain available while Worker is %s", async (state) => {
   const { cm, view } = await liveComposer();
-  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state } } } } });
+  protocolEvent({ event: "worker_state", data: { snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state } } } } });
   await settleMicrotasks();
   cm.focus();
   await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "next input" } });
@@ -418,7 +418,7 @@ test.each([
 ])("$label notifies a running Worker; the Stop button still cancels", async ({ platform, modifier }) => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
   const { cm, view } = await liveComposer();
-  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  protocolEvent({ event: "worker_state", data: { snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
   const stop = await view.findByRole("button", { name: "Stop Worker" });
   cm.focus();
   multiplexer.sendWorkerMethod.mockClear();
@@ -466,7 +466,7 @@ test.each([
 ] as const)("Shift submit queues the next input on $platform while $state", async ({ platform, modifier, state }) => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
   const { cm } = await liveComposer();
-  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state } } } } });
+  protocolEvent({ event: "worker_state", data: { snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state } } } } });
   await screen.findByRole("button", { name: "Queue Submit" });
   cm.focus();
   cm.dispatch({ changes: { from: 0, insert: "next turn" } });
@@ -494,7 +494,7 @@ test.each([
 ])("paused send uses Notify on $platform (button=$button), not Resume or Submit", async ({ platform, modifier, button }) => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
   const { cm, view } = await liveComposer();
-  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "paused" } } } } });
+  protocolEvent({ event: "worker_state", data: { snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "paused" } } } } });
   await view.findByRole("button", { name: "Queue Submit" });
   cm.focus();
   cm.dispatch({ changes: { from: 0, insert: "continue with this context" } });
@@ -513,7 +513,7 @@ test.each([
   await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
   // Only the Worker, not the UI, determines when the turn has started.
   expect(view.queryByRole("button", { name: "Stop Worker" })).toBeNull();
-  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  protocolEvent({ event: "worker_state", data: { snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
   await view.findByRole("button", { name: "Stop Worker" });
 });
 
@@ -534,7 +534,7 @@ test("running submit shortcut preserves structured drafts instead of sending the
   const { cm, view } = await liveComposer();
   await selectRun(cm);
   const draft = cm.state.doc.toString();
-  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  protocolEvent({ event: "worker_state", data: { snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
   await view.findByRole("button", { name: "Stop Worker" });
   multiplexer.sendWorkerMethod.mockClear();
   await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ctrlKey: true });
@@ -727,7 +727,7 @@ test("cancelled attachment ignores late completion and deletes only abandoned st
 
 test.each(["notification_rejected", "notification_accepted"] as const)("Notify keeps text until authoritative %s", async (outcome) => {
   const { cm } = await liveComposer();
-  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  protocolEvent({ event: "worker_state", data: { snapshot: { state_sequence: 0, last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
   cm.dispatch({ changes: { from: 0, insert: "通知" }, selection: { anchor: 2 } });
   await fireEvent.click(await screen.findByRole("button", { name: "Notify Worker" }));
   const first = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Extract<Method, { method: "notify" }>;

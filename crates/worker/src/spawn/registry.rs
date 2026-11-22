@@ -807,8 +807,11 @@ impl SpawnedWorkerRegistry {
                         {
                             let mut snapshot = published.snapshot.lock().unwrap();
                             snapshot.error = Some(error);
-                            snapshot.state = None;
+                            super::published::invalidate(&mut snapshot);
                         }
+                        let _ = parent_tx.send(Event::InternalWorkerObservationUnavailable {
+                            worker: worker.clone(),
+                        });
                         let _ = parent_tx.send(Event::InternalWorker {
                             worker: worker.clone(),
                             event: Box::new(Event::Error {
@@ -820,7 +823,18 @@ impl SpawnedWorkerRegistry {
                         });
                         break;
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _emit_guard = protocol_emit_lock
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if !protocol_terminal.load(Ordering::Acquire) {
+                            super::published::invalidate(&mut published.snapshot.lock().unwrap());
+                            let _ = parent_tx.send(Event::InternalWorkerObservationUnavailable {
+                                worker: worker.clone(),
+                            });
+                        }
+                        break;
+                    }
                 }
             }
         });
@@ -893,8 +907,11 @@ impl SpawnedWorkerRegistry {
                         {
                             let mut snapshot = published.snapshot.lock().unwrap();
                             snapshot.error = Some(error);
-                            snapshot.state = None;
+                            super::published::invalidate(&mut snapshot);
                         }
+                        let _ = parent_tx.send(Event::InternalWorkerObservationUnavailable {
+                            worker: worker.clone(),
+                        });
                         let _ = parent_tx.send(Event::InternalWorker {
                             worker: worker.clone(),
                             event: Box::new(Event::Error {
@@ -906,7 +923,18 @@ impl SpawnedWorkerRegistry {
                         });
                         break;
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _emit_guard = protocol_emit_lock
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if !protocol_terminal.load(Ordering::Acquire) {
+                            super::published::invalidate(&mut published.snapshot.lock().unwrap());
+                            let _ = parent_tx.send(Event::InternalWorkerObservationUnavailable {
+                                worker: worker.clone(),
+                            });
+                        }
+                        break;
+                    }
                 }
             }
         });
@@ -2027,6 +2055,10 @@ mod tests {
                 .unwrap();
         }
         registry.start_protocol_forwarding(record.clone());
+        assert!(matches!(
+            parent_rx.recv().await.unwrap(),
+            Event::InternalWorkerObservationUnavailable { .. }
+        ));
         let event = parent_rx.recv().await.unwrap();
         assert!(matches!(event, Event::InternalWorker { event, .. }
             if matches!(*event, Event::Error { ref message, .. } if message.contains("projection is incomplete"))));
@@ -2466,3 +2498,7 @@ mod tests {
         assert_eq!(record.stop_summary().change_stat, None);
     }
 }
+
+#[cfg(feature = "test-support")]
+#[path = "registry_observation_fixture.rs"]
+pub mod observation_fixture;

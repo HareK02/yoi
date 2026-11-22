@@ -290,6 +290,7 @@ pub struct App {
     next_command_id: u64,
     /// Derived Runtime-catalog compatibility projection used by existing UI.
     pub worker_status: WorkerStatus,
+    pub worker_observation_unavailable: bool,
     /// True while the Worker is in `WorkerStatus::Running`.
     pub running: bool,
     /// True while the Worker is in `WorkerStatus::Paused`.
@@ -416,6 +417,7 @@ impl App {
             worker_state: WorkerStateSnapshot::initial(),
             next_command_id: 1,
             worker_status: WorkerStatus::Idle,
+            worker_observation_unavailable: false,
             running: false,
             paused: false,
             run_started_at: None,
@@ -1615,11 +1617,24 @@ impl App {
     }
 
     fn apply_worker_state_snapshot(&mut self, snapshot: &WorkerStateSnapshot) {
+        if self.worker_observation_unavailable
+            || snapshot.state_sequence < self.worker_state.state_sequence
+        {
+            return;
+        }
         self.worker_state = snapshot.clone();
         self.set_worker_status(self.worker_state.catalog_status());
     }
 
     pub fn handle_worker_event(&mut self, event: Event) -> Option<Method> {
+        if self.worker_observation_unavailable
+            && matches!(
+                event,
+                Event::Snapshot { .. } | Event::WorkerState { .. } | Event::InternalWorker { .. }
+            )
+        {
+            return None;
+        }
         if self.rewind_refresh_fence && event_is_stale_after_rewind(&event) {
             return None;
         }
@@ -2060,6 +2075,15 @@ impl App {
             }
             Event::InternalWorker { worker, event } => {
                 self.apply_internal_worker_event(worker, *event)
+            }
+            Event::InternalWorkerObservationUnavailable { worker } => {
+                if let Some(child) = self
+                    .internal_workers
+                    .iter_mut()
+                    .find(|child| child.worker.session_id == worker.session_id)
+                {
+                    child.app.invalidate_worker_observation();
+                }
             }
             Event::InternalWorkerRemoved { worker } => self.remove_internal_worker(worker),
             Event::WorkerState { snapshot } => {
@@ -2896,7 +2920,11 @@ impl App {
             app.restore_session(&snapshot.session, None);
             app.apply_in_flight_snapshot(snapshot.in_flight);
         }
-        app.set_worker_status(snapshot.status);
+        if let Some(state) = snapshot.state {
+            app.apply_worker_state_snapshot(&state);
+        } else {
+            app.invalidate_worker_observation();
+        }
         if let Some(error) = snapshot.error {
             let _ = app.handle_worker_event(Event::Error {
                 code: protocol::ErrorCode::Internal,
@@ -2904,9 +2932,22 @@ impl App {
             });
         }
         app.replace_internal_worker_snapshots(snapshot.internal_workers);
+        if app.worker_observation_unavailable {
+            app.invalidate_worker_observation();
+        }
         InternalWorkerView {
             worker: snapshot.worker,
             app: Box::new(app),
+        }
+    }
+
+    fn invalidate_worker_observation(&mut self) {
+        self.worker_observation_unavailable = true;
+        self.connected = false;
+        self.running = false;
+        self.paused = false;
+        for child in &mut self.internal_workers {
+            child.app.invalidate_worker_observation();
         }
     }
 
@@ -2930,6 +2971,9 @@ impl App {
             self.internal_workers.last_mut().unwrap()
         };
         target.worker = worker;
+        if matches!(event, Event::Shutdown) {
+            target.app.invalidate_worker_observation();
+        }
         let _ = target.app.handle_worker_event(event);
     }
 
@@ -4493,6 +4537,7 @@ mod completion_flow_tests {
         assert_eq!(app.worker_status, WorkerStatus::Idle);
 
         let running = WorkerStateSnapshot {
+            state_sequence: 0,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             )),
@@ -4528,6 +4573,7 @@ mod completion_flow_tests {
                 command,
                 disposition: protocol::WorkerCommandDisposition::Accepted,
                 state: WorkerStateSnapshot {
+                    state_sequence: 0,
                     state: historical,
                     last_command_id: 20,
                     last_finished_submission_request_id: None,
@@ -4862,6 +4908,49 @@ mod completion_flow_tests {
             in_flight: protocol::InFlightSnapshot::default(),
             error: None,
             internal_workers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn internal_worker_observation_loss_fences_queued_state_until_parent_snapshot() {
+        for shutdown in [false, true] {
+            let mut app = App::new("parent".into());
+            let mut child = test_internal_worker_snapshot("child", "research");
+            child.state = Some(test_worker_state(WorkerStatus::Running));
+            child.state.as_mut().unwrap().state_sequence = 4;
+            app.replace_internal_worker_snapshots(vec![child.clone()]);
+            assert!(app.internal_workers[0].app.running);
+            let loss = if shutdown {
+                Event::InternalWorker {
+                    worker: child.worker.clone(),
+                    event: Box::new(Event::Shutdown),
+                }
+            } else {
+                Event::InternalWorkerObservationUnavailable {
+                    worker: child.worker.clone(),
+                }
+            };
+            app.handle_worker_event(loss);
+            app.handle_worker_event(Event::InternalWorker {
+                worker: child.worker.clone(),
+                event: Box::new(Event::WorkerState {
+                    snapshot: child.state.clone().unwrap(),
+                }),
+            });
+            assert!(!app.internal_workers[0].app.running);
+            assert!(!app.internal_workers[0].app.connected);
+            let mut lost = child.clone();
+            lost.state = None;
+            app.replace_internal_worker_snapshots(vec![lost]);
+            app.handle_worker_event(Event::InternalWorker {
+                worker: child.worker.clone(),
+                event: Box::new(Event::WorkerState {
+                    snapshot: child.state.clone().unwrap(),
+                }),
+            });
+            assert!(!app.internal_workers[0].app.running);
+            app.replace_internal_worker_snapshots(vec![child]);
+            assert!(app.internal_workers[0].app.running);
         }
     }
 
