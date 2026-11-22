@@ -8482,6 +8482,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::worker_control_list(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::worker_control_details(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::worker_control_authorize(
             service.clone(),
         ))

@@ -13,6 +13,7 @@ use worker_runtime::execution::{
 #[derive(Default)]
 struct LaunchExecutionBackend {
     snapshot_script: Mutex<std::collections::VecDeque<Option<protocol::WorkerStateSnapshot>>>,
+    snapshot_script_worker: Mutex<Option<String>>,
     lose_initial_ack: std::sync::atomic::AtomicBool,
     fail_stop: std::sync::atomic::AtomicBool,
     execution: DeterministicExecutionBackend,
@@ -201,7 +202,14 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         &self,
         worker: &worker_runtime::identity::WorkerRef,
     ) -> Option<protocol::Event> {
-        if let Some(snapshot) = self.snapshot_script.lock().unwrap().pop_front() {
+        if self
+            .snapshot_script_worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|id| id == &worker.worker_id.to_string())
+            && let Some(snapshot) = self.snapshot_script.lock().unwrap().pop_front()
+        {
             let snapshot = snapshot?;
             let execution = self
                 .execution
@@ -1329,6 +1337,7 @@ async fn known_worker_list_and_details_follow_embedded_and_remote_execution() {
             .unwrap();
         for (sequence, status, expected) in [
             (
+                1,
                 protocol::WorkerStatus::Idle,
                 server_api::WorkerListState::Idle,
             ),
@@ -1343,6 +1352,7 @@ async fn known_worker_list_and_details_follow_embedded_and_remote_execution() {
                 server_api::WorkerListState::Paused,
             ),
             (
+                4,
                 protocol::WorkerStatus::Idle,
                 server_api::WorkerListState::Idle,
             ),
@@ -1372,6 +1382,46 @@ async fn known_worker_list_and_details_follow_embedded_and_remote_execution() {
             .await
             .expect("list must reflect current execution over both host adapters");
         }
+        *f.backend.snapshot_script_worker.lock().unwrap() = Some(subject.worker_id.clone());
+        f.backend.snapshot_script.lock().unwrap().push_back(None);
+        let unavailable = list_known_workers(
+            State(f.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            ticket_check_headers(&controller),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            unavailable.items[0].state,
+            server_api::WorkerListState::Unavailable
+        );
+        // Reconnection replays the execution-owned latest snapshot, without a
+        // new Run or a fabricated catalog state/sequence.
+        f.backend.execution.publish_worker_state(
+            &subject,
+            protocol::WorkerStateSnapshot {
+                state_sequence: 4,
+                ..protocol::WorkerStateSnapshot::initial()
+            },
+        );
+        let recovered = list_known_workers(
+            State(f.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            ticket_check_headers(&controller),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            recovered.items[0].state,
+            server_api::WorkerListState::Idle,
+            "reconnected snapshot must restore observation without fabricating Idle from the catalog"
+        );
         let get_details = || {
             known_worker_details(
                 State(f.api.clone()),
