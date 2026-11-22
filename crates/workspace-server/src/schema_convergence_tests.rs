@@ -173,7 +173,7 @@ mod schema_convergence {
                                 (131, crate::launch_policy::MIGRATION_NAME),
                                 (133, crate::subject_policy::MIGRATION_NAME),
                                 (134, backend_job_finalizing::MIGRATION_NAME),
-                                (135, subject_release_recording_store::MIGRATION_NAME),
+                                (135, subject_release_input_handoff_store::MIGRATION_NAME),
                                 (136, launch_policy_identity_migration::MIGRATION_NAME),
                                 (137, worker_lifecycle_notifications::MIGRATION_NAME),
                                 (138, notification_routing::merge_requests::MIGRATION_NAME),

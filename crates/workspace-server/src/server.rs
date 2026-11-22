@@ -26,8 +26,10 @@
 
 use subjektiv::api::*;
 mod attachment_failure;
+mod backend_job_application;
 mod backend_job_profile;
 mod backend_job_recovery;
+mod backend_recording_job;
 mod chat;
 mod core_worker_creation;
 mod external_grant_failure;
@@ -5392,9 +5394,6 @@ impl WorkspaceApi {
                     .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))
             })
             .transpose()?;
-        if let Some(subject) = subjektiv_deletion::job_subject(&reservation.job.request) {
-            subjektiv_deletion::require_available(self, subject)?;
-        }
         let current_job = self
             .store
             .get_backend_job(&self.config.workspace_id, &reservation.job.request.job_id)?
@@ -5413,6 +5412,17 @@ impl WorkspaceApi {
             replayed: reservation.replayed,
             resource_reused: reservation.resource_reused,
         };
+        if backend_job_application::target_not_required(self, &reservation.job.request)? {
+            backend_job_application::settle_not_required(
+                self,
+                &reservation.job,
+                &reservation.attempt,
+            )?;
+            return Ok(BackendJobReservation {
+                replayed: true,
+                ..reservation
+            });
+        }
         if matches!(
             reservation.job.input_disposition,
             crate::backend_job::JobInputDisposition::Erased
@@ -6085,6 +6095,7 @@ impl WorkspaceApi {
             // admitted owners even if they remain pending or change timestamps.
             after = Some(next);
         }
+        backend_recording_job::recover(self)?;
         subjektiv_journal::recover_attempts(self)?;
         self.recover_backend_job_worker_cleanups()?;
         self.drain_reserved_backend_jobs();
@@ -6123,11 +6134,31 @@ impl WorkspaceApi {
                     .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
             })
             .transpose()?;
-        if let Some(subject) = result_job
-            .as_ref()
-            .and_then(|job| subjektiv_deletion::job_subject(&job.request))
+        if let Some(job) = &result_job
+            && backend_job_application::target_not_required(self, &job.request)?
         {
-            subjektiv_deletion::require_available(self, subject)?;
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    self.workspace_id(),
+                    &submission.job_id,
+                    &submission.attempt_id,
+                )?
+                .ok_or_else(|| {
+                    Error::WorkspacePermissionDenied("Result attempt is missing".into())
+                })?;
+            if job.current_attempt != attempt.attempt
+                || attempt.worker.as_ref() != Some(source_worker)
+                || attempt.input_digest != submission.input_digest
+            {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Result owner changed".into(),
+                ));
+            }
+            backend_job_application::settle_not_required(self, job, &attempt)?;
+            return Err(Error::WorkspacePermissionDenied(
+                "Result application is not required for the deleted target".into(),
+            ));
         }
         let accepted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let mut verified_submission = submission.clone();
@@ -6263,6 +6294,15 @@ impl WorkspaceApi {
             &verified_submission,
             &accepted_at,
         )?;
+        if subjektiv_deletion::job_subject(&acceptance.job.request).is_some() {
+            self.store.record_backend_job_result_application(
+                self.workspace_id(),
+                &acceptance.attempt,
+                &acceptance.job.intent_fingerprint,
+                crate::backend_job::JobResultApplicationDisposition::Applied,
+                &accepted_at,
+            )?;
+        }
         drop(subject_guard);
         // Closing a generation/releasing pins is a writer operation, not a consequence
         // of accepting a result. Canonical cleanup performs it after independent fences.
@@ -8808,6 +8848,7 @@ fn runtime_worker_summary_to_api(
             identity: worker.workspace.identity,
             workspace_id: worker.workspace.workspace_id,
         },
+        lifecycle: worker.lifecycle,
         state: worker.state,
         worker_state: worker
             .worker_state
@@ -29610,6 +29651,7 @@ fn worker_launch_worker_summary(worker: InternalWorkerSummary) -> WorkerLaunchWo
             identity: worker.workspace.identity,
             workspace_id: worker.workspace.workspace_id,
         },
+        lifecycle: worker.lifecycle,
         state: worker.state,
         last_seen_at: worker.last_seen_at,
         pinned: worker.pinned,
@@ -39071,6 +39113,7 @@ fn record_worker_summary(
             _ => protocol::subscription::SubscriptionWorkerState::Idle,
         };
         let observation = protocol::subscription::SubscriptionWorker {
+            lifecycle: worker.lifecycle,
             restore_observation_token: worker.restore_observation_token.clone(),
             worker_id,
             runtime_id: Some(worker.worker.runtime_id.clone()),
@@ -39105,6 +39148,7 @@ fn record_worker_summary(
 fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorkerSummary {
     InternalWorkerSummary {
         restore_observation_token: None,
+        lifecycle: None,
         worker: record.worker.clone(),
         host_id: "backend-registry".to_string(),
         display_name: record.display_name.clone(),
@@ -39152,6 +39196,7 @@ fn worker_summary_from_projection(
     let observed = observation.availability
         == protocol::subscription::SubscriptionWorkerAvailability::Observed;
     summary.availability = observation.availability;
+    summary.lifecycle = observation.worker.lifecycle;
     summary.restore_observation_token = observed
         .then(|| observation.worker.restore_observation_token.clone())
         .flatten();
@@ -42251,6 +42296,7 @@ mod tests {
             resource_key: Some("W-1".to_string()),
             observation: Some(WorkerRegistryObservationRecord {
                 worker: protocol::subscription::SubscriptionWorker {
+                    lifecycle: Some(protocol::WorkerLifecycleState::Active),
                     restore_observation_token: None,
                     worker_id: protocol::subscription::SubscriptionWorkerId::new("worker-a")
                         .unwrap(),
@@ -42274,6 +42320,10 @@ mod tests {
 
         let unavailable = worker_summary_from_projection(&projection).unwrap();
         assert_eq!(unavailable.availability, availability);
+        assert_eq!(
+            unavailable.lifecycle,
+            Some(protocol::WorkerLifecycleState::Active)
+        );
         assert_eq!(unavailable.state, "unavailable");
         assert_eq!(unavailable.worker_state, None);
         assert!(
@@ -42289,6 +42339,7 @@ mod tests {
         observation.worker.availability =
             protocol::subscription::SubscriptionWorkerAvailability::Observed;
         observation.worker.state = protocol::subscription::SubscriptionWorkerState::Stopped;
+        observation.worker.lifecycle = Some(protocol::WorkerLifecycleState::AwaitingRestore);
         observation.worker.worker_state = None;
         let observed_stopped = worker_summary_from_projection(&observed_stopped).unwrap();
         assert_eq!(
@@ -42296,6 +42347,10 @@ mod tests {
             protocol::subscription::SubscriptionWorkerAvailability::Observed
         );
         assert_eq!(observed_stopped.state, "stopped");
+        assert_eq!(
+            observed_stopped.lifecycle,
+            Some(protocol::WorkerLifecycleState::AwaitingRestore)
+        );
         assert_eq!(observed_stopped.worker_state, None);
     }
 
@@ -44690,6 +44745,7 @@ mod tests {
             request: &WorkerSpawnRequest,
         ) -> InternalWorkerSummary {
             InternalWorkerSummary {
+                lifecycle: Some(protocol::WorkerLifecycleState::Active),
                 restore_observation_token: Some(format!(
                     "fixture-generation:{}",
                     binding.worker_id
@@ -47209,6 +47265,7 @@ mod tests {
             .seed_observation(
                 EMBEDDED_WORKER_RUNTIME_ID,
                 &protocol::subscription::SubscriptionWorker {
+                    lifecycle: Some(protocol::WorkerLifecycleState::Active),
                     restore_observation_token: None,
                     worker_id: protocol::subscription::SubscriptionWorkerId::new("paused-worker")
                         .unwrap(),
@@ -48453,6 +48510,7 @@ mod tests {
                 "worker_ref": { "worker_id": request.worker_id },
                 "worker_id": request.worker_id,
                 "status": "idle",
+                "lifecycle": "active",
                 "execution_metadata_available": true,
                 "workspace_id": TEST_WORKSPACE_ID,
                 "workdir_attachments": workdir_attachments,
@@ -69222,6 +69280,7 @@ mod tests {
         ) -> server_api::WorkerSummary {
             server_api::WorkerSummary {
                 restore_observation_token: None,
+                lifecycle: None,
                 removal: None,
                 runtime_id: "runtime-test".to_string(),
                 worker_id: worker_id.to_string(),
@@ -69318,6 +69377,7 @@ mod tests {
         let discovered = workspace_worker_discovery_page(
             vec![server_api::WorkerSummary {
                 restore_observation_token: None,
+                lifecycle: None,
                 removal: None,
                 runtime_id: target.runtime_id.clone(),
                 worker_id: target.worker_id.clone(),

@@ -67,16 +67,9 @@ mod create_reconciliation_tests {
                     disk.restore_guard.observation_token,
                     initial.restore_guard.observation_token
                 );
-                if has_state {
-                    assert!(
-                        matches!(disk.execution_state, crate::fs_store::PersistedWorkerExecutionState::Available(ref execution) if execution.binding.is_some())
-                    );
-                } else {
-                    assert_eq!(
-                        disk.execution_state,
-                        crate::fs_store::PersistedWorkerExecutionState::Unavailable
-                    );
-                }
+                assert!(
+                    matches!(disk.execution_state, crate::fs_store::PersistedWorkerExecutionState::ReconciliationRequired(crate::fs_store::PersistedWorkerLifecycleOperation::Create(ref create)) if create.operation_id.is_some() && create.request.is_some())
+                );
             }
             // A pre-rename failure left the initial record; an uncertain response
             // here followed a real rename and is reconciled from disk, not guessed.

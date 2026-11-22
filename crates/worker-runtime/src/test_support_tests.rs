@@ -193,11 +193,10 @@ fn record(request: CreateWorkerRequest) -> PersistedWorkerRecord {
         workspace_id: Some(WORKSPACE.into()),
         workdir_attachments: vec![],
         logical_workdir_attachments: vec![],
-        execution_state: PersistedWorkerExecutionState::Available(PersistedWorkerExecution {
+        execution_state: PersistedWorkerExecutionState::Stopped(Some(PersistedWorkerExecution {
             request,
             binding: Some(PersistedWorkerExecutionBinding {}),
-            restore_intent: WorkerRestoreIntent::Explicit,
-        }),
+        })),
     }
 }
 
@@ -410,10 +409,9 @@ fn extraction_install_roundtrip_preserves_bytes_and_is_inactive() {
     let saved = state.workers.get(&worker_id()).unwrap();
     assert_eq!(saved.status, WorkerStatus::Stopped);
     assert!(saved.last_finished_submission_request_id.is_none());
-    let PersistedWorkerExecutionState::Available(execution) = &saved.execution_state else {
-        panic!("not available")
+    let PersistedWorkerExecutionState::Stopped(Some(execution)) = &saved.execution_state else {
+        panic!("installed fixture must retain trusted stopped execution metadata")
     };
-    assert_eq!(execution.restore_intent, WorkerRestoreIntent::Explicit);
     assert!(execution.binding.is_none());
     assert_eq!(execution.request, request());
     // Fresh restore guard, no operation owner/receipt history.
@@ -429,6 +427,10 @@ fn extraction_install_roundtrip_preserves_bytes_and_is_inactive() {
     let guard: GuardState = decode(&serde_json::to_vec(&saved.restore_guard).unwrap()).unwrap();
     assert!(guard.active_request_id.is_none() && guard.owners.is_empty());
     drop(opened.store);
+    let reextracted = StoppedWorkerTemplate::extract(&installed).unwrap();
+    assert_eq!(reextracted.session_manifest, template.session_manifest);
+    assert_eq!(reextracted.segment_jsonl, template.segment_jsonl);
+    assert_eq!(reextracted.worker_id(), template.worker_id());
 
     struct NoExecution;
     impl crate::execution::WorkerExecutionBackend for NoExecution {
@@ -573,6 +575,10 @@ fn rejects_uninitialized_untrusted_live_and_partial_destination() {
 fn extraction_rejects_nonstopped_pending_schema_and_metadata_mismatch() {
     for change in [
         "running",
+        "not-started",
+        "not-started-unavailable",
+        "stopped-unavailable",
+        "create-pending",
         "pending",
         "guard-pending",
         "attachment",
@@ -588,16 +594,47 @@ fn extraction_rejects_nonstopped_pending_schema_and_metadata_mismatch() {
         let (_source, worker, _) = source();
         let mut aggregate: WorkerAggregateRecord =
             decode(&fs::read(worker.join(WORKER_FILE)).unwrap()).unwrap();
+        let PersistedWorkerExecutionState::Stopped(Some(execution)) = &aggregate.execution_state
+        else {
+            panic!("source must retain trusted stopped execution metadata")
+        };
+        let execution = execution.clone();
         match change {
-            "running" => aggregate.status = WorkerStatus::Running,
+            "running" => {
+                aggregate.status = WorkerStatus::Running;
+                aggregate.execution_state = PersistedWorkerExecutionState::Runnable(execution.clone());
+            }
+            "not-started" => {
+                aggregate.execution_state = PersistedWorkerExecutionState::NotStarted(Some(
+                    PersistedWorkerExecution {
+                        request: execution.request.clone(),
+                        binding: None,
+                    },
+                ));
+            }
+            "not-started-unavailable" => {
+                aggregate.execution_state = PersistedWorkerExecutionState::NotStarted(None);
+            }
+            "stopped-unavailable" => {
+                aggregate.execution_state = PersistedWorkerExecutionState::Stopped(None);
+            }
+            "create-pending" => {
+                aggregate.execution_state = PersistedWorkerExecutionState::ReconciliationRequired(
+                    PersistedWorkerLifecycleOperation::Create(PersistedWorkerCreateOperation {
+                        operation_id: Some(WorkerLifecycleOperationId::new()),
+                        request: Some(execution.request.clone()),
+                        binding: None,
+                    }),
+                );
+            }
             "pending" => {
-                aggregate.execution_state = WorkerExecutionStateRecord::ReconciliationRequired(
+                aggregate.execution_state = PersistedWorkerExecutionState::ReconciliationRequired(
                     PersistedWorkerLifecycleOperation::Restore(PersistedWorkerRestoreOperation {
                         operation_id: WorkerLifecycleOperationId::new(),
                         mode: PersistedWorkerRestoreMode::Explicit,
                         commit: crate::runtime::RestoreCommitFact::NotCommitted,
                         source_repair_possible: false,
-                        request: request(),
+                        request: execution.request.clone(),
                         binding: None,
                         last_settled_status: WorkerStatus::Stopped,
                     }),
@@ -653,6 +690,22 @@ fn extraction_rejects_nonstopped_pending_schema_and_metadata_mismatch() {
             }
             _ => unreachable!(),
         }
+        if matches!(
+            change,
+            "running"
+                | "not-started"
+                | "not-started-unavailable"
+                | "stopped-unavailable"
+                | "create-pending"
+                | "pending"
+        ) {
+            // These are valid lifecycle records, not corrupt metadata that the
+            // store decoder would reject before fixture admission is checked.
+            aggregate
+                .clone()
+                .validate(&worker.join(WORKER_FILE))
+                .unwrap();
+        }
         atomic_write_json(&worker.join(WORKER_FILE), &aggregate, "test aggregate").unwrap();
         assert!(
             StoppedWorkerTemplate::extract(&worker).is_err(),
@@ -667,30 +720,44 @@ fn extraction_rejects_nonstopped_pending_schema_and_metadata_mismatch() {
 }
 
 #[test]
-fn schema_v12_settled_template_installs_current_aggregate_without_rewriting_session() {
+fn supported_settled_templates_install_current_aggregate_without_rewriting_session() {
     let (_source, _, mut template) = source();
-    template.runtime_schema_version = RESTORE_ADMISSION_SCHEMA_VERSION;
-    let bytes = serde_json::to_vec(&template).unwrap();
-    let (_target, options) = destination(&template);
-    template.install(&options, request(), &resolved()).unwrap();
-    assert_eq!(serde_json::to_vec(&template).unwrap(), bytes);
-    let worker = options.root.join(WORKERS_DIR).join(worker_id().to_string());
-    assert_eq!(
-        fs::read(worker.join("session/session.json")).unwrap(),
-        template.session_manifest
-    );
-    assert_eq!(
-        fs::read(worker.join(format!("session/segments/{}.jsonl", template.segment_id))).unwrap(),
-        template.segment_jsonl
-    );
-    let aggregate: WorkerAggregateRecord =
-        read_bounded_json(&worker.join(WORKER_FILE), "read installed fixture").unwrap();
-    let saved = aggregate.validate(&worker.join(WORKER_FILE)).unwrap();
-    assert_eq!(saved.status, WorkerStatus::Stopped);
-    assert!(matches!(
-        saved.execution_state,
-        PersistedWorkerExecutionState::Available(_)
-    ));
+    for version in [
+        RESTORE_ADMISSION_SCHEMA_VERSION,
+        ATTACHMENT_AUTHORITY_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    ] {
+        template.runtime_schema_version = version;
+        let bytes = serde_json::to_vec(&template).unwrap();
+        let restored: StoppedWorkerTemplate = serde_json::from_slice(&bytes).unwrap();
+        let (_target, options) = destination(&restored);
+        restored.install(&options, request(), &resolved()).unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+        let worker = options.root.join(WORKERS_DIR).join(worker_id().to_string());
+        assert_eq!(
+            fs::read(worker.join("session/session.json")).unwrap(),
+            template.session_manifest
+        );
+        assert_eq!(
+            fs::read(worker.join(format!("session/segments/{}.jsonl", template.segment_id)))
+                .unwrap(),
+            template.segment_jsonl
+        );
+        let aggregate: WorkerAggregateRecord =
+            read_bounded_json(&worker.join(WORKER_FILE), "read installed fixture").unwrap();
+        assert_eq!(aggregate.schema_version, SCHEMA_VERSION);
+        let saved = aggregate.validate(&worker.join(WORKER_FILE)).unwrap();
+        assert_eq!(saved.status, WorkerStatus::Stopped);
+        let PersistedWorkerExecutionState::Stopped(Some(execution)) = saved.execution_state else {
+            panic!("template schema {version} did not install trusted stopped execution metadata")
+        };
+        assert_eq!(execution.request, request());
+        assert!(execution.binding.is_none());
+        let reextracted = StoppedWorkerTemplate::extract(&worker).unwrap();
+        assert_eq!(reextracted.runtime_schema_version, SCHEMA_VERSION);
+        assert_eq!(reextracted.session_manifest, template.session_manifest);
+        assert_eq!(reextracted.segment_jsonl, template.segment_jsonl);
+    }
     // Unsupported template schemas do not enter the versioned reader.
     template.runtime_schema_version = RESTORE_ADMISSION_SCHEMA_VERSION - 1;
     assert!(template.validate_shape().is_err());

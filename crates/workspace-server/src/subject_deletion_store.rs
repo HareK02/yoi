@@ -535,7 +535,8 @@ impl SqliteWorkspaceStore {
             tx.execute("INSERT INTO subject_deletion_jobs(workspace_id,subject_id,job_id)
                 SELECT workspace_id,?2,job_id FROM backend_jobs WHERE workspace_id=?1 AND
                 (json_extract(request_json,'$.grants.subjektiv_journal.subject_id')=?2 OR
-                 json_extract(request_json,'$.grants.subjektiv_consolidation.subject_id')=?2)",params![workspace,subject])?;
+                 json_extract(request_json,'$.grants.subjektiv_consolidation.subject_id')=?2)
+                UNION SELECT workspace_id,?2,job_id FROM backend_job_recording_inputs WHERE workspace_id=?1 AND json_extract(scope_json,'$.subject_id')=?2",params![workspace,subject])?;
             let mut workers = tx.prepare("SELECT runtime_id,worker_id,singleton_key='subjektiv-consolidation:'||?2 FROM worker_singleton_owners WHERE workspace_id=?1 AND singleton_key IN ('subjektiv:'||?2,'subjektiv-consolidation:'||?2)
                 UNION SELECT runtime_id,worker_id,singleton_key='subjektiv-consolidation:'||?2 FROM worker_create_reservations WHERE workspace_id=?1 AND singleton_key IN ('subjektiv:'||?2,'subjektiv-consolidation:'||?2) AND state!='removed'")?
                 .query_map(params![workspace,subject],|r|Ok((RuntimeWorkerRef::new(r.get::<_,String>(0)?,r.get::<_,String>(1)?),r.get::<_,bool>(2)?)))?
@@ -567,11 +568,17 @@ impl SqliteWorkspaceStore {
             for worker in pending { pin_removal(&tx,workspace,subject,&worker)?; }
             let now = chrono::Utc::now().to_rfc3339();
             tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='subject_deleted',failure_detail=NULL,completed_at=?3,updated_at=?3,
+                result_application_disposition=coalesce(result_application_disposition,'not_required'),
+                result_application_recorded_at=coalesce(result_application_recorded_at,?3),
                 worker_cleanup_state=CASE WHEN worker_id IS NULL THEN 'completed' ELSE 'pending' END,
                 worker_cleanup_updated_at=?3,worker_cleanup_completed_at=CASE WHEN worker_id IS NULL THEN ?3 ELSE NULL END
                 WHERE workspace_id=?1 AND job_id IN (SELECT job_id FROM subject_deletion_jobs WHERE workspace_id=?1 AND subject_id=?2) AND state IN ('reserved','dispatching','dispatched','unknown')",params![workspace,subject,now])?;
+            // Finite Host recording Jobs retain their pending owner until every
+            // linked execution is cleaned; that owner then settles NotRequired.
             tx.execute("UPDATE backend_jobs SET state='failed',failure_category='subject_deleted',failure_detail=NULL,completed_at=?3,updated_at=?3
-                WHERE workspace_id=?1 AND job_id IN (SELECT job_id FROM subject_deletion_jobs WHERE workspace_id=?1 AND subject_id=?2) AND state IN ('pending','unknown')",params![workspace,subject,now])?;
+                WHERE workspace_id=?1 AND job_id IN (SELECT job_id FROM subject_deletion_jobs WHERE workspace_id=?1 AND subject_id=?2)
+                AND job_id NOT IN (SELECT job_id FROM backend_job_recording_inputs WHERE workspace_id=?1)
+                AND state IN ('pending','unknown')",params![workspace,subject,now])?;
             tx.commit()?;
             Ok(())
         })

@@ -285,7 +285,9 @@ fn connected_create_initial_input_read_failure_keeps_create_context() {
         StartupBoundaryReason::FinalizeFailed
     );
     assert!(backend.dispatched_inputs.lock().unwrap().is_empty());
-    assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+    // No shutdown side effect is admitted without a canonical lifecycle owner.
+    // The backend still owns the candidate for the original Create's recovery.
+    assert_eq!(*backend.stop_count.lock().unwrap(), 0);
 }
 
 #[test]
@@ -533,7 +535,9 @@ fn failed_create_rollback_retains_record_when_canonical_refresh_fails() {
                 .contains(&worker_ref.worker_id)
         );
         assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
-        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        // No shutdown side effect is admitted without a canonical lifecycle owner.
+        // The backend still owns the candidate for the original Create's recovery.
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
         drop(runtime);
         drop(backend);
         let reopened = Runtime::with_fs_store(options).unwrap();
@@ -764,7 +768,9 @@ fn connected_create_unknown_cleanup_retention_write_failure_preserves_primary() 
             })
     );
     assert_eq!(runtime.list_workers().unwrap().len(), 1);
-    assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+    // No shutdown side effect is admitted without a canonical lifecycle owner.
+    // The backend still owns the candidate for the original Create's recovery.
+    assert_eq!(*backend.stop_count.lock().unwrap(), 0);
     assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
     assert!(
         backend

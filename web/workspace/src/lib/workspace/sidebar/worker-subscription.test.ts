@@ -114,6 +114,39 @@ Deno.test('Worker list state uses the authoritative live snapshot separately fro
   assertEquals(liveWorkerState(unavailable), 'stopped');
 });
 
+Deno.test('workspace Worker projection preserves Runtime lifecycle separately from last catalog status', () => {
+  const projection = createWorkspaceWorkersProjection();
+  const observed = { ...worker('runtime-a', 'worker-1'), lifecycle: 'awaiting_restore' as const, state: 'running' as const };
+  applyWorkspaceWorkersFrame(projection, snapshot('subscription-1', [observed]));
+  const current = projection.workers.get(key('runtime-a', 'worker-1'));
+  assertEquals(current?.lifecycle, 'awaiting_restore');
+  assertEquals(current?.state, 'running');
+  applyWorkspaceWorkersFrame(projection, event('subscription-1', {
+    event: 'worker_upserted', data: { worker: { ...observed, lifecycle: 'restoring' } },
+  }));
+  assertEquals(projection.workers.get(key('runtime-a', 'worker-1'))?.lifecycle, 'restoring');
+});
+
+Deno.test('registry-only Worker snapshots and updates do not infer stopped lifecycle', () => {
+  const projection = createWorkspaceWorkersProjection();
+  const registryOnly: SubscriptionWorker = {
+    ...worker('runtime-a', 'worker-1', false, 'unavailable'), state: 'stopped',
+  };
+  applyWorkspaceWorkersFrame(projection, snapshot('subscription-1', [registryOnly]));
+  const current = projection.workers.get(key('runtime-a', 'worker-1'));
+  assertEquals(current?.lifecycle, undefined);
+  assertEquals(current?.state, 'stopped');
+  assertEquals(liveWorkerState(current!), 'unknown');
+  applyWorkspaceWorkersFrame(projection, event('subscription-1', {
+    event: 'worker_upserted', data: { worker: { ...registryOnly, lifecycle: 'stopped' } },
+  }));
+  assertEquals(projection.workers.get(key('runtime-a', 'worker-1'))?.lifecycle, 'stopped');
+  applyWorkspaceWorkersFrame(projection, event('subscription-1', {
+    event: 'worker_upserted', data: { worker: registryOnly },
+  }));
+  assertEquals(projection.workers.get(key('runtime-a', 'worker-1'))?.lifecycle, undefined);
+});
+
 Deno.test('workspace Worker snapshot keeps equal local ids from different Runtimes', () => {
   const projection = createWorkspaceWorkersProjection();
   applyWorkspaceWorkersFrame(

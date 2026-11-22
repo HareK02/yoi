@@ -519,6 +519,7 @@ mod tests {
         state: protocol::subscription::SubscriptionWorkerState,
     ) -> protocol::subscription::SubscriptionWorker {
         protocol::subscription::SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: protocol::subscription::SubscriptionWorkerId::new("worker-a").unwrap(),
             runtime_id: Some("runtime-a".to_string()),

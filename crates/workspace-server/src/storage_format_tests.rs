@@ -176,7 +176,7 @@ fn saved_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
 
 // Explicit canonical tail: schema 132 has no registered migration. Keep this
 // expectation independent of published_plan and the production migration list.
-fn expected_published_tail() -> [(i64, &'static str); 16] {
+fn expected_published_tail() -> [(i64, &'static str); 18] {
     [
         (122, crate::config_adoption::MIGRATION_NAME),
         (123, super::super::backend_job_upgrade::MIGRATION_NAME),
@@ -186,7 +186,10 @@ fn expected_published_tail() -> [(i64, &'static str); 16] {
             super::super::backend_job_recovery_store::CAUSE_MIGRATION_NAME,
         ),
         (126, super::super::SERVICE_OUTCOME_MIGRATION_NAME),
-        (127, super::super::journal_removal_store::MIGRATION_NAME),
+        (
+            127,
+            super::super::worker_input_handoff_store::MIGRATION_NAME,
+        ),
         (128, super::super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME),
         (
             129,
@@ -198,7 +201,7 @@ fn expected_published_tail() -> [(i64, &'static str); 16] {
         (134, super::super::backend_job_finalizing::MIGRATION_NAME),
         (
             135,
-            super::super::subject_release_recording_store::MIGRATION_NAME,
+            super::super::subject_release_input_handoff_store::MIGRATION_NAME,
         ),
         (
             136,
@@ -212,6 +215,14 @@ fn expected_published_tail() -> [(i64, &'static str); 16] {
             138,
             super::super::notification_routing::merge_requests::MIGRATION_NAME,
         ),
+        (
+            139,
+            super::super::backend_job_result_application::MIGRATION_NAME,
+        ),
+        (
+            140,
+            super::super::backend_job_recording_input::MIGRATION_NAME,
+        ),
     ]
 }
 
@@ -222,7 +233,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
         assert_eq!(plan.current_schema_version, current);
-        assert_eq!(plan.target_schema_version, 138);
+        assert_eq!(plan.target_schema_version, 140);
         assert_eq!(
             plan.migrations
                 .iter()
@@ -548,7 +559,7 @@ fn published_receipt_matrix_preserves_prefixes_and_plans_only_the_missing_tail()
         );
         let plan = FailureTail::Canonical.plan(current);
         assert_eq!(plan.current_schema_version, current);
-        assert_eq!(plan.target_schema_version, 138);
+        assert_eq!(plan.target_schema_version, 140);
         assert_eq!(
             plan.migrations
                 .iter()

@@ -1731,6 +1731,7 @@ impl JournalAttemptEffect {
 
 enum SubjectEffectPrincipal {
     Worker(RuntimeWorkerRef),
+    RecordingJobSource(Box<crate::store::BackendJobRecordingInput>),
     RetainedJournalSource {
         attribution: crate::subjektiv::SubjectSessionAttribution,
         progress: Box<subjektiv_journal::RetainedSourceProgress>,
@@ -1842,6 +1843,29 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
         };
         let worker = match &self.principal {
             SubjectEffectPrincipal::Worker(worker) => worker,
+            SubjectEffectPrincipal::RecordingJobSource(input) => {
+                let current = api
+                    .config_store
+                    .get_backend_job_recording_input(api.workspace_id(), &input.job_id)
+                    .map_err(|error| reject(error.into()))?;
+                let job = api
+                    .store
+                    .get_backend_job(api.workspace_id(), &input.job_id)
+                    .map_err(|error| reject(error.into()))?;
+                if current.as_ref() != Some(input.as_ref())
+                    || job.is_none_or(|job| job.state != BackendJobState::Pending)
+                    || input.scope.subject_id != self.subject
+                    || self.operation != "journal.recording.request"
+                    || !CurrentSubjectPolicy::Canonical(source)
+                        .allows_in_registry(&authority, &requested, false, &self.subject, &registry)
+                        .map_err(reject)?
+                {
+                    return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                        "Recording Job input ownership or current policy changed".into(),
+                    ));
+                }
+                return Ok(Box::new((catalog, registry)));
+            }
             SubjectEffectPrincipal::RetainedJournalSource {
                 attribution,
                 progress,
@@ -2023,6 +2047,41 @@ pub(super) fn retained_journal_source_store(
                 attribution: attribution.clone(),
                 progress: Box::new(progress),
             },
+            subject: subject.clone(),
+            operation: permission.operation,
+            runtime_source: None,
+            #[cfg(test)]
+            before_registry: None,
+            #[cfg(test)]
+            after_reservation: None,
+        })),
+    )
+}
+
+/// The finite original bytes are owned by a saved Host Job. Neither a removed
+/// producer nor a successor body is borrowed as authority for the next prefix.
+pub(super) fn recording_job_source_store(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    input: &crate::store::BackendJobRecordingInput,
+) -> ApiResult<subjektiv::SubjektivStore> {
+    let subject = &input.scope.subject_id;
+    let permission = ScopedPermission {
+        operation: "journal.recording.request".into(),
+        resource: PermissionResource::Subject {
+            workspace_id: api.workspace_id().into(),
+            subject_id: subject.clone(),
+        },
+    };
+    let current_policy =
+        policy(api, subject)?.ok_or_else(|| denied("Subject permissions are unset"))?;
+    if !current_policy.allows(&WorkerAuthorityView::from(api), &permission, false, subject)? {
+        return Err(denied("Current policy denies Job-owned recording input"));
+    }
+    Ok(
+        store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+            api: api.clone(),
+            principal: SubjectEffectPrincipal::RecordingJobSource(Box::new(input.clone())),
             subject: subject.clone(),
             operation: permission.operation,
             runtime_source: None,

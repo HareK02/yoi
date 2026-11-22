@@ -1,5 +1,6 @@
 // Integration boundary: real Runtime, Controller/router, Git materializer and
 // bare Git provider. Only model inference is replaced by the existing MockFactory.
+#[cfg(feature = "http-server")]
 #[test]
 fn publication_fences_live_workdir_and_requires_current_worker_on_each_execution() {
     use crate::catalog::{

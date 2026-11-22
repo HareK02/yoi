@@ -16,8 +16,8 @@ fn lease() -> WorkerSingletonLease {
         generation: 1,
     }
 }
-fn binding() -> JournalRemovalBinding {
-    JournalRemovalBinding {
+fn binding() -> WorkerInputHandoffBinding {
+    WorkerInputHandoffBinding {
         subject_id: "subject".into(),
         writer_session_id: "session".into(),
         writer_binding_id: "binding".into(),
@@ -28,8 +28,8 @@ fn binding() -> JournalRemovalBinding {
         },
     }
 }
-fn members() -> Vec<FrozenJournalRemovalMember> {
-    vec![FrozenJournalRemovalMember {
+fn members() -> Vec<WorkerInputHandoffMember> {
+    vec![WorkerInputHandoffMember {
         session_id: "session".into(),
         active_segment_id: None,
         materialized: false,
@@ -42,7 +42,7 @@ fn members() -> Vec<FrozenJournalRemovalMember> {
 }
 
 #[test]
-fn release_recording_preparation_cancel_reopen_and_completion_are_independent() {
+fn release_input_handoff_preparation_cancel_reopen_and_admission_are_independent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("server.db");
     let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
@@ -55,18 +55,18 @@ fn release_recording_preparation_cancel_reopen_and_completion_are_independent() 
         .reserve_subject_release(workspace, &lease, "binding", "cancel")
         .unwrap();
     let cancelled = store
-        .prepare_release_journal_recording(workspace, &lease, "cancel", &binding, &members)
+        .prepare_subject_release_input_handoff(workspace, &lease, "cancel", &binding, &members)
         .unwrap();
     assert!(!cancelled.released);
     assert!(
         store
-            .list_pending_release_journal_recordings(workspace, None, 100)
+            .list_pending_subject_release_input_handoffs(workspace, None, 100)
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .update_release_journal_recording(&cancelled, true, None)
+            .update_subject_release_input_handoff(&cancelled, InputHandoffStatus::Admitted, None)
             .is_err()
     );
     store
@@ -74,24 +74,24 @@ fn release_recording_preparation_cancel_reopen_and_completion_are_independent() 
         .unwrap();
     assert!(
         store
-            .get_release_journal_recording(workspace, &lease.worker)
+            .get_subject_release_input_handoff(workspace, &lease.worker)
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .prepare_release_journal_recording(workspace, &lease, "cancel", &binding, &members)
+            .prepare_subject_release_input_handoff(workspace, &lease, "cancel", &binding, &members)
             .is_err()
     );
     store
         .reserve_subject_release(workspace, &lease, "binding", "release")
         .unwrap();
     let prepared = store
-        .prepare_release_journal_recording(workspace, &lease, "release", &binding, &members)
+        .prepare_subject_release_input_handoff(workspace, &lease, "release", &binding, &members)
         .unwrap();
     assert_eq!(
         store
-            .prepare_release_journal_recording(workspace, &lease, "release", &binding, &members)
+            .prepare_subject_release_input_handoff(workspace, &lease, "release", &binding, &members)
             .unwrap(),
         prepared
     );
@@ -99,14 +99,16 @@ fn release_recording_preparation_cancel_reopen_and_completion_are_independent() 
     different.database.physical = "other".into();
     assert!(
         store
-            .prepare_release_journal_recording(workspace, &lease, "release", &different, &members)
+            .prepare_subject_release_input_handoff(
+                workspace, &lease, "release", &different, &members
+            )
             .is_err()
     );
     drop(store);
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     assert_eq!(
         store
-            .get_release_journal_recording(workspace, &lease.worker)
+            .get_subject_release_input_handoff(workspace, &lease.worker)
             .unwrap(),
         Some(prepared.clone())
     );
@@ -118,53 +120,56 @@ fn release_recording_preparation_cancel_reopen_and_completion_are_independent() 
         .unwrap();
     assert!(
         store
-            .update_release_journal_recording(&prepared, true, None)
+            .update_subject_release_input_handoff(&prepared, InputHandoffStatus::Admitted, None)
             .is_err(),
-        "stale pre-release observation cannot complete recording"
+        "stale pre-release observation cannot admit input"
     );
     let released = store
-        .get_release_journal_recording(workspace, &lease.worker)
+        .get_subject_release_input_handoff(workspace, &lease.worker)
         .unwrap()
         .unwrap();
-    assert!(released.released && !released.recording.completed);
+    assert!(released.released && released.handoff.handoff_status == InputHandoffStatus::Pending);
     assert_eq!(
         store
-            .list_pending_release_journal_recordings(workspace, None, 100)
+            .list_pending_subject_release_input_handoffs(workspace, None, 100)
             .unwrap(),
         vec![released.clone()]
     );
     store
-        .update_release_journal_recording(&released, false, Some(JournalRemovalCause::JobFailed))
+        .update_subject_release_input_handoff(
+            &released,
+            InputHandoffStatus::Pending,
+            Some(WorkerInputHandoffCause::JobFailed),
+        )
         .unwrap();
     assert!(
         store
-            .update_release_journal_recording(&released, true, None)
+            .update_subject_release_input_handoff(&released, InputHandoffStatus::Admitted, None)
             .is_err()
     );
     let failed = store
-        .get_release_journal_recording(workspace, &lease.worker)
+        .get_subject_release_input_handoff(workspace, &lease.worker)
         .unwrap()
         .unwrap();
     store
-        .update_release_journal_recording(&failed, true, None)
+        .update_subject_release_input_handoff(&failed, InputHandoffStatus::Admitted, None)
         .unwrap();
     assert!(
         store
-            .list_pending_release_journal_recordings(workspace, None, 100)
+            .list_pending_subject_release_input_handoffs(workspace, None, 100)
             .unwrap()
             .is_empty()
     );
-    let completed = store
-        .get_release_journal_recording(workspace, &lease.worker)
+    let admitted = store
+        .get_subject_release_input_handoff(workspace, &lease.worker)
         .unwrap()
         .unwrap();
     assert!(
         store
-            .update_release_journal_recording(&completed, false, None)
+            .update_subject_release_input_handoff(&admitted, InputHandoffStatus::Pending, None)
             .is_err()
     );
     store.with_conn(|conn| {
-        assert!(conn.execute("UPDATE subject_worker_releases SET recording_json=json_remove(recording_json,'$.completed') WHERE operation_id='release'", []).is_err());
         assert!(conn.execute("UPDATE subject_worker_releases SET binding_id='different' WHERE operation_id='release'", []).is_err());
         assert!(conn.execute("UPDATE subject_worker_releases SET recording_json=json_set(recording_json,'$.members',json('[]')) WHERE operation_id='release'", []).is_err());
         Ok(())
@@ -223,13 +228,13 @@ fn release_recording_migration_preserves_old_receipt_and_rolls_back_failed_publi
     let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     assert!(
         reopened
-            .get_release_journal_recording("release-workspace", &lease().worker)
+            .get_subject_release_input_handoff("release-workspace", &lease().worker)
             .unwrap()
             .is_none()
     );
     assert!(
         reopened
-            .prepare_release_journal_recording(
+            .prepare_subject_release_input_handoff(
                 "release-workspace",
                 &lease(),
                 "old-complete",

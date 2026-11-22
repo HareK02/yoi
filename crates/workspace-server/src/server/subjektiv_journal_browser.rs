@@ -80,32 +80,32 @@ pub(super) struct BrowserSession {
     pub journal: JournalMetadata,
     pub unreflected_sources: bool,
     pub original_source: SourceStatus,
-    pub retained_recording: Option<RetainedRecordingObservation>,
+    pub input_handoff: Option<InputHandoffObservation>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum RecordingProducerState {
+pub(super) enum InputHandoffProducerState {
     Released,
     Removing,
     Removed,
 }
 
-/// The whole fixed source scope, not just the prefix already admitted to a Job.
-/// Producer release/removal and recording completion are independent observations.
+/// Admission of the frozen input scope to finite Jobs, not Journal reflection.
+/// Producer release/removal does not establish input admission.
 #[derive(Debug, Serialize, Deserialize)]
-pub(super) struct RetainedRecordingObservation {
-    pub producer: RecordingProducerState,
-    pub completed: bool,
-    pub cause: Option<crate::store::JournalRemovalCause>,
+pub(super) struct InputHandoffObservation {
+    pub producer: InputHandoffProducerState,
+    pub status: crate::store::InputHandoffStatus,
+    pub cause: Option<crate::store::WorkerInputHandoffCause>,
 }
 
-fn retained_recording(
+fn input_handoff(
     api: &WorkspaceApi,
     store: &crate::subjektiv::SubjektivStore,
     subject: &str,
     session: &str,
-) -> Result<Option<RetainedRecordingObservation>> {
+) -> Result<Option<InputHandoffObservation>> {
     let Some(attr) = store
         .session_attribution(session)
         .map_err(subjektiv_store_error)?
@@ -128,8 +128,8 @@ fn retained_recording(
         .config_store
         .recover_worker_removal_plan(api.workspace_id(), &worker)
         .map_err(|error| Error::Store(error.to_string()))?
-        && let Some(progress) = api.store.get_journal_removal_for_plan(&prepared)?
-        && let Some(recording) = progress.metadata.retained_recording
+        && let Some(progress) = api.store.get_worker_input_handoff_for_plan(&prepared)?
+        && let Some(handoff) = progress.metadata.released_input_handoff
         && progress.metadata.binding.subject_id == subject
         && progress.metadata.binding.database == identity
         && progress
@@ -138,32 +138,33 @@ fn retained_recording(
             .as_ref()
             .is_some_and(|members| members.iter().any(|member| member.session_id == session))
     {
-        return Ok(Some(RetainedRecordingObservation {
-            producer: if progress.metadata.phase == crate::store::JournalRemovalPhase::Completed {
-                RecordingProducerState::Removed
+        return Ok(Some(InputHandoffObservation {
+            producer: if progress.metadata.phase == crate::store::WorkerInputHandoffPhase::Completed
+            {
+                InputHandoffProducerState::Removed
             } else {
-                RecordingProducerState::Removing
+                InputHandoffProducerState::Removing
             },
-            completed: recording.completed,
-            cause: recording.cause,
+            status: handoff.handoff_status,
+            cause: handoff.cause,
         }));
     }
     if let Some(progress) = api
         .config_store
-        .get_release_journal_recording(api.workspace_id(), &worker)?
+        .get_subject_release_input_handoff(api.workspace_id(), &worker)?
         && progress.released
-        && progress.recording.binding.subject_id == subject
-        && progress.recording.binding.database == identity
+        && progress.handoff.binding.subject_id == subject
+        && progress.handoff.binding.database == identity
         && progress
-            .recording
+            .handoff
             .members
             .iter()
             .any(|member| member.session_id == session)
     {
-        return Ok(Some(RetainedRecordingObservation {
-            producer: RecordingProducerState::Released,
-            completed: progress.recording.completed,
-            cause: progress.recording.cause,
+        return Ok(Some(InputHandoffObservation {
+            producer: InputHandoffProducerState::Released,
+            status: progress.handoff.handoff_status,
+            cause: progress.handoff.cause,
         }));
     }
     Ok(None)
@@ -337,18 +338,15 @@ fn execute(
                     store.journal_has_unreflected_sources(host, &journal.id)?;
                 let original_source =
                     source_status(api, store, subject_id, Some(&journal.source_session_id));
-                let retained_recording =
-                    retained_recording(api, store, subject_id, &journal.source_session_id)
-                        .map_err(|_| {
-                            JournalError::Conflict(
-                                "Retained recording observation unavailable".into(),
-                            )
-                        })?;
+                let input_handoff =
+                    input_handoff(api, store, subject_id, &journal.source_session_id).map_err(
+                        |_| JournalError::Conflict("Input handoff observation unavailable".into()),
+                    )?;
                 items.push(BrowserSession {
                     journal,
                     unreflected_sources,
                     original_source,
-                    retained_recording,
+                    input_handoff,
                 });
             }
             BrowserResponse::Sessions(JournalPage {

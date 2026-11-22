@@ -84,9 +84,10 @@ use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
 use crate::backend_job::{
     BackendJobAttemptRecord, BackendJobAttemptState, BackendJobRecord, BackendJobRequest,
-    BackendJobReservation, BackendJobResultAcceptance, BackendJobResultSubmission, BackendJobState,
-    BackendJobWorkerBinding, BackendJobWorkerCleanupState, attempt_id, bounded_failure_detail,
-    result_digest,
+    BackendJobReservation, BackendJobResultAcceptance, BackendJobResultApplicationReceipt,
+    BackendJobResultSubmission, BackendJobState, BackendJobWorkerBinding,
+    BackendJobWorkerCleanupState, JobResultApplicationDisposition, attempt_id,
+    bounded_failure_detail, result_digest,
 };
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
@@ -133,6 +134,12 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
+#[path = "backend_job_recording_input.rs"]
+mod backend_job_recording_input;
+pub use backend_job_recording_input::{
+    BackendJobRecordingInput, BackendJobRecordingOutcome, BackendJobRecordingScope,
+    MAX_RECORDING_CHUNKS, MAX_RECORDING_INPUT_BYTES,
+};
 #[path = "backend_job_current.rs"]
 mod backend_job_current;
 #[path = "backend_job_finalizing.rs"]
@@ -141,32 +148,35 @@ mod backend_job_finalizing;
 mod backend_job_recovery_store;
 #[path = "backend_job_reference_migration.rs"]
 mod backend_job_reference_migration;
+#[path = "backend_job_result_application.rs"]
+mod backend_job_result_application;
 #[path = "backend_job_upgrade.rs"]
 pub(crate) mod backend_job_upgrade;
 #[path = "storage_formats.rs"]
 mod storage_formats;
 pub use backend_job_recovery_store::BackendJobReconciliation;
 
-#[path = "journal_removal_store.rs"]
-mod journal_removal_store;
-pub use journal_removal_store::{
-    FrozenJournalRemovalMember, JournalRemovalBinding, JournalRemovalCause, JournalRemovalMetadata,
-    JournalRemovalPhase, JournalRemovalProgress, PendingWorkerRemovalIntent,
+#[path = "worker_input_handoff_store.rs"]
+mod worker_input_handoff_store;
+pub use worker_input_handoff_store::{
+    InputHandoffStatus, PendingWorkerRemovalIntent, WorkerInputHandoffBinding,
+    WorkerInputHandoffCause, WorkerInputHandoffMember, WorkerInputHandoffMetadata,
+    WorkerInputHandoffPhase, WorkerInputHandoffProgress,
 };
-pub(crate) use journal_removal_store::{
+pub(crate) use worker_input_handoff_store::{
     complete as complete_journal_removal,
     record_physical_failure as record_journal_removal_physical_failure,
 };
 
-#[path = "subject_release_recording_store.rs"]
-mod subject_release_recording_store;
-pub(crate) use subject_release_recording_store::{
-    ReleaseJournalRecording, ReleaseJournalRecordingProgress,
+#[path = "subject_release_input_handoff_store.rs"]
+mod subject_release_input_handoff_store;
+pub(crate) use subject_release_input_handoff_store::{
+    SubjectReleaseInputHandoff, SubjectReleaseInputHandoffProgress,
 };
 
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
-const LATEST_SCHEMA_VERSION: i64 = 139;
+const LATEST_SCHEMA_VERSION: i64 = 141;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -582,8 +592,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 127,
-        name: journal_removal_store::MIGRATION_NAME,
-        apply: journal_removal_store::migrate_to_v127,
+        name: worker_input_handoff_store::MIGRATION_NAME,
+        apply: worker_input_handoff_store::migrate_to_v127,
     },
     Migration {
         version: 128,
@@ -617,8 +627,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 135,
-        name: subject_release_recording_store::MIGRATION_NAME,
-        apply: subject_release_recording_store::migrate,
+        name: subject_release_input_handoff_store::MIGRATION_NAME,
+        apply: subject_release_input_handoff_store::migrate,
     },
     Migration {
         version: 136,
@@ -637,8 +647,18 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 139,
+        name: backend_job_result_application::MIGRATION_NAME,
+        apply: backend_job_result_application::migrate,
+    },
+    Migration {
+        version: 140,
+        name: backend_job_recording_input::MIGRATION_NAME,
+        apply: backend_job_recording_input::migrate,
+    },
+    Migration {
+        version: 141,
         name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME,
-        apply: migrate_external_workdir_sessions_v138_to_v139,
+        apply: migrate_external_workdir_sessions_v140_to_v141,
     },
 ];
 
@@ -1803,85 +1823,85 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         let _ = (workspace_id, worker);
         Ok(None)
     }
-    fn retain_journal_recording(
+    fn retain_released_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
+        expected: &WorkerInputHandoffProgress,
         archive_id: &str,
-    ) -> Result<JournalRemovalProgress> {
+    ) -> Result<WorkerInputHandoffProgress> {
         let _ = (prepared, expected, archive_id);
         Err(Error::InvalidInput(
             "Journal recording persistence unavailable".into(),
         ))
     }
-    fn list_retained_journal_recordings(
+    fn list_pending_released_input_handoffs(
         &self,
         workspace_id: &str,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<JournalRemovalProgress>> {
+    ) -> Result<Vec<WorkerInputHandoffProgress>> {
         let _ = (workspace_id, after, limit);
         Err(Error::InvalidInput(
             "Journal recording persistence unavailable".into(),
         ))
     }
-    fn update_retained_journal_recording(
+    fn update_released_input_handoff(
         &self,
-        expected: &JournalRemovalProgress,
-        completed: bool,
-        cause: Option<JournalRemovalCause>,
-    ) -> Result<JournalRemovalProgress> {
-        let _ = (expected, completed, cause);
+        expected: &WorkerInputHandoffProgress,
+        status: InputHandoffStatus,
+        cause: Option<WorkerInputHandoffCause>,
+    ) -> Result<WorkerInputHandoffProgress> {
+        let _ = (expected, status, cause);
         Err(Error::InvalidInput(
             "Journal recording persistence unavailable".into(),
         ))
     }
-    fn get_journal_removal(
+    fn get_worker_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-    ) -> Result<Option<JournalRemovalProgress>> {
+    ) -> Result<Option<WorkerInputHandoffProgress>> {
         let _ = prepared;
         Err(Error::InvalidInput(
             "Journal removal persistence unavailable".into(),
         ))
     }
-    fn get_journal_removal_for_plan(
+    fn get_worker_input_handoff_for_plan(
         &self,
         plan: &crate::retention::WorkerRemovalPlan,
-    ) -> Result<Option<JournalRemovalProgress>> {
+    ) -> Result<Option<WorkerInputHandoffProgress>> {
         let _ = plan;
         Err(Error::InvalidInput(
             "Journal removal persistence unavailable".into(),
         ))
     }
-    fn init_journal_removal(
+    fn init_worker_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        binding: &JournalRemovalBinding,
-    ) -> Result<JournalRemovalProgress> {
+        binding: &WorkerInputHandoffBinding,
+    ) -> Result<WorkerInputHandoffProgress> {
         let _ = (prepared, binding);
         Err(Error::InvalidInput(
             "Journal removal persistence unavailable".into(),
         ))
     }
-    fn freeze_journal_removal(
+    fn freeze_worker_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
-        members: &[FrozenJournalRemovalMember],
-    ) -> Result<JournalRemovalProgress> {
+        expected: &WorkerInputHandoffProgress,
+        members: &[WorkerInputHandoffMember],
+    ) -> Result<WorkerInputHandoffProgress> {
         let _ = (prepared, expected, members);
         Err(Error::InvalidInput(
             "Journal removal persistence unavailable".into(),
         ))
     }
-    fn update_journal_removal_progress(
+    fn update_worker_input_handoff_progress(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
-        phase: JournalRemovalPhase,
-        cause: Option<JournalRemovalCause>,
-    ) -> Result<JournalRemovalProgress> {
+        expected: &WorkerInputHandoffProgress,
+        phase: WorkerInputHandoffPhase,
+        cause: Option<WorkerInputHandoffCause>,
+    ) -> Result<WorkerInputHandoffProgress> {
         let _ = (prepared, expected, phase, cause);
         Err(Error::InvalidInput(
             "Journal removal persistence unavailable".into(),
@@ -1898,12 +1918,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
             "Worker removal continuation persistence unavailable".into(),
         ))
     }
-    fn list_pending_journal_removals(
+    fn list_pending_worker_input_handoffs(
         &self,
         workspace_id: &str,
         after_operation_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<JournalRemovalProgress>> {
+    ) -> Result<Vec<WorkerInputHandoffProgress>> {
         let _ = (workspace_id, after_operation_id, limit);
         Err(Error::InvalidInput(
             "Journal removal persistence unavailable".into(),
@@ -2209,8 +2229,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         request: &BackendJobRequest,
         now: &str,
     ) -> Result<BackendJobReservation>;
-    /// Host-only retirement; fence domain mutations and delivered snapshots first for erasure.
-    /// Completed reclamation additionally requires canonical Worker cleanup for all attempts.
+
     fn finalize_backend_job(
         &self,
         workspace_id: &str,
@@ -2253,6 +2272,20 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         job_id: &str,
         attempt_id: &str,
     ) -> Result<Option<BackendJobAttemptRecord>>;
+    /// Host-only domain settlement. The consumer must supply authoritative
+    /// deletion proof before choosing NotRequired; missing Runtime/registry state
+    /// is not deletion proof. This API neither performs domain application nor
+    /// changes execution, result, failure, cleanup or input-retirement state.
+    /// Only immutable attempt/input/Worker/run binding is compared, allowing an
+    /// identical replay after cleanup or retirement has progressed.
+    fn record_backend_job_result_application(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        expected_intent_fingerprint: &str,
+        disposition: JobResultApplicationDisposition,
+        now: &str,
+    ) -> Result<BackendJobResultApplicationReceipt>;
     /// Full ordered execution history for exact-owner release CAS.
     fn list_backend_job_attempts(
         &self,
@@ -7135,65 +7168,65 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         SqliteWorkspaceStore::recover_worker_removal_execution(self, workspace_id, worker)
     }
 
-    fn retain_journal_recording(
+    fn retain_released_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
+        expected: &WorkerInputHandoffProgress,
         archive_id: &str,
-    ) -> Result<JournalRemovalProgress> {
-        SqliteWorkspaceStore::retain_journal_recording(self, prepared, expected, archive_id)
+    ) -> Result<WorkerInputHandoffProgress> {
+        SqliteWorkspaceStore::retain_released_input_handoff(self, prepared, expected, archive_id)
     }
-    fn list_retained_journal_recordings(
+    fn list_pending_released_input_handoffs(
         &self,
         workspace_id: &str,
         after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<JournalRemovalProgress>> {
-        SqliteWorkspaceStore::list_retained_journal_recordings(self, workspace_id, after, limit)
+    ) -> Result<Vec<WorkerInputHandoffProgress>> {
+        SqliteWorkspaceStore::list_pending_released_input_handoffs(self, workspace_id, after, limit)
     }
-    fn update_retained_journal_recording(
+    fn update_released_input_handoff(
         &self,
-        expected: &JournalRemovalProgress,
-        completed: bool,
-        cause: Option<JournalRemovalCause>,
-    ) -> Result<JournalRemovalProgress> {
-        SqliteWorkspaceStore::update_retained_journal_recording(self, expected, completed, cause)
+        expected: &WorkerInputHandoffProgress,
+        status: InputHandoffStatus,
+        cause: Option<WorkerInputHandoffCause>,
+    ) -> Result<WorkerInputHandoffProgress> {
+        SqliteWorkspaceStore::update_released_input_handoff(self, expected, status, cause)
     }
-    fn get_journal_removal(
+    fn get_worker_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-    ) -> Result<Option<JournalRemovalProgress>> {
-        SqliteWorkspaceStore::get_journal_removal(self, prepared)
+    ) -> Result<Option<WorkerInputHandoffProgress>> {
+        SqliteWorkspaceStore::get_worker_input_handoff(self, prepared)
     }
-    fn get_journal_removal_for_plan(
+    fn get_worker_input_handoff_for_plan(
         &self,
         plan: &crate::retention::WorkerRemovalPlan,
-    ) -> Result<Option<JournalRemovalProgress>> {
-        SqliteWorkspaceStore::get_journal_removal_for_plan(self, plan)
+    ) -> Result<Option<WorkerInputHandoffProgress>> {
+        SqliteWorkspaceStore::get_worker_input_handoff_for_plan(self, plan)
     }
-    fn init_journal_removal(
+    fn init_worker_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        binding: &JournalRemovalBinding,
-    ) -> Result<JournalRemovalProgress> {
-        SqliteWorkspaceStore::init_journal_removal(self, prepared, binding)
+        binding: &WorkerInputHandoffBinding,
+    ) -> Result<WorkerInputHandoffProgress> {
+        SqliteWorkspaceStore::init_worker_input_handoff(self, prepared, binding)
     }
-    fn freeze_journal_removal(
+    fn freeze_worker_input_handoff(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
-        members: &[FrozenJournalRemovalMember],
-    ) -> Result<JournalRemovalProgress> {
-        SqliteWorkspaceStore::freeze_journal_removal(self, prepared, expected, members)
+        expected: &WorkerInputHandoffProgress,
+        members: &[WorkerInputHandoffMember],
+    ) -> Result<WorkerInputHandoffProgress> {
+        SqliteWorkspaceStore::freeze_worker_input_handoff(self, prepared, expected, members)
     }
-    fn update_journal_removal_progress(
+    fn update_worker_input_handoff_progress(
         &self,
         prepared: &crate::retention::PreparedWorkerRemoval,
-        expected: &JournalRemovalProgress,
-        phase: JournalRemovalPhase,
-        cause: Option<JournalRemovalCause>,
-    ) -> Result<JournalRemovalProgress> {
-        SqliteWorkspaceStore::update_journal_removal_progress(
+        expected: &WorkerInputHandoffProgress,
+        phase: WorkerInputHandoffPhase,
+        cause: Option<WorkerInputHandoffCause>,
+    ) -> Result<WorkerInputHandoffProgress> {
+        SqliteWorkspaceStore::update_worker_input_handoff_progress(
             self, prepared, expected, phase, cause,
         )
     }
@@ -7210,13 +7243,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             limit,
         )
     }
-    fn list_pending_journal_removals(
+    fn list_pending_worker_input_handoffs(
         &self,
         workspace_id: &str,
         after_operation_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<JournalRemovalProgress>> {
-        SqliteWorkspaceStore::list_pending_journal_removals(
+    ) -> Result<Vec<WorkerInputHandoffProgress>> {
+        SqliteWorkspaceStore::list_pending_worker_input_handoffs(
             self,
             workspace_id,
             after_operation_id,
@@ -8731,84 +8764,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         request: &BackendJobRequest,
         now: &str,
     ) -> Result<BackendJobReservation> {
-        request.validate()?;
-        let fingerprint = request.fingerprint()?;
-        let request_json = serde_json::to_string(request).map_err(|error| {
-            Error::InvalidInput(format!("serialize Backend Job request: {error}"))
-        })?;
-        let deadline = backend_job_deadline(now, request.limits.timeout_seconds)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            subject_deletion_store::require_job_admission(&tx, workspace_id, request)?;
-            if let Some(job) = read_backend_job(&tx, workspace_id, &request.job_id)? {
-                if job.intent_fingerprint != fingerprint {
-                    return Err(Error::InvalidInput(format!(
-                        "Backend Job id `{}` was reused with different intent",
-                        request.job_id
-                    )));
-                }
-                let attempt_id = attempt_id(&request.job_id, job.current_attempt);
-                let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
-                    .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
-                tx.commit()?;
-                return Ok(BackendJobReservation { job, attempt, replayed: true, resource_reused: false });
-            }
-            if let Some(key) = request.resource_key()
-                && let Some(job) = read_active_backend_job_for_resource(&tx, workspace_id, &key)?
-            {
-                let id = attempt_id(&job.request.job_id, job.current_attempt);
-                let attempt = read_backend_job_attempt(&tx, workspace_id, &job.request.job_id, &id)?
-                    .ok_or_else(|| Error::Store("active Backend Job current attempt is missing".into()))?;
-                tx.commit()?;
-                return Ok(BackendJobReservation {
-                    job, attempt, replayed: false, resource_reused: true,
-                });
-            }
-            for (role, worker) in [
-                ("source", request.source_worker.as_ref()),
-                ("notification target", request.notification_target.as_ref()),
-            ] {
-                if let Some(worker) = worker
-                    && !worker_registry_identity_exists(&tx, workspace_id, worker)?
-                {
-                    let retained_source = if role == "source" {
-                        if let Some(grant) = &request.grants.subjektiv_journal {
-                            tx.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM worker_removal_operations r, json_each(r.journal_removal_json,'$.members') member
-                                 WHERE r.workspace_id=?1 AND r.runtime_id=?2 AND r.worker_id=?3
-                                   AND json_extract(r.journal_removal_json,'$.binding.subject_id')=?4
-                                   AND json_extract(member.value,'$.session_id')=?5
-                                   AND json_extract(r.journal_removal_json,'$.phase') IN ('released','completed')
-                                   AND json_extract(r.journal_removal_json,'$.retained_recording.completed')=0
-                                   AND length(json_extract(r.journal_removal_json,'$.retained_recording.archive_id'))>0)",
-                                params![workspace_id,worker.runtime_id,worker.worker_id,grant.subject_id,grant.session_id],
-                                |row| row.get::<_,bool>(0),
-                            )?
-                        } else { false }
-                    } else { false };
-                    if !retained_source {
-                        return Err(Error::InvalidInput(format!(
-                            "Backend Job {role} Worker does not belong to this Workspace"
-                        )));
-                    }
-                }
-            }
-            let current_attempt = 1_u8;
-            let attempt_id = attempt_id(&request.job_id, current_attempt);
-            tx.execute(
-                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_digest, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at, resource_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10)",
-                params![workspace_id, request.job_id, request.purpose, request.input_digest()?, request.input_ref, request_json, fingerprint, current_attempt as i64, now, request.resource_key()],
-            )?;
-            tx.execute(
-                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_digest, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
-                params![workspace_id, request.job_id, attempt_id, current_attempt as i64, request.input_digest()?, deadline, now],
-            )?;
-            let job = read_backend_job(&tx, workspace_id, &request.job_id)?
-                .ok_or_else(|| Error::Store("reserved Backend Job is missing".to_string()))?;
-            let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
-                .ok_or_else(|| Error::Store("reserved Backend Job attempt is missing".to_string()))?;
+            let reservation = reserve_backend_job_in_transaction(&tx, workspace_id, request, now)?;
             tx.commit()?;
-            Ok(BackendJobReservation { job, attempt, replayed: false, resource_reused: false })
+            Ok(reservation)
         })
     }
 
@@ -8977,6 +8937,24 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         attempt_id: &str,
     ) -> Result<Option<BackendJobAttemptRecord>> {
         self.with_conn(|conn| read_backend_job_attempt(conn, workspace_id, job_id, attempt_id))
+    }
+
+    fn record_backend_job_result_application(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        expected_intent_fingerprint: &str,
+        disposition: JobResultApplicationDisposition,
+        now: &str,
+    ) -> Result<BackendJobResultApplicationReceipt> {
+        backend_job_result_application::record(
+            self,
+            workspace_id,
+            expected,
+            expected_intent_fingerprint,
+            disposition,
+            now,
+        )
     }
 
     fn list_backend_job_attempts(
@@ -9149,7 +9127,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             // without reserving the writer or changing the last dispatch fact.
             let tx = conn.unchecked_transaction()?;
             let mut statement = tx.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('reserved', 'dispatching', 'dispatched') AND a.attempt=j.current_attempt AND j.state='pending' AND j.input_disposition='available' ORDER BY a.job_id, a.attempt_id LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.attempt=j.current_attempt AND j.input_disposition='available' AND ((a.state IN ('reserved', 'dispatching', 'dispatched') AND j.state='pending') OR (a.state='failed' AND j.state='failed' AND j.failure_category IN ('journal_attempt_fenced','journal_execution_terminated') AND j.current_attempt < json_extract(j.request_json,'$.limits.max_attempts'))) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
             // Identities remain stable when earlier owners update state or
             // timestamps. Reading a page never grants allocation/Submit authority.
@@ -14143,7 +14121,7 @@ fn read_backend_job_attempt(
     attempt_id: &str,
 ) -> Result<Option<BackendJobAttemptRecord>> {
     let row = conn.query_row(
-        "SELECT attempt, input_digest, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at, allocation_precluded_at, failure_cause, worker_cleanup_failure_cause FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
+        "SELECT attempt, input_digest, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at, allocation_precluded_at, failure_cause, worker_cleanup_failure_cause, result_application_disposition, result_application_recorded_at FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
         params![workspace_id, job_id, attempt_id],
         |row| Ok((
             row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
@@ -14154,6 +14132,7 @@ fn read_backend_job_attempt(
             row.get::<_, Option<String>>(15)?, row.get::<_, Option<String>>(16)?, row.get::<_, String>(17)?,
             row.get::<_, String>(18)?, row.get::<_, Option<String>>(19)?, row.get::<_, Option<String>>(20)?,
             row.get::<_, Option<String>>(21)?, row.get::<_, Option<String>>(22)?,
+            row.get::<_, Option<String>>(23)?, row.get::<_, Option<String>>(24)?,
         )),
     ).optional()?;
     let Some((
@@ -14180,6 +14159,8 @@ fn read_backend_job_attempt(
         allocation_precluded_at,
         failure_cause,
         worker_cleanup_failure_cause,
+        result_application_disposition,
+        result_application_recorded_at,
     )) = row
     else {
         return Ok(None);
@@ -14222,6 +14203,11 @@ fn read_backend_job_attempt(
         failure_cause: failure_cause.map(crate::backend_job::StoredFailure::from_storage),
         worker_cleanup_failure_cause: worker_cleanup_failure_cause
             .map(crate::backend_job::StoredFailure::from_storage),
+        result_application_disposition: result_application_disposition
+            .as_deref()
+            .map(JobResultApplicationDisposition::parse)
+            .transpose()?,
+        result_application_recorded_at,
         worker_cleanup_state: worker_cleanup_state
             .as_deref()
             .map(BackendJobWorkerCleanupState::parse)
@@ -14313,6 +14299,7 @@ fn read_worker_registry_projection(
                 })?
             } else {
                 SubscriptionWorker {
+                    lifecycle: None,
                     restore_observation_token: None,
                     worker_id: SubscriptionWorkerId::new(worker.worker_id.to_string())
                         .map_err(|error| Error::InvalidInput(error.to_string()))?,
@@ -17292,8 +17279,8 @@ fn migrate_worker_create_failure_to_v124(conn: &Connection) -> Result<()> {
 const RETAINED_FAILURE_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 127,
-        name: journal_removal_store::RETAINED_BRIDGE_NAME,
-        apply: journal_removal_store::migrate_retained_to_v127,
+        name: worker_input_handoff_store::RETAINED_BRIDGE_NAME,
+        apply: worker_input_handoff_store::migrate_retained_to_v127,
     },
     Migration {
         version: 125,
@@ -17590,7 +17577,7 @@ fn install_external_workdir_session_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_external_workdir_sessions_v138_to_v139(conn: &Connection) -> Result<()> {
+fn migrate_external_workdir_sessions_v140_to_v141(conn: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     install_external_workdir_session_columns(&tx)?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
@@ -17620,7 +17607,7 @@ fn migrate_external_workdir_sessions_v138_to_v139(conn: &Connection) -> Result<(
         [&now],
     )?;
     tx.execute(
-        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(139,?1)",
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(141,?1)",
         [EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME],
     )?;
     tx.commit()?;
@@ -17654,12 +17641,14 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     verify_worker_create_failure_schema(conn)?;
     conn.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
     conn.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
-    conn.execute_batch(journal_removal_store::SCHEMA_SQL)?;
-    conn.execute_batch(subject_release_recording_store::SCHEMA_SQL)?;
+    conn.execute_batch(worker_input_handoff_store::SCHEMA_SQL)?;
+    conn.execute_batch(subject_release_input_handoff_store::SCHEMA_SQL)?;
     conn.execute_batch(crate::config_publication::SCHEMA)?;
     conn.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
     worker_lifecycle_notifications::install(conn)?;
     notification_routing::merge_requests::install(conn)?;
+    conn.execute_batch(backend_job_result_application::SCHEMA)?;
+    conn.execute_batch(backend_job_recording_input::SCHEMA_SQL)?;
     install_external_workdir_session_columns(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!("fresh Ticket schema verification failed: {error}"))
@@ -18855,6 +18844,7 @@ mod tests {
     include!("subject_assignment_migration_tests.rs");
     include!("notification_routing_tests.rs");
     include!("notification_diagnostics_tests.rs");
+    include!("backend_job_result_application_tests.rs");
     include!("job_notification_tests.rs");
     include!("worker_lifecycle_notification_tests.rs");
     include!("implementation_result_tests.rs");
@@ -20151,7 +20141,7 @@ mod tests {
         fn legacy_database() -> (tempfile::TempDir, std::path::PathBuf) {
             let temp = tempfile::tempdir_in(".").unwrap();
             let path = temp.path().join("legacy-external.db");
-            prepare_retained_schema(&path, 138);
+            prepare_retained_schema(&path, 140);
             let conn = Connection::open(&path).unwrap();
             configure_sqlite(&conn).unwrap();
             conn.execute_batch(
@@ -20211,7 +20201,7 @@ mod tests {
             assert_eq!(
                 plan.migrations,
                 vec![WorkspaceSchemaMigrationStep {
-                    version: 139,
+                    version: 141,
                     name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
                 }]
             );
@@ -20331,7 +20321,7 @@ mod tests {
             )
             .unwrap();
             assert!(apply_migrations(&conn).is_err());
-            assert_eq!(current_schema_version(&conn).unwrap(), 138);
+            assert_eq!(current_schema_version(&conn).unwrap(), 140);
             assert!(
                 !column_exists(
                     &conn,
@@ -20352,7 +20342,7 @@ mod tests {
             conn.execute_batch("DROP TRIGGER reject_session_cleanup_fence;")
                 .unwrap();
             apply_migrations(&conn).unwrap();
-            assert_eq!(current_schema_version(&conn).unwrap(), 139);
+            assert_eq!(current_schema_version(&conn).unwrap(), 141);
             assert!(
                 crate::grant_cleanup_operation::read_intent(&conn, "legacy-ws", "legacy-online")
                     .unwrap()
@@ -22899,7 +22889,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             },
             WorkspaceSchemaMigrationStep {
                 version: 127,
-                name: journal_removal_store::MIGRATION_NAME.into(),
+                name: worker_input_handoff_store::MIGRATION_NAME.into(),
             },
             WorkspaceSchemaMigrationStep {
                 version: 128,
@@ -22927,7 +22917,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             },
             WorkspaceSchemaMigrationStep {
                 version: 135,
-                name: subject_release_recording_store::MIGRATION_NAME.into(),
+                name: subject_release_input_handoff_store::MIGRATION_NAME.into(),
             },
             WorkspaceSchemaMigrationStep {
                 version: 136,
@@ -22943,6 +22933,14 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             },
             WorkspaceSchemaMigrationStep {
                 version: 139,
+                name: backend_job_result_application::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 140,
+                name: backend_job_recording_input::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 141,
                 name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
             },
         ]
@@ -23084,18 +23082,20 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.to_string()),
 (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.to_string()),
 (126, SERVICE_OUTCOME_MIGRATION_NAME.to_string()),
-(127, journal_removal_store::MIGRATION_NAME.to_string()),
+(127, worker_input_handoff_store::MIGRATION_NAME.to_string()),
 (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.to_string()),
 (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
 (130, backend_job_current::MIGRATION_NAME.into()),
 (131, crate::launch_policy::MIGRATION_NAME.into()),
 (133, crate::subject_policy::MIGRATION_NAME.into()),
 (134, backend_job_finalizing::MIGRATION_NAME.into()),
-(135, subject_release_recording_store::MIGRATION_NAME.into()),
+(135, subject_release_input_handoff_store::MIGRATION_NAME.into()),
                     (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
                     (137, worker_lifecycle_notifications::MIGRATION_NAME.into()),
                     (138, notification_routing::merge_requests::MIGRATION_NAME.into()),
-                    (139, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
+                    (139, backend_job_result_application::MIGRATION_NAME.into()),
+                    (140, backend_job_recording_input::MIGRATION_NAME.into()),
+                    (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -26425,7 +26425,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
                          (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
                          (126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
-                         (127, journal_removal_store::MIGRATION_NAME.into()),
+                         (127, worker_input_handoff_store::MIGRATION_NAME.into()),
                          (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into()),
                          (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
 (130, backend_job_current::MIGRATION_NAME.into())].into_iter().chain(MIGRATIONS.iter().filter(|step| step.version > 130).map(|step| (step.version, step.name.into()))).collect::<Vec<_>>());
@@ -29529,6 +29529,7 @@ INSERT INTO worker_registry (
 
         for record in [&runtime_a, &runtime_b] {
             let observed = SubscriptionWorker {
+                lifecycle: Some(protocol::WorkerLifecycleState::Active),
                 restore_observation_token: None,
                 worker_id: SubscriptionWorkerId::new("shared-local-id").unwrap(),
                 runtime_id: Some(record.worker.runtime_id.clone()),
@@ -29667,6 +29668,7 @@ INSERT INTO worker_registry (
             Some("W-1")
         );
         let observed = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("known").unwrap(),
             runtime_id: Some("embedded".to_string()),
@@ -29688,6 +29690,7 @@ INSERT INTO worker_registry (
         };
         store.upsert_worker_registry(&other_catalog).unwrap();
         let other_observed = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("other").unwrap(),
             runtime_id: Some("runtime-other".to_string()),
@@ -29698,6 +29701,7 @@ INSERT INTO worker_registry (
             .apply_worker_registry_observation("local-dev", "runtime-other", &other_observed, "2")
             .unwrap();
         let orphan = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("orphan").unwrap(),
             ..observed.clone()
@@ -29865,6 +29869,7 @@ INSERT INTO worker_registry (
                 .is_none()
         );
         let event = SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("removed").unwrap(),
             runtime_id: Some("embedded".to_string()),
@@ -32636,3 +32641,100 @@ mod plugin_catalog_migration_tests;
 #[cfg(test)]
 #[path = "plugin_plan/migration_tests.rs"]
 mod plugin_plan_migration_tests;
+
+pub(crate) fn reserve_backend_job_in_transaction(
+    tx: &Connection,
+    workspace_id: &str,
+    request: &BackendJobRequest,
+    now: &str,
+) -> Result<BackendJobReservation> {
+    request.validate()?;
+    let fingerprint = request.fingerprint()?;
+    let request_json = serde_json::to_string(request)
+        .map_err(|error| Error::InvalidInput(format!("serialize Backend Job request: {error}")))?;
+    let deadline = backend_job_deadline(now, request.limits.timeout_seconds)?;
+    subject_deletion_store::require_job_admission(&tx, workspace_id, request)?;
+    if let Some(job) = read_backend_job(&tx, workspace_id, &request.job_id)? {
+        if job.intent_fingerprint != fingerprint {
+            return Err(Error::InvalidInput(format!(
+                "Backend Job id `{}` was reused with different intent",
+                request.job_id
+            )));
+        }
+        let attempt_id = attempt_id(&request.job_id, job.current_attempt);
+        let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
+            .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
+        return Ok(BackendJobReservation {
+            job,
+            attempt,
+            replayed: true,
+            resource_reused: false,
+        });
+    }
+    if let Some(key) = request.resource_key()
+        && let Some(job) = read_active_backend_job_for_resource(&tx, workspace_id, &key)?
+    {
+        let id = attempt_id(&job.request.job_id, job.current_attempt);
+        let attempt = read_backend_job_attempt(&tx, workspace_id, &job.request.job_id, &id)?
+            .ok_or_else(|| Error::Store("active Backend Job current attempt is missing".into()))?;
+        return Ok(BackendJobReservation {
+            job,
+            attempt,
+            replayed: false,
+            resource_reused: true,
+        });
+    }
+    for (role, worker) in [
+        ("source", request.source_worker.as_ref()),
+        ("notification target", request.notification_target.as_ref()),
+    ] {
+        if let Some(worker) = worker
+            && !worker_registry_identity_exists(&tx, workspace_id, worker)?
+        {
+            let retained_source = if role == "source" {
+                if let Some(grant) = &request.grants.subjektiv_journal {
+                    tx.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM backend_job_recording_inputs i JOIN backend_jobs j USING(workspace_id,job_id)
+                                 WHERE i.workspace_id=?1 AND j.state='pending' AND j.input_disposition='available'
+                                   AND json_extract(i.scope_json,'$.worker.runtime_id')=?2
+                                   AND json_extract(i.scope_json,'$.worker.worker_id')=?3
+                                   AND json_extract(i.scope_json,'$.subject_id')=?4
+                                   AND json_extract(i.scope_json,'$.session_id')=?5
+                                   AND json_extract(i.scope_json,'$.binding_id')=?6)",
+                                params![workspace_id,worker.runtime_id,worker.worker_id,grant.subject_id,grant.session_id,grant.binding_id],
+                                |row| row.get::<_,bool>(0),
+                            )?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !retained_source {
+                return Err(Error::InvalidInput(format!(
+                    "Backend Job {role} Worker does not belong to this Workspace"
+                )));
+            }
+        }
+    }
+    let current_attempt = 1_u8;
+    let attempt_id = attempt_id(&request.job_id, current_attempt);
+    tx.execute(
+                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_digest, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at, resource_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10)",
+                params![workspace_id, request.job_id, request.purpose, request.input_digest()?, request.input_ref, request_json, fingerprint, current_attempt as i64, now, request.resource_key()],
+            )?;
+    tx.execute(
+                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_digest, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
+                params![workspace_id, request.job_id, attempt_id, current_attempt as i64, request.input_digest()?, deadline, now],
+            )?;
+    let job = read_backend_job(&tx, workspace_id, &request.job_id)?
+        .ok_or_else(|| Error::Store("reserved Backend Job is missing".to_string()))?;
+    let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
+        .ok_or_else(|| Error::Store("reserved Backend Job attempt is missing".to_string()))?;
+    Ok(BackendJobReservation {
+        job,
+        attempt,
+        replayed: false,
+        resource_reused: false,
+    })
+}

@@ -74,6 +74,11 @@ fn stopped_worker(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId) 
         }}
     });
     if schema == SCHEMA_VERSION {
+        worker_document["execution_state"]["state"] = json!("stopped");
+        worker_document["execution_state"]["execution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("restore_intent");
         worker_document["workdir_attachments_guard"] =
             serde_json::to_value(crate::runtime::WorkdirAttachmentsGuard::default()).unwrap();
     }

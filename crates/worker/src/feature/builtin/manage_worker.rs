@@ -2626,7 +2626,7 @@ mod tests {
             let body = serde_json::json!({
                 "removed": false, "runtime_id": "r", "worker_id": "w",
                 "operation_id": "saved-removal", "state": state,
-                "phase": "recording", "cause": cause,
+                "phase": "input_handoff", "cause": cause,
             })
             .to_string();
             let output = tool_output(

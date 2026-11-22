@@ -11197,9 +11197,15 @@ mod tests {
                 .await
                 .err()
                 .expect("HTTP is unavailable");
-            assert!(error.contains("HTTP transport is unavailable"), "{error}");
+            assert!(
+                error.to_string().contains("HTTP transport is unavailable"),
+                "{error}"
+            );
             let error = factory.preflight_restore(&restore).await.unwrap_err();
-            assert!(error.contains("HTTP transport is unavailable"), "{error}");
+            assert!(
+                error.to_string().contains("HTTP transport is unavailable"),
+                "{error}"
+            );
             let failure = factory.recover_restore_source(&restore).await.unwrap_err();
             assert_eq!(failure.stage, RuntimeRestoreStage::Preflight);
             assert_eq!(failure.resources, RuntimeRestoreResources::None);

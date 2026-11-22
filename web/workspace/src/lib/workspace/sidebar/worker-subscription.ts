@@ -211,6 +211,7 @@ export function workspaceWorkersStore(
               availability: summary.availability,
               state: summary.state as SubscriptionWorker["state"],
               worker_state: summary.worker_state,
+              lifecycle: summary.lifecycle,
               restore_observation_token: summary.restore_observation_token,
             });
           }
@@ -233,6 +234,7 @@ export function workspaceWorkersStore(
               availability: latest.availability,
               state: latest.state,
               worker_state: latest.worker_state,
+              lifecycle: latest.lifecycle,
               restore_observation_token: latest.restore_observation_token,
             };
           });
@@ -400,6 +402,7 @@ function projectWorker(
     },
     availability: worker.availability,
     state: liveWorkerState(worker),
+    lifecycle: worker.lifecycle,
     lifecycleState: worker.state,
     restore_observation_token: worker.restore_observation_token,
     worker_state: worker.worker_state,

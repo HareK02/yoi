@@ -10,6 +10,7 @@ use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, HttpMethod};
+pub use protocol::WorkerLifecycleState;
 use protocol::{CompletionEntry, CompletionKind, Segment, WorkerId, WorkerStateSnapshot};
 use serde::{Deserialize, Serialize};
 use workdir::workspace::{MaterializerKind, RuntimeWorkerRef, RuntimeWorkingDirectorySummary};
@@ -645,6 +646,7 @@ pub struct WorkerSummary {
     pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
+    pub lifecycle: WorkerLifecycleState,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
@@ -821,6 +823,7 @@ pub struct WorkerLifecycleAck {
     #[serde(default)]
     pub replayed: bool,
     pub worker_ref: WorkerRef,
+    pub lifecycle: WorkerLifecycleState,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<WorkerStateSnapshot>,
@@ -2082,10 +2085,14 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_ack_legacy_default_and_replay_marker_round_trip() {
+    fn lifecycle_ack_requires_lifecycle_and_preserves_replay_marker() {
         let mut value = serde_json::json!({
-            "worker_ref": {"worker_id": WorkerId::now_v7()}, "status": "stopped"
+            "worker_ref": {"worker_id": WorkerId::now_v7()}, "status": "stopped",
+            "lifecycle": "stopped"
         });
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("lifecycle");
+        assert!(serde_json::from_value::<WorkerLifecycleAck>(missing).is_err());
         let legacy: WorkerLifecycleAck = serde_json::from_value(value.clone()).unwrap();
         assert!(!legacy.replayed);
         value["replayed"] = serde_json::json!(false);

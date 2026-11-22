@@ -360,7 +360,10 @@ pub struct InternalWorkerSummary {
     /// Freshness of the Runtime observation carried by `worker_state`.
     #[serde(default)]
     pub availability: protocol::subscription::SubscriptionWorkerAvailability,
-    /// Runtime catalog lifecycle compatibility state.
+    /// Runtime-owned lifecycle, absent for registry-only membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<protocol::WorkerLifecycleState>,
+    /// Last observed Runtime catalog status.
     pub state: String,
     /// Runtime-process reconstruction evidence used only for lifecycle coordination.
     #[serde(skip)]
@@ -476,6 +479,7 @@ pub(crate) fn workspace_worker_summary(
             workspace_id: summary.workspace.workspace_id,
         },
         availability: summary.availability,
+        lifecycle: summary.lifecycle,
         state: summary.state,
         worker_state: summary.worker_state,
         last_seen_at: summary.last_seen_at,
@@ -3457,6 +3461,7 @@ impl EmbeddedWorkerRuntime {
         );
         InternalWorkerSummary {
             restore_observation_token: summary.restore_observation_token.clone(),
+            lifecycle: Some(summary.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -3502,6 +3507,7 @@ impl EmbeddedWorkerRuntime {
         );
         InternalWorkerSummary {
             restore_observation_token: detail.restore_observation_token.clone(),
+            lifecycle: Some(detail.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -6274,6 +6280,7 @@ impl RemoteWorkerRuntime {
         );
         InternalWorkerSummary {
             restore_observation_token: summary.restore_observation_token.clone(),
+            lifecycle: Some(summary.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -6317,6 +6324,7 @@ impl RemoteWorkerRuntime {
         );
         InternalWorkerSummary {
             restore_observation_token: detail.restore_observation_token.clone(),
+            lifecycle: Some(detail.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -9196,6 +9204,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
     let host_id = host_id.into();
     InternalWorkerSummary {
         restore_observation_token: None,
+        lifecycle: None,
         worker: RuntimeWorkerRef::new("placeholder", "worker-placeholder"),
         host_id,
         display_name: "Worker runtime actions are not implemented".to_string(),
@@ -9715,7 +9724,7 @@ mod tests {
                 };
                 let mut response = if accepted {
                     mock_response("POST", format!("/v1/workers/{worker_id}/{suffix}"), true, 200,
-                        json!({ "ack": {"worker_ref": {"worker_id":worker_id}, "status":"idle", "command":evidence} }).to_string())
+                        json!({ "ack": {"worker_ref": {"worker_id":worker_id}, "status":"idle", "lifecycle":"active", "command":evidence} }).to_string())
                 } else {
                     let cause = if disposition.is_none() {
                         RuntimeControlCause::ResultUnavailable
@@ -10860,6 +10869,7 @@ mod tests {
                 host_id: host_id.to_string(),
                 workers: vec![InternalWorkerSummary {
                     restore_observation_token: None,
+                    lifecycle: None,
                     worker: RuntimeWorkerRef::new(runtime_id, worker_id),
                     host_id: host_id.to_string(),
                     display_name: label.to_string(),
@@ -12200,6 +12210,7 @@ mod tests {
         let mut execution_unavailable =
             worker_json_with_status("remote:primary", &worker_ids[4], "running");
         execution_unavailable["execution_metadata_available"] = serde_json::json!(false);
+        execution_unavailable["lifecycle"] = serde_json::json!("awaiting_restore");
         let (base_url, server) = serve_mock_http(vec![
             mock_response(
                 "GET",
@@ -12261,6 +12272,15 @@ mod tests {
         assert_eq!(workers.items[2].state, "paused");
         assert_eq!(workers.items[3].state, "idle");
         assert_eq!(workers.items[4].state, "execution_unavailable");
+        assert_eq!(
+            workers.items[4].lifecycle,
+            Some(protocol::WorkerLifecycleState::AwaitingRestore)
+        );
+        let public = workspace_worker_summary(workers.items[4].clone(), "W-5".into(), Vec::new());
+        assert_eq!(
+            serde_json::to_value(public).unwrap()["lifecycle"],
+            "awaiting_restore"
+        );
         assert!(
             workers.items[4]
                 .diagnostics
@@ -12278,6 +12298,10 @@ mod tests {
                 .is_none()
         );
         assert_eq!(stopped_detail.state, "stopped");
+        assert_eq!(
+            stopped_detail.lifecycle,
+            Some(protocol::WorkerLifecycleState::Stopped)
+        );
 
         server.join().expect("mock remote server finished");
     }
@@ -12998,6 +13022,7 @@ mod tests {
             "runtime_id": runtime_id,
             "worker_id": worker_id,
             "status": status,
+            "lifecycle": if status == "stopped" { "stopped" } else { "active" },
             "execution_metadata_available": true,
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },

@@ -628,7 +628,7 @@ impl Runtime {
             if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
                 return Err(ownership_unknown("Worker removal owner mismatch"));
             }
-            if worker.status != WorkerStatus::Stopped || worker.has_pending_lifecycle_operation() {
+            if !worker.is_settled_inactive() || worker.has_pending_lifecycle_operation() {
                 return Err(execution_unconfirmed(
                     "Worker removal requires stopped, reconciled execution",
                 ));
@@ -715,7 +715,7 @@ impl Runtime {
                 state.refresh_uncertain_worker_write(&worker_ref)?;
                 let worker = state.worker(&worker_ref)?;
                 if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str())
-                    || worker.status != WorkerStatus::Stopped
+                    || !worker.is_settled_inactive()
                     || worker.has_pending_lifecycle_operation()
                 {
                     return Err(execution_unconfirmed(
@@ -853,7 +853,7 @@ impl Runtime {
             let state = self.lock()?;
             if let Some(current) = state.workers.get(&worker) {
                 if current.workspace_id.as_deref() != Some(scope.workspace_id.as_str())
-                    || current.status != WorkerStatus::Stopped
+                    || !current.is_settled_inactive()
                     || current.has_pending_lifecycle_operation()
                 {
                     return Err(rejected(

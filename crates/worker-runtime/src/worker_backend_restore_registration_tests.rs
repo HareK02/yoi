@@ -818,10 +818,10 @@ fn published_terminal_receipt_fault(fault: TerminalFault) {
             payload => panic!("unexpected catalog update: {payload:?}"),
         }
     }
-    assert!(
+    assert_eq!(
         serde_json::to_value(last_applied.expect("restore must publish its catalog state"))
-            .unwrap()
-            == serde_json::to_value(&workers[0]).unwrap(),
+            .unwrap(),
+        serde_json::to_value(&workers[0]).unwrap(),
         "original catalog subscriber diverged after {fault:?}"
     );
     drop(fresh_catalog);

@@ -539,6 +539,7 @@ fn project_registry_worker(
         worker
     } else {
         SubscriptionWorker {
+            lifecycle: None,
             restore_observation_token: None,
             worker_id: protocol::subscription::SubscriptionWorkerId::new(
                 record.registry.worker.worker_id.clone(),
@@ -713,6 +714,7 @@ mod tests {
 
     fn external_worker() -> SubscriptionWorker {
         SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: worker_id(),
             runtime_id: Some("runtime-1".to_string()),

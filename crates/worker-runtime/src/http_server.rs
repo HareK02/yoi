@@ -6424,7 +6424,8 @@ mod ws_tests {
                 ..
             }) if delivered_subscription_id == subscription_id
                 && worker.worker_id.as_str() == worker_ref.worker_id.to_string()
-                && worker.state == protocol::subscription::SubscriptionWorkerState::Idle
+                && worker.state == protocol::subscription::SubscriptionWorkerState::Running
+                && worker.lifecycle == Some(protocol::WorkerLifecycleState::Active)
                 && matches!(
                     worker.worker_state,
                     Some(protocol::WorkerStateSnapshot {

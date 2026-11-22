@@ -3,25 +3,26 @@ import type {
   BrowserWorkerWorkingDirectorySelection,
   BrowserWorkspaceOrchestratorResponse,
   CreateWorkspaceWorkerRequest,
-  WorkerCreationAuthorization,
   Diagnostic,
   DiagnosticSeverity,
   RepositoryApiError,
   RuntimeWorkerWorkdirAttachmentSummary,
   RuntimeWorkingDirectoryCleanupTarget,
   RuntimeWorkingDirectorySummary,
+  WorkerCreationAuthorization,
   WorkerImplementationSummary,
   WorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption,
   WorkerLaunchWorkerSummary,
+  WorkerLifecycleState,
   WorkerListResponse,
+  WorkerRemovalCause,
+  WorkerRemovalObservation,
+  WorkerRemovalPhase,
+  WorkerRemovalState,
   WorkerStateSnapshot,
   WorkerSummary,
-  WorkerRemovalObservation,
-  WorkerRemovalState,
-  WorkerRemovalPhase,
-  WorkerRemovalCause,
   WorkerWorkdirAttachmentSummary,
   WorkerWorkspaceSummary,
   WorkingDirectoryRepositoryOption,
@@ -102,11 +103,7 @@ function optional<T>(
   label: string,
   parse: (item: unknown, label: string) => T,
 ): T | null | undefined {
-  return value === undefined
-    ? undefined
-    : value === null
-    ? null
-    : parse(value, label);
+  return value === undefined ? undefined : value === null ? null : parse(value, label);
 }
 
 function diagnostic(value: unknown, label: string): Diagnostic {
@@ -356,13 +353,42 @@ export type ParsedWorkerListResponse = Omit<WorkerListResponse, "items"> & {
   items: ParsedWorkerSummary[];
 };
 
+const WORKER_LIFECYCLE_STATES: readonly WorkerLifecycleState[] = [
+  "not_started",
+  "awaiting_restore",
+  "active",
+  "stopped",
+  "creating",
+  "restoring",
+  "stopping",
+  "recovery_required",
+];
+
+function workerLifecycle(value: unknown, label: string): WorkerLifecycleState {
+  if (
+    typeof value !== "string" || !WORKER_LIFECYCLE_STATES.includes(value as WorkerLifecycleState)
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value as WorkerLifecycleState;
+}
+
 const REMOVAL_STATES: readonly WorkerRemovalState[] = ["waiting", "held"];
 const REMOVAL_PHASES: readonly WorkerRemovalPhase[] = [
-  "awaiting_quiescence", "recording", "awaiting_effects_end", "released", "completed",
+  "awaiting_quiescence",
+  "input_handoff",
+  "awaiting_effects_end",
+  "released",
+  "completed",
 ];
 const REMOVAL_CAUSES: readonly WorkerRemovalCause[] = [
-  "recording_disabled", "source_unavailable", "ownership_unknown", "job_pending", "job_failed",
-  "execution_unconfirmed", "storage_unavailable",
+  "recording_disabled",
+  "source_unavailable",
+  "ownership_unknown",
+  "job_pending",
+  "job_failed",
+  "execution_unconfirmed",
+  "storage_unavailable",
 ];
 
 function removalEnum<T extends string>(value: unknown, values: readonly T[], label: string): T {
@@ -386,7 +412,11 @@ export function parseWorkerRemovalObservation(
     operation_id,
     state: removalEnum(item.state, REMOVAL_STATES, `${label}.state`),
     phase: removalEnum(item.phase, REMOVAL_PHASES, `${label}.phase`),
-    cause: optional(item.cause, `${label}.cause`, (value, path) => removalEnum(value, REMOVAL_CAUSES, path)),
+    cause: optional(
+      item.cause,
+      `${label}.cause`,
+      (value, path) => removalEnum(value, REMOVAL_CAUSES, path),
+    ),
   };
 }
 
@@ -414,6 +444,7 @@ export function parseWorkerSummary(
       "workspace",
       "availability",
       "state",
+      "lifecycle",
       "worker_state",
       "restore_observation_token",
       "removal",
@@ -451,12 +482,11 @@ export function parseWorkerSummary(
       `${label}.singleton_key`,
       string,
     ),
-    tags: item.tags === undefined
-      ? []
-      : array(item.tags, `${label}.tags`, string),
+    tags: item.tags === undefined ? [] : array(item.tags, `${label}.tags`, string),
     workspace: workspaceSummary(item.workspace, `${label}.workspace`),
     availability,
     state: string(item.state, `${label}.state`),
+    lifecycle: optional(item.lifecycle, `${label}.lifecycle`, workerLifecycle),
     worker_state: workerState,
     removal: optional(item.removal, `${label}.removal`, parseWorkerRemovalObservation),
     restore_observation_token: optional(
@@ -471,9 +501,7 @@ export function parseWorkerSummary(
       },
     ),
     last_seen_at: optional(item.last_seen_at, `${label}.last_seen_at`, string),
-    pinned: item.pinned === undefined
-      ? false
-      : boolean(item.pinned, `${label}.pinned`),
+    pinned: item.pinned === undefined ? false : boolean(item.pinned, `${label}.pinned`),
     retention_state: item.retention_state === undefined
       ? ""
       : string(item.retention_state, `${label}.retention_state`),
@@ -481,13 +509,11 @@ export function parseWorkerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    workdir_attachments: item.workdir_attachments === undefined
-      ? undefined
-      : array(
-        item.workdir_attachments,
-        `${label}.workdir_attachments`,
-        workerWorkdirAttachment,
-      ),
+    workdir_attachments: item.workdir_attachments === undefined ? undefined : array(
+      item.workdir_attachments,
+      `${label}.workdir_attachments`,
+      workerWorkdirAttachment,
+    ),
     diagnostics: item.diagnostics === undefined
       ? []
       : array(item.diagnostics, `${label}.diagnostics`, diagnostic),
@@ -670,6 +696,7 @@ function workerSummary(
       "tags",
       "workspace",
       "state",
+      "lifecycle",
       "last_seen_at",
       "pinned",
       "retention_state",
@@ -690,6 +717,7 @@ function workerSummary(
     tags: array(item.tags, `${label}.tags`, string),
     workspace: workspaceSummary(item.workspace, `${label}.workspace`),
     state: string(item.state, `${label}.state`),
+    lifecycle: optional(item.lifecycle, `${label}.lifecycle`, workerLifecycle),
     last_seen_at: nullableString(item.last_seen_at, `${label}.last_seen_at`),
     pinned: boolean(item.pinned, `${label}.pinned`),
     retention_state: string(item.retention_state, `${label}.retention_state`),
@@ -697,13 +725,11 @@ function workerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    workdir_attachments: item.workdir_attachments === undefined
-      ? undefined
-      : array(
-        item.workdir_attachments,
-        `${label}.workdir_attachments`,
-        runtimeWorkdirAttachment,
-      ),
+    workdir_attachments: item.workdir_attachments === undefined ? undefined : array(
+      item.workdir_attachments,
+      `${label}.workdir_attachments`,
+      runtimeWorkdirAttachment,
+    ),
     diagnostics: array(item.diagnostics, `${label}.diagnostics`, diagnostic),
   };
 }
@@ -1023,12 +1049,16 @@ function creationAuthorization(value: unknown): WorkerCreationAuthorization {
       new TextEncoder().encode(authorizationKey).byteLength > 512 ||
       /\p{Cc}/u.test(authorizationKey)
     ) {
-      throw new Error("policy_authorization_key must contain 1..512 UTF-8 bytes and no control characters");
+      throw new Error(
+        "policy_authorization_key must contain 1..512 UTF-8 bytes and no control characters",
+      );
     }
     return {
-      kind: "policy", policy_id: policyId,
+      kind: "policy",
+      policy_id: policyId,
       policy_authorization_key: authorizationKey as Extract<
-        WorkerCreationAuthorization, { kind: "policy" }
+        WorkerCreationAuthorization,
+        { kind: "policy" }
       >["policy_authorization_key"],
     };
   }

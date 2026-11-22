@@ -55,49 +55,101 @@ const journal = {
   updated_at: entry.updated_at,
 };
 const original = { state: "missing", history_href: null };
-Deno.test("Journal retained recording does not infer completion from removal or admitted coverage", () => {
-  const response = (retained_recording: unknown) => ({
+function sessionsResponse(input_handoff: unknown, unreflected_sources = false) {
+  return {
     kind: "sessions",
     value: {
       items: [{
         journal,
-        unreflected_sources: false,
+        unreflected_sources,
         original_source: original,
-        retained_recording,
+        input_handoff,
       }],
       next: null,
     },
-  });
+  };
+}
+Deno.test("Journal input admission is independent of producer removal and Journal reflection", () => {
   for (const producer of ["released", "removing", "removed"]) {
-    const pending = { producer, completed: false, cause: "job_failed" };
-    assertEquals(
-      parseJournalResponse(response(pending), "sessions", "subject").items[0]
-        .retained_recording,
-      pending,
-    );
-    const completed = { producer, completed: true, cause: null };
-    assertEquals(
-      parseJournalResponse(response(completed), "sessions", "subject").items[0]
-        .retained_recording,
-      completed,
-    );
+    for (const status of ["pending", "admitted", "subject_deleted"]) {
+      for (const unreflected of [false, true]) {
+        const observation = {
+          producer,
+          status,
+          cause: status === "pending" ? "job_pending" : null,
+        };
+        const parsed = parseJournalResponse(
+          sessionsResponse(observation, unreflected),
+          "sessions",
+          "subject",
+        ).items[0];
+        assertEquals(parsed.input_handoff, observation);
+        assertEquals(parsed.unreflected_sources, unreflected);
+      }
+    }
   }
   assertEquals(
-    parseJournalResponse(response(null), "sessions").items[0]
-      .retained_recording,
+    parseJournalResponse(sessionsResponse(null), "sessions").items[0]
+      .input_handoff,
     null,
   );
+});
+Deno.test("Journal input handoff decodes bounded causes without inferring admission", () => {
+  for (
+    const cause of [
+      null,
+      "recording_disabled",
+      "source_unavailable",
+      "ownership_unknown",
+      "job_pending",
+      "job_failed",
+      "execution_unconfirmed",
+      "storage_unavailable",
+    ]
+  ) {
+    const observation = { producer: "removed", status: "pending", cause };
+    assertEquals(
+      parseJournalResponse(sessionsResponse(observation), "sessions").items[0]
+        .input_handoff,
+      observation,
+    );
+  }
+});
+Deno.test("Journal input handoff rejects malformed and superseded observations", () => {
   for (
     const invalid of [
       undefined,
       {},
-      { producer: "missing", completed: false, cause: null },
-      { producer: "removed", completed: true, cause: "job_failed" },
-      { producer: "released", completed: false, cause: "arbitrary_text" },
+      { producer: "missing", status: "pending", cause: null },
+      { producer: "removed", status: "completed", cause: null },
+      { producer: "removed", completed: true, cause: null },
+      { producer: "removed", status: "admitted", cause: "job_failed" },
+      { producer: "released", status: "subject_deleted", cause: "job_pending" },
+      { producer: "released", status: "pending", cause: "arbitrary_text" },
+      { producer: "released", status: "pending" },
     ]
   ) {
-    assertThrows(() => parseJournalResponse(response(invalid), "sessions"));
+    assertThrows(() =>
+      parseJournalResponse(sessionsResponse(invalid), "sessions")
+    );
   }
+});
+Deno.test("Journal sessions transport preserves admitted input with unreflected originals", async () => {
+  const requests: { path: string; request: unknown }[] = [];
+  const observation = { producer: "removed", status: "admitted", cause: null };
+  const fetcher = ((path: string, init: RequestInit) => {
+    requests.push({ path, request: JSON.parse(String(init.body)) });
+    return Promise.resolve(Response.json(sessionsResponse(observation, true)));
+  }) as typeof fetch;
+  const request = { action: "sessions" as const, after: null, limit: 20 };
+  const result = await loadJournal(fetcher, "workspace", "subject", request);
+  assertEquals(result.error, null);
+  assertEquals(result.data?.items[0].input_handoff, observation);
+  assertEquals(result.data?.items[0].unreflected_sources, true);
+  assertEquals(requests, [{
+    path: "/api/w/workspace/subjektiv/subjects/subject/journal-browser",
+    request,
+  }]);
 });
 Deno.test("Journal parser preserves missing originals independently of linked saved entries", () => {
   const value = {

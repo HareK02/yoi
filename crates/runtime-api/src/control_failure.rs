@@ -242,7 +242,7 @@ mod tests {
                 "state": serde_json::to_value(protocol::WorkerStateSnapshot::initial()).unwrap()
             }
         });
-        let value = serde_json::json!({"worker_ref":{"worker_id":"01968f08-2122-7000-8000-000000000001"}, "status":"idle", "command":command});
+        let value = serde_json::json!({"worker_ref":{"worker_id":"01968f08-2122-7000-8000-000000000001"}, "status":"idle", "lifecycle":"active", "command":command});
         let lifecycle: super::super::WorkerLifecycleAck =
             serde_json::from_value(value.clone()).unwrap();
         let interaction: super::super::WorkerInteractionAck =
