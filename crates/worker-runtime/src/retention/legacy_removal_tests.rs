@@ -368,6 +368,280 @@ fn legacy_success_rejects_contradictions_without_rewriting_original_evidence() {
     }
 }
 
+// Both the public recovery entry and the Subject consumer must reject lost
+// originals before normalizing a receipt or acknowledging its bound child.
+#[test]
+fn archive_payload_faults_preserve_receipt_and_subject_child_across_reopen() {
+    for (completed, schema) in [(false, 1), (true, 1), (false, 2), (true, 2)] {
+        for fault in ["missing", "corrupt"] {
+            let root = tempfile::tempdir().unwrap();
+            super::runtime_v5_tests::runtime_fixture(root.path(), 17);
+            let (request, deletion) = old_receipt(root.path(), 1, SessionDisposition::Archive);
+            let provider = FsWorkerRetentionProvider::new(root.path());
+            let path = provider.operation_path(&request.operation_id).unwrap();
+            let archive = provider
+                .archive_dir(request.archive_id.as_ref().unwrap())
+                .unwrap();
+            let session_root = archive.join("session");
+            let original_payload = collect_files(&session_root, "fixture originals")
+                .unwrap()
+                .into_iter()
+                .map(|(relative, path)| (relative, fs::read(path).unwrap()))
+                .collect::<Vec<_>>();
+            let mut wire = read_value(&path);
+            wire["schema_version"] = json!(schema);
+            wire["result"]["source_removed"] = json!(completed);
+            write_json(&path, &wire);
+            let original_receipt = fs::read(&path).unwrap();
+            let digest = read_operation_receipt(&path)
+                .unwrap()
+                .unwrap()
+                .identity_sha256()
+                .unwrap();
+            let mut fence = json!({"request": deletion, "response": null});
+            if completed {
+                fence["canonical_removal"] = json!({"request": request, "receipt_sha256": digest});
+            }
+            let snapshot_path = root.path().join("runtime.json");
+            let mut snapshot = read_value(&snapshot_path);
+            snapshot["subject_delete_worker_fences"][deletion.worker_id.to_string()] =
+                fence.clone();
+            write_json(&snapshot_path, &snapshot);
+            if fault == "missing" {
+                fs::remove_dir_all(&session_root).unwrap();
+            } else {
+                let (_, segment) = collect_files(&session_root, "fixture segment")
+                    .unwrap()
+                    .into_iter()
+                    .find(|(relative, _)| relative.extension().is_some_and(|ext| ext == "jsonl"))
+                    .unwrap();
+                OpenOptions::new()
+                    .append(true)
+                    .open(segment)
+                    .unwrap()
+                    .write_all(b"corrupt after publication\n")
+                    .unwrap();
+            }
+            let damaged_archive = collect_files(&archive, "damaged fixture")
+                .unwrap()
+                .into_iter()
+                .map(|(relative, path)| (relative, fs::read(path).unwrap()))
+                .collect::<Vec<_>>();
+            let options = FsRuntimeStoreOptions::new(root.path()).with_runtime_id("runtime-a");
+            let scope = RuntimeWorkspaceScope::new("workspace-a", "owner-a");
+            for _ in 0..2 {
+                let runtime = Runtime::with_fs_store_and_execution_backend(
+                    options.clone(),
+                    Arc::new(NoHistoricalStop),
+                )
+                .unwrap();
+                runtime.bind_runtime_identity("runtime-a").unwrap();
+                let error = runtime
+                    .execute_worker_retention(&request)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("archive checksum or content summary mismatch"),
+                    "{completed}/{fault}: {error}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), original_receipt);
+                assert!(
+                    runtime
+                        .subject_delete_worker_scoped(&scope, deletion.clone())
+                        .is_err()
+                );
+                assert_eq!(fs::read(&path).unwrap(), original_receipt);
+                assert_eq!(
+                    read_value(&snapshot_path)["subject_delete_worker_fences"]
+                        [deletion.worker_id.to_string()],
+                    fence
+                );
+                assert!(!provider.worker_dir(request.worker_id).exists());
+                assert_eq!(
+                    collect_files(&archive, "after rejection")
+                        .unwrap()
+                        .into_iter()
+                        .map(|(relative, path)| (relative, fs::read(path).unwrap()))
+                        .collect::<Vec<_>>(),
+                    damaged_archive
+                );
+            }
+            // Repair only this isolated fixture. No new operation or child is
+            // minted; the original pending removal may now finish and replay.
+            for (relative, bytes) in original_payload {
+                let destination = session_root.join(relative);
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                fs::write(destination, bytes).unwrap();
+            }
+            let runtime =
+                Runtime::with_fs_store_and_execution_backend(options, Arc::new(NoHistoricalStop))
+                    .unwrap();
+            runtime.bind_runtime_identity("runtime-a").unwrap();
+            let result = runtime.execute_worker_retention(&request).unwrap();
+            assert!(result.source_removed);
+            assert!(
+                runtime
+                    .subject_delete_worker_scoped(&scope, deletion.clone())
+                    .unwrap()
+                    .originals_absent
+            );
+            let normalized = read_operation_receipt(&path).unwrap().unwrap();
+            assert_eq!(normalized.request, request);
+            if completed {
+                assert_eq!(normalized.identity_sha256().unwrap(), digest);
+            }
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(runtime.execute_worker_retention(&request).unwrap(), result);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn matching_explicit_erasure_allows_original_operation_retry_but_unrelated_erasure_does_not() {
+    for completed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        super::runtime_v5_tests::runtime_fixture(root.path(), 17);
+        let (request, deletion) = old_receipt(root.path(), 1, SessionDisposition::Archive);
+        let provider = FsWorkerRetentionProvider::new(root.path());
+        let path = provider.operation_path(&request.operation_id).unwrap();
+        let archive = provider
+            .archive_dir(request.archive_id.as_ref().unwrap())
+            .unwrap();
+        let mut wire = read_value(&path);
+        wire["result"]["source_removed"] = json!(completed);
+        write_json(&path, &wire);
+        let original = fs::read(&path).unwrap();
+        let session = wire["result"]["archive"]["source_session_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let retention = runtime_session_retention(root.path());
+        let intent = session_store::retention::SessionDeletionIntent::ErasePermanently;
+        let unrelated = session_store::new_session_id();
+        retention.delete(unrelated, intent, || Ok(())).unwrap();
+        fs::remove_dir_all(archive.join("session")).unwrap();
+        assert!(provider.execute(&request).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        retention.delete(session, intent, || Ok(())).unwrap();
+        let options = FsRuntimeStoreOptions::new(root.path()).with_runtime_id("runtime-a");
+        let scope = RuntimeWorkspaceScope::new("workspace-a", "owner-a");
+        let mut normalized = None;
+        for _ in 0..2 {
+            let runtime = Runtime::with_fs_store_and_execution_backend(
+                options.clone(),
+                Arc::new(NoHistoricalStop),
+            )
+            .unwrap();
+            runtime.bind_runtime_identity("runtime-a").unwrap();
+            let result = runtime.execute_worker_retention(&request).unwrap();
+            assert!(result.source_removed);
+            assert_eq!(result.operation_id, request.operation_id);
+            assert!(
+                runtime
+                    .subject_delete_worker_scoped(&scope, deletion.clone())
+                    .unwrap()
+                    .originals_absent
+            );
+            let bytes = fs::read(&path).unwrap();
+            if let Some(saved) = &normalized {
+                assert_eq!(&bytes, saved);
+            }
+            normalized = Some(bytes);
+            assert!(!archive.join("session").exists());
+            assert!(!provider.worker_dir(request.worker_id).exists());
+        }
+    }
+}
+
+#[test]
+fn primary_erasure_never_substitutes_for_a_retained_siblings_erasure() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("workers")).unwrap();
+    let (request, deletion) = old_receipt(root.path(), 1, SessionDisposition::Archive);
+    let provider = FsWorkerRetentionProvider::new(root.path());
+    let path = provider.operation_path(&request.operation_id).unwrap();
+    let archive = provider
+        .archive_dir(request.archive_id.as_ref().unwrap())
+        .unwrap();
+    let session = archive.join("session");
+    let retained = session_store::new_session_id();
+    let segment = session_store::new_segment_id();
+    session_store::WorkerSessionStore::new(
+        session.join("retained-sessions").join(retained.to_string()),
+    )
+    .unwrap()
+    .create_segment(
+        retained,
+        segment,
+        &[session_store::LogEntry::AnnotatedSegmentStart {
+            ts: 1,
+            session_id: retained,
+            system_prompt: None,
+            config: Default::default(),
+            history: vec![],
+            forked_from: None,
+            compacted_from: None,
+        }],
+    )
+    .unwrap();
+    let mut receipt = read_value(&path);
+    let manifest = &mut receipt["result"]["archive"];
+    manifest["retained_sessions"] =
+        json!([session_store::worker_sources::RetainedSessionBinding {
+            owner: session_store::worker_sources::WorkerSessionOwner {
+                workspace_id: request.workspace_id.clone(),
+                worker_id: request.worker_id.to_string()
+            },
+            session_id: retained,
+            active_segment_id: segment,
+        }]);
+    let (checksum, bytes, count) =
+        checksum_files(&collect_files(&session, "fixture").unwrap(), "fixture").unwrap();
+    manifest["content_checksum_sha256"] = json!(checksum);
+    manifest["content_bytes"] = json!(bytes);
+    manifest["content_file_count"] = json!(count);
+    write_json(&archive.join("manifest.json"), manifest);
+    write_json(&path, &receipt);
+    let original = fs::read(&path).unwrap();
+    let primary = receipt["result"]["archive"]["source_session_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let retention = runtime_session_retention(root.path());
+    let intent = session_store::retention::SessionDeletionIntent::ErasePermanently;
+    retention
+        .delete(primary, intent, || {
+            remove_archived_session_copies(root.path(), primary)
+        })
+        .unwrap();
+    // Lost sibling originals are NOT authorized by erasing the primary.
+    fs::remove_dir_all(session.join("retained-sessions").join(retained.to_string())).unwrap();
+    assert!(provider.execute(&request).is_err());
+    assert!(
+        provider
+            .subject_completed_removal(&deletion, "runtime-a", None)
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    // The explicit whole-owner action still fences/erases all remaining copies,
+    // without changing the historical receipt or requiring preservation proof.
+    provider.purge_subject_job_removal(&request).unwrap();
+    provider.purge_subject_job_removal(&request).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(
+        matches!(retention.ensure_live(retained), Err(session_store::StoreError::SessionErased(id)) if id == retained)
+    );
+    assert!(provider.execute(&request).unwrap().source_removed);
+    assert!(
+        provider
+            .subject_completed_removal(&deletion, "runtime-a", None)
+            .is_ok()
+    );
+}
+
 #[test]
 fn legacy_purge_success_is_not_archive_success_and_exact_replay_keeps_operation() {
     let root = tempfile::tempdir().unwrap();

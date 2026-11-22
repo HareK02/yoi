@@ -680,37 +680,77 @@ impl FsWorkerRetentionProvider {
             ));
         }
         if receipt.result.source_removed {
-            let source_present =
-                match fs::symlink_metadata(self.worker_dir(receipt.request.worker_id)) {
-                    Ok(_) => true,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(source) => {
-                        return Err(RuntimeError::StoreIo {
-                            operation: "inspect completed removal source",
-                            path: self.worker_dir(receipt.request.worker_id),
-                            source,
-                        });
-                    }
-                };
-            if source_present {
-                return Err(RuntimeError::InvalidRequest(
-                    "Completed removal conflicts with a present Worker aggregate".into(),
-                ));
-            }
+            self.ensure_removal_source_absent(receipt.request.worker_id)?;
         }
         if let Some(archive) = &receipt.result.archive {
-            let (saved, _) = self.session_archive_identity(&archive.archive_id)?;
-            if saved != *archive {
-                return Err(RuntimeError::InvalidRequest(
-                    "Removal archive receipt mismatch".into(),
-                ));
-            }
+            self.validate_removal_archive(archive)?;
         }
         if receipt.schema_version != OPERATION_SCHEMA_VERSION {
             receipt.schema_version = OPERATION_SCHEMA_VERSION;
             atomic_write_json(path, &receipt, "normalize Worker retention receipt")?;
         }
         Ok(Some(receipt))
+    }
+
+    fn ensure_removal_source_absent(&self, worker_id: WorkerId) -> Result<(), RuntimeError> {
+        match fs::symlink_metadata(self.worker_dir(worker_id)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(RuntimeError::StoreIo {
+                operation: "inspect completed removal source",
+                path: self.worker_dir(worker_id),
+                source,
+            }),
+            Ok(_) => Err(RuntimeError::InvalidRequest(
+                "Completed removal conflicts with a present Worker aggregate".into(),
+            )),
+        }
+    }
+
+    // The immutable ingestion manifest is not proof that its material survives.
+    // Use the migration-aware storage checksum unless every member was explicitly
+    // erased under its own Session identity. Partial erasure cannot attest the
+    // remaining bytes against a whole-archive checksum; leave it unresolved.
+    fn validate_removal_archive(
+        &self,
+        archive: &WorkerSessionArchiveManifest,
+    ) -> Result<(), RuntimeError> {
+        let (saved, _) = self.session_archive_identity(&archive.archive_id)?;
+        if saved != *archive {
+            return Err(RuntimeError::InvalidRequest(
+                "Removal archive receipt mismatch".into(),
+            ));
+        }
+        let archive_dir = self.archive_dir(&archive.archive_id)?;
+        // Even permanent erasure must not hide a contradictory storage identity.
+        archive_storage(&archive_dir, archive)?;
+        let primary = archive
+            .source_session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid removal Session identity".into()))?;
+        let mut sessions = vec![primary];
+        for binding in &archive.retained_sessions {
+            if binding.owner.workspace_id != archive.workspace_id
+                || binding.owner.worker_id != archive.source_worker_id.to_string()
+            {
+                return Err(RuntimeError::InvalidRequest(
+                    "Removal retained Session owner mismatch".into(),
+                ));
+            }
+            sessions.push(binding.session_id);
+        }
+        let retention = runtime_session_retention(&self.runtime_root);
+        let mut all_erased = true;
+        for session in sessions {
+            match retention.ensure_live(session) {
+                Ok(()) => all_erased = false,
+                Err(session_store::StoreError::SessionErased(id)) if id == session => (),
+                Err(error) => return Err(retention_error(error)),
+            }
+        }
+        if !all_erased {
+            validate_existing_archive(&archive_dir, archive, false)?;
+        }
+        Ok(())
     }
 
     /// Caller holds the Worker operation lock and has verified the durable
@@ -737,8 +777,10 @@ impl FsWorkerRetentionProvider {
             path: lock_path,
             source,
         })?;
-        let receipt = self
-            .normalized_receipt(&self.operation_path(&request.operation_id)?)?
+        // Explicit whole-Subject erasure owns the remaining copies, including
+        // partially erased material. It validates historical identity, not current
+        // preservation, and must never normalize or complete an unproven receipt.
+        let receipt = read_operation_receipt(&self.operation_path(&request.operation_id)?)?
             .ok_or_else(|| {
                 RuntimeError::InvalidRequest("Canonical removal receipt missing".into())
             })?;
@@ -752,12 +794,12 @@ impl FsWorkerRetentionProvider {
                 != (request.diagnostics_disposition == DiagnosticsDisposition::Retain)
             || result.archive.is_some()
                 != (request.session_disposition == SessionDisposition::Archive)
-            || self.worker_dir(request.worker_id).exists()
         {
             return Err(RuntimeError::InvalidRequest(
                 "Canonical removal is not an exact successful receipt".into(),
             ));
         }
+        self.ensure_removal_source_absent(request.worker_id)?;
         let mut sessions = if let Some(manifest) = &result.archive {
             if request.archive_id.as_ref() != Some(&manifest.archive_id)
                 || manifest.workspace_id != request.workspace_id
@@ -2853,10 +2895,14 @@ mod tests {
         )
         .unwrap();
         assert!(provider.session_archive("archive-a").is_err());
+        let receipt_path = provider.operation_path(&request.operation_id).unwrap();
+        let receipt = fs::read(&receipt_path).unwrap();
+        assert!(provider.execute(&request).is_err());
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt);
     }
 
     #[test]
-    fn session_migration_updates_published_archive_without_changing_completed_receipt() {
+    fn session_migration_and_receipt_normalization_preserve_completed_identity() {
         let temp = tempfile::tempdir().unwrap();
         let worker = WorkerId::now_v7();
         let compact = old_compacted_source(temp.path(), worker);
@@ -2885,7 +2931,7 @@ mod tests {
         write_json(
             &provider.operation_path(&request.operation_id).unwrap(),
             &RetentionOperationReceipt {
-                schema_version: OPERATION_SCHEMA_VERSION,
+                schema_version: 1,
                 request: request.clone(),
                 result: completed.clone(),
                 shutdown: None,
@@ -2894,6 +2940,12 @@ mod tests {
         );
         fs::remove_dir_all(provider.worker_dir(worker)).unwrap();
         let receipt = fs::read(provider.operation_path(&request.operation_id).unwrap()).unwrap();
+        let identity =
+            read_operation_receipt(&provider.operation_path(&request.operation_id).unwrap())
+                .unwrap()
+                .unwrap()
+                .identity_sha256()
+                .unwrap();
         migrate_staged_sessions(temp.path()).unwrap();
         let (manifest, root) = provider.session_archive("archive-a").unwrap();
         assert_eq!(completed.archive.as_ref(), Some(&manifest));
@@ -2902,6 +2954,13 @@ mod tests {
             receipt
         );
         assert_eq!(provider.execute(&request).unwrap(), completed);
+        let normalized =
+            read_operation_receipt(&provider.operation_path(&request.operation_id).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(normalized.schema_version, OPERATION_SCHEMA_VERSION);
+        assert_eq!(normalized.identity_sha256().unwrap(), identity);
+        let receipt = fs::read(provider.operation_path(&request.operation_id).unwrap()).unwrap();
         assert!(session_store::WorkerSessionStore::open_read_only(&root).is_ok());
         let storage_path = provider
             .archive_dir("archive-a")
@@ -2911,6 +2970,26 @@ mod tests {
         storage.ingestion.archive_id = "another-archive".into();
         write_json(&storage_path, &storage);
         assert!(provider.session_archive("archive-a").is_err());
+        assert!(provider.completed_for(&request).is_err());
+        assert!(provider.execute(&request).is_err());
+        let receipt_path = provider.operation_path(&request.operation_id).unwrap();
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt);
+        // A legacy operation schema must not be rewritten around a contradictory
+        // migration attestation, even when the Session was explicitly erased.
+        let mut legacy = read_operation_receipt(&receipt_path).unwrap().unwrap();
+        legacy.schema_version = 1;
+        write_json(&receipt_path, &legacy);
+        let before = fs::read(&receipt_path).unwrap();
+        let session = manifest.source_session_id.parse().unwrap();
+        runtime_session_retention(temp.path())
+            .delete(
+                session,
+                session_store::retention::SessionDeletionIntent::ErasePermanently,
+                || remove_archived_session_copies(temp.path(), session),
+            )
+            .unwrap();
+        assert!(provider.execute(&request).is_err());
+        assert_eq!(fs::read(&receipt_path).unwrap(), before);
     }
 
     #[test]
