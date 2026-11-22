@@ -456,7 +456,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .collect::<Vec<_>>(),
         (92..=113)
             .chain([
-                122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138
+                122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138,
+                139, 140, 141
             ])
             .collect::<Vec<_>>()
     );
@@ -544,10 +545,19 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (131, crate::launch_policy::MIGRATION_NAME.into()),
                     (133, crate::subject_policy::MIGRATION_NAME.into()),
                     (134, backend_job_finalizing::MIGRATION_NAME.into()),
-                    (135, subject_release_input_handoff_store::MIGRATION_NAME.into()),
+                    (
+                        135,
+                        subject_release_input_handoff_store::MIGRATION_NAME.into()
+                    ),
                     (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
                     (137, worker_lifecycle_notifications::MIGRATION_NAME.into()),
-                    (138, notification_routing::merge_requests::MIGRATION_NAME.into())
+                    (
+                        138,
+                        notification_routing::merge_requests::MIGRATION_NAME.into()
+                    ),
+                    (139, backend_job_result_application::MIGRATION_NAME.into()),
+                    (140, backend_job_recording_input::MIGRATION_NAME.into()),
+                    (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {
