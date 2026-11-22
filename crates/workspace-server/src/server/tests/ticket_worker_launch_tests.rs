@@ -12,6 +12,7 @@ use worker_runtime::execution::{
 // published Profile projection; leave Worker creation/control to the real Runtime.
 #[derive(Default)]
 struct LaunchExecutionBackend {
+    snapshot_script: Mutex<std::collections::VecDeque<Option<protocol::WorkerStateSnapshot>>>,
     lose_initial_ack: std::sync::atomic::AtomicBool,
     fail_stop: std::sync::atomic::AtomicBool,
     execution: DeterministicExecutionBackend,
@@ -187,6 +188,24 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
                 .insert(claim.alias.clone(), binding);
         }
         self.execution.spawn_worker(request)
+    }
+
+    fn worker_snapshot(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> Option<protocol::Event> {
+        if let Some(snapshot) = self.snapshot_script.lock().unwrap().pop_front() {
+            let snapshot = snapshot?;
+            let execution = self
+                .execution
+                .contexts
+                .lock()
+                .unwrap()
+                .get(worker)
+                .cloned()?;
+            *execution.state.lock().unwrap() = snapshot;
+        }
+        self.execution.worker_snapshot(worker)
     }
 
     fn dispatch_input(
@@ -1177,3 +1196,90 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
 
 // Real Runtime creation and SQLite finalization fail independently; only Stop is
 // injected. Reconciliation must retain the create reservation while absence is unknown.
+
+// The execution boundary is deterministic; both Backend adapters, Runtime detail
+// refresh/publication, HTTP conversion (remote), and assignment persistence are real.
+#[tokio::test(flavor = "multi_thread")]
+async fn assignment_rejects_live_running_and_unavailable_despite_catalog_idle() {
+    for remote in [false, true] {
+        for unavailable in [false, true] {
+            let f = LaunchFixture::new(remote).await;
+            let ticket = f.ticket();
+            let mut create = f.payload("", "live-assignment", "builtin:companion", false);
+            create["initial_submit"] = json!([]);
+            let (status, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+            assert_eq!(status, StatusCode::OK, "{worker}");
+            let id = worker["worker_id"].as_str().unwrap();
+            let mut running = protocol::WorkerStateSnapshot::initial();
+            running.state_sequence = 1;
+            running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            ));
+            f.backend
+                .snapshot_script
+                .lock()
+                .unwrap()
+                .push_back(if unavailable { None } else { Some(running) });
+            let (status, error) = f.assign(&ticket, &worker, "reject-live").await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "remote={remote} unavailable={unavailable}: {error}"
+            );
+            assert!(
+                f.api
+                    .store
+                    .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(f.backend.submits_for(id).is_empty());
+            assert_eq!(f.backend.creates_for(id).len(), 1);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assignment_rechecks_live_state_after_initial_idle_before_unchanged_commit() {
+    for remote in [false, true] {
+        let f = LaunchFixture::new(remote).await;
+        let ticket = f.ticket();
+        let mut create = f.payload("", "assignment-race", "builtin:companion", false);
+        create["initial_submit"] = json!([]);
+        let (status, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+        assert_eq!(status, StatusCode::OK, "{worker}");
+        let mut running = protocol::WorkerStateSnapshot::initial();
+        running.state_sequence = 1;
+        running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+            protocol::WorkerRunState::Running,
+        ));
+        *f.backend.snapshot_script.lock().unwrap() = [
+            Some(protocol::WorkerStateSnapshot::initial()),
+            Some(running),
+        ]
+        .into();
+        let (status, error) = f.assign(&ticket, &worker, "changed-before-commit").await;
+        assert_eq!(status, StatusCode::CONFLICT, "remote={remote}: {error}");
+        assert!(f.backend.snapshot_script.lock().unwrap().is_empty());
+        assert!(
+            f.api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
+                .unwrap()
+                .is_none()
+        );
+        let claim = f
+            .api
+            .store
+            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "changed-before-commit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.claim_state, "failed");
+        assert!(claim.assignment_id.is_none());
+        assert!(
+            f.backend
+                .submits_for(worker["worker_id"].as_str().unwrap())
+                .is_empty()
+        );
+    }
+}

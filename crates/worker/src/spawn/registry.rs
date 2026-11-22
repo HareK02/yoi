@@ -804,7 +804,11 @@ impl SpawnedWorkerRegistry {
                         let error = format!(
                             "internal Worker output lagged by {skipped} events; published projection is incomplete; stop and recreate the session"
                         );
-                        published.snapshot.lock().unwrap().error = Some(error);
+                        {
+                            let mut snapshot = published.snapshot.lock().unwrap();
+                            snapshot.error = Some(error);
+                            snapshot.state = None;
+                        }
                         let _ = parent_tx.send(Event::InternalWorker {
                             worker: worker.clone(),
                             event: Box::new(Event::Error {
@@ -886,7 +890,11 @@ impl SpawnedWorkerRegistry {
                         let error = format!(
                             "internal Worker output lagged by {skipped} events; published projection is incomplete; stop and recreate the session"
                         );
-                        published.snapshot.lock().unwrap().error = Some(error);
+                        {
+                            let mut snapshot = published.snapshot.lock().unwrap();
+                            snapshot.error = Some(error);
+                            snapshot.state = None;
+                        }
                         let _ = parent_tx.send(Event::InternalWorker {
                             worker: worker.clone(),
                             event: Box::new(Event::Error {
@@ -1194,7 +1202,7 @@ fn internal_worker_live_snapshot(snapshot: InternalWorkerSnapshot) -> Option<Eve
     Some(Event::Snapshot {
         session: snapshot.session,
         greeting: snapshot.greeting?,
-        state: snapshot.status.into(),
+        state: snapshot.state?,
         in_flight: snapshot.in_flight,
         internal_workers: snapshot.internal_workers,
     })
@@ -2031,6 +2039,8 @@ mod tests {
                 .contains("stop and recreate")
         );
         assert!(published.in_flight.is_empty());
+        assert!(published.state.is_none());
+        assert!(internal_worker_live_snapshot(published).is_none());
         assert!(matches!(
             parent_rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)

@@ -239,6 +239,7 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
         .worker_state
         .clone()
         .expect("connected test Worker must expose its initial state");
+    running.state_sequence += 1;
     running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
         protocol::WorkerRunState::Running,
     ));
@@ -399,6 +400,7 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
         .worker_state
         .clone()
         .expect("connected test Worker must expose its initial state");
+    running.state_sequence += 1;
     running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
         protocol::WorkerRunState::Running,
     ));
@@ -539,6 +541,7 @@ async fn embedded_downstream_overflow_recovers_through_a_fresh_snapshot() {
     let final_command_id = (DOWNSTREAM_QUEUE_CAPACITY as u64) * 3;
     for command_id in 1..=final_command_id {
         let mut snapshot = worker.worker_state.clone().unwrap();
+        snapshot.state_sequence = command_id;
         snapshot.last_command_id = command_id;
         runtime
             .observe_worker_event(

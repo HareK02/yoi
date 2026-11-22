@@ -386,6 +386,7 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
                             entries: Vec::new(),
                         },
                         greeting: Some(greeting),
+                        state: Some(WorkerStateSnapshot::initial()),
                         status: WorkerStatus::Idle,
                         error: None,
                         in_flight: InFlightSnapshot::default(),

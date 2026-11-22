@@ -284,6 +284,14 @@ pub enum WorkerMaintenanceState {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WorkerStateSnapshot {
+    /// Source-authored ordering within one Worker execution. Snapshot and live
+    /// delivery may overlap; receivers compare source sequences only within that execution.
+    /// Advances on changes to any snapshot field, independently of command IDs.
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
+    pub state_sequence: u64,
     /// Highest lifecycle command id observed by this controller instance.
     #[cfg_attr(
         feature = "json-schema",
@@ -305,6 +313,7 @@ pub struct WorkerStateSnapshot {
 impl WorkerStateSnapshot {
     pub fn initial() -> Self {
         Self {
+            state_sequence: 0,
             last_command_id: 0,
             last_finished_submission_request_id: None,
             state: WorkerState::Idle,
@@ -333,6 +342,7 @@ impl From<WorkerStatus> for WorkerStateSnapshot {
             WorkerStatus::Paused => WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused)),
         };
         Self {
+            state_sequence: 0,
             last_command_id: 0,
             last_finished_submission_request_id: None,
             state,
@@ -912,6 +922,10 @@ pub struct InternalWorkerSnapshot {
     /// workers may omit it; clients must never substitute the parent's values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub greeting: Option<Greeting>,
+    /// Exact execution-owned state and source sequence. Absent when the source is
+    /// unavailable; catalog status cannot reconstruct a live snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<WorkerStateSnapshot>,
     #[serde(default)]
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2144,14 +2158,20 @@ mod tests {
     #[test]
     fn worker_state_snapshot_wire_shape_has_one_authoritative_state() {
         let snapshot = WorkerStateSnapshot {
+            state_sequence: 12,
             last_command_id: 7,
             last_finished_submission_request_id: Some("request-7".to_string()),
             state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
         };
         let value = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(
+            serde_json::from_value::<WorkerStateSnapshot>(value.clone()).unwrap(),
+            snapshot
+        );
+        assert_eq!(
             value,
             serde_json::json!({
+                "state_sequence": 12,
                 "last_command_id": 7,
                 "last_finished_submission_request_id": "request-7",
                 "state": {
@@ -2160,6 +2180,22 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn worker_state_snapshot_requires_an_unsigned_source_sequence() {
+        let mut value = serde_json::to_value(WorkerStateSnapshot::initial()).unwrap();
+        assert_eq!(value["state_sequence"], 0);
+        value.as_object_mut().unwrap().remove("state_sequence");
+        assert!(serde_json::from_value::<WorkerStateSnapshot>(value.clone()).is_err());
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!("1"),
+            serde_json::Value::Null,
+        ] {
+            value["state_sequence"] = invalid;
+            assert!(serde_json::from_value::<WorkerStateSnapshot>(value.clone()).is_err());
+        }
     }
 
     #[test]
@@ -2833,7 +2869,7 @@ mod tests {
 
     #[test]
     fn event_snapshot_in_flight_roundtrip_and_default() {
-        let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"state":{"last_command_id":0,"state":{"kind":"busy","state":{"kind":"run","state":"running"}}}}}"#;
+        let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"state":{"state_sequence":0,"last_command_id":0,"state":{"kind":"busy","state":{"kind":"run","state":"running"}}}}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
             Event::Snapshot {
@@ -3002,6 +3038,7 @@ mod tests {
     fn event_worker_state_format() {
         let event = Event::WorkerState {
             snapshot: WorkerStateSnapshot {
+                state_sequence: 15,
                 last_command_id: 9,
                 last_finished_submission_request_id: None,
                 state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
@@ -3015,6 +3052,7 @@ mod tests {
                 "event": "worker_state",
                 "data": {
                     "snapshot": {
+                        "state_sequence": 15,
                         "last_command_id": 9,
                         "state": {
                             "kind": "busy",
@@ -3030,6 +3068,7 @@ mod tests {
             decoded,
             Event::WorkerState {
                 snapshot: WorkerStateSnapshot {
+                    state_sequence: 15,
                     last_command_id: 9,
                     state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
                     ..
@@ -3513,6 +3552,46 @@ mod tests {
     }
 
     #[test]
+    fn internal_worker_snapshot_wire_preserves_source_state_or_explicit_absence() {
+        let state = WorkerStateSnapshot {
+            state_sequence: 19,
+            last_command_id: 0,
+            last_finished_submission_request_id: None,
+            state: WorkerState::Idle,
+        };
+        let worker = InternalWorkerRef {
+            session_id: "child-session".into(),
+            name: "child".into(),
+            parent_session_id: None,
+            kind: InternalWorkerKind::SubWorker,
+        };
+        let mut value = serde_json::json!({
+            "worker": worker,
+            "session": { "entries": [] },
+            "status": "idle",
+            "state": state,
+        });
+        let decoded: InternalWorkerSnapshot = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.state, Some(state));
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["state"],
+            value["state"]
+        );
+        value["state"] = serde_json::Value::Null;
+        let decoded: InternalWorkerSnapshot = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            decoded.state.is_none(),
+            "Idle catalog status cannot fabricate source sequence 0"
+        );
+        value.as_object_mut().unwrap().remove("state");
+        let decoded: InternalWorkerSnapshot = serde_json::from_value(value).unwrap();
+        assert!(
+            decoded.state.is_none(),
+            "an absent source snapshot must stay unavailable"
+        );
+    }
+
+    #[test]
     fn internal_worker_removal_roundtrip_preserves_terminal_fence() {
         let event = Event::InternalWorkerRemoved {
             worker: InternalWorkerRef {
@@ -3577,6 +3656,7 @@ mod tests {
                     "tools": []
                 },
                 "state": {
+                    "state_sequence": 0,
                     "last_command_id": 0,
                     "state": { "kind": "idle" }
                 }

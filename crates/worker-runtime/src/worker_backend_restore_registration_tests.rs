@@ -695,7 +695,23 @@ fn published_terminal_receipt_fault(fault: TerminalFault) {
     assert!(context.test_buffered_events().is_empty());
     let transport = assert_real_attach(&fixture, &old);
     assert_single_publication(&fixture, 1);
+    let mut before_receipt = observations.resubscribe();
     alert_marker(&old, "terminal-before-receipt");
+    fixture
+        .backend
+        .run_on_adapter_runtime(async move {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let observed = before_receipt.recv().await.unwrap();
+                    if is_marker(&observed.payload, "terminal-before-receipt") {
+                        break;
+                    }
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
     let store = runtime.test_runtime_store();
     let reconcile_before = store.test_worker_reconcile_counts();
     store.fail_next_worker_write(if matches!(fault, TerminalFault::BeforeRename) {

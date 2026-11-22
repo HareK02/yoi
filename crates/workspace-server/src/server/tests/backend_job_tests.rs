@@ -1321,6 +1321,7 @@ async fn backend_job_restart_without_live_host_owner_keeps_cleanup_unconfirmed()
             &runtime_worker_ref,
             protocol::Event::WorkerState {
                 snapshot: protocol::WorkerStateSnapshot {
+                    state_sequence: 1,
                     last_command_id: 0,
                     last_finished_submission_request_id: None,
                     state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
@@ -1582,6 +1583,7 @@ async fn backend_job_result_http_response_precedes_cleanup_until_tracked_run_fin
     execution.publish_worker_state(
         &worker,
         protocol::WorkerStateSnapshot {
+            state_sequence: 0,
             last_command_id: 0,
             last_finished_submission_request_id: None,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
@@ -1639,6 +1641,7 @@ async fn backend_job_result_http_response_precedes_cleanup_until_tracked_run_fin
     execution.publish_worker_state(
         &worker,
         protocol::WorkerStateSnapshot {
+            state_sequence: 0,
             last_command_id: 0,
             last_finished_submission_request_id: Some(runtime_run_id),
             state: protocol::WorkerState::Idle,

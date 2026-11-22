@@ -53,14 +53,14 @@ pub(crate) enum ControllerMessage {
 
 pub(crate) struct ControllerReceiver {
     rx: mpsc::Receiver<ControllerMessage>,
-    shared_state: Arc<WorkerSharedState>,
+    shared_state: WorkerStateOwner,
     events: broadcast::Sender<Event>,
 }
 
 impl ControllerReceiver {
     pub(crate) fn new(
         rx: mpsc::Receiver<ControllerMessage>,
-        shared_state: Arc<WorkerSharedState>,
+        shared_state: WorkerStateOwner,
         events: broadcast::Sender<Event>,
     ) -> Self {
         Self {
@@ -111,6 +111,14 @@ impl ControllerReceiver {
             };
             match admission {
                 WorkerCommandAdmission::Accepted | WorkerCommandAdmission::Retry => {
+                    if admission == WorkerCommandAdmission::Accepted {
+                        // Command identity is snapshot content even when the command
+                        // does not change Run state. Publish the same source sequence that
+                        // a reconnect can already read before dispatching effects.
+                        let _ = self.events.send(Event::WorkerState {
+                            snapshot: self.shared_state.snapshot(),
+                        });
+                    }
                     if let Some(reply) = reply {
                         self.shared_state
                             .register_command_reply(envelope.command_id, kind, reply);
