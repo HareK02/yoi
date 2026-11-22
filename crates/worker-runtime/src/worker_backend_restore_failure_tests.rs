@@ -691,6 +691,129 @@ impl ProfileFailureFixture {
 
 #[test]
 #[serial_test::serial(worker_allocation)]
+fn profile_restore_v4_readiness_check_preserves_saved_restrictions_and_history() {
+    for readiness_check in [true, false] {
+        let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
+        let worker_ref = &fixture.worker.worker_ref;
+        let aggregate = fixture
+            .backend
+            .factory
+            .worker_aggregate_dir(worker_ref)
+            .unwrap();
+        let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(worker_ref);
+        let metadata_store = WorkerAggregateStore::new(&aggregate, &name).unwrap();
+        let mut saved = metadata_store.read_by_name(&name).unwrap().unwrap();
+        let mut expected = manifest::read_persisted_worker_manifest_snapshot(
+            saved.resolved_manifest_snapshot.clone().unwrap(),
+        )
+        .unwrap();
+        expected.feature.merge_request = manifest::MergeRequestFeatureConfig::default();
+        expected.feature.filesystem_write.enabled = false;
+        expected.feature.bash.enabled = false;
+        expected.feature.sub_worker.enabled = false;
+        expected.scope = serde_json::from_value(serde_json::json!({
+            "allow": [{
+                "target": fixture.root.path().join("g"),
+                "permission": "read",
+                "recursive": false,
+                "symlink_policy": "resolved"
+            }],
+            "deny": [{
+                "target": fixture.root.path().join("g/README.md"),
+                "permission": "read"
+            }]
+        }))
+        .unwrap();
+        let mut snapshot = manifest::write_persisted_worker_manifest_snapshot(&expected).unwrap();
+        snapshot["schema_version"] = serde_json::json!(4);
+        snapshot["manifest"]["feature"]["merge_request"]["readiness_check"] =
+            serde_json::json!(readiness_check);
+        saved.resolved_manifest_snapshot = Some(snapshot);
+        metadata_store.write(&saved).unwrap();
+
+        let active = saved.active.as_ref().unwrap();
+        let session_id = active.session_id;
+        let segment_id = active.segment_id.unwrap();
+        let sessions = WorkerSessionStore::new(aggregate.join("session")).unwrap();
+        sessions
+            .append(
+                session_id,
+                segment_id,
+                &LogEntry::AnnotatedAssistantItem {
+                    ts: 17,
+                    entry: LoggedHistoryEntry {
+                        item: LoggedItem::Message {
+                            role: LoggedRole::Assistant,
+                            content: vec![LoggedContentPart::Text {
+                                text: "retained response before readiness migration".into(),
+                            }],
+                        },
+                        metadata: LoggedSessionHistoryMetadata {
+                            input_metadata: None,
+                            entry_id: LoggedSessionHistoryEntryId::new(),
+                            origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                            derivation: None,
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        let history_before = sessions.read_all_read_only(session_id, segment_id).unwrap();
+        assert!(
+            session_store::collect_state(&history_before)
+                .system_prompt
+                .is_some()
+        );
+        let history_before = serde_json::to_value(&history_before).unwrap();
+        let history_before = history_before.as_array().unwrap();
+
+        let request = fixture.runtime.test_restore_request(worker_ref);
+        let restored = fixture
+            .runtime
+            .restore_worker_operation(worker_ref, request)
+            .unwrap();
+        assert_eq!(
+            restored.state,
+            server_api::WorkerRestoreState::Accepted,
+            "v4 readiness_check={readiness_check}: {restored:?}"
+        );
+        let handle = fixture.backend.workers.lock().unwrap()[worker_ref]
+            .handle
+            .clone();
+        assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
+        let restored_history = serde_json::to_value(handle.committed_entries()).unwrap();
+        assert!(restored_history.as_array().unwrap().starts_with(history_before));
+        fixture.runtime.stop_worker(worker_ref, None).unwrap();
+
+        let restored_metadata = WorkerAggregateStore::open_read_only(&aggregate, &name)
+            .unwrap()
+            .read_by_name(&name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_metadata.active, saved.active);
+        let restored_manifest = manifest::read_persisted_worker_manifest_snapshot(
+            restored_metadata.resolved_manifest_snapshot.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_manifest.feature, expected.feature);
+        assert_eq!(
+            serde_json::to_value(&restored_manifest.scope).unwrap(),
+            serde_json::to_value(&expected.scope).unwrap()
+        );
+        let restored_sessions = WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+        let retained_history = serde_json::to_value(
+            restored_sessions
+                .read_all_read_only(session_id, segment_id)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(retained_history.as_array().unwrap().starts_with(history_before));
+        assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
 fn profile_restore_prior_effects_survive_read_only_reprepare_failure() {
     for read_stage in [
         RuntimeRestoreStage::Metadata,

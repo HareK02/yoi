@@ -183,7 +183,7 @@
   {
     "path": "crates/manifest/src/lib.rs",
     "kind": "saved_data",
-    "reason": "read_persisted_worker_manifest_snapshot の無version・schema 2/3 readerが旧Memory設定keyを検証してschema 4へ変換するための綴りとそのfixture。削除するとWorkspace identity・language・実行設定を持つ既存Worker manifestを復元できず、部分設定やmixed authorityの拒否検証も失う。現行manifestのwriterは旧keyを出さない。",
+    "reason": "read_persisted_worker_manifest_snapshot の無version・schema 2/3 readerが旧Memory設定keyを検証して現行形式へ変換するための綴りとそのfixture。削除するとWorkspace identity・language・実行設定を持つ既存Worker manifestを復元できず、部分設定やmixed authorityの拒否検証も失う。現行manifestのwriterは旧keyを出さない。",
     "lines": [
       {
         "sha256": "895bf9a35a75911f2ee00873cee8216858b19d28c331be7363d5d92905e20463",
@@ -208,6 +208,17 @@
       {
         "sha256": "aff9330758edaa811259d84e5ebea60cdb7bbdfbd318acfa478af3e395b8fabb",
         "count": 2
+      }
+    ]
+  },
+  {
+    "path": "crates/manifest/src/lib.rs",
+    "kind": "rejection_test",
+    "reason": "Manifest snapshotのschema更新で旧Memory counter移行をschema 4以降へ誤適用しないことを検証する拒否fixture。実在した旧keyを与え、現行保存形式が未知項目として拒否する境界を維持する。",
+    "lines": [
+      {
+        "sha256": "7f75957d9228c9ea7ba5edfba43114ef66a72fa431c76ce927792ca80b13e556",
+        "count": 1
       }
     ]
   },
