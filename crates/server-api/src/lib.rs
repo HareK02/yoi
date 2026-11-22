@@ -3671,7 +3671,7 @@ pub trait ServerApi {
     )]
     async fn external_workdir_grant_create(
         &self,
-        #[extension] actor: RequestActor,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: ExternalWorkdirGrantCreateRequest,
     ) -> Result<ExternalWorkdirGrantResponse, WorkdirManagementApiError>;

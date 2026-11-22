@@ -88,6 +88,7 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     verify_connection_observation_shape(conn, current)?;
     verify_worker_lifecycle_shape(conn, current)?;
     verify_job_recording_shape(conn, current)?;
+    verify_external_session_shape(conn, current)?;
     let tail = failure_tail(conn, current, &rows)?;
     verify_failure_shape(conn, current, tail)?;
     let journal = tail == FailureTail::Journal || current >= 127;
@@ -435,6 +436,7 @@ impl FailureTail {
         ));
         tail.push((139, super::backend_job_result_application::MIGRATION_NAME));
         tail.push((140, super::backend_job_recording_input::MIGRATION_NAME));
+        tail.push((141, super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -643,6 +645,46 @@ fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> R
         .collect();
     if actual != expected {
         return Err(invalid("Service outcome receipt/shape mismatch"));
+    }
+    Ok(())
+}
+
+fn verify_external_session_shape(conn: &Connection, current: i64) -> Result<()> {
+    if current < 141 {
+        for column in ["session_credential_digest", "reconnect_deadline_at"] {
+            if super::column_exists(conn, "external_workdir_grants", column)? {
+                return Err(invalid(
+                    "External session columns before their migration receipt",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    static EXPECTED: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let expected = EXPECTED
+        .get_or_init(|| {
+            (|| {
+                let reference = reference_base()?;
+                super::install_external_workdir_session_columns(&reference)?;
+                Ok::<_, Error>(
+                    snapshot(&reference)?
+                        .into_iter()
+                        .filter(|(_, object)| {
+                            object.0 == "table" && object.1 == "external_workdir_grants"
+                        })
+                        .collect(),
+                )
+            })()
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(invalid)?;
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| object.0 == "table" && object.1 == "external_workdir_grants")
+        .collect();
+    if &actual != expected {
+        return Err(invalid("External sharing session receipt/shape mismatch"));
     }
     Ok(())
 }
@@ -1555,7 +1597,7 @@ mod failure_format_tests {
 
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
-        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140,
+        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141,
     ];
 
     #[test]
