@@ -385,16 +385,21 @@ impl WorkerStatus {
 }
 
 pub use protocol::WorkerLifecycleState;
+pub use runtime_api::WorkerObservationState;
 
 /// Lightweight persisted Worker identity projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
     pub lifecycle: WorkerLifecycleState,
+    #[serde(default)]
+    pub observation: WorkerObservationState,
     /// Creation timestamp in Unix epoch milliseconds for records created on this schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
@@ -418,11 +423,15 @@ pub struct WorkerSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_submission_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
     pub lifecycle: WorkerLifecycleState,
+    #[serde(default)]
+    pub observation: WorkerObservationState,
     /// Creation timestamp in Unix epoch milliseconds for records created on this schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,

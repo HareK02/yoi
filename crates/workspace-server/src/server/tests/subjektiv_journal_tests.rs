@@ -3325,6 +3325,7 @@ async fn explicit_erasure_interrupts_completed_journal_cleanup_waiting_for_run_t
     f.execution.publish_worker_state(
         worker,
         protocol::WorkerStateSnapshot {
+            state_sequence: 0,
             last_command_id: 0,
             last_finished_submission_request_id: None,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(

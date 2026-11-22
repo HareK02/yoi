@@ -125,6 +125,16 @@ async fn known_list_projects_live_state_without_launch_or_workdir_details() {
             let worker = workers.iter_mut().find(|w| w.worker == f.worker).unwrap();
             worker.state = "idle".into(); // Deliberately stale catalog, never the list source.
             worker.lifecycle = lifecycle;
+            worker.observation = snapshot
+                .as_ref()
+                .filter(|_| availability)
+                .map(|snapshot: &protocol::WorkerStateSnapshot| {
+                    runtime_api::WorkerObservationState::Current {
+                        state_sequence: snapshot.state_sequence,
+                    }
+                })
+                .unwrap_or(runtime_api::WorkerObservationState::Unavailable);
+            worker.last_finished_submission_request_id = Some("durable-history-not-live".into());
             worker.worker_state = snapshot;
             worker.availability = if availability {
                 protocol::subscription::SubscriptionWorkerAvailability::Observed

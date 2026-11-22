@@ -2542,9 +2542,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .remove(&request.worker_ref);
         let (handle, shutdown_rx, controller_task) =
             (started.handle, started.shutdown, started.controller_task);
-        if flow_transition_enabled {
-            handle.shared_state.enable_flow_transition();
-        }
         if let Err(error) = self.observation_hub.register(
             request.worker_ref.clone(),
             observation_workspace_id,
@@ -5111,20 +5108,28 @@ where
             return Ok(());
         };
         if bridge.snapshot_pending {
-            let streams = bridge
+            let mut streams = bridge
                 .streams
                 .lock()
                 .map_err(|_| "protocol streams lock is poisoned")?;
-            bridge
-                .context
-                .publish_protocol_event(
-                    streams
-                        .as_ref()
-                        .expect("unadmitted bridge owns streams")
-                        .snapshot_event
-                        .clone(),
-                )
-                .map_err(|error| error.to_string())?;
+            publish_bridge_snapshot(
+                streams.as_mut().expect("unadmitted bridge owns streams"),
+                worker_state,
+                &mut || subscribe_worker_protocol_session(handle),
+                &mut |event| {
+                    bridge
+                        .context
+                        .publish_protocol_event(event)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .map_err(|message| {
+                if let Err(error) = bridge.context.invalidate_observation(&message) {
+                    tracing::error!(%message, %error, "Worker observation invalidation failed");
+                }
+                message
+            })?;
             bridge.snapshot_pending = false;
         }
         #[cfg(test)]
@@ -5140,66 +5145,29 @@ where
         let bridge_worker_state = worker_state.clone();
         let bridge_handle = handle.clone();
         let task = self.spawn_on_adapter_runtime(async move {
-            let streams = streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take().expect("one bridge consumes the paired subscription");
-            let mut events = streams.events;
-            let mut entry_events = streams.log_entries;
-                loop {
-                    tokio::select! {
-                        event = events.recv() => {
-                            match event {
-                                Ok(event) => {
-                                    let mut event = match bridge_handle.alerter.freshen_event(event) {
-                                        Ok(event) => event,
-                                        Err(_) => {
-                                            // This shared bridge also carries Worker state: do
-                                            // not terminate it when a bounded Alert was evicted.
-                                            // Replace both receivers with the paired snapshot.
-                                            let replacement = subscribe_worker_protocol_session(&bridge_handle);
-                                            events = replacement.events;
-                                            entry_events = replacement.log_entries;
-                                            let mut snapshot = replacement.snapshot_event;
-                                            if apply_protocol_worker_state(&bridge_worker_state, &mut snapshot).is_err() {
-                                                break;
-                                            }
-                                            let _ = bridge_context.publish_protocol_event(snapshot);
-                                            for alert in replacement.alert_snapshot {
-                                                let _ = bridge_context.publish_protocol_event(Event::Alert(alert));
-                                            }
-                                            continue;
-                                        }
-                                    };
-                                    match apply_protocol_worker_state(&bridge_worker_state, &mut event) {
-                                        Ok(true) => {
-                                            let _ = bridge_context.publish_protocol_event(event);
-                                        }
-                                        Ok(false) => {}
-                                        Err(message) => {
-                                            let _ = bridge_context.publish_protocol_event(Event::Error {
-                                                code: protocol::ErrorCode::Internal,
-                                                message: format!("worker state stream rejected: {message}"),
-                                            });
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                        entry = entry_events.recv() => {
-                            match entry {
-                                Ok(entry) => {
-                                    if let Some(event) = live_log_entry_event(entry) {
-                                        let _ = bridge_context.publish_protocol_event(event);
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                    }
-                }
+            let streams = streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("one bridge consumes the paired subscription");
+            run_protocol_bridge(
+                streams,
+                bridge_worker_state,
+                |event| bridge_handle.alerter.freshen_event(event).map_err(|_| ()),
+                || subscribe_worker_protocol_session(&bridge_handle),
+                |event| {
+                    bridge_context
+                        .publish_protocol_event(event)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+                |message| {
+                    bridge_context
+                        .invalidate_observation(message)
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await;
         })?;
         tasks.push("protocol bridge", task, true);
         *retained = None;
@@ -5339,10 +5307,10 @@ where
             let _ = bridge_context;
         }
 
-        let connected_worker_state = worker_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // Connection may retain a subscribe-time snapshot while the Controller
+        // has already advanced. Return current source state, not the laggable
+        // bridge cache; source sequences order this with concurrent live events.
+        let connected_worker_state = handle.shared_state.snapshot();
         let workspace_id = workspace_client
             .as_ref()
             .and_then(|client| client.workspace_id().map(str::to_string));
@@ -6132,6 +6100,7 @@ fn apply_protocol_worker_state(
     current: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
     event: &mut Event,
 ) -> Result<bool, String> {
+    let full_snapshot = matches!(event, Event::Snapshot { .. });
     let incoming = match event {
         Event::WorkerState { snapshot } => snapshot,
         Event::Snapshot { state, .. } => state,
@@ -6140,8 +6109,208 @@ fn apply_protocol_worker_state(
     let mut current = current
         .write()
         .map_err(|_| "worker state projection lock is poisoned".to_string())?;
-    *current = incoming.clone();
-    Ok(true)
+    match incoming.state_sequence.cmp(&current.state_sequence) {
+        std::cmp::Ordering::Greater => {
+            *current = incoming.clone();
+            Ok(true)
+        }
+        std::cmp::Ordering::Equal if *incoming != *current => Err(format!(
+            "conflicting Worker state at source sequence {}",
+            incoming.state_sequence
+        )),
+        _ => {
+            // A session snapshot still carries history and other observations.
+            // Keep those fields, but never replay its older state over live state.
+            if full_snapshot {
+                *incoming = current.clone();
+            }
+            Ok(full_snapshot)
+        }
+    }
+}
+
+#[cfg(feature = "ws-server")]
+fn pending_bridge_log_events(
+    streams: &mut WorkerProtocolSessionStreams,
+) -> Result<Vec<Event>, String> {
+    // Inspect the old lane before replacing it, so resubscription cannot erase
+    // a pending loss/closure signal or facts from a preceding segment.
+    let pending = streams.log_entries.len();
+    let mut events = Vec::new();
+    for _ in 0..pending.saturating_add(1) {
+        match streams.log_entries.try_recv() {
+            Ok(entry) => events.push(
+                live_log_entry_event(entry)
+                    .ok_or_else(|| "Worker log entry has no protocol projection".to_string())?,
+            ),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                return Err(format!(
+                    "Worker session log stream lagged by {skipped} entries"
+                ));
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                return Err("Worker session log stream closed".into());
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+        }
+    }
+    Ok(events)
+}
+
+#[cfg(feature = "ws-server")]
+fn resubscribe_bridge(
+    resubscribe: &mut impl FnMut() -> WorkerProtocolSessionStreams,
+) -> Result<WorkerProtocolSessionStreams, String> {
+    let streams = resubscribe();
+    if streams.events.is_closed() {
+        return Err("Worker protocol event stream closed".into());
+    }
+    if streams.log_entries.is_closed() {
+        return Err("Worker session log stream closed".into());
+    }
+    Ok(streams)
+}
+
+#[cfg(feature = "ws-server")]
+fn publish_bridge_event(
+    event: Event,
+    streams: &mut WorkerProtocolSessionStreams,
+    current: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
+    resubscribe: &mut impl FnMut() -> WorkerProtocolSessionStreams,
+    publish: &mut impl FnMut(Event) -> Result<(), String>,
+) -> Result<(), String> {
+    let Err(failure) = publish(event.clone()) else {
+        return Ok(());
+    };
+    let recovery = (|| {
+        if streams.events.is_closed() {
+            return Err("Worker protocol event stream closed".to_string());
+        }
+        let replacement = resubscribe_bridge(resubscribe)?;
+        let pending = pending_bridge_log_events(streams)?;
+        *streams = replacement;
+        let mut snapshot = streams.snapshot_event.clone();
+        apply_protocol_worker_state(current, &mut snapshot)?;
+        // These are deliberately raw publications: recovery gets one attempt,
+        // never recursively another recovery on a persistent or unknown error.
+        // The owner callback refreshes its canonical fence before accepting it.
+        publish(snapshot)?;
+        for alert in streams.alert_snapshot.drain(..) {
+            publish(Event::Alert(alert))?;
+        }
+        // A fresh snapshot supersedes failed current-state observations and
+        // carries last_finished_submission_request_id. Historical events must
+        // retain their original identity and get one retry after that snapshot.
+        if !matches!(event, Event::WorkerState { .. } | Event::Snapshot { .. }) {
+            publish(event)?;
+        }
+        for event in pending {
+            publish(event)?;
+        }
+        Ok(())
+    })();
+    recovery.map_err(|error| {
+        format!("Worker publication failed: {failure}; one-shot recovery failed: {error}")
+    })
+}
+
+#[cfg(feature = "ws-server")]
+fn publish_bridge_snapshot(
+    streams: &mut WorkerProtocolSessionStreams,
+    current: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
+    resubscribe: &mut impl FnMut() -> WorkerProtocolSessionStreams,
+    publish: &mut impl FnMut(Event) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut snapshot = streams.snapshot_event.clone();
+    apply_protocol_worker_state(current, &mut snapshot)?;
+    publish_bridge_event(snapshot, streams, current, resubscribe, publish)?;
+    publish_bridge_alerts(streams, current, resubscribe, publish)
+}
+
+#[cfg(feature = "ws-server")]
+fn publish_bridge_alerts(
+    streams: &mut WorkerProtocolSessionStreams,
+    current: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
+    resubscribe: &mut impl FnMut() -> WorkerProtocolSessionStreams,
+    publish: &mut impl FnMut(Event) -> Result<(), String>,
+) -> Result<(), String> {
+    // Recovery replaces and drains this snapshot, so do not retain an obsolete
+    // Alert batch across a successful resubscription.
+    while !streams.alert_snapshot.is_empty() {
+        let alert = streams.alert_snapshot.remove(0);
+        publish_bridge_event(Event::Alert(alert), streams, current, resubscribe, publish)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ws-server")]
+async fn run_protocol_bridge(
+    mut streams: WorkerProtocolSessionStreams,
+    current: Arc<RwLock<protocol::WorkerStateSnapshot>>,
+    mut freshen: impl FnMut(Event) -> Result<Event, ()>,
+    mut resubscribe: impl FnMut() -> WorkerProtocolSessionStreams,
+    mut publish: impl FnMut(Event) -> Result<(), String>,
+    mut invalidate: impl FnMut(&str) -> Result<(), String>,
+) {
+    let result: Result<(), String> = async {
+        publish_bridge_alerts(&mut streams, &current, &mut resubscribe, &mut publish)?;
+        loop {
+            tokio::select! {
+                event = streams.events.recv() => {
+                    let event = match event {
+                        Ok(event) => freshen(event).ok(),
+                        Err(broadcast::error::RecvError::Lagged(_)) => None,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err("Worker protocol event stream closed".into());
+                        }
+                    };
+                    if let Some(mut event) = event {
+                        if apply_protocol_worker_state(&current, &mut event)? {
+                            publish_bridge_event(event, &mut streams, &current, &mut resubscribe, &mut publish)?;
+                        }
+                    } else {
+                        // Recover even if the last state event was lost and no
+                        // future state change will arrive. The owner subscribes
+                        // before reading the replacement snapshot.
+                        let replacement = resubscribe_bridge(&mut resubscribe)?;
+                        let pending = pending_bridge_log_events(&mut streams)?;
+                        streams = replacement;
+                        for event in pending {
+                            publish_bridge_event(event, &mut streams, &current, &mut resubscribe, &mut publish)?;
+                        }
+                        publish_bridge_snapshot(&mut streams, &current, &mut resubscribe, &mut publish)?;
+                    }
+                }
+                entry = streams.log_entries.recv() => {
+                    match entry {
+                        Ok(entry) => {
+                            let event = live_log_entry_event(entry).ok_or_else(|| {
+                                "Worker log entry has no protocol projection".to_string()
+                            })?;
+                            publish_bridge_event(event, &mut streams, &current, &mut resubscribe, &mut publish)?;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // The current segment snapshot cannot prove recovery
+                            // of all durable facts across a segment rotation.
+                            return Err(format!("Worker session log stream lagged by {skipped} entries"));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err("Worker session log stream closed".into());
+                        }
+                    }
+                }
+            }
+        }
+    }.await;
+    if let Err(message) = result {
+        // The one-shot same-owner recovery has failed, or a stream lost
+        // history/closed. No cached snapshot may remain usable after this exit.
+        if let Err(error) = invalidate(&message) {
+            tracing::error!(%message, %error, "Worker observation invalidation failed");
+        } else {
+            tracing::warn!(%message, "Worker observation bridge unavailable");
+        }
+    }
 }
 
 impl<F> WorkerExecutionBackend for WorkerRuntimeExecutionBackend<F>
@@ -9593,14 +9762,14 @@ mod tests {
         // forwarded with its now-unresolvable pending-text position.
         execution
             .handle
-            .send_event(Event::Alert(protocol::Alert {
+            .publish_alert(protocol::Alert {
                 id: Some("evicted-alert".into()),
                 position: Some(protocol::AlertPosition::AfterInFlight { block_id: 99 }),
                 level: protocol::AlertLevel::Warn,
                 source: protocol::AlertSource::Worker,
                 message: "stale alert".into(),
                 timestamp_ms: 1,
-            }))
+            })
             .unwrap();
         backend.run_on_adapter_runtime(async move {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -9786,23 +9955,6 @@ mod tests {
                     );
                     assert!(pending.acknowledgement.is_none());
                 }
-                // A mismatched ID or command kind is not this Shutdown's verdict.
-                for (id, kind) in [
-                    (command_id + 1, protocol::WorkerCommandKind::Shutdown),
-                    (command_id, protocol::WorkerCommandKind::Cancel),
-                ] {
-                    checking
-                        .handle
-                        .send_event(Event::CommandAcknowledged {
-                            acknowledgement: protocol::WorkerCommandAcknowledgement {
-                                command_id: id,
-                                command: kind,
-                                disposition: protocol::WorkerCommandDisposition::Accepted,
-                                state: checking.handle.shared_state.snapshot(),
-                            },
-                        })
-                        .unwrap();
-                }
                 release.send(()).unwrap();
                 let error = checking
                     .tasks
@@ -9833,6 +9985,23 @@ mod tests {
             acknowledgement: None,
             uncertainty: None,
         };
+        // Correlation filtering belongs to this receiver boundary. Inject
+        // mismatches only through its local channel, never a public Worker API.
+        for (command_id, command) in [
+            (38, protocol::WorkerCommandKind::Shutdown),
+            (37, protocol::WorkerCommandKind::Cancel),
+        ] {
+            events
+                .send(Event::CommandAcknowledged {
+                    acknowledgement: protocol::WorkerCommandAcknowledgement {
+                        command_id,
+                        command,
+                        disposition: protocol::WorkerCommandDisposition::Accepted,
+                        state: protocol::WorkerStateSnapshot::initial(),
+                    },
+                })
+                .unwrap();
+        }
         assert!(
             pending
                 .wait(Duration::from_millis(10))
@@ -9841,6 +10010,8 @@ mod tests {
                 .contains("timed out")
         );
         assert!(pending.uncertainty.as_ref().unwrap().contains("timed out"));
+        assert!(pending.acknowledgement.is_none());
+        assert_eq!(pending.command_id, 37);
         let acknowledgement = protocol::WorkerCommandAcknowledgement {
             command_id: 37,
             command: protocol::WorkerCommandKind::Shutdown,
@@ -11686,46 +11857,650 @@ mod tests {
     }
 
     #[test]
-    fn protocol_bridge_applies_state_events_but_preserves_acknowledgements_as_evidence() {
+    fn protocol_bridge_orders_state_sequences_not_command_ids_and_preserves_ack_evidence() {
         let running = protocol::WorkerStateSnapshot {
+            state_sequence: 2,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 2,
             last_finished_submission_request_id: Some("request-old".to_string()),
         };
-        let current = Arc::new(RwLock::new(running));
-        let idle = protocol::WorkerStateSnapshot {
-            state: protocol::WorkerState::Idle,
-            last_command_id: 0,
-            last_finished_submission_request_id: None,
+        let current = Arc::new(RwLock::new(running.clone()));
+        let mut stale = Event::WorkerState {
+            snapshot: protocol::WorkerStateSnapshot::initial(),
         };
-        let mut replacement = Event::WorkerState {
+        assert!(!apply_protocol_worker_state(&current, &mut stale).unwrap());
+        assert_eq!(*current.read().unwrap(), running);
+        let mut duplicate = Event::WorkerState {
+            snapshot: running.clone(),
+        };
+        assert!(!apply_protocol_worker_state(&current, &mut duplicate).unwrap());
+        let mut conflict = Event::WorkerState {
+            snapshot: protocol::WorkerStateSnapshot {
+                state: protocol::WorkerState::Idle,
+                ..running.clone()
+            },
+        };
+        assert!(apply_protocol_worker_state(&current, &mut conflict).is_err());
+        assert_eq!(*current.read().unwrap(), running);
+
+        // Finishing an ordinary Run does not require a new lifecycle command.
+        let idle = protocol::WorkerStateSnapshot {
+            state_sequence: 3,
+            state: protocol::WorkerState::Idle,
+            last_finished_submission_request_id: Some("request-new".into()),
+            ..running.clone()
+        };
+        let mut finished = Event::WorkerState {
             snapshot: idle.clone(),
         };
-        assert!(apply_protocol_worker_state(&current, &mut replacement).unwrap());
+        assert!(apply_protocol_worker_state(&current, &mut finished).unwrap());
+        assert_eq!(*current.read().unwrap(), idle);
+        let mut late_running = Event::WorkerState {
+            snapshot: running.clone(),
+        };
+        assert!(!apply_protocol_worker_state(&current, &mut late_running).unwrap());
         assert_eq!(*current.read().unwrap(), idle);
 
-        let paused = protocol::WorkerStateSnapshot {
-            state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                protocol::WorkerRunState::Paused,
-            )),
-            last_command_id: 3,
-            last_finished_submission_request_id: None,
-        };
         let mut acknowledgement = Event::CommandAcknowledged {
             acknowledgement: protocol::WorkerCommandAcknowledgement {
-                command_id: 3,
+                command_id: 2,
                 command: protocol::WorkerCommandKind::Pause,
                 disposition: protocol::WorkerCommandDisposition::Accepted,
-                state: paused.clone(),
+                state: running.clone(),
             },
         };
         assert!(apply_protocol_worker_state(&current, &mut acknowledgement).unwrap());
         assert_eq!(*current.read().unwrap(), idle);
         assert!(
-            matches!(acknowledgement, Event::CommandAcknowledged { acknowledgement } if acknowledgement.state == paused)
+            matches!(acknowledgement, Event::CommandAcknowledged { acknowledgement } if acknowledgement.state == running)
         );
+    }
+
+    fn bridge_snapshot(state: protocol::WorkerStateSnapshot) -> Event {
+        Event::Snapshot {
+            state,
+            session: protocol::SessionSnapshot {
+                pending_submissions: Default::default(),
+                entries: vec![protocol::SessionSnapshotEntry {
+                    entry_id: "durable-entry".into(),
+                    timestamp: 1,
+                    provenance: protocol::SessionEntryProvenance::HumanInput,
+                    derived_from: vec![],
+                    use_policy: None,
+                    data: protocol::SessionSnapshotEntryData::UserInput { segments: vec![] },
+                }],
+            },
+            greeting: protocol::Greeting {
+                worker_name: "bridge".into(),
+                cwd: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                scope_summary: String::new(),
+                tools: vec![],
+                context_window: 0,
+                context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
+            },
+            in_flight: Default::default(),
+            internal_workers: vec![],
+        }
+    }
+
+    #[test]
+    fn protocol_bridge_keeps_full_snapshot_history_without_rolling_back_live_state() {
+        let latest = protocol::WorkerStateSnapshot {
+            state_sequence: 4,
+            last_finished_submission_request_id: Some("request-finished".into()),
+            ..protocol::WorkerStateSnapshot::initial()
+        };
+        let current = Arc::new(RwLock::new(latest.clone()));
+        for state in [protocol::WorkerStateSnapshot::initial(), latest.clone()] {
+            let mut event = bridge_snapshot(state);
+            assert!(apply_protocol_worker_state(&current, &mut event).unwrap());
+            assert_eq!(*current.read().unwrap(), latest);
+            let Event::Snapshot {
+                state,
+                session,
+                greeting,
+                ..
+            } = event
+            else {
+                panic!("snapshot")
+            };
+            assert_eq!(state, latest);
+            assert_eq!(session.entries[0].entry_id, "durable-entry");
+            assert_eq!(greeting.worker_name, "bridge");
+        }
+        let mut conflict = bridge_snapshot(protocol::WorkerStateSnapshot {
+            last_finished_submission_request_id: None,
+            ..latest.clone()
+        });
+        assert!(apply_protocol_worker_state(&current, &mut conflict).is_err());
+        assert_eq!(*current.read().unwrap(), latest);
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn bridge_test_streams(
+        capacity: usize,
+        state: protocol::WorkerStateSnapshot,
+    ) -> (
+        WorkerProtocolSessionStreams,
+        broadcast::Sender<Event>,
+        broadcast::Sender<session_store::LogEntry>,
+    ) {
+        let (events, receiver) = broadcast::channel(capacity);
+        let (logs, log_receiver) = broadcast::channel(capacity);
+        (
+            WorkerProtocolSessionStreams {
+                snapshot_event: bridge_snapshot(state),
+                alert_snapshot: vec![],
+                events: receiver,
+                log_entries: log_receiver,
+            },
+            events,
+            logs,
+        )
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[tokio::test]
+    async fn protocol_bridge_recovers_lost_last_state_without_a_future_state_event() {
+        let initial = protocol::WorkerStateSnapshot::initial();
+        let latest = protocol::WorkerStateSnapshot {
+            state_sequence: 7,
+            last_finished_submission_request_id: Some("last-run".into()),
+            ..initial.clone()
+        };
+        let (streams, events, _logs) = bridge_test_streams(1, initial.clone());
+        events
+            .send(Event::WorkerState {
+                snapshot: latest.clone(),
+            })
+            .unwrap();
+        events.send(Event::ContextUsage { usage: None }).unwrap();
+        events.send(Event::Shutdown).unwrap();
+        let (mut replacement, replacement_events, _replacement_logs) =
+            bridge_test_streams(4, latest.clone());
+        replacement.alert_snapshot.push(protocol::Alert {
+            id: Some("retained-alert".into()),
+            position: None,
+            level: protocol::AlertLevel::Warn,
+            source: protocol::AlertSource::Worker,
+            message: "recovered".into(),
+            timestamp_ms: 1,
+        });
+        // An overlapping queued event must not undo the resnapshot.
+        replacement_events
+            .send(Event::WorkerState {
+                snapshot: initial.clone(),
+            })
+            .unwrap();
+        replacement_events.send(Event::Shutdown).unwrap();
+        let mut replacement = Some(replacement);
+        let mut replacement_sender = Some(replacement_events);
+        let current = Arc::new(RwLock::new(initial));
+        let mut published = vec![];
+        let mut invalidations = vec![];
+        let mut subscriptions = 0;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_protocol_bridge(
+                streams,
+                current.clone(),
+                Ok,
+                || {
+                    subscriptions += 1;
+                    replacement.take().expect("only one recovery")
+                },
+                |event| {
+                    if matches!(event, Event::Shutdown) {
+                        replacement_sender.take();
+                    }
+                    published.push(event);
+                    Ok(())
+                },
+                |reason| {
+                    invalidations.push(reason.to_string());
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(subscriptions, 1);
+        assert_eq!(*current.read().unwrap(), latest);
+        assert!(
+            matches!(&published[0], Event::Snapshot { state, session, .. } if *state == latest && session.entries[0].entry_id == "durable-entry")
+        );
+        assert!(
+            matches!(&published[1], Event::Alert(alert) if alert.id.as_deref() == Some("retained-alert"))
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|event| matches!(event, Event::WorkerState { .. }))
+        );
+        assert_eq!(invalidations.len(), 1);
+        assert!(invalidations[0].contains("event stream closed"));
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[tokio::test]
+    async fn protocol_bridge_invalidates_lost_durable_log_facts_instead_of_continuing() {
+        let initial = protocol::WorkerStateSnapshot::initial();
+        let (streams, _events, logs) = bridge_test_streams(1, initial.clone());
+        for ts in 0..3 {
+            logs.send(session_store::LogEntry::RunCancelled { ts, entry_id: None })
+                .unwrap();
+        }
+        let mut invalidations = vec![];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_protocol_bridge(
+                streams,
+                Arc::new(RwLock::new(initial)),
+                Ok,
+                || panic!("log loss cannot be repaired by a current segment snapshot"),
+                |_| panic!("must not publish a partial log after loss"),
+                |reason| {
+                    invalidations.push(reason.to_string());
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalidations.len(), 1);
+        assert!(invalidations[0].contains("log stream lagged"));
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[tokio::test]
+    async fn protocol_bridge_event_resnapshot_cannot_hide_concurrent_log_loss() {
+        let initial = protocol::WorkerStateSnapshot::initial();
+        let (streams, events, logs) = bridge_test_streams(1, initial.clone());
+        for _ in 0..3 {
+            events.send(Event::Shutdown).unwrap();
+        }
+        let (replacement, _replacement_events, _replacement_logs) =
+            bridge_test_streams(1, initial.clone());
+        let mut replacement = Some(replacement);
+        let mut invalidations = vec![];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_protocol_bridge(
+                streams,
+                Arc::new(RwLock::new(initial)),
+                Ok,
+                || {
+                    // Force the event-lag branch to win, then lose durable history
+                    // before the paired receivers are replaced.
+                    for ts in 0..3 {
+                        logs.send(session_store::LogEntry::RunCancelled { ts, entry_id: None })
+                            .unwrap();
+                    }
+                    replacement.take().unwrap()
+                },
+                |_| panic!("must invalidate rather than hide old log loss with a fresh snapshot"),
+                |reason| {
+                    invalidations.push(reason.to_string());
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalidations.len(), 1);
+        assert!(invalidations[0].contains("log stream lagged"));
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[tokio::test]
+    async fn protocol_bridge_invalidates_both_closed_streams_without_retry() {
+        for close_events in [true, false] {
+            let initial = protocol::WorkerStateSnapshot::initial();
+            let (streams, events, logs) = bridge_test_streams(1, initial.clone());
+            let mut events = Some(events);
+            let mut logs = Some(logs);
+            if close_events {
+                events.take();
+            } else {
+                logs.take();
+            }
+            let mut invalidations = vec![];
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                run_protocol_bridge(
+                    streams,
+                    Arc::new(RwLock::new(initial)),
+                    Ok,
+                    || panic!("closed streams do not cause a retry loop"),
+                    |_| panic!("closed streams contain no publishable event"),
+                    |reason| {
+                        invalidations.push(reason.to_string());
+                        Ok(())
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(invalidations.len(), 1);
+            assert!(invalidations[0].contains(if close_events {
+                "event stream closed"
+            } else {
+                "log stream closed"
+            }));
+        }
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[tokio::test]
+    async fn protocol_bridge_invalidates_publication_failure_after_local_state_merge() {
+        let initial = protocol::WorkerStateSnapshot::initial();
+        let latest = protocol::WorkerStateSnapshot {
+            state_sequence: 1,
+            ..initial.clone()
+        };
+        let (streams, events, _logs) = bridge_test_streams(4, initial.clone());
+        events
+            .send(Event::WorkerState {
+                snapshot: latest.clone(),
+            })
+            .unwrap();
+        events.send(Event::Shutdown).unwrap();
+        let (replacement, _replacement_events, _replacement_logs) =
+            bridge_test_streams(4, latest.clone());
+        let mut replacement = Some(replacement);
+        let current = Arc::new(RwLock::new(initial));
+        let mut invalidations = vec![];
+        let mut publications = 0;
+        let mut recoveries = 0;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_protocol_bridge(
+                streams,
+                current.clone(),
+                Ok,
+                || {
+                    recoveries += 1;
+                    replacement.take().expect("only one recovery")
+                },
+                |_| {
+                    publications += 1;
+                    Err("injected durable publication failure".into())
+                },
+                |reason| {
+                    invalidations.push(reason.to_string());
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*current.read().unwrap(), latest);
+        assert_eq!(recoveries, 1);
+        assert_eq!(
+            publications, 2,
+            "initial publication and one recovery snapshot attempt only"
+        );
+        assert_eq!(invalidations.len(), 1);
+        assert!(invalidations[0].contains("injected durable publication failure"));
+        assert!(invalidations[0].contains("one-shot recovery failed"));
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[tokio::test]
+    async fn protocol_bridge_transient_state_failure_resnapshots_and_continues_paired_tail() {
+        assert_transient_bridge_publication_recovery(false).await;
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[tokio::test]
+    async fn protocol_bridge_transient_history_failure_retries_original_after_snapshot() {
+        assert_transient_bridge_publication_recovery(true).await;
+    }
+
+    #[cfg(feature = "ws-server")]
+    async fn assert_transient_bridge_publication_recovery(history: bool) {
+        let initial = protocol::WorkerStateSnapshot::initial();
+        let finished = protocol::WorkerStateSnapshot {
+            state_sequence: 1,
+            last_finished_submission_request_id: Some("finished-before-failure".into()),
+            ..initial.clone()
+        };
+        let tail = protocol::WorkerStateSnapshot {
+            state_sequence: 2,
+            ..finished.clone()
+        };
+        let (streams, events, logs) = bridge_test_streams(4, initial.clone());
+        let failed_event = if history {
+            let entry = session_store::LogEntry::RunCancelled {
+                ts: 1,
+                entry_id: Some(LoggedSessionHistoryEntryId::new()),
+            };
+            logs.send(entry.clone()).unwrap();
+            live_log_entry_event(entry).unwrap()
+        } else {
+            let event = Event::WorkerState {
+                snapshot: finished.clone(),
+            };
+            events.send(event.clone()).unwrap();
+            event
+        };
+        let (replacement, replacement_events, _replacement_logs) =
+            bridge_test_streams(4, finished.clone());
+        replacement_events
+            .send(Event::WorkerState {
+                snapshot: tail.clone(),
+            })
+            .unwrap();
+        replacement_events.send(Event::Shutdown).unwrap();
+        let mut replacement_sender = Some(replacement_events);
+        let mut replacement = Some(replacement);
+        let current = Arc::new(RwLock::new(initial));
+        let mut attempts = vec![];
+        let mut published = vec![];
+        let mut invalidations = vec![];
+        let mut recoveries = 0;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_protocol_bridge(
+                streams,
+                current.clone(),
+                Ok,
+                || {
+                    recoveries += 1;
+                    replacement.take().expect("only one recovery")
+                },
+                |event| {
+                    attempts.push(serde_json::to_value(&event).unwrap());
+                    if attempts.len() == 1 {
+                        return Err("injected transient publication failure".into());
+                    }
+                    if matches!(event, Event::Shutdown) {
+                        replacement_sender.take();
+                    }
+                    published.push(event);
+                    Ok(())
+                },
+                |reason| {
+                    invalidations.push(reason.to_string());
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recoveries, 1);
+        assert_eq!(attempts[0], serde_json::to_value(&failed_event).unwrap());
+        assert!(matches!(&published[0], Event::Snapshot { state, .. } if *state == finished));
+        let tail_index = if history {
+            assert_eq!(
+                serde_json::to_value(&published[1]).unwrap(),
+                serde_json::to_value(&failed_event).unwrap(),
+                "retry preserves the original durable event identity after the snapshot"
+            );
+            2
+        } else {
+            // The canonical snapshot carries the failed completion fence; do
+            // not republish an obsolete state event over the fresh observation.
+            1
+        };
+        assert!(
+            matches!(&published[tail_index], Event::WorkerState { snapshot } if *snapshot == tail)
+        );
+        assert!(matches!(&published[tail_index + 1], Event::Shutdown));
+        assert_eq!(*current.read().unwrap(), tail);
+        assert_eq!(invalidations.len(), 1);
+        assert!(
+            invalidations[0].contains("event stream closed"),
+            "healthy recovery must not invalidate; only the deliberately closed live tail may do so"
+        );
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    fn protocol_bridge_backend_recovers_real_overflow_and_joins_on_stop() {
+        assert_protocol_bridge_backend_connection(true);
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    fn protocol_bridge_backend_returns_live_running_after_retaining_initial_idle() {
+        assert_protocol_bridge_backend_connection(false);
+    }
+
+    // Uses the production adapter connection, paired subscription, Controller,
+    // and Stop/join. Only the LLM boundary is substituted; no state is injected.
+    #[cfg(feature = "ws-server")]
+    fn assert_protocol_bridge_backend_connection(overflow: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let backend = WorkerRuntimeExecutionBackend::new(MockFactory {
+            client: MockClient::sequential(vec![MockResponse::Gated {
+                started: started.clone(),
+                release: Arc::new(tokio::sync::Notify::new()),
+                events: vec![],
+            }]),
+            runtime_base: root.path().join("control"),
+            cwd: root.path().to_path_buf(),
+            store_dir: root.path().join("sessions"),
+            worker_metadata_dir: root.path().join("metadata"),
+            observed_cwds: Arc::default(),
+            observed_workspace_clients: Arc::default(),
+        })
+        .unwrap();
+        let request = create_request("bridge overflow");
+        let worker_ref = WorkerRef::new(request.worker_id);
+        let (published_tx, published) = mpsc::channel();
+        let context = WorkerExecutionContext::new(
+            worker_ref.clone(),
+            Arc::new(move |worker_ref, payload| {
+                if matches!(payload, Event::Snapshot { .. }) {
+                    published_tx.send(payload.clone()).unwrap();
+                }
+                Ok(crate::observation::WorkerObservationEvent::new(
+                    1, worker_ref, payload,
+                ))
+            }),
+        );
+        let spawn_request = WorkerExecutionSpawnRequest {
+            worker_ref: worker_ref.clone(),
+            request,
+            workspace_scope: None,
+            context: context.clone(),
+            workdir_attachments: BTreeMap::new(),
+            config_bundle: None,
+        };
+        let factory = backend.factory.clone();
+        let (controller, streams) = backend
+            .run_joined_on_adapter_runtime(async move {
+                let controller = factory
+                    .spawn_controller(spawn_request)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?;
+                let streams = subscribe_worker_protocol_session(&controller.handle);
+                controller
+                    .handle
+                    .send(Method::submit_text("bridge-run", "start"))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tokio::time::timeout(Duration::from_secs(5), started.notified())
+                    .await
+                    .map_err(|_| "Controller did not start the Run".to_string())?;
+                // The initial Idle snapshot is retained while the real source
+                // advances to Running, before bridge admission or connection return.
+                // The overflow case additionally drops its last state event.
+                if overflow {
+                    for _ in 0..1024 {
+                        controller.handle.alert(
+                            protocol::AlertLevel::Warn,
+                            protocol::AlertSource::Worker,
+                            "overflow".into(),
+                        );
+                    }
+                }
+                Ok((controller, streams))
+            })
+            .unwrap();
+        let Event::Snapshot { state: initial, .. } = &streams.snapshot_event else {
+            panic!("snapshot")
+        };
+        let initial = initial.clone();
+        assert_eq!(initial.state, protocol::WorkerState::Idle);
+        let result = backend.connect_handle(
+            WorkerExecutionOperation::Spawn,
+            worker_ref.clone(),
+            context,
+            controller.handle,
+            controller.shutdown,
+            controller.controller_task,
+            None,
+            vec![],
+            Some(controller.workspace_client),
+            Some(streams),
+        );
+        let WorkerExecutionSpawnResult::Connected {
+            worker_state: connected,
+            ..
+        } = result
+        else {
+            panic!("connection failed: {result:?}")
+        };
+        assert!(connected.state_sequence > initial.state_sequence);
+        assert_eq!(connected.catalog_status(), WorkerStatus::Running);
+        // Runtime fresh detail/reconnect must likewise read the actual source,
+        // not the subscribe-time projection retained by this bridge.
+        let Event::Snapshot { state: direct, .. } = backend.worker_snapshot(&worker_ref).unwrap()
+        else {
+            panic!("snapshot")
+        };
+        assert_eq!(direct, connected);
+        if overflow {
+            let recovered = published
+                .recv_timeout(Duration::from_secs(5))
+                .expect("lag must resnapshot without a new state event");
+            let Event::Snapshot { state, session, .. } = recovered else {
+                panic!("snapshot")
+            };
+            assert_eq!(state, connected);
+            assert!(
+                !session.entries.is_empty(),
+                "resnapshot includes committed input"
+            );
+            assert_eq!(
+                *backend.workers.lock().unwrap()[&worker_ref]
+                    .worker_state
+                    .read()
+                    .unwrap(),
+                state
+            );
+        }
+        assert!(backend.stop_worker(&worker_ref).is_accepted());
+        assert!(backend.workers.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -13941,31 +14716,31 @@ mod tests {
         let hub = Arc::new(RuntimeWorkerObservationHub::default());
         let worker_id = crate::identity::WorkerId::from_legacy_u64(7);
         let worker_ref = WorkerRef::new(worker_id);
-        let shared_state = Arc::new(WorkerSharedState::new(
-            "peer-worker".to_string(),
-            session_store::new_segment_id(),
-            "[worker]\nname = \"peer-worker\"".to_string(),
-            protocol::Greeting {
-                worker_name: "peer-worker".to_string(),
-                cwd: "/tmp".to_string(),
-                provider: "test".to_string(),
-                model: "test".to_string(),
-                scope_summary: String::new(),
-                tools: Vec::new(),
-                context_window: 1_000,
-                context_tokens: 0,
-                reasoning: None,
-                context_usage: None,
-            },
-        ));
-        hub.workers.lock().unwrap().insert(
-            worker_ref,
-            RuntimeObservedWorker {
-                workspace_id: Some("workspace-1".to_string()),
-                shared_state: Arc::downgrade(&shared_state),
-                sink: SegmentLogSink::new(),
-            },
-        );
+        let root = tempfile::tempdir().unwrap();
+        let factory = MockFactory {
+            client: MockClient::new(vec![]),
+            runtime_base: root.path().join("control"),
+            cwd: root.path().to_path_buf(),
+            store_dir: root.path().join("sessions"),
+            worker_metadata_dir: root.path().join("metadata"),
+            observed_cwds: Arc::default(),
+            observed_workspace_clients: Arc::default(),
+        };
+        let mut request = create_request("peer-worker");
+        request.worker_id = worker_id;
+        let controller = factory
+            .spawn_controller(WorkerExecutionSpawnRequest {
+                worker_ref: worker_ref.clone(),
+                request,
+                workspace_scope: None,
+                context: test_execution_context(worker_ref.clone()),
+                workdir_attachments: BTreeMap::new(),
+                config_bundle: None,
+            })
+            .await
+            .unwrap();
+        hub.register(worker_ref, Some("workspace-1".into()), &controller.handle)
+            .unwrap();
         let grant = crate::identity::RuntimeWorkerRef::new("runtime-1", worker_id.to_string());
         let provider = RuntimeGrantedWorkerObservationProvider {
             runtime_id: "runtime-1".to_string(),
@@ -14015,7 +14790,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(hidden, WorkerObservationError::NotFound));
 
-        drop(shared_state);
+        shutdown_profile_controller(controller).await;
         assert!(provider.list_worker_sessions().await.unwrap().is_empty());
     }
 

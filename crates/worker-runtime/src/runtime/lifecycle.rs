@@ -15,6 +15,8 @@ enum WorkerExecutionState {
 #[derive(Debug, Clone)]
 struct ActiveWorkerExecution {
     snapshot: protocol::WorkerStateSnapshot,
+    owner: Option<WorkerLifecycleOperationId>,
+    observation_valid: bool,
     internal_workers: InternalWorkerActivityProjection,
 }
 
@@ -22,6 +24,8 @@ impl ActiveWorkerExecution {
     fn new(snapshot: protocol::WorkerStateSnapshot) -> Self {
         Self {
             snapshot,
+            owner: None,
+            observation_valid: true,
             internal_workers: InternalWorkerActivityProjection::default(),
         }
     }
@@ -43,6 +47,7 @@ struct CreateOperation {
     // Legacy unresolved creates have no operation identity. Never invent one on reopen.
     operation_id: Option<WorkerLifecycleOperationId>,
     snapshot: Option<protocol::WorkerStateSnapshot>,
+    observation_valid: bool,
     internal_workers: InternalWorkerActivityProjection,
 }
 
@@ -161,8 +166,20 @@ impl WorkerRecord {
         }
     }
 
+    fn observation_state(&self) -> crate::catalog::WorkerObservationState {
+        match self.active_execution() {
+            Some(active) if active.observation_valid => {
+                crate::catalog::WorkerObservationState::Current {
+                    state_sequence: active.snapshot.state_sequence,
+                }
+            }
+            _ => crate::catalog::WorkerObservationState::Unavailable,
+        }
+    }
+
     fn worker_state(&self) -> Option<protocol::WorkerStateSnapshot> {
         self.observation_execution()
+            .filter(|active| active.observation_valid)
             .map(|active| active.snapshot.clone())
     }
 
@@ -352,19 +369,39 @@ impl WorkerRecord {
         };
     }
 
-    fn handoff_active(&mut self, snapshot: protocol::WorkerStateSnapshot) {
-        self.remember_finished_submission(&snapshot);
-        let internal_workers = match &self.execution {
+    fn handoff_active(
+        &mut self,
+        mut snapshot: protocol::WorkerStateSnapshot,
+    ) -> Result<(), RuntimeError> {
+        let (owner, observation_valid, internal_workers) = match &self.execution {
             WorkerExecutionState::Creating(create)
             | WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Create(create)) => {
-                create.internal_workers.clone()
+                if let Some(latest) = &create.snapshot {
+                    if latest.state_sequence == snapshot.state_sequence && latest != &snapshot {
+                        return Err(RuntimeError::InvalidRequest(
+                            "conflicting Create snapshot source sequence".into(),
+                        ));
+                    }
+                    if latest.state_sequence > snapshot.state_sequence {
+                        snapshot = latest.clone();
+                    }
+                }
+                (
+                    create.operation_id,
+                    create.observation_valid,
+                    create.internal_workers.clone(),
+                )
             }
-            _ => InternalWorkerActivityProjection::default(),
+            _ => (None, false, InternalWorkerActivityProjection::default()),
         };
+        self.remember_finished_submission(&snapshot);
         self.execution = WorkerExecutionState::Active(ActiveWorkerExecution {
             snapshot,
+            owner,
+            observation_valid,
             internal_workers,
         });
+        Ok(())
     }
 
     fn remember_finished_submission(&mut self, snapshot: &protocol::WorkerStateSnapshot) {
@@ -378,11 +415,20 @@ impl WorkerRecord {
         match &mut self.execution {
             WorkerExecutionState::Creating(create)
             | WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Create(create)) => {
-                create.snapshot = Some(snapshot)
+                if create
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|old| snapshot.state_sequence > old.state_sequence)
+                {
+                    create.snapshot = Some(snapshot);
+                    create.observation_valid = true;
+                }
             }
             WorkerExecutionState::Restoring(restore)
             | WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Restore(restore)) => {
-                restore.candidate = RestoreCandidate::Prepared(ActiveWorkerExecution::new(snapshot))
+                let mut active = ActiveWorkerExecution::new(snapshot);
+                active.owner = Some(restore.pending.operation_id);
+                restore.candidate = RestoreCandidate::Prepared(active)
             }
             _ => {}
         }
@@ -458,6 +504,7 @@ impl WorkerRecord {
                 | WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Create(old)),
             ) if current.operation_id == old.operation_id => {
                 current.snapshot = old.snapshot.clone();
+                current.observation_valid = old.observation_valid;
                 current.internal_workers = old.internal_workers.clone();
             }
             (
@@ -493,6 +540,7 @@ impl WorkerRecord {
             _ => CreateOperation {
                 operation_id: None,
                 snapshot: None,
+                observation_valid: false,
                 internal_workers: InternalWorkerActivityProjection::default(),
             },
         };
@@ -548,29 +596,80 @@ impl WorkerRecord {
         }
     }
 
+    fn accepts_observation_owner(&self, owner: WorkerLifecycleOperationId) -> bool {
+        if self
+            .observation_execution()
+            .is_some_and(|active| active.owner == Some(owner))
+        {
+            return true;
+        }
+        matches!(&self.execution, WorkerExecutionState::Creating(create)
+            if create.operation_id == Some(owner))
+    }
+
+    fn owns_observation_context(&self, owner: WorkerLifecycleOperationId) -> bool {
+        self.accepts_observation_owner(owner)
+            || self
+                .restore_operation()
+                .is_some_and(|restore| restore.pending.operation_id == owner)
+    }
+
+    fn invalidate_observation(&mut self) {
+        if let Some(active) = self.observation_execution_mut() {
+            active.observation_valid = false;
+        }
+        match &mut self.execution {
+            WorkerExecutionState::Creating(create)
+            | WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Create(create)) => {
+                create.observation_valid = false;
+            }
+            WorkerExecutionState::Restoring(restore) => match &mut restore.candidate {
+                RestoreCandidate::Existing(active)
+                | RestoreCandidate::Prepared(active)
+                | RestoreCandidate::Publishing(active) => active.observation_valid = false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     fn apply_owned_observation(&mut self, snapshot: &protocol::WorkerStateSnapshot) -> bool {
         if self.active_execution().is_some() {
             return self.apply_worker_state(snapshot);
         }
         if self.observation_execution().is_none() {
-            // Create's context is not a Restore candidate context. Its events are
-            // retained by the create operation, never used to construct Active.
-            if matches!(self.execution, WorkerExecutionState::Creating(_)) {
+            if let WorkerExecutionState::Creating(create) = &self.execution {
+                if create
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|old| old.state_sequence >= snapshot.state_sequence)
+                {
+                    if create.snapshot.as_ref() == Some(snapshot) && !create.observation_valid {
+                        if let WorkerExecutionState::Creating(create) = &mut self.execution {
+                            create.observation_valid = true;
+                        }
+                        return true;
+                    }
+                    return false;
+                }
                 self.retain_candidate_snapshot(snapshot.clone());
+                return true;
             }
             return false;
         }
-        if self
-            .observation_execution()
-            .map(|active| &active.snapshot.state)
-            != Some(&snapshot.state)
+        let active = self.observation_execution().expect("publication owner");
+        if snapshot.state_sequence < active.snapshot.state_sequence
+            || (snapshot == &active.snapshot && active.observation_valid)
         {
+            return false;
+        }
+        if active.snapshot.state_sequence != snapshot.state_sequence {
             self.restore_guard.rotate();
         }
         self.remember_finished_submission(snapshot);
-        self.observation_execution_mut()
-            .expect("publication owner")
-            .snapshot = snapshot.clone();
+        let active = self.observation_execution_mut().expect("publication owner");
+        active.snapshot = snapshot.clone();
+        active.observation_valid = true;
         true
     }
 
@@ -642,6 +741,11 @@ impl WorkerRecord {
             .unwrap_or_default();
         restore.candidate = RestoreCandidate::Publishing(ActiveWorkerExecution {
             snapshot: snapshot.clone(),
+            owner: restore
+                .candidate
+                .execution()
+                .and_then(|active| active.owner),
+            observation_valid: true,
             internal_workers: children,
         });
         // No new execution was allocated: the backend attested the existing one.

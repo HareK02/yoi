@@ -124,6 +124,12 @@ export type WorkerState = { "kind": "idle" } | { "kind": "busy", "state": Worker
 
 export type WorkerStateSnapshot = {
 /**
+ * Source-authored ordering within one Worker execution. Snapshot and live
+ * delivery may overlap; receivers compare source sequences only within that execution.
+ * Advances on changes to any snapshot field, independently of command IDs.
+ */
+state_sequence: number,
+/**
  * Highest lifecycle command id observed by this controller instance.
  */
 last_command_id: number,
@@ -335,7 +341,12 @@ export type InternalWorkerSnapshot = { worker: InternalWorkerRef, session: Sessi
  * Public execution metadata for this child. Older snapshots and service
  * workers may omit it; clients must never substitute the parent's values.
  */
-greeting?: Greeting | null, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
+greeting?: Greeting | null,
+/**
+ * Exact execution-owned state and source sequence. Absent when the source is
+ * unavailable; catalog status cannot reconstruct a live snapshot.
+ */
+state?: WorkerStateSnapshot | null, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
 
 export type Alert = {
 /**

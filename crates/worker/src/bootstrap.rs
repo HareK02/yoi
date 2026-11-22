@@ -408,9 +408,6 @@ where
                 source,
                 cleanup_failed: true,
             })?;
-        if flow_enabled {
-            initialized.handle.shared_state.enable_flow_transition();
-        }
         let streams = {
             let _guard = initialized.handle.protocol_snapshot_publish_guard();
             crate::ipc::protocol_session::subscribe_worker_protocol_session(&initialized.handle)

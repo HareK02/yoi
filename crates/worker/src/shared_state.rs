@@ -1,13 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::{
-    OnceLock, RwLock,
+    Arc, OnceLock, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 
 use protocol::{
-    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
-    WorkerCommandKind, WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot,
-    WorkerStatus,
+    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    WorkerCommandKind, WorkerState, WorkerStateSnapshot, WorkerStatus,
 };
 use serde_json::json;
 use session_store::SegmentId;
@@ -31,7 +30,16 @@ pub(crate) enum WorkerCommandAdmission {
     StaleCommandId,
 }
 
-/// Shared state between WorkerController and runtime directory.
+/// Read-only observation of a Controller, shared with handles and IPC.
+///
+/// The Controller retains a separate private update capability. Cloning a
+/// [`crate::WorkerHandle`] or this observation never grants snapshot mutation.
+///
+/// ```compile_fail,E0599
+/// fn overwrite(handle: &worker::WorkerHandle) {
+///     handle.shared_state.transition(protocol::WorkerState::Idle);
+/// }
+/// ```
 ///
 /// `WorkerStateSnapshot` is the sole live execution-state authority. Runtime
 /// catalog status remains a separate lifecycle projection because `Stopped`
@@ -55,7 +63,7 @@ pub struct WorkerSharedState {
 }
 
 impl WorkerSharedState {
-    pub fn new(
+    fn new(
         worker_name: String,
         segment_id: SegmentId,
         manifest_toml: String,
@@ -75,12 +83,6 @@ impl WorkerSharedState {
         }
     }
 
-    /// Attach the Worker's filesystem view. Called once during controller
-    /// startup. Subsequent calls are silently ignored (`OnceLock`).
-    pub fn set_fs_view(&self, view: WorkerFsView) {
-        let _ = self.fs_view.set(view);
-    }
-
     /// Borrow the attached `WorkerFsView`, if any. Returns `None` for unit
     /// tests that didn't wire one up.
     pub fn fs_view(&self) -> Option<&WorkerFsView> {
@@ -94,17 +96,6 @@ impl WorkerSharedState {
             .clone()
     }
 
-    pub fn set_feature_invocations(&self, registry: crate::feature::FeatureInvocationRegistry) {
-        *self
-            .feature_invocations
-            .write()
-            .expect("feature invocation registry lock poisoned") = registry;
-    }
-
-    pub fn enable_flow_transition(&self) {
-        self.flow_transition_enabled.store(true, Ordering::Release);
-    }
-
     pub fn flow_transition_enabled(&self) -> bool {
         self.flow_transition_enabled.load(Ordering::Acquire)
     }
@@ -116,7 +107,124 @@ impl WorkerSharedState {
             .clone()
     }
 
-    pub fn update_context_usage(&self, tokens: Option<u64>, source: protocol::ContextTokenSource) {
+    pub(crate) fn command_acknowledgement(
+        &self,
+        command_id: u64,
+        kind: WorkerCommandKind,
+    ) -> Option<WorkerCommandAcknowledgement> {
+        self.accepted_commands
+            .read()
+            .expect("worker command ledger lock poisoned")
+            .iter()
+            .find(|command| command.envelope.command_id == command_id && command.kind == kind)
+            .and_then(|command| command.acknowledgement.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_result(
+        &self,
+        command_id: u64,
+    ) -> Option<Option<WorkerCommandDisposition>> {
+        self.accepted_commands
+            .read()
+            .expect("worker command ledger lock poisoned")
+            .iter()
+            .find(|command| command.envelope.command_id == command_id)
+            .map(|command| command.acknowledgement.as_ref().map(|ack| ack.disposition))
+    }
+
+    pub fn snapshot(&self) -> WorkerStateSnapshot {
+        self.state
+            .read()
+            .expect("worker state lock poisoned; refusing an inferred fallback state")
+            .clone()
+    }
+
+    /// Runtime catalog projection. This must not be used as live command
+    /// admission authority.
+    pub fn catalog_status(&self) -> WorkerStatus {
+        self.snapshot().catalog_status()
+    }
+
+    /// Serialize the runtime-directory lifecycle projection as JSON while
+    /// retaining the full state snapshot for diagnostics and reconnects.
+    pub fn status_json(&self) -> String {
+        let snapshot = self.snapshot();
+        json!({
+            "state": snapshot.catalog_status(),
+            "worker_state": snapshot,
+            "segment_id": self.segment_id.to_string(),
+            "worker_name": self.worker_name,
+        })
+        .to_string()
+    }
+}
+
+// Exhaustion must fail closed before mutation rather than wrap and make a new
+// snapshot appear older than an already observed value.
+fn next_state_sequence(snapshot: &WorkerStateSnapshot) -> u64 {
+    snapshot
+        .state_sequence
+        .checked_add(1)
+        .expect("worker source sequence exhausted")
+}
+
+/// Controller-owned update capability; no conversion from a public read handle.
+#[derive(Clone)]
+pub(crate) struct WorkerStateOwner(Arc<WorkerSharedState>);
+
+impl std::ops::Deref for WorkerStateOwner {
+    type Target = WorkerSharedState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl WorkerStateOwner {
+    pub(crate) fn new(
+        worker_name: String,
+        segment_id: SegmentId,
+        manifest_toml: String,
+        greeting: protocol::Greeting,
+    ) -> Self {
+        Self(Arc::new(WorkerSharedState::new(
+            worker_name,
+            segment_id,
+            manifest_toml,
+            greeting,
+        )))
+    }
+
+    pub(crate) fn reader(&self) -> Arc<WorkerSharedState> {
+        self.0.clone()
+    }
+
+    /// Attach the Worker's filesystem view. Called once during controller
+    /// startup. Subsequent calls are silently ignored (`OnceLock`).
+    pub(crate) fn set_fs_view(&self, view: WorkerFsView) {
+        let _ = self.fs_view.set(view);
+    }
+
+    pub(crate) fn set_feature_invocations(
+        &self,
+        registry: crate::feature::FeatureInvocationRegistry,
+    ) {
+        *self
+            .feature_invocations
+            .write()
+            .expect("feature invocation registry lock poisoned") = registry;
+    }
+
+    pub(crate) fn enable_flow_transition(&self) {
+        self.flow_transition_enabled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn update_context_usage(
+        &self,
+        tokens: Option<u64>,
+        source: protocol::ContextTokenSource,
+    ) {
         let mut greeting = self
             .greeting
             .write()
@@ -125,12 +233,13 @@ impl WorkerSharedState {
         greeting.context_usage = tokens.map(|tokens| protocol::ContextUsage { tokens, source });
     }
 
-    pub fn transition(&self, state: WorkerState) -> WorkerStateSnapshot {
+    pub(crate) fn transition(&self, state: WorkerState) -> WorkerStateSnapshot {
         let mut snapshot = self
             .state
             .write()
             .expect("worker state lock poisoned; refusing an inferred fallback state");
         if snapshot.state != state {
+            snapshot.state_sequence = next_state_sequence(&snapshot);
             snapshot.state = state;
         }
         snapshot.clone()
@@ -148,8 +257,13 @@ impl WorkerSharedState {
             .state
             .write()
             .expect("worker state lock poisoned; refusing an inferred fallback state");
-        snapshot.state = state;
-        snapshot.last_finished_submission_request_id = Some(submission_request_id);
+        if snapshot.state != state
+            || snapshot.last_finished_submission_request_id.as_ref() != Some(&submission_request_id)
+        {
+            snapshot.state_sequence = next_state_sequence(&snapshot);
+            snapshot.state = state;
+            snapshot.last_finished_submission_request_id = Some(submission_request_id);
+        }
         snapshot.clone()
     }
 
@@ -180,6 +294,7 @@ impl WorkerSharedState {
             return WorkerCommandAdmission::StaleCommandId;
         }
 
+        snapshot.state_sequence = next_state_sequence(&snapshot);
         snapshot.last_command_id = envelope.command_id;
         accepted.push_back(AcceptedWorkerCommand {
             envelope,
@@ -204,6 +319,7 @@ impl WorkerSharedState {
             .expect("worker command ledger lock poisoned");
         let command_id = snapshot.last_command_id.checked_add(1)?;
         let envelope = WorkerCommandEnvelope::new(command_id);
+        snapshot.state_sequence = next_state_sequence(&snapshot);
         snapshot.last_command_id = command_id;
         accepted.push_back(AcceptedWorkerCommand {
             envelope,
@@ -235,19 +351,6 @@ impl WorkerSharedState {
                 command.replies.push(reply);
             }
         }
-    }
-
-    pub(crate) fn command_acknowledgement(
-        &self,
-        command_id: u64,
-        kind: WorkerCommandKind,
-    ) -> Option<WorkerCommandAcknowledgement> {
-        self.accepted_commands
-            .read()
-            .expect("worker command ledger lock poisoned")
-            .iter()
-            .find(|command| command.envelope.command_id == command_id && command.kind == kind)
-            .and_then(|command| command.acknowledgement.clone())
     }
 
     pub(crate) fn close_command_replies(&self) {
@@ -315,60 +418,15 @@ impl WorkerSharedState {
         }
         acknowledgement
     }
-
-    #[cfg(test)]
-    pub(crate) fn command_result(
-        &self,
-        command_id: u64,
-    ) -> Option<Option<WorkerCommandDisposition>> {
-        self.accepted_commands
-            .read()
-            .expect("worker command ledger lock poisoned")
-            .iter()
-            .find(|command| command.envelope.command_id == command_id)
-            .map(|command| command.acknowledgement.as_ref().map(|ack| ack.disposition))
-    }
-
-    pub fn snapshot(&self) -> WorkerStateSnapshot {
-        self.state
-            .read()
-            .expect("worker state lock poisoned; refusing an inferred fallback state")
-            .clone()
-    }
-
-    /// Runtime catalog projection. This must not be used as live command
-    /// admission authority.
-    pub fn catalog_status(&self) -> WorkerStatus {
-        match self.snapshot().state {
-            WorkerState::Idle => WorkerStatus::Idle,
-            WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused)) => WorkerStatus::Paused,
-            WorkerState::Busy(WorkerBusyState::Run(_))
-            | WorkerState::Busy(WorkerBusyState::Maintenance(WorkerMaintenanceState::Compacting)) => {
-                WorkerStatus::Running
-            }
-        }
-    }
-
-    /// Serialize the runtime-directory lifecycle projection as JSON while
-    /// retaining the full state snapshot for diagnostics and reconnects.
-    pub fn status_json(&self) -> String {
-        let snapshot = self.snapshot();
-        json!({
-            "state": self.catalog_status(),
-            "worker_state": snapshot,
-            "segment_id": self.segment_id.to_string(),
-            "worker_name": self.worker_name,
-        })
-        .to_string()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{WorkerBusyState, WorkerMaintenanceState, WorkerRunState};
 
-    fn test_state() -> WorkerSharedState {
-        WorkerSharedState::new(
+    fn test_state() -> WorkerStateOwner {
+        WorkerStateOwner::new(
             "test-worker".into(),
             session_store::new_segment_id(),
             "[engine]\nname = \"test-worker\"".into(),
@@ -420,6 +478,113 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_state_sequence_advances_only_for_changed_content() {
+        let owner = test_state();
+        let reader = owner.reader();
+        assert_eq!(reader.snapshot().state_sequence, 0);
+        assert_eq!(owner.transition(WorkerState::Idle), reader.snapshot());
+        assert_eq!(reader.snapshot().state_sequence, 0);
+
+        let running = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running));
+        let run = owner.transition(running.clone());
+        assert_eq!(run.state_sequence, 1);
+        assert_eq!(owner.transition(running), run);
+        assert_eq!(run.last_command_id, 0);
+
+        let finished = owner.finish_submission_run(WorkerState::Idle, "submit-1".into());
+        assert_eq!(
+            finished.state_sequence, 2,
+            "state and finished identity are one mutation"
+        );
+        assert_eq!(finished.last_command_id, 0);
+        assert_eq!(reader.snapshot(), finished);
+        assert_eq!(
+            owner.finish_submission_run(WorkerState::Idle, "submit-1".into()),
+            finished
+        );
+        let next_finished = owner.finish_submission_run(WorkerState::Idle, "submit-2".into());
+        assert_eq!(
+            next_finished.state_sequence, 3,
+            "new finished identity changes an already Idle snapshot"
+        );
+        assert_eq!(
+            next_finished.last_finished_submission_request_id.as_deref(),
+            Some("submit-2")
+        );
+        assert_eq!(owner.transition(WorkerState::Idle), next_finished);
+    }
+
+    #[test]
+    fn command_identity_changes_state_sequence_but_retry_conflict_stale_and_ack_do_not() {
+        let owner = test_state();
+        assert_eq!(
+            owner.admit_command(WorkerCommandEnvelope::new(50), WorkerCommandKind::Pause),
+            WorkerCommandAdmission::Accepted
+        );
+        let admitted = owner.snapshot();
+        assert_eq!(admitted.state_sequence, 1);
+        assert_eq!(admitted.last_command_id, 50);
+        assert_eq!(admitted.state, WorkerState::Idle);
+        let acknowledgement = owner.complete_command(
+            50,
+            WorkerCommandKind::Pause,
+            WorkerCommandDisposition::InvalidState,
+        );
+        assert_eq!(acknowledgement.state, admitted);
+        for (id, kind, expected) in [
+            (50, WorkerCommandKind::Pause, WorkerCommandAdmission::Retry),
+            (
+                50,
+                WorkerCommandKind::Cancel,
+                WorkerCommandAdmission::Conflict,
+            ),
+            (
+                49,
+                WorkerCommandKind::Pause,
+                WorkerCommandAdmission::StaleCommandId,
+            ),
+        ] {
+            assert_eq!(
+                owner.admit_command(WorkerCommandEnvelope::new(id), kind),
+                expected
+            );
+            assert_eq!(owner.snapshot(), admitted);
+        }
+        let host = owner.admit_host_command(WorkerCommandKind::Cancel).unwrap();
+        assert_eq!(host.command_id, 51);
+        assert_eq!(owner.snapshot().state_sequence, 2);
+        let running = owner.transition(WorkerState::Busy(WorkerBusyState::Run(
+            WorkerRunState::Running,
+        )));
+        assert_eq!(running.last_command_id, 51);
+        assert_eq!(running.state_sequence, 3);
+        assert_eq!(
+            owner
+                .command_acknowledgement(50, WorkerCommandKind::Pause)
+                .unwrap()
+                .state,
+            admitted,
+            "replayed command evidence must retain its original snapshot source sequence"
+        );
+    }
+
+    #[test]
+    fn snapshot_state_sequence_exhaustion_fails_closed_without_wrapping() {
+        let owner = test_state();
+        owner.state.write().unwrap().state_sequence = u64::MAX;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.transition(WorkerState::Busy(WorkerBusyState::Run(
+                WorkerRunState::Running,
+            )))
+        }));
+        assert!(outcome.is_err());
+        let poisoned = owner.state.read().unwrap_err();
+        let unchanged = poisoned.into_inner();
+        assert_eq!(unchanged.state_sequence, u64::MAX);
+        assert_eq!(unchanged.state, WorkerState::Idle);
+    }
+
+    #[test]
     fn transitions_publish_full_state() {
         let state = test_state();
         let running = WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running));
@@ -451,6 +616,7 @@ mod tests {
         assert_eq!(
             state.snapshot(),
             WorkerStateSnapshot {
+                state_sequence: 1,
                 last_command_id: 9,
                 last_finished_submission_request_id: None,
                 state: WorkerState::Idle,
@@ -516,6 +682,7 @@ mod tests {
         assert_eq!(
             parsed["worker_state"],
             json!({
+                "state_sequence": 1,
                 "last_command_id": 0,
                 "state": {
                     "kind": "busy",

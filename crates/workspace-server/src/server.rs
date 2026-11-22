@@ -5858,9 +5858,8 @@ impl WorkspaceApi {
             }
             match self.runtime.worker(worker) {
                 Ok(detail)
-                    if detail.worker_state.as_ref().is_some_and(|state| {
-                        state.last_finished_submission_request_id == attempt.runtime_run_id
-                    }) =>
+                    if detail.last_finished_submission_request_id.is_some()
+                        && detail.last_finished_submission_request_id == attempt.runtime_run_id =>
                 {
                     break;
                 }
@@ -17699,13 +17698,7 @@ async fn start_manual_ticket_worker_assignment_on_host(
         .runtime
         .worker(&worker)
         .map_err(|error| error.into_error())?;
-    if observed.state != "idle" {
-        return Err(Error::TicketAssignmentConflict(format!(
-            "manual Worker assignment requires an idle Worker; Worker {}:{} is {}",
-            worker.runtime_id, worker.worker_id, observed.state
-        ))
-        .into());
-    }
+    require_current_idle_worker(&observed)?;
     let binding =
         validate_manual_ticket_worker_workdir_binding(api, &worker, &record.ticket_id, &selected)?;
     let admitted = reserve_ticket_start(
@@ -17939,6 +17932,19 @@ async fn start_manual_ticket_worker_assignment_on_host(
     .await
 }
 
+fn require_current_idle_worker(observed: &InternalWorkerSummary) -> Result<()> {
+    if !observed.is_current_idle() {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "manual Worker assignment requires a current Idle snapshot from an Active execution; Worker {}:{} has lifecycle {:?} and observation {:?}",
+            observed.worker.runtime_id,
+            observed.worker.worker_id,
+            observed.lifecycle,
+            observed.observation
+        )));
+    }
+    Ok(())
+}
+
 // No Runtime mutation has been admitted on this path. A replay rechecks the live
 // session and exact connections rather than requiring or manufacturing a restore.
 fn finalize_unchanged_ticket_worker_claim(
@@ -17968,15 +17974,8 @@ fn finalize_unchanged_ticket_worker_claim(
             )
             .into());
         }
-        if api
-            .runtime
-            .worker(worker)
-            .map_err(|e| e.into_error())?
-            .state
-            != "idle"
-        {
-            return Err(Error::TicketAssignmentConflict("Worker is no longer idle".into()).into());
-        }
+        let observed = api.runtime.worker(worker).map_err(|e| e.into_error())?;
+        require_current_idle_worker(&observed)?;
         api.store
             .validate_ticket_assignment_operation_fence(api.workspace_id(), operation_id)?;
         Ok(api.store.start_ticket_with_worker_assignment(
@@ -18021,12 +18020,21 @@ async fn finalize_manual_ticket_worker_claim(
             diagnostics,
         ));
     }
-    match api.store.start_ticket_with_worker_assignment(
-        record,
-        &new_id("tasev"),
-        operation_id,
-        Some(binding_fingerprint),
-    ) {
+    // The Runtime detail read refreshes the actual execution observation under
+    // its operation lock. It is not a reservation across this Backend commit.
+    let result = (|| -> Result<_> {
+        let observed = api.runtime.worker(worker).map_err(|e| e.into_error())?;
+        require_current_idle_worker(&observed)?;
+        api.store
+            .validate_ticket_assignment_operation_fence(api.workspace_id(), operation_id)?;
+        api.store.start_ticket_with_worker_assignment(
+            record,
+            &new_id("tasev"),
+            operation_id,
+            Some(binding_fingerprint),
+        )
+    })();
+    match result {
         Ok(assignment) => Ok(assignment),
         Err(error) => {
             let diagnostics =
@@ -29074,9 +29082,6 @@ async fn list_known_workers(
 fn worker_list_state(worker: &InternalWorkerSummary) -> server_api::WorkerListState {
     use protocol::{WorkerBusyState, WorkerLifecycleState as L, WorkerRunState as R, WorkerState};
     use server_api::WorkerListState as S;
-    if worker.availability != protocol::subscription::SubscriptionWorkerAvailability::Observed {
-        return S::Unavailable;
-    }
     match worker.lifecycle {
         Some(L::NotStarted) => S::NotStarted,
         Some(L::AwaitingRestore) => S::AwaitingRestore,
@@ -29085,15 +29090,28 @@ fn worker_list_state(worker: &InternalWorkerSummary) -> server_api::WorkerListSt
         Some(L::Restoring) => S::Restoring,
         Some(L::Stopping) => S::Stopping,
         Some(L::RecoveryRequired) => S::RecoveryRequired,
-        Some(L::Active) => match worker.worker_state.as_ref().map(|snapshot| &snapshot.state) {
-            Some(WorkerState::Idle) => S::Idle,
-            Some(WorkerState::Busy(WorkerBusyState::Run(R::Running))) => S::Running,
-            Some(WorkerState::Busy(WorkerBusyState::Run(R::Pausing))) => S::Pausing,
-            Some(WorkerState::Busy(WorkerBusyState::Run(R::Paused))) => S::Paused,
-            Some(WorkerState::Busy(WorkerBusyState::Run(R::Cancelling))) => S::Cancelling,
-            Some(WorkerState::Busy(WorkerBusyState::Maintenance(_))) => S::Maintenance,
-            None => S::Unavailable,
-        },
+        Some(L::Active) => {
+            let snapshot = match (&worker.observation, &worker.worker_state) {
+                (
+                    runtime_api::WorkerObservationState::Current { state_sequence },
+                    Some(snapshot),
+                ) if *state_sequence == snapshot.state_sequence
+                    && worker.availability
+                        == protocol::subscription::SubscriptionWorkerAvailability::Observed =>
+                {
+                    snapshot
+                }
+                _ => return S::Unavailable,
+            };
+            match &snapshot.state {
+                WorkerState::Idle => S::Idle,
+                WorkerState::Busy(WorkerBusyState::Run(R::Running)) => S::Running,
+                WorkerState::Busy(WorkerBusyState::Run(R::Pausing)) => S::Pausing,
+                WorkerState::Busy(WorkerBusyState::Run(R::Paused)) => S::Paused,
+                WorkerState::Busy(WorkerBusyState::Run(R::Cancelling)) => S::Cancelling,
+                WorkerState::Busy(WorkerBusyState::Maintenance(_)) => S::Maintenance,
+            }
+        }
         None => S::Unavailable,
     }
 }
@@ -39323,6 +39341,8 @@ fn record_worker_summary(
 
 fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorkerSummary {
     InternalWorkerSummary {
+        last_finished_submission_request_id: None,
+        observation: runtime_api::WorkerObservationState::Unavailable,
         restore_observation_token: None,
         lifecycle: None,
         worker: record.worker.clone(),
@@ -39390,6 +39410,14 @@ fn worker_summary_from_projection(
     summary.worker_state = observed
         .then(|| observation.worker.worker_state.clone())
         .flatten();
+    summary.observation = match (&summary.lifecycle, &summary.worker_state) {
+        (Some(protocol::WorkerLifecycleState::Active), Some(snapshot)) if observed => {
+            runtime_api::WorkerObservationState::Current {
+                state_sequence: snapshot.state_sequence,
+            }
+        }
+        _ => runtime_api::WorkerObservationState::Unavailable,
+    };
     summary.last_seen_at = Some(observation.observed_at.clone());
     summary.implementation.display_hint = if observed {
         "Runtime-backed Worker".to_string()
@@ -45060,6 +45088,8 @@ mod tests {
             request: &WorkerSpawnRequest,
         ) -> InternalWorkerSummary {
             InternalWorkerSummary {
+                last_finished_submission_request_id: None,
+                observation: runtime_api::WorkerObservationState::Current { state_sequence: 0 },
                 lifecycle: Some(protocol::WorkerLifecycleState::Active),
                 restore_observation_token: Some(format!(
                     "fixture-generation:{}",
@@ -45090,7 +45120,7 @@ mod tests {
                 availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 execution_reconstructed: false,
-                worker_state: None,
+                worker_state: Some(protocol::WorkerStateSnapshot::initial()),
                 last_seen_at: None,
                 pinned: false,
                 retention_state: "normal".to_string(),
@@ -53900,10 +53930,16 @@ mod tests {
 
         fn publish_event(
             &self,
-            event: protocol::Event,
+            mut event: protocol::Event,
         ) -> std::result::Result<(), worker_runtime::error::RuntimeError> {
-            if let protocol::Event::WorkerState { snapshot } = &event {
-                *self.state.lock().unwrap() = snapshot.clone();
+            if let protocol::Event::WorkerState { snapshot } = &mut event {
+                let mut current = self.state.lock().unwrap();
+                // This fixture is the source execution owner. State changes,
+                // including finish markers, advance its source sequence.
+                if snapshot.state_sequence <= current.state_sequence && snapshot != &*current {
+                    snapshot.state_sequence = current.state_sequence.checked_add(1).unwrap();
+                }
+                *current = snapshot.clone();
             }
             let _ = self.events.send(event.clone());
             self.context.publish_protocol_event(event).map(|_| ())
@@ -54744,6 +54780,7 @@ mod tests {
             };
             let mut state = execution.state.lock().unwrap();
             state.last_command_id += 1;
+            state.state_sequence += 1;
             let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Cancel)
                 .with_worker_state(state.clone());
             result.command = Some(protocol::WorkerCommandResult::Acknowledged {
@@ -54811,7 +54848,7 @@ mod tests {
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     submission_request_id.expect("Notify test input has a Runtime request id"),
                 )
-                .with_worker_state(protocol::WorkerStateSnapshot::initial())
+                .with_worker_state(execution.state.lock().unwrap().clone())
             } else if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
@@ -54820,6 +54857,7 @@ mod tests {
                     protocol::SubmissionDisposition::Started,
                 )
                 .with_worker_state(protocol::WorkerStateSnapshot {
+                    state_sequence: 0,
                     last_command_id: 0,
                     last_finished_submission_request_id: Some(submission_request_id),
                     state: protocol::WorkerState::Idle,
@@ -54828,8 +54866,14 @@ mod tests {
                 worker_runtime::execution::WorkerExecutionResult::accepted(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                 )
-                .with_worker_state(protocol::WorkerStateSnapshot::initial())
+                .with_worker_state(execution.state.lock().unwrap().clone())
             };
+            if let Some(snapshot) = receipt.worker_state.take() {
+                execution
+                    .publish_event(protocol::Event::WorkerState { snapshot })
+                    .unwrap();
+                receipt.worker_state = Some(execution.state.lock().unwrap().clone());
+            }
             receipt.execution_id = Some(execution.execution_id);
             if let Some(id) = &input.submission_request_id {
                 self.receipts.lock().unwrap().insert(

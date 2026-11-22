@@ -61,6 +61,8 @@ impl Fixture {
                 .bind_core_worker_execution_grant(&grant)
                 .unwrap();
             runtime.workers.lock().unwrap().push(InternalWorkerSummary {
+                last_finished_submission_request_id: None,
+                observation: runtime_api::WorkerObservationState::Unavailable,
                 restore_observation_token: None,
                 lifecycle: Some(protocol::WorkerLifecycleState::Active),
                 worker: RuntimeWorkerRef::new(WorkdirlessFixtureRuntime::RUNTIME_ID, worker),

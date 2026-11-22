@@ -18,14 +18,14 @@ pub(super) struct PublishedProtocol {
 impl PublishedProtocol {
     /// The host registers a prepared Idle session before its first Run.
     pub fn new(source: &InternalWorkerSessionHandle, worker: protocol::InternalWorkerRef) -> Self {
-        let events = source.subscribe_events();
-        let initial = source.protocol_snapshot();
+        let (initial, events) = source.subscribe_protocol();
         Self {
             snapshot: Mutex::new(InternalWorkerSnapshot {
                 worker,
                 session: initial.session,
                 greeting: initial.greeting,
                 status: initial.status,
+                state: initial.state,
                 error: initial.error,
                 in_flight: initial.in_flight,
                 internal_workers: initial.internal_workers,
@@ -51,11 +51,13 @@ pub(super) fn apply(
             snapshot.session = session.clone();
             snapshot.greeting = Some(greeting.clone());
             snapshot.status = state.catalog_status();
+            snapshot.state = Some(state.clone());
             snapshot.in_flight = in_flight.clone();
             snapshot.internal_workers = internal_workers.clone();
         }
         Event::WorkerState { snapshot: state } => {
             snapshot.status = state.catalog_status();
+            snapshot.state = Some(state.clone());
             if snapshot.status != protocol::WorkerStatus::Running {
                 snapshot.in_flight = Default::default();
             } else {
@@ -64,6 +66,7 @@ pub(super) fn apply(
         }
         Event::Shutdown => {
             snapshot.status = protocol::WorkerStatus::Stopped;
+            snapshot.state = None;
             snapshot.in_flight = Default::default();
         }
         Event::Error { message, .. } => snapshot.error = Some(message.clone()),
@@ -287,6 +290,7 @@ pub(super) fn apply(
                     session: session.clone(),
                     greeting: Some(greeting.clone()),
                     status: state.catalog_status(),
+                    state: Some(state.clone()),
                     error: None,
                     in_flight: in_flight.clone(),
                     internal_workers: internal_workers.clone(),

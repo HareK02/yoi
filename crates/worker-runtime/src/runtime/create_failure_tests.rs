@@ -298,11 +298,10 @@ fn connected_create_publication_failure_preserves_known_input_acceptance() {
     let worker_ref = WorkerRef::new(request.worker_id);
     // Substitute only Connected data. The invalid backend Workdir identifier
     // reaches the real subscription projection after the owner commit.
-    backend
-        .contexts
-        .lock()
-        .unwrap()
-        .insert(request.worker_id, runtime.execution_context(worker_ref));
+    backend.contexts.lock().unwrap().insert(
+        request.worker_id,
+        runtime.execution_context(worker_ref, WorkerLifecycleOperationId::new()),
+    );
     *backend.spawn_result.lock().unwrap() = Some(WorkerExecutionSpawnResult::Connected {
         worker_state: protocol::WorkerStatus::Idle.into(),
         workdir_attachments: vec![WorkingDirectoryAttachmentStatus {

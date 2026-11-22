@@ -4853,6 +4853,7 @@ mod completion_flow_tests {
                 kind: protocol::InternalWorkerKind::SubWorker,
             },
             status: WorkerStatus::Idle,
+            state: Some(test_worker_state(WorkerStatus::Idle)),
             greeting: None,
             session: protocol::SessionSnapshot {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
@@ -5197,6 +5198,7 @@ mod completion_flow_tests {
                 },
                 greeting: None,
                 status: WorkerStatus::Running,
+                state: Some(test_worker_state(WorkerStatus::Running)),
                 error: None,
                 in_flight: Default::default(),
                 internal_workers: Vec::new(),
