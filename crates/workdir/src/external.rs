@@ -21,6 +21,10 @@ use crate::{BoundedReadLimits, WorkdirId, WorkdirPath, WorkdirSessionCapabilitie
 
 pub const EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION: u16 = 3;
 /// A disconnected sharing process cannot extend this window by retrying.
+/// Two minutes permits recovery beyond the provider's lost-heartbeat detection
+/// and repeated short reconnect backoffs, without retaining unavailable shares
+/// indefinitely. The Backend persists the first outage deadline; TTL may end it
+/// earlier, and only authenticated activation starts a new connection lifetime.
 pub const EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS: u64 = 120;
 /// Process-local continuity credential, carried only by authenticated HTTP
 /// grant creation and provider upgrade requests, never in DTOs or frames.

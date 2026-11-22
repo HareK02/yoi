@@ -305,17 +305,23 @@ pub(super) fn registration_failed(
         Error::ExternalWorkdirConnectionSource(source),
         Reason::GrantConnectionTransportFailed,
     );
-    if let Err(error) = api.store.update_external_workdir_grant_state(
-        &grant.workspace_id,
-        &grant.grant_id,
-        &connection.provider_instance_id,
-        connection.generation,
-        "offline",
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-    ).and_then(|updated| {
-        if updated { refresh_external_workdir_expiry(api, &grant.grant_id)?; }
-        Ok(())
-    }) {
+    if let Err(error) = api
+        .store
+        .update_external_workdir_grant_state(
+            &grant.workspace_id,
+            &grant.grant_id,
+            &connection.provider_instance_id,
+            connection.generation,
+            "offline",
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        )
+        .and_then(|updated| {
+            if updated {
+                refresh_external_workdir_expiry(api, &grant.grant_id)?;
+            }
+            Ok(())
+        })
+    {
         primary = combine(
             primary,
             connection_error(error, Reason::GrantConnectionStateFailed),

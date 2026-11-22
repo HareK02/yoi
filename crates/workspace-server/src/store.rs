@@ -17578,9 +17578,18 @@ fn install_external_workdir_session_columns(conn: &Connection) -> Result<()> {
 }
 
 fn migrate_external_workdir_sessions_v140_to_v141(conn: &Connection) -> Result<()> {
+    if !conn.is_autocommit() || current_schema_version(conn)? != 140 {
+        return Err(Error::Store(
+            "External sharing session migration requires schema 140".into(),
+        ));
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     install_external_workdir_session_columns(&tx)?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    // Legacy clients never established process-local continuity credentials.
+    // Issuing one from a public ID would permit root replacement. End those
+    // sessions at upgrade and retain real cleanup intents/links until release
+    // is confirmed; sharing again requires a new grant and explicit attachment.
     let legacy = {
         let mut statement = tx.prepare(
             "UPDATE external_workdir_grants

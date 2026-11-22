@@ -83,7 +83,15 @@ async fn client(
     String,
     reqwest::Client,
 ) {
-    let token = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
+    let token = format!("api-token-{TEST_WORKSPACE_ID}");
+    if api
+        .store
+        .resolve_api_token(&crate::auth::token_hash(&token))
+        .unwrap()
+        .is_none()
+    {
+        seed_test_owner_api_token(api, TEST_WORKSPACE_ID);
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = build_router(api.clone());

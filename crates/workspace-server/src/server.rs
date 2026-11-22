@@ -1293,7 +1293,9 @@ impl ExternalProviderWorkdirSession {
     {
         let control_cancel = matches!(&operation, WorkdirSessionOperation::CommandCancel(_));
         if !control_cancel && self.connection.access_fenced.load(Ordering::Acquire) {
-            return Err(workdir::WorkdirError::Unavailable("External Workdir connection is fenced".into()));
+            return Err(workdir::WorkdirError::Unavailable(
+                "External Workdir connection is fenced".into(),
+            ));
         }
         let operation_kind = external_workdir_operation_kind(&operation);
         let operation_timeout = external_workdir_operation_timeout(&operation);
@@ -15386,15 +15388,26 @@ impl server_api::ServerApi for ServerApiContractService {
         server_api::WorkdirManagementApiError,
     > {
         let digest = external_workdir_session_credential_digest(
-            context.transport_headers.iter().filter_map(|(name, value)| {
-                name.eq_ignore_ascii_case("x-yoi-external-session-key").then_some(value.as_slice())
-            }),
-        ).map_err(|error| error.into_workdir_management_api_error(
-            workdir::management_failure::WorkdirManagementOperation::GrantCreate,
-        ))?;
+            context
+                .transport_headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("x-yoi-external-session-key")
+                        .then_some(value.as_slice())
+                }),
+        )
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::GrantCreate,
+            )
+        })?;
         let actor = context.actor.ok_or_else(|| {
-            ApiError::from(Error::WorkspacePermissionDenied("External sharing requires an authenticated creator".into()))
-                .into_workdir_management_api_error(workdir::management_failure::WorkdirManagementOperation::GrantCreate)
+            ApiError::from(Error::WorkspacePermissionDenied(
+                "External sharing requires an authenticated creator".into(),
+            ))
+            .into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::GrantCreate,
+            )
         })?;
         let (_, Json(response)) = scoped_create_external_workdir_grant(
             State(self.workspace_api()?.clone()),
@@ -29982,13 +29995,22 @@ fn external_workdir_session_credential_digest<'a>(
     mut values: impl Iterator<Item = &'a [u8]>,
 ) -> ApiResult<String> {
     let value = values.next().filter(|value| {
-        value.len() == 64 && value.iter().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        value.len() == 64
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
     });
-    if let Some(value) = value && values.next().is_none() {
-        return Ok(crate::auth::token_hash(std::str::from_utf8(value).expect("validated ASCII")));
+    if let Some(value) = value
+        && values.next().is_none()
+    {
+        return Ok(crate::auth::token_hash(
+            std::str::from_utf8(value).expect("validated ASCII"),
+        ));
     }
     Err(ApiError::workdir_management_source(
-        Error::WorkspacePermissionDenied("External sharing requires a valid process-local session credential".into()),
+        Error::WorkspacePermissionDenied(
+            "External sharing requires a valid process-local session credential".into(),
+        ),
         workdir::management_failure::WorkdirManagementOperation::GrantConnect,
         workdir::management_failure::WorkdirManagementReason::GrantCreatorRequired,
     ))
@@ -29997,16 +30019,26 @@ fn external_workdir_session_credential_digest<'a>(
 fn external_workdir_session_deadline(
     grant: &ExternalWorkdirGrantRecord,
 ) -> Result<Option<chrono::DateTime<Utc>>> {
-    let reconnect = grant.reconnect_deadline_at.as_deref().map(|value| {
-        chrono::DateTime::parse_from_rfc3339(value)
-            .map(|value| value.with_timezone(&Utc))
-            .map_err(|_| Error::Store("External Workdir has invalid reconnect deadline".into()))
-    }).transpose()?;
-    Ok(external_workdir_expires_at(grant)?.into_iter().chain(reconnect).min())
+    let reconnect = grant
+        .reconnect_deadline_at
+        .as_deref()
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|_| Error::Store("External Workdir has invalid reconnect deadline".into()))
+        })
+        .transpose()?;
+    Ok(external_workdir_expires_at(grant)?
+        .into_iter()
+        .chain(reconnect)
+        .min())
 }
 
 fn external_workdir_grant_is_expired(grant: &ExternalWorkdirGrantRecord) -> Result<bool> {
-    Ok(external_workdir_session_deadline(grant)?.is_some_and(|expires_at| expires_at <= Utc::now()))
+    Ok(
+        external_workdir_session_deadline(grant)?
+            .is_some_and(|expires_at| expires_at <= Utc::now()),
+    )
 }
 
 fn schedule_external_workdir_expiry(
@@ -30089,7 +30121,10 @@ fn schedule_external_workdir_expiry(
 }
 
 fn refresh_external_workdir_expiry(api: &WorkspaceApi, grant_id: &str) -> Result<()> {
-    if let Some(grant) = api.store.get_external_workdir_grant(&api.config.workspace_id, grant_id)? {
+    if let Some(grant) = api
+        .store
+        .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
+    {
         schedule_external_workdir_expiry(api, &grant)?;
     }
     Ok(())
@@ -30167,7 +30202,9 @@ fn fence_external_workdir_grant_expired_stage(
             // A reconnect may advance generation between the read and fence.
             continue;
         }
-        api.external_workdir_providers.lock().expect("External Workdir provider registry poisoned")
+        api.external_workdir_providers
+            .lock()
+            .expect("External Workdir provider registry poisoned")
             .fence(&grant.grant_id, grant.generation);
         let audit = api
             .store
@@ -30355,7 +30392,10 @@ async fn external_workdir_provider_upgrade(
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     let session_digest = external_workdir_session_credential_digest(
-        headers.get_all("x-yoi-external-session-key").iter().map(HeaderValue::as_bytes),
+        headers
+            .get_all("x-yoi-external-session-key")
+            .iter()
+            .map(HeaderValue::as_bytes),
     )?;
     let stage_api = api.clone();
     let stage_workspace_id = workspace_id.clone();
@@ -30640,9 +30680,15 @@ async fn serve_external_workdir_provider(
             );
             match activated {
                 Ok(true) => {
-                    let current = api.store.get_external_workdir_grant(
-                        &initial_grant.workspace_id, &initial_grant.grant_id,
-                    )?.ok_or_else(|| Error::Store("Activated External Workdir disappeared".into()))?;
+                    let current = api
+                        .store
+                        .get_external_workdir_grant(
+                            &initial_grant.workspace_id,
+                            &initial_grant.grant_id,
+                        )?
+                        .ok_or_else(|| {
+                            Error::Store("Activated External Workdir disappeared".into())
+                        })?;
                     schedule_external_workdir_expiry(&api, &current)?;
                 }
                 Ok(false) => return Ok(None),
@@ -30676,17 +30722,23 @@ async fn serve_external_workdir_provider(
             ) {
                 let mut primary =
                     external_grant_failure::connection_error(error, Reason::GrantAuditFailed);
-                if let Err(error) = api.store.update_external_workdir_grant_state(
-                    &initial_grant.workspace_id,
-                    &initial_grant.grant_id,
-                    &initial_grant.provider_instance_id,
-                    registration_generation,
-                    "offline",
-                    &now,
-                ).and_then(|updated| {
-                    if updated { refresh_external_workdir_expiry(&api, &initial_grant.grant_id)?; }
-                    Ok(())
-                }) {
+                if let Err(error) = api
+                    .store
+                    .update_external_workdir_grant_state(
+                        &initial_grant.workspace_id,
+                        &initial_grant.grant_id,
+                        &initial_grant.provider_instance_id,
+                        registration_generation,
+                        "offline",
+                        &now,
+                    )
+                    .and_then(|updated| {
+                        if updated {
+                            refresh_external_workdir_expiry(&api, &initial_grant.grant_id)?;
+                        }
+                        Ok(())
+                    })
+                {
                     primary = external_grant_failure::combine(
                         primary,
                         external_grant_failure::connection_error(
@@ -31029,10 +31081,14 @@ async fn serve_external_workdir_provider(
                     false
                 }
             };
-            if state_updated && terminal_status == "offline"
+            if state_updated
+                && terminal_status == "offline"
                 && let Err(error) = refresh_external_workdir_expiry(&api, &initial_grant.grant_id)
             {
-                let followup = external_grant_failure::connection_error(error, Reason::GrantConnectionStateFailed);
+                let followup = external_grant_failure::connection_error(
+                    error,
+                    Reason::GrantConnectionStateFailed,
+                );
                 primary = Some(match primary {
                     Some(error) => external_grant_failure::combine(error, followup),
                     None => followup,
@@ -31223,7 +31279,9 @@ async fn scoped_revoke_external_workdir_grant(
                 )? {
                     continue;
                 }
-                api.external_workdir_providers.lock().expect("External Workdir provider registry poisoned")
+                api.external_workdir_providers
+                    .lock()
+                    .expect("External Workdir provider registry poisoned")
                     .fence(&grant_id, grant.generation);
                 grant.status = "revoked".to_string();
                 grant.updated_at = updated_at;
@@ -43155,8 +43213,8 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             workdir_id: "offline-expiry-workdir".to_string(),
             provider_instance_id: "offline-expiry-provider".to_string(),
-        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
-        reconnect_deadline_at: None,
+            session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+            reconnect_deadline_at: None,
             display_name: "Offline expiry".to_string(),
             permissions: "read_only".to_string(),
             created_by: test_browser_request_actor().account_id,
@@ -43262,8 +43320,8 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             workdir_id: "session-open-expiry-workdir".to_string(),
             provider_instance_id: "session-open-expiry-provider".to_string(),
-        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
-        reconnect_deadline_at: None,
+            session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+            reconnect_deadline_at: None,
             display_name: "Session-open expiry".to_string(),
             permissions: "read_only".to_string(),
             created_by: test_browser_request_actor().account_id,
@@ -43513,8 +43571,8 @@ mod tests {
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     workdir_id: format!("external-{permissions}-{status}"),
                     provider_instance_id: format!("provider-{permissions}-{status}"),
-        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
-        reconnect_deadline_at: None,
+                    session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+                    reconnect_deadline_at: None,
                     display_name: format!("External {permissions} {status}"),
                     permissions: permissions.to_string(),
                     created_by: test_browser_request_actor().account_id,
@@ -43547,7 +43605,9 @@ mod tests {
                     .create_external_workdir_grant(&grant, &record)
                     .unwrap();
                 if legacy {
-                    legacy_records.push((grant, record));
+                    if !matches!(status, &"revoked" | &"expired") {
+                        legacy_records.push((grant, record));
+                    }
                 } else {
                     expected_ids.insert(record.workdir_id);
                 }
@@ -43657,8 +43717,8 @@ mod tests {
                     ttl_seconds: None,
                     permissions,
                 }),
-            crate::auth::token_hash(&"a".repeat(64)),
-)
+                crate::auth::token_hash(&"a".repeat(64)),
+            )
             .await
             .unwrap();
             assert_eq!(grant.permissions, permissions);
@@ -43708,8 +43768,8 @@ mod tests {
                     ttl_seconds: None,
                     permissions,
                 }),
-            crate::auth::token_hash(&"a".repeat(64)),
-)
+                crate::auth::token_hash(&"a".repeat(64)),
+            )
             .await
             .unwrap_err();
             assert!(error.error.to_string().contains("exactly one level"));
@@ -43750,8 +43810,8 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: format!("launch-external-{index}"),
                 provider_instance_id: format!("launch-provider-{index}"),
-        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
-        reconnect_deadline_at: None,
+                session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+                reconnect_deadline_at: Some(expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true)),
                 display_name: format!("External launch {index}"),
                 permissions: permissions.to_string(),
                 created_by: test_browser_request_actor().account_id,
@@ -44153,8 +44213,8 @@ mod tests {
                     command: true,
                 },
             }),
-        crate::auth::token_hash(&"a".repeat(64)),
-)
+            crate::auth::token_hash(&"a".repeat(64)),
+        )
         .await
         .unwrap();
 
@@ -44172,7 +44232,10 @@ mod tests {
         let provider_request = || {
             use tokio_tungstenite::tungstenite::client::IntoClientRequest;
             let mut request = url.as_str().into_client_request().unwrap();
-            request.headers_mut().insert(workdir::external::EXTERNAL_WORKDIR_SESSION_KEY_HEADER, "a".repeat(64).parse().unwrap());
+            request.headers_mut().insert(
+                workdir::external::EXTERNAL_WORKDIR_SESSION_KEY_HEADER,
+                "a".repeat(64).parse().unwrap(),
+            );
             request
         };
         let register = |generation| {
@@ -44272,11 +44335,12 @@ mod tests {
         let pinned_provider_root = workdir::ExternalWorkdirRoot::pin(provider_root.path()).unwrap();
         let local_session = workdir::LocalWorkdirSession::external_with_capabilities_pinned(
             workdir::Workdir::new(&grant.working_directory_id),
-            pinned_provider_root,
+            pinned_provider_root.clone(),
             workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
             workdir::WorkdirSessionCapabilities::ALL,
         )
         .unwrap();
+        let (disconnect_provider, disconnected) = tokio::sync::oneshot::channel();
         let (second, _) = connect_async(provider_request()).await.unwrap();
         let registration = register(2);
         let provider = tokio::spawn(async move {
@@ -44285,7 +44349,11 @@ mod tests {
                 registration,
                 &local_session,
                 2,
-                std::future::pending::<std::result::Result<(), String>>(),
+                async move {
+                    disconnected
+                        .await
+                        .map_err(|_| "fixture disconnect lost".to_string())
+                },
             )
             .await
         });
@@ -44424,6 +44492,134 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not found"), "{error}");
+
+        let original_link = api
+            .store
+            .latest_workdir_worker_link(TEST_WORKSPACE_ID, &grant.working_directory_id)
+            .unwrap()
+            .unwrap();
+        disconnect_provider.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), provider)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            yoi::workdir_share::ProviderEnd::Interrupted
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if api
+                    .store
+                    .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == "offline"
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnected provider did not become unavailable");
+        assert!(
+            broker_session
+                .read(workdir::ReadRequest {
+                    path: workdir::WorkdirPath::new("events.jsonl").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 1024,
+                })
+                .await
+                .is_err(),
+            "the old session must not fall back while disconnected"
+        );
+        assert_eq!(
+            fs::read(provider_root.path().join("events.jsonl")).unwrap(),
+            b"one\ntwo\n"
+        );
+        assert_eq!(
+            fs::read(provider_root.path().join("image.gif")).unwrap(),
+            image_bytes
+        );
+        let local_session = workdir::LocalWorkdirSession::external_with_capabilities_pinned(
+            workdir::Workdir::new(&grant.working_directory_id),
+            pinned_provider_root,
+            workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
+            workdir::WorkdirSessionCapabilities::ALL,
+        )
+        .unwrap();
+        let (third, _) = connect_async(provider_request()).await.unwrap();
+        let registration = register(3);
+        let provider = tokio::spawn(async move {
+            yoi::workdir_share::serve_external_workdir_provider_socket(
+                third,
+                registration,
+                &local_session,
+                3,
+                std::future::pending::<std::result::Result<(), String>>(),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let current = api
+                    .store
+                    .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+                    .unwrap()
+                    .unwrap();
+                if current.status == "online" && current.generation == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authenticated reconnect did not activate");
+        let session_guard = Arc::new(
+            current_worker_session_lock(&api, &worker)
+                .lock_owned()
+                .await,
+        );
+        let broker_session = open_current_worker_workdir_session_locked(
+            &api,
+            &worker,
+            &external_link,
+            &session_guard,
+        )
+        .await
+        .unwrap();
+        drop(session_guard);
+        assert_eq!(
+            broker_session
+                .read(workdir::ReadRequest {
+                    path: workdir::WorkdirPath::new("events.jsonl").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 1024,
+                })
+                .await
+                .unwrap()
+                .bytes,
+            b"one\ntwo\n"
+        );
+        let restored_link = api
+            .store
+            .latest_workdir_worker_link(TEST_WORKSPACE_ID, &grant.working_directory_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_link.connection_id, original_link.connection_id);
+        assert_eq!(restored_link.alias, original_link.alias);
+        assert!(restored_link.unlinked_at.is_none());
+        assert_eq!(
+            api.store
+                .list_external_workdir_grants(TEST_WORKSPACE_ID)
+                .unwrap()
+                .len(),
+            1
+        );
 
         let edit = broker_session
             .edit(workdir::EditRequest {
@@ -47217,8 +47413,8 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             workdir_id: "external-workdir".to_string(),
             provider_instance_id: "external-provider".to_string(),
-        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
-        reconnect_deadline_at: None,
+            session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+            reconnect_deadline_at: None,
             display_name: "External Workdir".to_string(),
             permissions: "read_only".to_string(),
             created_by: test_browser_request_actor().account_id,
@@ -65885,8 +66081,8 @@ mod tests {
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     workdir_id: record.workdir_id.clone(),
                     provider_instance_id: "private-provider-instance".to_string(),
-        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
-        reconnect_deadline_at: None,
+                    session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+                    reconnect_deadline_at: None,
                     display_name: record.display_name.clone().unwrap(),
                     permissions: if legacy { "command_only" } else { "read_write" }.to_string(),
                     created_by: "test-account".to_string(),
