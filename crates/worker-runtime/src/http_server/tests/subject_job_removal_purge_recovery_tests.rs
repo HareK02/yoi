@@ -63,7 +63,7 @@ fn subject_job_removal_purge_partial_physical_failure_keeps_fence_and_retry_eras
 }
 
 #[test]
-fn subject_job_removal_purge_unconfirmed_fence_never_invents_removed_execution_proof() {
+fn subject_job_removal_purge_legacy_success_reconciles_fence_without_inventing_shutdown() {
     let f = Fixture::new();
     let request = f.removal_purge_request(SessionDisposition::Archive);
     let original_result = f.complete_removal(&request);
@@ -81,10 +81,14 @@ fn subject_job_removal_purge_unconfirmed_fence_never_invents_removed_execution_p
     } = f;
     drop(store);
     drop(runtime);
-    // Model proofless retained history, not a current crash window. Removing
-    // only the Subject response is insufficient: the original canonical Stop
-    // now survives removal and legitimately permits historical reconciliation.
-    // Remove that proof too, leaving the completed removal request/result intact.
+    // Model a pre-shutdown-field success and a lost Subject response. The
+    // completed canonical removal remains authoritative; normalizing it must
+    // neither invent historical execution observations nor erase archive bytes.
+    legacy_receipt["schema_version"] = serde_json::json!(1);
+    legacy_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("create_fingerprint");
     assert!(
         legacy_receipt
             .as_object_mut()
@@ -117,34 +121,79 @@ fn subject_job_removal_purge_unconfirmed_fence_never_invents_removed_execution_p
     );
     assert_eq!(tree(&temp.path().join("archives")), copies);
     assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt);
-    let removal = serde_json::from_value(serde_json::to_value(&request.removal).unwrap()).unwrap();
-    assert_eq!(
-        runtime.execute_worker_retention(&removal).unwrap(),
-        original_result
-    );
-    assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt);
-    let error = runtime
+    let response = runtime
         .subject_delete_worker_scoped(&scope, request.deletion.clone())
-        .unwrap_err();
-    let diagnostic = error.to_string().to_ascii_lowercase();
-    assert!(
-        diagnostic.contains("original") && diagnostic.contains("shutdown"),
-        "expected rejection for absent original shutdown proof, got: {error}"
-    );
-    assert!(
-        runtime
-            .purge_subject_job_removal_scoped(&scope, request.clone())
-            .is_err()
+        .unwrap();
+    assert!(response.originals_absent);
+    assert_eq!(response.operation_id, request.deletion.operation_id);
+    assert_eq!(
+        response.create_fingerprint,
+        request.deletion.create_fingerprint
     );
     assert_eq!(tree(&temp.path().join("archives")), copies);
-    assert_eq!(std::fs::read(receipt_path).unwrap(), receipt);
-    let snapshot: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
-    assert_eq!(
-        snapshot["subject_delete_worker_fences"][request.deletion.worker_id.to_string()],
-        unconfirmed_fence,
-        "proofless history must not acquire a Subject response or a fabricated Stop child"
+    runtime_session_retention(temp.path())
+        .ensure_live(session)
+        .unwrap();
+    let normalized_bytes = std::fs::read(&receipt_path).unwrap();
+    let normalized: serde_json::Value = serde_json::from_slice(&normalized_bytes).unwrap();
+    assert_eq!(normalized["request"], legacy_receipt["request"]);
+    assert_eq!(normalized["result"], legacy_receipt["result"]);
+    assert!(
+        normalized
+            .get("shutdown")
+            .is_none_or(serde_json::Value::is_null)
     );
+    assert!(
+        normalized
+            .get("create_fingerprint")
+            .is_none_or(serde_json::Value::is_null)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+    let confirmed_fence =
+        &snapshot["subject_delete_worker_fences"][request.deletion.worker_id.to_string()];
+    assert_eq!(confirmed_fence["request"], unconfirmed_fence["request"]);
+    assert_eq!(
+        confirmed_fence["response"],
+        serde_json::to_value(&response).unwrap()
+    );
+    assert_eq!(
+        confirmed_fence["canonical_removal"]["request"],
+        normalized["request"]
+    );
+    assert!(
+        confirmed_fence["canonical_removal"]
+            .get("shutdown")
+            .is_none()
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            runtime
+                .subject_delete_worker_scoped(&scope, request.deletion.clone())
+                .unwrap(),
+            response
+        );
+        let removal =
+            serde_json::from_value(serde_json::to_value(&request.removal).unwrap()).unwrap();
+        assert_eq!(
+            runtime.execute_worker_retention(&removal).unwrap(),
+            original_result
+        );
+        runtime
+            .purge_subject_job_removal_scoped(&scope, request.clone())
+            .unwrap();
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), normalized_bytes);
+    }
+    assert!(
+        !temp
+            .path()
+            .join("archives/workers/canonical-archive/session")
+            .exists()
+    );
+    assert!(matches!(
+        runtime_session_retention(temp.path()).ensure_live(session),
+        Err(session_store::StoreError::SessionErased(_))
+    ));
     assert!(
         runtime
             .worker_detail(&WorkerRef::new(request.deletion.worker_id))
@@ -157,7 +206,91 @@ fn subject_job_removal_purge_unconfirmed_fence_never_invents_removed_execution_p
             .join(request.deletion.worker_id.to_string())
             .exists()
     );
-    runtime_session_retention(temp.path())
-        .ensure_live(session)
+}
+
+#[test]
+fn subject_job_removal_purge_unresolved_removal_never_confirms_absent_worker() {
+    for condition in ["missing", "pending", "foreign_workspace"] {
+        let f = Fixture::new();
+        let request = f.removal_purge_request(SessionDisposition::Archive);
+        f.complete_removal(&request);
+        let copies = f.copies();
+        let receipt_path = f.receipt_path();
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        let Fixture {
+            temp,
+            runtime,
+            scope,
+            store,
+            session,
+            ..
+        } = f;
+        drop(store);
+        drop(runtime);
+        receipt["schema_version"] = serde_json::json!(1);
+        receipt.as_object_mut().unwrap().remove("shutdown");
+        receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("create_fingerprint");
+        match condition {
+            "missing" => std::fs::remove_file(&receipt_path).unwrap(),
+            "pending" => {
+                receipt["result"]["source_removed"] = serde_json::json!(false);
+                std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            }
+            "foreign_workspace" => {
+                receipt["request"]["workspace_id"] = serde_json::json!("other-workspace");
+                std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let retained_receipt = std::fs::read(&receipt_path).ok();
+        let snapshot_path = temp.path().join("runtime.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+        let fence =
+            &mut snapshot["subject_delete_worker_fences"][request.deletion.worker_id.to_string()];
+        fence["response"] = serde_json::Value::Null;
+        assert!(fence.get("canonical_removal").is_none());
+        let unconfirmed = fence.clone();
+        std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::FsRuntimeStoreOptions::new(temp.path()).with_runtime_id("runtime-test"),
+            Arc::new(AcceptingBackend),
+        )
         .unwrap();
+        runtime.bind_runtime_identity("runtime-test").unwrap();
+        for _ in 0..2 {
+            assert!(
+                runtime
+                    .subject_delete_worker_scoped(&scope, request.deletion.clone())
+                    .is_err(),
+                "{condition}"
+            );
+            assert!(
+                runtime
+                    .purge_subject_job_removal_scoped(&scope, request.clone())
+                    .is_err(),
+                "{condition}"
+            );
+        }
+        assert_eq!(tree(&temp.path().join("archives")), copies, "{condition}");
+        assert_eq!(
+            std::fs::read(&receipt_path).ok(),
+            retained_receipt,
+            "{condition}"
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+        assert_eq!(
+            snapshot["subject_delete_worker_fences"][request.deletion.worker_id.to_string()],
+            unconfirmed,
+            "{condition}"
+        );
+        runtime_session_retention(temp.path())
+            .ensure_live(session)
+            .unwrap();
+    }
 }

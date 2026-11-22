@@ -42,6 +42,7 @@ function worker(overrides: Partial<Worker> = {}): Worker {
     tags: [],
     workspace: { visibility: "workspace", identity: "workspace-a" },
     availability: "observed",
+    lifecycle: "stopped",
     state: "stopped",
     pinned: true,
     retention_state: "pinned",
@@ -443,27 +444,33 @@ function restoreResponse(
   });
 }
 
-test.each(["stopped", "idle", "running", "paused", "unavailable"] as const)(
-  "Restore eligibility uses observed stopped catalog lifecycle (%s)",
-  async (state) => {
-    catalog();
+test.each(["not_started", "stopped", "active", "awaiting_restore", "creating", "restoring", "stopping", "recovery_required", undefined] as const)(
+  "Restore and Delete eligibility use canonical lifecycle instead of last stopped status (%s)",
+  async (lifecycle) => {
+    const store = catalog();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json(plan())));
-    render(WorkersPage, {
-      data: data(
-        "page-test",
-        worker({
-          state,
-          availability: state === "unavailable" ? "unavailable" : "observed",
-        }),
-      ),
+    const item = worker({ state: "stopped", lifecycle, pinned: false });
+    render(WorkersPage, { data: data("page-test", item) });
+    publish(store, [item]);
+    const disabled = lifecycle !== "not_started" && lifecycle !== "stopped";
+    expect((screen.getByRole("button", { name: "Restore Catalog worker" }) as HTMLButtonElement).disabled).toBe(disabled);
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: "Delete Catalog worker" }) as HTMLButtonElement).disabled).toBe(disabled);
     });
-    expect(
-      (screen.getByRole("button", {
-        name: "Restore Catalog worker",
-      }) as HTMLButtonElement).disabled,
-    ).toBe(state !== "stopped");
   },
 );
+
+test("unavailable observation cannot authorize actions from a retained settled lifecycle", async () => {
+  const store = catalog();
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json(plan())));
+  const item = worker({ availability: "unavailable", pinned: false });
+  render(WorkersPage, { data: data("page-test", item) });
+  publish(store, [item]);
+  expect((screen.getByRole("button", { name: "Restore Catalog worker" }) as HTMLButtonElement).disabled).toBe(true);
+  await waitFor(() => {
+    expect((screen.getByRole("button", { name: "Delete Catalog worker" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
 
 test.each(
   [

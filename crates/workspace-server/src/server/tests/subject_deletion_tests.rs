@@ -598,10 +598,27 @@ async fn pending_consolidation_is_purged_and_captured_dispatch_and_late_result_a
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["completed"], false);
-    assert!(
-        api.dispatch_backend_job_reservation(captured.clone())
-            .is_err()
+    // T-878 settles a disappeared destination as NotRequired. A captured
+    // dispatch can replay that omission, but must neither execute nor accept a
+    // result; termination and the failed cleanup remain independently owned.
+    execution.take_inputs();
+    let replay = api
+        .dispatch_backend_job_reservation(captured.clone())
+        .unwrap();
+    assert!(replay.replayed);
+    let omitted = api
+        .store
+        .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt.attempt_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        omitted.result_application_disposition,
+        Some(crate::backend_job::JobResultApplicationDisposition::NotRequired)
     );
+    assert_eq!(omitted.state, BackendJobAttemptState::Failed);
+    assert_eq!(omitted.worker.as_ref(), Some(&worker));
+    assert!(omitted.result.is_none());
+    assert!(execution.take_inputs().is_empty());
     assert!(
         api.accept_backend_job_result(
             &worker,

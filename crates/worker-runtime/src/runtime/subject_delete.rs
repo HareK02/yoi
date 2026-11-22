@@ -1,19 +1,14 @@
 use super::*;
 
-struct SubjectOriginalAbsence {
-    // None only for the existing confirmation-before-removal path.
-    removal_shutdown: Option<crate::execution::WorkerExecutionTermination>,
-}
-
 impl RuntimeState {
-    // Absence needs original scope shutdown evidence, independently of current
-    // resource cleanup. A new missing catalog ID is never proof.
+    // Canonical removal owns completion. A new missing catalog ID is not a
+    // completed removal, and cannot be upgraded by an empty backend registry.
     fn confirmed_subject_delete_originals_absent(
         &mut self,
         request: &runtime_api::SubjectDeleteWorkerRequest,
-    ) -> Result<Option<SubjectOriginalAbsence>, RuntimeError> {
+    ) -> Result<bool, RuntimeError> {
         if self.workers.contains_key(&request.worker_id) {
-            return Ok(None);
+            return Ok(false);
         }
         if self.unreconciled_worker_writes.contains(&request.worker_id) {
             return Err(RuntimeError::InvalidRequest(
@@ -48,15 +43,13 @@ impl RuntimeState {
                         && saved.operation_id == request.operation_id
                 })
             {
-                return Ok(Some(SubjectOriginalAbsence {
-                    removal_shutdown: None,
-                }));
+                return Ok(true);
             }
             let runtime_id = self.runtime_identity.as_deref().ok_or_else(|| {
                 RuntimeError::InvalidRequest("Subject removal Runtime identity missing".into())
             })?;
-            let (removal, termination, receipt_sha256) =
-                FsWorkerRetentionProvider::new(store.runtime_dir()).subject_shutdown_removal(
+            let (removal, receipt_sha256) = FsWorkerRetentionProvider::new(store.runtime_dir())
+                .subject_completed_removal(
                     request,
                     runtime_id,
                     fence
@@ -74,9 +67,7 @@ impl RuntimeState {
             // Bind the original child before external resource cleanup. Retry
             // also synchronizes a prior uncertain snapshot acknowledgement.
             self.persist_runtime_snapshot()?;
-            return Ok(Some(SubjectOriginalAbsence {
-                removal_shutdown: Some(termination),
-            }));
+            return Ok(true);
         }
         #[cfg(not(feature = "fs-store"))]
         Err(RuntimeError::InvalidRequest(
@@ -93,14 +84,14 @@ pub(crate) struct SubjectCanonicalRemoval {
     receipt_sha256: String,
 }
 
-/// Permanent exclusion survives WorkerRemoval. A receipt never substitutes for a
-/// fresh execution reconciliation on exact retry, including after Runtime reopen.
+/// Permanent exclusion survives WorkerRemoval. Exact retry checks the original
+/// removal identity, not a second historical execution shutdown proof.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SubjectDeleteWorkerFence {
     pub(crate) request: runtime_api::SubjectDeleteWorkerRequest,
     pub(crate) response: Option<runtime_api::SubjectDeleteWorkerResponse>,
-    // Child identity only; shutdown remains authoritative in the removal receipt.
+    // Child identity only; completion remains owned by the removal receipt.
     #[cfg(feature = "fs-store")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) canonical_removal: Option<SubjectCanonicalRemoval>,
@@ -210,8 +201,11 @@ impl Runtime {
             if state.workers.contains_key(&request.worker_id) {
                 state.refresh_uncertain_worker_write(&worker_ref)?;
                 let worker = state.worker(&worker_ref)?;
+                // WorkerId identifies the allocation even when a settled legacy
+                // aggregate lacks restore material. Compare every retained
+                // fingerprint, but do not require or invent a restore request.
                 if worker.workspace_id.as_deref() != Some(request.workspace_id.as_str())
-                    || worker.request.as_ref().is_none_or(|create| {
+                    || worker.request.as_ref().is_some_and(|create| {
                         create.create_fingerprint != request.create_fingerprint
                     })
                 {
@@ -292,27 +286,15 @@ impl Runtime {
             let mut state = self.lock()?;
             state.confirmed_subject_delete_originals_absent(&request)?
         };
-        if let Some(absent) = absent {
-            if let Some(saved) = absent.removal_shutdown.as_ref() {
-                let current = backend
-                    .reconcile_termination_receipt(&worker_ref, saved)
-                    .map_err(RuntimeError::InvalidRequest)?;
-                if current.as_ref() != Some(saved) {
-                    return Err(RuntimeError::InvalidRequest(
-                        "Original removal Stop no longer matches execution owner".into(),
-                    ));
-                }
-            }
-            // The durable confirmed fence or original removal owns historical
-            // shutdown proof; separately check current adapter/factory resources.
+        if absent {
+            // Completed removal is authoritative for historical shutdown. This
+            // checks only conflicting current resource owners and remaining
+            // factory cleanup; it does not re-attest the removed execution.
             backend
                 .confirm_subject_delete_worker_absent(&request)
                 .map_err(RuntimeError::InvalidRequest)?;
             let mut state = self.lock()?;
-            if state
-                .confirmed_subject_delete_originals_absent(&request)?
-                .is_none()
-            {
+            if !state.confirmed_subject_delete_originals_absent(&request)? {
                 return Err(RuntimeError::InvalidRequest(
                     "Subject originals changed during absence reconciliation".into(),
                 ));
@@ -332,71 +314,49 @@ impl Runtime {
             state.persist_runtime_snapshot()?;
             return Ok(response);
         }
-        let (stop, canonical, pending_stop) = {
+        let stop = {
             let mut state = self.lock()?;
-            // A prior uncertain Stop write must be synchronized before it can
-            // supply evidence or choose the durable child for this retry.
             state.refresh_uncertain_worker_write(&worker_ref)?;
             let worker = state.worker(&worker_ref)?;
-            if let Some(pending) = worker.pending_stop() {
-                (
+            if worker.is_settled_inactive() {
+                // Both NotStarted and Stopped are authoritative. In particular,
+                // NotStarted has no execution or Stop receipt to manufacture.
+                None
+            } else if let Some(pending) = worker.pending_stop() {
+                Some((
                     WorkerExecutionStopRequest {
                         worker_ref: worker_ref.clone(),
                         operation_id: pending.operation_id,
                     },
                     worker.stop_termination().cloned(),
-                    true,
-                )
-            } else if let Some(saved) = worker.restore_guard.execution_termination.clone() {
-                if !worker.is_settled_inactive() || worker.pending_restore().is_some() {
-                    return Err(RuntimeError::InvalidRequest(
-                        "Subject canonical Stop is not settled".into(),
-                    ));
-                }
-                (
-                    WorkerExecutionStopRequest {
-                        worker_ref: worker_ref.clone(),
-                        operation_id: saved.stop_operation_id,
-                    },
-                    Some(saved),
-                    false,
-                )
+                ))
             } else {
                 drop(state);
-                // Never call begin on an existing canonical receipt: it clears
-                // the old proof. No-record/never-started cases cannot get here
-                // through an empty backend map as evidence of historical shutdown.
                 let operation_id = WorkerLifecycleOperationId::new();
                 self.begin_stop_operation(&worker_ref, operation_id)?;
-                (
+                Some((
                     WorkerExecutionStopRequest {
                         worker_ref: worker_ref.clone(),
                         operation_id,
                     },
                     None,
-                    true,
-                )
+                ))
             }
         };
-        let result = backend
-            .subject_delete_worker_stop(&request, stop.clone(), canonical.as_ref())
-            .map_err(RuntimeError::InvalidRequest)?;
-        if let Some(saved) = canonical {
-            if !result.is_accepted()
-                || result.operation != WorkerExecutionOperation::Stop
-                || result.execution_id != Some(saved.execution_id)
-                || result.termination.as_ref() != Some(&saved)
-                || !saved.confirms_scope_shutdown(&worker_ref, stop.operation_id)
-            {
-                return Err(RuntimeError::InvalidRequest(
-                    "Subject canonical Stop was not exactly reconciled".into(),
-                ));
-            }
-        }
-        if pending_stop {
-            // Settled A is read-only; pending B must settle through the ordinary
-            // validator only after cleanup reconciles its original whole receipt.
+        if let Some((stop, termination)) = stop {
+            // Only an unfinished operation resumes its owned cleanup. Historical
+            // termination is retained as progress, never a gate on settled state.
+            let result = backend
+                .subject_delete_worker_stop(&request, stop.clone(), termination.as_ref())
+                .map_err(RuntimeError::InvalidRequest)?;
             self.commit_stopped_worker(&worker_ref, stop.operation_id, result)?;
+        } else {
+            // A settled lifecycle authorizes removal without Stop. Admission is
+            // already fenced; reject a conflicting current candidate/resource
+            // owner without interpreting an older Stop as its termination.
+            backend
+                .preflight_worker_removal(&worker_ref)
+                .map_err(RuntimeError::InvalidRequest)?;
         }
         let mut state = self.lock()?;
         // This is storage-owner evidence under the same lock that permanently

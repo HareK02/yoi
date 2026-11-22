@@ -246,7 +246,13 @@ async fn remove_worker(
     }
     match api.runtime.worker(worker) {
         Ok(detail) => {
-            if !detail.state.eq_ignore_ascii_case("stopped") {
+            if !matches!(
+                detail.lifecycle,
+                Some(
+                    protocol::WorkerLifecycleState::NotStarted
+                        | protocol::WorkerLifecycleState::Stopped
+                )
+            ) {
                 let stopped = api
                     .runtime
                     .stop_worker(
@@ -269,7 +275,16 @@ async fn remove_worker(
                 .runtime
                 .worker(worker)
                 .map_err(RuntimeRegistryError::into_error)?;
-            if !actual.state.eq_ignore_ascii_case("stopped") {
+            if actual.availability
+                != protocol::subscription::SubscriptionWorkerAvailability::Observed
+                || !matches!(
+                    actual.lifecycle,
+                    Some(
+                        protocol::WorkerLifecycleState::NotStarted
+                            | protocol::WorkerLifecycleState::Stopped
+                    )
+                )
+            {
                 return Err(
                     Error::RepositoryConflict("Subject Worker stop is unconfirmed".into()).into(),
                 );
