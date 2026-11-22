@@ -20,6 +20,15 @@ use crate::http::{WorkdirSessionOperation, WorkdirSessionOperationResult, Workdi
 use crate::{BoundedReadLimits, WorkdirId, WorkdirPath, WorkdirSessionCapabilities};
 
 pub const EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION: u16 = 3;
+/// A disconnected sharing process cannot extend this window by retrying.
+/// Two minutes permits recovery beyond the provider's lost-heartbeat detection
+/// and repeated short reconnect backoffs, without retaining unavailable shares
+/// indefinitely. The Backend persists the first outage deadline; TTL may end it
+/// earlier, and only authenticated activation starts a new connection lifetime.
+pub const EXTERNAL_WORKDIR_RECONNECT_GRACE_SECS: u64 = 120;
+/// Process-local continuity credential, carried only by authenticated HTTP
+/// grant creation and provider upgrade requests, never in DTOs or frames.
+pub const EXTERNAL_WORKDIR_SESSION_KEY_HEADER: &str = "x-yoi-external-session-key";
 /// Maximum serialized Backend-to-provider command frame size.
 pub const MAX_EXTERNAL_SERVER_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum serialized provider-to-Backend result frame size. Read bytes are
@@ -672,6 +681,10 @@ mod tests {
                             "host_path",
                             "root",
                             "credential",
+                            "session_key",
+                            "session_credential",
+                            "session_credential_digest",
+                            EXTERNAL_WORKDIR_SESSION_KEY_HEADER,
                             "credentials",
                             "token",
                             "access_token",
@@ -752,6 +765,34 @@ mod tests {
                 Some(EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION.into())
             );
             assert_no_provider_authority(&value);
+        }
+    }
+
+    #[test]
+    fn provider_registration_rejects_session_credential_fields_in_frames() {
+        for field in [
+            "session_key",
+            "session_credential",
+            "session_credential_digest",
+            EXTERNAL_WORKDIR_SESSION_KEY_HEADER,
+        ] {
+            let mut input = serde_json::json!({
+                "version": EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION,
+                "message": {
+                    "kind": "register",
+                    "registration": {
+                        "provider_instance_id": "provider-a",
+                        "grant_id": "grant-a",
+                        "workdir_id": "workdir-a",
+                        "generation": 1,
+                        "capabilities": serde_json::to_value(WorkdirSessionCapabilities::READ_ONLY).unwrap(),
+                        "read_limits": serde_json::to_value(BoundedReadLimits::EXTERNAL_DEFAULT).unwrap()
+                    }
+                }
+            });
+            assert!(serde_json::from_value::<ExternalWorkdirProviderFrame>(input.clone()).is_ok());
+            input["message"]["registration"][field] = Value::String("a".repeat(64));
+            assert!(serde_json::from_value::<ExternalWorkdirProviderFrame>(input).is_err());
         }
     }
 

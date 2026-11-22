@@ -35,6 +35,8 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
         workspace_id: TEST_WORKSPACE_ID.into(),
         workdir_id: "restore-external".into(),
         provider_instance_id: "offline-provider".into(),
+        session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+        reconnect_deadline_at: Some((Utc::now() + Duration::seconds(120)).to_rfc3339()),
         display_name: "Offline external".into(),
         permissions: "read_only".into(),
         created_by: test_browser_request_actor().account_id,
