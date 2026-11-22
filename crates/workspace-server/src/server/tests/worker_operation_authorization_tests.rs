@@ -1041,3 +1041,51 @@ async fn current_policy_control_rejection_produces_typed_problem_without_runtime
     assert!(!String::from_utf8_lossy(&body).contains("canary"));
     assert_eq!(effects(&f), before);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_worker_details_follows_list_target_and_current_disclosure_grant() {
+    let f = OperationFixture::new().await;
+    f.assign(vec![workspace_permission("worker.create")], vec![])
+        .await;
+    let target = f.child("details-target", vec![]).await;
+    f.assign(vec![workspace_permission("worker.list")], vec![])
+        .await;
+    let host = worker_tool_host(&f._dir.path().join("details-tools"), f.client(&f.source)).await;
+    let before = effects(&f);
+    let listed = execute_tool(&host, "WorkerList", json!({})).await;
+    let item = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["target"]["worker_id"] == target.worker_id)
+        .unwrap();
+    assert!(item["worker"].as_str().unwrap().starts_with("W-"));
+    assert!(item.get("workdir_connections").is_none());
+    assert!(item.get("summary").is_none());
+    let details = execute_tool(&host, "WorkerDetails", json!({"target":item["target"]})).await;
+    assert_eq!(details["target"], item["target"]);
+    assert_eq!(details["worker"], item["worker"]);
+    assert_eq!(details["workdir_connections"], json!([]));
+    assert!(details["restore_observation_token"].is_string());
+    assert_eq!(
+        effects(&f),
+        before,
+        "detail reads are not lifecycle operations"
+    );
+    let grant = f
+        .api
+        .store
+        .get_active_worker_control_grant(TEST_WORKSPACE_ID, &f.source, &target)
+        .unwrap()
+        .unwrap();
+    f.api
+        .store
+        .revoke_worker_control_grant(
+            TEST_WORKSPACE_ID,
+            &grant.grant_id,
+            &now_registry_timestamp(),
+        )
+        .unwrap();
+    assert!(execute_tool_result(&host, "WorkerDetails", json!({"target":item["target"]})).is_err());
+    assert_eq!(effects(&f), before);
+}

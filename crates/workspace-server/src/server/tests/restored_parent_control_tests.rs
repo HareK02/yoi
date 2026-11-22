@@ -327,7 +327,7 @@ async fn tools_for_restored_client(
     assert!(!report.has_errors(), "{}", report.error_message());
     let server = host.engine().tool_server_handle();
     server.flush_pending();
-    ["WorkerList", "WorkerSendInput"]
+    ["WorkerList", "WorkerDetails", "WorkerSendInput"]
         .into_iter()
         .map(|name| (name.into(), server.get_tool(name).unwrap().1))
         .collect()
@@ -542,6 +542,16 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             grants_before
         );
         let target = list["items"][0]["target"].clone();
+        let detail_output = call(&tools, "WorkerDetails", json!({"target":target})).await;
+        let details: Value =
+            serde_json::from_str(detail_output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(details["target"], target);
+        assert_eq!(details["worker"], list["items"][0]["worker"]);
+        assert!(details["workdir_connections"].is_array());
+        assert!(
+            details["restore_observation_token"].is_null(),
+            "no Restore permission in this grant"
+        );
         let marker = format!("restored-parent-marker-{}", uuid::Uuid::now_v7());
         let mut child_events = child_handle.subscribe();
         let output = call(
