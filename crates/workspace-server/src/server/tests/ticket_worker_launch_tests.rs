@@ -189,6 +189,13 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         self.execution.spawn_worker(request)
     }
 
+    fn restore_worker(
+        &self,
+        request: worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.execution.restore_worker(request)
+    }
+
     fn dispatch_input(
         &self,
         worker: &worker_runtime::identity::WorkerRef,
@@ -1177,3 +1184,164 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
 
 // Real Runtime creation and SQLite finalization fail independently; only Stop is
 // injected. Reconciliation must retain the create reservation while absence is unknown.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn known_worker_list_and_details_follow_embedded_and_remote_execution() {
+    for remote in [false, true] {
+        let f = LaunchFixture::new(remote).await;
+        f.backend.execution.accept_restores();
+        let mut create = f.payload("", "list-controller", "builtin:companion", false);
+        create["initial_submit"] = json!([]);
+        create["authorization"] = serde_json::to_value(test_worker_operation_authorization(&[(
+            "worker",
+            &["worker.list", "worker.restore"],
+        )]))
+        .unwrap();
+        let (status, controller) = f.post(TEST_WORKSPACE_ID, create).await;
+        assert_eq!(status, StatusCode::OK, "{controller}");
+        let controller =
+            RuntimeWorkerRef::new(&f.runtime_id, controller["worker_id"].as_str().unwrap());
+        let mut create = f.payload("", "list-subject", "builtin:companion", false);
+        create["initial_submit"] = json!([]);
+        let (status, subject) = f.post(TEST_WORKSPACE_ID, create).await;
+        assert_eq!(status, StatusCode::OK, "{subject}");
+        let subject = RuntimeWorkerRef::new(&f.runtime_id, subject["worker_id"].as_str().unwrap());
+        f.api
+            .store
+            .create_worker_control_grant(&WorkerControlGrantRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                grant_id: "list-execution".into(),
+                controller: controller.clone(),
+                subject: subject.clone(),
+                relation: "spawned".into(),
+                origin: "fixture".into(),
+                permissions: vec!["send_input".into(), "restore".into()],
+                operation_id: "list-execution".into(),
+                created_at: now_registry_timestamp(),
+                revoked_at: None,
+            })
+            .unwrap();
+        for (status, expected) in [
+            (
+                protocol::WorkerStatus::Idle,
+                server_api::WorkerListState::Idle,
+            ),
+            (
+                protocol::WorkerStatus::Running,
+                server_api::WorkerListState::Running,
+            ),
+            (
+                protocol::WorkerStatus::Paused,
+                server_api::WorkerListState::Paused,
+            ),
+            (
+                protocol::WorkerStatus::Idle,
+                server_api::WorkerListState::Idle,
+            ),
+        ] {
+            f.backend
+                .execution
+                .publish_worker_state(&subject, status.into());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let listed = list_known_workers(
+                        State(f.api.clone()),
+                        AxumPath(ScopedWorkspacePath {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                        }),
+                        ticket_check_headers(&controller),
+                    )
+                    .await
+                    .unwrap()
+                    .0;
+                    assert_eq!(listed.items.len(), 1);
+                    if listed.items[0].state == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("list must reflect current execution over both host adapters");
+        }
+        let get_details = || {
+            known_worker_details(
+                State(f.api.clone()),
+                AxumPath(ScopedRuntimeWorkerPath {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    worker: subject.clone(),
+                }),
+                ticket_check_headers(&controller),
+            )
+        };
+        let empty = get_details().await.unwrap().0;
+        assert_eq!(empty.workdir_connections, Some(vec![]));
+        f.api
+            .runtime
+            .stop_worker(
+                &subject,
+                WorkerLifecycleRequest {
+                    stop_intent: None,
+                    reason: Some("list restore token check".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let stopped = get_details().await.unwrap().0;
+        assert_eq!(stopped.state, server_api::WorkerListState::Stopped);
+        let token = stopped.restore_observation_token.unwrap();
+        let restored = restore_known_worker(
+            State(f.api.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: subject.clone(),
+            }),
+            ticket_check_headers(&controller),
+            server_api::WorkerRestoreRequest {
+                expected_observation_token: token.clone(),
+                request_id: "list-restore".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .0
+        .result;
+        assert_eq!(
+            restored.state,
+            server_api::WorkerRestoreState::Accepted,
+            "{restored:?}"
+        );
+        f.api
+            .runtime
+            .stop_worker(
+                &subject,
+                WorkerLifecycleRequest {
+                    stop_intent: None,
+                    reason: None,
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let stale = restore_known_worker(
+            State(f.api.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: subject.clone(),
+            }),
+            ticket_check_headers(&controller),
+            server_api::WorkerRestoreRequest {
+                expected_observation_token: token,
+                request_id: "stale-list-restore".into(),
+            },
+        )
+        .await;
+        assert!(
+            stale.is_err(),
+            "remote={remote}: old detail token cannot survive ABA: {stale:?}"
+        );
+        assert_eq!(
+            stale.unwrap_err().into_response().status(),
+            StatusCode::CONFLICT
+        );
+    }
+}

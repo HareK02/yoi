@@ -11304,6 +11304,26 @@ impl server_api::ServerApi for ServerApiContractService {
         Ok(response)
     }
 
+    async fn worker_control_details(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::WorkerControlDetails, server_api::RepositoryApiError> {
+        known_worker_details(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            current_worker_contract_headers(&context)?,
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn worker_control_authorize(
         &self,
         context: server_api::ServerRequestContext,
@@ -28977,13 +28997,111 @@ async fn list_known_workers(
                     .runtime
                     .worker(&grant.subject)
                     .map_err(|error| error.into_error())?;
-                let workdir_connections = if grant
-                    .permissions
-                    .iter()
-                    .any(|p| p == "send_input" || p == "observe")
-                {
+                let worker_key = api
+                    .store
+                    .worker_resource_key(&path.workspace_id, &grant.subject)?
+                    .ok_or_else(|| Error::UnknownWorker {
+                        worker: grant.subject.clone(),
+                    })?;
+                items.push(server_api::WorkerControlRecord {
+                    subject: server_api::WorkerControlSubject {
+                        runtime_id: grant.subject.runtime_id,
+                        worker_id: grant.subject.worker_id,
+                    },
+                    worker: worker_key,
+                    display_name: summary.display_name.clone(),
+                    state: worker_list_state(&summary),
+                    relation: grant.relation,
+                    permissions: grant.permissions,
+                });
+            }
+            Ok(Json(server_api::WorkerControlListResponse {
+                limit,
+                workspace_id: path.workspace_id,
+                items,
+                truncated,
+            }))
+        })
+        .await
+}
+
+fn worker_list_state(worker: &InternalWorkerSummary) -> server_api::WorkerListState {
+    use protocol::{WorkerBusyState, WorkerLifecycleState as L, WorkerRunState as R, WorkerState};
+    use server_api::WorkerListState as S;
+    if worker.availability != protocol::subscription::SubscriptionWorkerAvailability::Observed {
+        return S::Unavailable;
+    }
+    match worker.lifecycle {
+        Some(L::NotStarted) => S::NotStarted,
+        Some(L::AwaitingRestore) => S::AwaitingRestore,
+        Some(L::Stopped) => S::Stopped,
+        Some(L::Creating) => S::Creating,
+        Some(L::Restoring) => S::Restoring,
+        Some(L::Stopping) => S::Stopping,
+        Some(L::RecoveryRequired) => S::RecoveryRequired,
+        Some(L::Active) => match worker.worker_state.as_ref().map(|snapshot| &snapshot.state) {
+            Some(WorkerState::Idle) => S::Idle,
+            Some(WorkerState::Busy(WorkerBusyState::Run(R::Running))) => S::Running,
+            Some(WorkerState::Busy(WorkerBusyState::Run(R::Pausing))) => S::Pausing,
+            Some(WorkerState::Busy(WorkerBusyState::Run(R::Paused))) => S::Paused,
+            Some(WorkerState::Busy(WorkerBusyState::Run(R::Cancelling))) => S::Cancelling,
+            Some(WorkerState::Busy(WorkerBusyState::Maintenance(_))) => S::Maintenance,
+            None => S::Unavailable,
+        },
+        None => S::Unavailable,
+    }
+}
+
+async fn known_worker_details(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    headers: HeaderMap,
+) -> ApiResult<Json<server_api::WorkerControlDetails>> {
+    api.host_executors
+        .host()?
+        .run(move || {
+            validate_workspace_scope(&api, &path.workspace_id)?;
+            let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+            let controller = RuntimeWorkerRef::new(source.runtime_id, source.worker_id);
+            subject_authorization::authorize(
+                &api,
+                &controller,
+                &server_api::authorization::OperationAuthorizationRequest {
+                    operation: "worker.list".into(),
+                    resource: server_api::authorization::PermissionResource::Workspace {
+                        workspace_id: path.workspace_id.clone(),
+                    },
+                },
+            )?;
+            let subject = resolve_workspace_worker_reference(
+                &api,
+                &path.worker.runtime_id,
+                &path.worker.worker_id,
+            )?;
+            let grant = api
+                .store
+                .get_active_worker_control_grant(&path.workspace_id, &controller, &subject)?
+                .ok_or_else(|| Error::UnknownWorker {
+                    worker: subject.clone(),
+                })?;
+            let summary = api
+                .runtime
+                .worker(&subject)
+                .map_err(|error| error.into_error())?;
+            let worker_key = api
+                .store
+                .worker_resource_key(&path.workspace_id, &subject)?
+                .ok_or_else(|| Error::UnknownWorker {
+                    worker: subject.clone(),
+                })?;
+            let workdir_connections = if grant
+                .permissions
+                .iter()
+                .any(|p| p == "send_input" || p == "observe")
+            {
+                Some(
                     api.store
-                        .list_worker_workdir_links(&path.workspace_id, &grant.subject)?
+                        .list_worker_workdir_links(&path.workspace_id, &subject)?
                         .into_iter()
                         .filter(|link| link.unlinked_at.is_none())
                         .map(|link| server_api::CurrentWorkerWorkdirAttachmentItem {
@@ -28992,26 +29110,26 @@ async fn list_known_workers(
                             capabilities: link.capabilities,
                             connection_id: link.connection_id,
                         })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                items.push(server_api::WorkerControlRecord {
-                    workdir_connections,
-                    subject: server_api::WorkerControlSubject {
-                        runtime_id: grant.subject.runtime_id,
-                        worker_id: grant.subject.worker_id,
-                    },
-                    relation: grant.relation,
-                    origin: grant.origin,
-                    permissions: grant.permissions,
-                    summary: worker_launch_worker_summary(summary),
-                });
-            }
-            Ok(Json(server_api::WorkerControlListResponse {
-                workspace_id: path.workspace_id,
-                items,
-                truncated,
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            Ok(Json(server_api::WorkerControlDetails {
+                subject: server_api::WorkerControlSubject {
+                    runtime_id: subject.runtime_id,
+                    worker_id: subject.worker_id,
+                },
+                worker: worker_key,
+                state: worker_list_state(&summary),
+                restore_observation_token: grant
+                    .permissions
+                    .iter()
+                    .any(|p| p == "restore")
+                    .then(|| summary.restore_observation_token.clone())
+                    .flatten(),
+                workdir_connections,
+                summary: worker_launch_worker_summary(summary),
             }))
         })
         .await
@@ -42023,6 +42141,7 @@ mod tests {
     mod workdir_session_close_tests;
     mod worker_drive_tests;
     mod worker_launch_policy_api_tests;
+    mod worker_list_tests;
     mod worker_operations_tests;
     mod worker_protocol_tests;
     mod worker_registry_access_tests;

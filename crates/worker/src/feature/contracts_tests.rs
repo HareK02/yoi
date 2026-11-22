@@ -70,6 +70,13 @@ impl WorkerControlService for TestServices {
     async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError> {
         unreachable!("not an observation operation")
     }
+    async fn worker_details(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        unreachable!("not an observation operation")
+    }
     async fn send_input(
         &self,
         _: WorkerControlSubject,

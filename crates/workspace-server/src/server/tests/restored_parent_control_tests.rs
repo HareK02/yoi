@@ -524,25 +524,30 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
         let expected_subject = json!({"kind":"runtime_worker", "runtime_id": child.runtime_id, "worker_id": child.worker_id});
         assert_eq!(list["items"].as_array().unwrap().len(), 1, "{list}");
         assert_eq!(
-            list["items"][0]["subject"], expected_subject,
-            "restored parent's list must expose the complete child subject"
+            list["items"][0]["target"], expected_subject,
+            "restored parent's list must expose the complete child target"
         );
         assert_eq!(list["items"][0]["permissions"], json!(grant.permissions));
-        assert_eq!(list["items"][0]["summary"]["runtime_id"], child.runtime_id);
-        assert_eq!(list["items"][0]["summary"]["worker_id"], child.worker_id);
+        assert!(
+            list["items"][0]["worker"]
+                .as_str()
+                .unwrap()
+                .starts_with("W-")
+        );
+        assert!(list["items"][0].get("summary").is_none());
         assert_eq!(
             api.store
                 .list_active_worker_control_grants(TEST_WORKSPACE_ID, &parent, 10)
                 .unwrap(),
             grants_before
         );
-        let subject = list["items"][0]["subject"].clone();
+        let target = list["items"][0]["target"].clone();
         let marker = format!("restored-parent-marker-{}", uuid::Uuid::now_v7());
         let mut child_events = child_handle.subscribe();
         let output = call(
             &tools,
             "WorkerSendInput",
-            json!({"subject":subject,"content":marker}),
+            json!({"target":target,"content":marker}),
         )
         .await;
         let input: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
@@ -574,7 +579,7 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             .unwrap();
         let refused = tools["WorkerSendInput"]
             .execute(
-                &json!({"subject": subject, "content": marker}).to_string(),
+                &json!({"target": target, "content": marker}).to_string(),
                 ToolExecutionContext::new("revoked-input", "restored-parent", 1),
             )
             .await;

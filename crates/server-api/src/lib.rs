@@ -744,6 +744,8 @@ impl_openapi_schema!(
     WorkerRestoreRequest,
     WorkerControlSubject,
     WorkerControlRecord,
+    WorkerListState,
+    WorkerControlDetails,
     WorkerControlListResponse,
     WorkspaceWorkerDiscoveryQuery,
     WorkspaceWorkerSubject,
@@ -2183,6 +2185,19 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkerControlListResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
+    async fn worker_control_details(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+    ) -> Result<WorkerControlDetails, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/permissions/{permission}",
         status = 204,
@@ -10813,11 +10828,44 @@ pub struct WorkerControlSubject {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerControlRecord {
-    pub workdir_connections: Vec<CurrentWorkerWorkdirAttachmentItem>,
     pub subject: WorkerControlSubject,
+    pub worker: String,
+    pub display_name: String,
+    pub state: WorkerListState,
     pub relation: String,
-    pub origin: String,
     pub permissions: Vec<String>,
+}
+
+/// A display projection, never an admission decision or a second state owner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerListState {
+    Idle,
+    Running,
+    Pausing,
+    Paused,
+    Cancelling,
+    Maintenance,
+    NotStarted,
+    AwaitingRestore,
+    Stopped,
+    Creating,
+    Restoring,
+    Stopping,
+    RecoveryRequired,
+    Failed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerControlDetails {
+    pub subject: WorkerControlSubject,
+    pub worker: String,
+    pub state: WorkerListState,
+    /// None means no binding-read permission, not an empty attachment set.
+    pub workdir_connections: Option<Vec<CurrentWorkerWorkdirAttachmentItem>>,
+    pub restore_observation_token: Option<String>,
     pub summary: WorkerLaunchWorkerSummary,
 }
 
@@ -10825,6 +10873,8 @@ pub struct WorkerControlRecord {
 #[serde(deny_unknown_fields)]
 pub struct WorkerControlListResponse {
     pub workspace_id: String,
+    #[schemars(range(min = 1, max = 500_usize))]
+    pub limit: usize,
     pub items: Vec<WorkerControlRecord>,
     pub truncated: bool,
 }
@@ -16022,6 +16072,7 @@ mod openapi_artifact_tests {
             "merge_request_reviewer_child_register",
             "runtime_resource_fetch",
             "worker_control_authorize",
+            "worker_control_details",
             "worker_control_cancel",
             "worker_control_input",
             "worker_control_list",
