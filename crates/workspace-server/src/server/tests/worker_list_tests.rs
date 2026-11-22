@@ -182,6 +182,73 @@ async fn known_list_projects_live_state_without_launch_or_workdir_details() {
 }
 
 #[tokio::test]
+async fn details_observed_empty_bindings_feed_workdirless_assignment() {
+    let (f, controller) = fixture().await;
+    for id in [&f.main_workdir_id, &f.docs_workdir_id] {
+        f.api
+            .store
+            .detach_worker_workdir(TEST_WORKSPACE_ID, &f.worker, Some(id), TEST_CREATED_AT)
+            .unwrap();
+    }
+    sync_runtime_worker_workdir_attachments(&f.api, &f.worker).unwrap();
+    browser_ticket_backend(&f.api)
+        .unwrap()
+        .edit_item(
+            f.ticket_id.clone().into(),
+            TicketItemEdit {
+                targets: Some(TicketTargetsEdit::Clear),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let listed = list(&f, &controller).await;
+    let observed = details(&f, &controller).await;
+    assert_eq!(observed.worker, listed.items[0].worker);
+    let connections = observed.workdir_connections.unwrap();
+    assert!(
+        connections.is_empty(),
+        "an authorized empty observation is not null"
+    );
+    let mut request = manual_worker_assignment_request(&f, "assign-empty-from-details");
+    request.workdir_bindings = connections
+        .into_iter()
+        .map(|item| server_api::TicketWorkerAttachmentBinding {
+            alias: item.alias,
+            working_directory_id: item.working_directory_id,
+            connection_id: item.connection_id,
+        })
+        .collect();
+    let Json(accepted) = scoped_set_ticket_assignment(
+        State(f.api.clone()),
+        AxumPath((
+            TEST_WORKSPACE_ID.into(),
+            f.ticket_id.clone(),
+            "worker".into(),
+        )),
+        Json(request),
+    )
+    .await
+    .unwrap();
+    let saved = f
+        .api
+        .store
+        .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &f.ticket_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        accepted.assignment.unwrap().assignment_id,
+        saved.assignment_id
+    );
+    assert_eq!(saved.worker, f.worker);
+    assert!(
+        f.runtime
+            .logical_attachments(&f.worker.worker_id)
+            .is_empty()
+    );
+    assert_eq!(*f.runtime.restore_attempts.lock().unwrap(), 0);
+}
+
+#[tokio::test]
 async fn details_bindings_feed_assignment_and_stale_rebind_is_rejected() {
     let (f, controller) = fixture().await;
     let observed = details(&f, &controller).await;
