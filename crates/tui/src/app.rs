@@ -2882,11 +2882,26 @@ impl App {
         mode: Mode,
     ) -> InternalWorkerView {
         let mut refreshed = Self::internal_worker_view_from_snapshot(snapshot, mode);
-        Self::transfer_worker_view_state(&mut previous.app, &mut refreshed.app);
+        Self::transfer_worker_view_projection(&mut previous.app, &mut refreshed.app);
         refreshed
     }
 
-    fn transfer_worker_view_state(previous: &mut App, refreshed: &mut App) {
+    fn transfer_worker_view_projection(previous: &mut App, refreshed: &mut App) {
+        // A parent's sequence does not order its children's observations. Keep
+        // each same-session source's full state (including last_finished) and
+        // high-water mark even through None/unavailable snapshots. Only a paired
+        // snapshot at or above that mark can recover an unavailable observation.
+        let previous_sequence = previous.worker_state.state_sequence;
+        let refreshed_sequence = refreshed.worker_state.state_sequence;
+        if refreshed_sequence < previous_sequence
+            || (refreshed.worker_observation_unavailable && refreshed_sequence == previous_sequence)
+        {
+            refreshed.worker_state = previous.worker_state.clone();
+            refreshed.set_worker_status(previous.worker_state.catalog_status());
+            refreshed.run_started_at = previous.run_started_at;
+            refreshed.worker_observation_unavailable |= previous.worker_observation_unavailable;
+        }
+
         refreshed.scroll = std::mem::take(&mut previous.scroll);
         refreshed.text_selection = std::mem::take(&mut previous.text_selection);
         refreshed.task_pane_scroll = previous.task_pane_scroll;
@@ -2900,11 +2915,16 @@ impl App {
                 .position(|old| old.worker.session_id == child.worker.session_id)
             {
                 let mut old = previous_children.remove(index);
-                Self::transfer_worker_view_state(&mut old.app, &mut child.app);
+                Self::transfer_worker_view_projection(&mut old.app, &mut child.app);
             }
         }
         if refreshed.selected_internal_worker_index().is_none() {
             refreshed.selected_internal_worker_session_id = None;
+        }
+        if refreshed.worker_observation_unavailable {
+            // Reapply the ancestor fence after recursively retaining descendant
+            // observations; a fresher descendant cannot recover a lost parent.
+            refreshed.invalidate_worker_observation();
         }
     }
 
@@ -4909,6 +4929,329 @@ mod completion_flow_tests {
             error: None,
             internal_workers: Vec::new(),
         }
+    }
+
+    fn sequenced_worker_state(
+        status: WorkerStatus,
+        sequence: u64,
+        finished: Option<&str>,
+    ) -> WorkerStateSnapshot {
+        let mut state = test_worker_state(status);
+        state.state_sequence = sequence;
+        state.last_finished_submission_request_id = finished.map(Into::into);
+        state
+    }
+
+    fn parent_snapshot(sequence: u64, children: Vec<InternalWorkerSnapshot>) -> Event {
+        Event::Snapshot {
+            greeting: test_greeting(),
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: Vec::new(),
+            },
+            state: sequenced_worker_state(WorkerStatus::Idle, sequence, None),
+            in_flight: Default::default(),
+            internal_workers: children,
+        }
+    }
+
+    #[test]
+    fn parent_snapshots_preserve_independent_child_and_grandchild_source_order() {
+        let mut app = App::new("parent".into());
+        let mut child = test_internal_worker_snapshot("child", "research");
+        child.state = Some(sequenced_worker_state(WorkerStatus::Running, 3, None));
+        let mut grandchild = test_internal_worker_snapshot("grandchild", "nested");
+        grandchild.worker.parent_session_id = Some("child".into());
+        grandchild.state = Some(sequenced_worker_state(WorkerStatus::Running, 8, None));
+        child.internal_workers.push(grandchild.clone());
+        app.handle_worker_event(parent_snapshot(100, vec![child.clone()]));
+
+        let child_finished = sequenced_worker_state(WorkerStatus::Idle, 4, Some("child-finished"));
+        let grandchild_finished =
+            sequenced_worker_state(WorkerStatus::Idle, 9, Some("grandchild-finished"));
+        app.handle_worker_event(Event::InternalWorker {
+            worker: child.worker.clone(),
+            event: Box::new(Event::WorkerState {
+                snapshot: child_finished.clone(),
+            }),
+        });
+        app.handle_worker_event(Event::InternalWorker {
+            worker: child.worker.clone(),
+            event: Box::new(Event::InternalWorker {
+                worker: grandchild.worker.clone(),
+                event: Box::new(Event::WorkerState {
+                    snapshot: grandchild_finished.clone(),
+                }),
+            }),
+        });
+        // Equal/newer parent sequences cannot order either child's source.
+        for sequence in [100, 101] {
+            app.handle_worker_event(parent_snapshot(sequence, vec![child.clone()]));
+            let view = &app.internal_workers[0].app;
+            assert_eq!(view.worker_state, child_finished);
+            assert!(!view.running);
+            assert_eq!(
+                view.internal_workers[0].app.worker_state,
+                grandchild_finished
+            );
+            assert!(!view.internal_workers[0].app.running);
+        }
+
+        child.state = Some(sequenced_worker_state(
+            WorkerStatus::Running,
+            5,
+            Some("child-finished"),
+        ));
+        app.handle_worker_event(parent_snapshot(102, vec![child.clone()]));
+        assert_eq!(
+            app.internal_workers[0].app.worker_state,
+            child.state.clone().unwrap()
+        );
+        assert_eq!(
+            app.internal_workers[0].app.internal_workers[0]
+                .app
+                .worker_state,
+            grandchild_finished
+        );
+
+        let grandchild_newer =
+            sequenced_worker_state(WorkerStatus::Paused, 10, Some("grandchild-finished"));
+        child.internal_workers[0].state = Some(grandchild_newer.clone());
+        child.state = Some(child_finished);
+        app.handle_worker_event(parent_snapshot(103, vec![child]));
+        let view = &app.internal_workers[0].app;
+        assert_eq!(view.worker_state.state_sequence, 5);
+        assert!(view.running);
+        assert_eq!(view.internal_workers[0].app.worker_state, grandchild_newer);
+        assert!(view.internal_workers[0].app.paused);
+    }
+
+    #[test]
+    fn parent_none_snapshots_retain_recursive_high_water_until_fresh_paired_recovery() {
+        let mut app = App::new("parent".into());
+        let mut child = test_internal_worker_snapshot("child", "research");
+        let child_finished = sequenced_worker_state(WorkerStatus::Idle, 4, Some("child-finished"));
+        child.state = Some(child_finished.clone());
+        let mut grandchild = test_internal_worker_snapshot("grandchild", "nested");
+        grandchild.worker.parent_session_id = Some("child".into());
+        grandchild.state = Some(sequenced_worker_state(
+            WorkerStatus::Idle,
+            9,
+            Some("grandchild-finished"),
+        ));
+        child.internal_workers.push(grandchild.clone());
+        app.handle_worker_event(parent_snapshot(100, vec![child.clone()]));
+
+        // A lost ancestor still carries a newer descendant fence; retaining the
+        // old App must not lower it merely because the ancestor is unavailable.
+        child.state = None;
+        let grandchild_newer =
+            sequenced_worker_state(WorkerStatus::Running, 11, Some("grandchild-finished"));
+        child.internal_workers[0].state = Some(grandchild_newer.clone());
+        app.handle_worker_event(parent_snapshot(101, vec![child.clone()]));
+        let view = &app.internal_workers[0].app;
+        assert_eq!(view.worker_state, child_finished);
+        assert!(view.worker_observation_unavailable);
+        assert_eq!(view.internal_workers[0].app.worker_state, grandchild_newer);
+        assert!(view.internal_workers[0].app.worker_observation_unavailable);
+        assert!(!view.internal_workers[0].app.running);
+
+        child.state = Some(sequenced_worker_state(WorkerStatus::Running, 3, None));
+        child.internal_workers[0].state = None;
+        app.handle_worker_event(parent_snapshot(102, vec![child.clone()]));
+        app.handle_worker_event(Event::InternalWorker {
+            worker: child.worker.clone(),
+            event: Box::new(parent_snapshot(50, vec![grandchild.clone()])),
+        });
+        let view = &app.internal_workers[0].app;
+        assert_eq!(view.worker_state, child_finished);
+        assert!(view.worker_observation_unavailable);
+        assert_eq!(view.internal_workers[0].app.worker_state, grandchild_newer);
+        assert!(view.internal_workers[0].app.worker_observation_unavailable);
+
+        child.state = Some(child_finished.clone());
+        child.internal_workers[0].state = grandchild.state.clone();
+        app.handle_worker_event(parent_snapshot(103, vec![child.clone()]));
+        let view = &app.internal_workers[0].app;
+        assert!(!view.worker_observation_unavailable);
+        assert_eq!(view.worker_state, child_finished);
+        assert!(view.internal_workers[0].app.worker_observation_unavailable);
+        assert_eq!(view.internal_workers[0].app.worker_state, grandchild_newer);
+
+        child.internal_workers[0].state = Some(grandchild_newer.clone());
+        app.handle_worker_event(parent_snapshot(104, vec![child]));
+        let view = &app.internal_workers[0].app.internal_workers[0].app;
+        assert!(!view.worker_observation_unavailable);
+        assert_eq!(view.worker_state, grandchild_newer);
+        assert!(view.running);
+    }
+
+    #[test]
+    fn invalidated_child_and_grandchild_reject_old_parent_snapshots_and_queued_events() {
+        for shutdown in [false, true] {
+            for nested in [false, true] {
+                let mut app = App::new("parent".into());
+                let mut child = test_internal_worker_snapshot("child", "research");
+                child.state = Some(sequenced_worker_state(
+                    WorkerStatus::Running,
+                    4,
+                    Some("child"),
+                ));
+                let mut grandchild = test_internal_worker_snapshot("grandchild", "nested");
+                grandchild.worker.parent_session_id = Some("child".into());
+                grandchild.state = Some(sequenced_worker_state(
+                    WorkerStatus::Running,
+                    9,
+                    Some("nested"),
+                ));
+                child.internal_workers.push(grandchild.clone());
+                app.handle_worker_event(parent_snapshot(100, vec![child.clone()]));
+                let worker = if nested {
+                    &grandchild.worker
+                } else {
+                    &child.worker
+                };
+                let loss = if shutdown {
+                    Event::InternalWorker {
+                        worker: worker.clone(),
+                        event: Box::new(Event::Shutdown),
+                    }
+                } else {
+                    Event::InternalWorkerObservationUnavailable {
+                        worker: worker.clone(),
+                    }
+                };
+                app.handle_worker_event(if nested {
+                    Event::InternalWorker {
+                        worker: child.worker.clone(),
+                        event: Box::new(loss),
+                    }
+                } else {
+                    loss
+                });
+
+                let mut older = child.clone();
+                older.state.as_mut().unwrap().state_sequence = 3;
+                older.internal_workers[0]
+                    .state
+                    .as_mut()
+                    .unwrap()
+                    .state_sequence = 8;
+                app.handle_worker_event(parent_snapshot(101, vec![older]));
+                // Neither a queued live state nor a standalone child Snapshot
+                // can reopen a lost observation, even with a higher sequence.
+                let queued = Event::WorkerState {
+                    snapshot: sequenced_worker_state(WorkerStatus::Idle, 50, None),
+                };
+                for event in [queued, parent_snapshot(50, Vec::new())] {
+                    let event = Event::InternalWorker {
+                        worker: worker.clone(),
+                        event: Box::new(event),
+                    };
+                    app.handle_worker_event(if nested {
+                        Event::InternalWorker {
+                            worker: child.worker.clone(),
+                            event: Box::new(event),
+                        }
+                    } else {
+                        event
+                    });
+                }
+                let child_view = &app.internal_workers[0].app;
+                assert_eq!(child_view.worker_state, child.state.clone().unwrap());
+                assert_eq!(child_view.worker_observation_unavailable, !nested);
+                let nested_view = &child_view.internal_workers[0].app;
+                assert_eq!(nested_view.worker_state, grandchild.state.clone().unwrap());
+                assert!(nested_view.worker_observation_unavailable);
+                assert!(!nested_view.running);
+                assert!(!nested_view.connected);
+
+                app.handle_worker_event(parent_snapshot(102, vec![child.clone()]));
+                let child_view = &app.internal_workers[0].app;
+                assert!(!child_view.worker_observation_unavailable);
+                assert!(child_view.running);
+                assert!(
+                    !child_view.internal_workers[0]
+                        .app
+                        .worker_observation_unavailable
+                );
+                assert!(child_view.internal_workers[0].app.running);
+            }
+        }
+    }
+
+    #[test]
+    fn parent_snapshot_removal_and_session_replacement_do_not_transfer_old_observations() {
+        let mut app = App::new("parent".into());
+        let mut child = test_internal_worker_snapshot("child", "research");
+        child.state = Some(sequenced_worker_state(
+            WorkerStatus::Idle,
+            40,
+            Some("old-child"),
+        ));
+        let mut grandchild = test_internal_worker_snapshot("grandchild", "nested");
+        grandchild.state = Some(sequenced_worker_state(
+            WorkerStatus::Idle,
+            90,
+            Some("old-nested"),
+        ));
+        child.internal_workers.push(grandchild.clone());
+        app.handle_worker_event(parent_snapshot(100, vec![child.clone()]));
+        app.handle_worker_event(Event::InternalWorker {
+            worker: child.worker.clone(),
+            event: Box::new(Event::InternalWorkerRemoved {
+                worker: grandchild.worker.clone(),
+            }),
+        });
+        app.handle_worker_event(Event::InternalWorker {
+            worker: child.worker.clone(),
+            event: Box::new(Event::InternalWorker {
+                worker: grandchild.worker,
+                event: Box::new(Event::WorkerState {
+                    snapshot: sequenced_worker_state(WorkerStatus::Running, 91, None),
+                }),
+            }),
+        });
+        assert!(app.internal_workers[0].app.internal_workers.is_empty());
+        child.internal_workers.clear();
+        app.handle_worker_event(parent_snapshot(101, vec![child.clone()]));
+        assert!(app.internal_workers[0].app.internal_workers.is_empty());
+
+        app.handle_worker_event(Event::InternalWorkerRemoved {
+            worker: child.worker.clone(),
+        });
+        app.handle_worker_event(Event::InternalWorker {
+            worker: child.worker,
+            event: Box::new(parent_snapshot(50, Vec::new())),
+        });
+        assert!(app.internal_workers.is_empty());
+        let mut replacement = test_internal_worker_snapshot("new-session", "research");
+        let new_state = sequenced_worker_state(WorkerStatus::Running, 1, None);
+        replacement.state = Some(new_state.clone());
+        app.handle_worker_event(parent_snapshot(102, vec![replacement]));
+        let view = &app.internal_workers[0];
+        assert_eq!(view.worker.session_id, "new-session");
+        assert_eq!(view.app.worker_state, new_state);
+        assert!(!view.app.worker_observation_unavailable);
+        assert!(view.app.running);
+        assert!(view.app.internal_workers.is_empty());
+
+        // Same display name, different session: neither the old high-water nor
+        // its unavailability fence belongs to the replacement execution.
+        app.handle_worker_event(Event::InternalWorkerObservationUnavailable {
+            worker: view.worker.clone(),
+        });
+        let mut replacement = test_internal_worker_snapshot("next-session", "research");
+        let next_state = sequenced_worker_state(WorkerStatus::Running, 0, None);
+        replacement.state = Some(next_state.clone());
+        app.handle_worker_event(parent_snapshot(103, vec![replacement]));
+        let view = &app.internal_workers[0];
+        assert_eq!(view.worker.session_id, "next-session");
+        assert_eq!(view.app.worker_state, next_state);
+        assert!(!view.app.worker_observation_unavailable);
+        assert!(view.app.running);
+        app.handle_worker_event(parent_snapshot(104, Vec::new()));
+        assert!(app.internal_workers.is_empty());
     }
 
     #[test]

@@ -8023,20 +8023,30 @@ impl RuntimeState {
         activity: &mut InternalWorkerActivityProjection,
         snapshot: &protocol::InternalWorkerSnapshot,
     ) {
+        Self::internal_worker_snapshot_observations(activity, snapshot, false);
+    }
+
+    fn internal_worker_snapshot_observations(
+        activity: &mut InternalWorkerActivityProjection,
+        snapshot: &protocol::InternalWorkerSnapshot,
+        ancestor_unavailable: bool,
+    ) {
+        let unavailable = ancestor_unavailable || snapshot.state.is_none();
         activity.workers.insert(
             snapshot.worker.session_id.clone(),
             InternalWorkerActivity {
-                observation_unavailable: snapshot.state.is_none(),
-                status: snapshot
-                    .state
-                    .as_ref()
-                    .map(protocol::WorkerStateSnapshot::catalog_status),
+                observation_unavailable: unavailable,
+                snapshot: if unavailable {
+                    None
+                } else {
+                    snapshot.state.clone()
+                },
                 state_sequence: snapshot.state.as_ref().map(|state| state.state_sequence),
                 parent_session_id: snapshot.worker.parent_session_id.clone(),
             },
         );
         for child in &snapshot.internal_workers {
-            Self::internal_worker_snapshot_statuses(activity, child);
+            Self::internal_worker_snapshot_observations(activity, child, unavailable);
         }
     }
 
@@ -8110,7 +8120,7 @@ impl RuntimeState {
             .and_modify(|activity| activity.parent_session_id = worker.parent_session_id.clone())
             .or_insert_with(|| InternalWorkerActivity {
                 observation_unavailable: false,
-                status: None,
+                snapshot: None,
                 state_sequence: None,
                 parent_session_id: worker.parent_session_id.clone(),
             });
@@ -8124,7 +8134,7 @@ impl RuntimeState {
         for session in Self::internal_worker_subtree_ids(activity, &worker.session_id) {
             if let Some(current) = activity.workers.get_mut(&session) {
                 current.observation_unavailable = true;
-                current.status = None;
+                current.snapshot = None;
             }
         }
     }
@@ -8160,7 +8170,7 @@ impl RuntimeState {
                     worker.session_id.clone(),
                     InternalWorkerActivity {
                         observation_unavailable: false,
-                        status: Some(state.catalog_status()),
+                        snapshot: Some(state.clone()),
                         state_sequence: Some(state.state_sequence),
                         parent_session_id: worker.parent_session_id.clone(),
                     },
@@ -8196,7 +8206,7 @@ impl RuntimeState {
                     worker.session_id.clone(),
                     InternalWorkerActivity {
                         observation_unavailable: false,
-                        status: Some(snapshot.catalog_status()),
+                        snapshot: Some(snapshot.clone()),
                         state_sequence: Some(snapshot.state_sequence),
                         parent_session_id: worker.parent_session_id.clone(),
                     },
@@ -8213,7 +8223,7 @@ impl RuntimeState {
         for (session, current) in &mut activity.workers {
             if let Some(old) = previous.workers.get(session) {
                 if current.observation_unavailable {
-                    current.state_sequence = old.state_sequence;
+                    current.state_sequence = current.state_sequence.max(old.state_sequence);
                 }
             }
             if let Some(old) = previous.workers.get(session)
@@ -8222,11 +8232,75 @@ impl RuntimeState {
                 && old_sequence > current_sequence
             {
                 if !current.observation_unavailable {
-                    current.status = old.status;
+                    current.snapshot = old.snapshot.clone();
                     current.observation_unavailable = old.observation_unavailable;
                 }
                 current.state_sequence = old.state_sequence;
             }
+        }
+    }
+
+    // The public payload and the activity projection must observe the same child
+    // high-water marks. A parent's sequence cannot order its independent children.
+    fn reconcile_internal_snapshot(
+        activity: &InternalWorkerActivityProjection,
+        snapshot: &mut protocol::InternalWorkerSnapshot,
+    ) {
+        if let Some(incoming) = &snapshot.state
+            && let Some(previous) = activity.workers.get(&snapshot.worker.session_id)
+            && previous
+                .state_sequence
+                .is_some_and(|sequence| sequence > incoming.state_sequence)
+        {
+            snapshot.state = previous.snapshot.clone();
+        }
+        if let Some(state) = &snapshot.state {
+            snapshot.status = state.catalog_status();
+        }
+        for child in &mut snapshot.internal_workers {
+            Self::reconcile_internal_snapshot(activity, child);
+        }
+    }
+
+    fn reconcile_internal_payload(
+        activity: &InternalWorkerActivityProjection,
+        payload: &mut protocol::Event,
+    ) {
+        match payload {
+            protocol::Event::Snapshot {
+                internal_workers, ..
+            } => {
+                for child in internal_workers {
+                    Self::reconcile_internal_snapshot(activity, child);
+                }
+            }
+            protocol::Event::InternalWorker { worker, event } => {
+                if activity.removed_workers.contains_key(&worker.session_id)
+                    || activity
+                        .workers
+                        .get(&worker.session_id)
+                        .is_some_and(|previous| previous.observation_unavailable)
+                {
+                    // Queued events cannot recover a closed child stream. Only a
+                    // paired ancestor snapshot may reopen it at its high-water mark.
+                    *payload = protocol::Event::InternalWorkerObservationUnavailable {
+                        worker: worker.clone(),
+                    };
+                    return;
+                }
+                if let protocol::Event::WorkerState { snapshot }
+                | protocol::Event::Snapshot {
+                    state: snapshot, ..
+                } = &mut **event
+                    && let Some(previous) = activity.workers.get(&worker.session_id)
+                    && let Some(latest) = &previous.snapshot
+                    && latest.state_sequence > snapshot.state_sequence
+                {
+                    *snapshot = latest.clone();
+                }
+                Self::reconcile_internal_payload(activity, event);
+            }
+            _ => {}
         }
     }
 
@@ -8402,6 +8476,9 @@ impl RuntimeState {
             }
             candidate.apply_owned_observation(incoming);
         }
+        if let Some(activity) = candidate.observation_activity_mut() {
+            Self::reconcile_internal_payload(activity, &mut payload);
+        }
         let activity_changed = candidate
             .observation_activity_mut()
             .is_some_and(|activity| Self::update_internal_worker_activity(activity, &payload));
@@ -8468,7 +8545,7 @@ struct WorkerObservationChange {
 #[derive(Debug, Clone)]
 struct InternalWorkerActivity {
     observation_unavailable: bool,
-    status: Option<protocol::WorkerStatus>,
+    snapshot: Option<protocol::WorkerStateSnapshot>,
     state_sequence: Option<u64>,
     parent_session_id: Option<String>,
 }
@@ -8491,9 +8568,11 @@ impl InternalWorkerActivityProjection {
     }
 
     fn has_running_worker(&self) -> bool {
-        self.workers
-            .values()
-            .any(|worker| worker.status == Some(protocol::WorkerStatus::Running))
+        self.workers.values().any(|worker| {
+            worker.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.catalog_status() == protocol::WorkerStatus::Running
+            })
+        })
     }
 }
 
@@ -10288,7 +10367,10 @@ mod tests {
             };
             RuntimeState::update_internal_worker_activity(&mut activity, &replay);
             assert_eq!(
-                activity.workers["command-child"].status,
+                activity.workers["command-child"]
+                    .snapshot
+                    .as_ref()
+                    .map(protocol::WorkerStateSnapshot::catalog_status),
                 Some(protocol::WorkerStatus::Running)
             );
         }

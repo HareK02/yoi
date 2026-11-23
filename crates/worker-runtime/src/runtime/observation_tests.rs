@@ -36,7 +36,10 @@ mod observation_sync_tests {
         );
         assert_eq!(activity.workers["child"].state_sequence, Some(4));
         assert_eq!(
-            activity.workers["child"].status,
+            activity.workers["child"]
+                .snapshot
+                .as_ref()
+                .map(protocol::WorkerStateSnapshot::catalog_status),
             Some(protocol::WorkerStatus::Idle)
         );
         assert!(!activity.has_running_worker());
@@ -48,8 +51,208 @@ mod observation_sync_tests {
             &mut activity,
             &parent_snapshot(vec![unavailable]),
         );
-        assert_eq!(activity.workers["child"].status, None);
+        assert_eq!(
+            activity.workers["child"]
+                .snapshot
+                .as_ref()
+                .map(protocol::WorkerStateSnapshot::catalog_status),
+            None
+        );
         assert_eq!(activity.workers["child"].state_sequence, Some(4));
+    }
+
+    #[test]
+    fn published_parent_snapshots_preserve_nested_completion_and_recovery_fences() {
+        // Real execution-owned publication and cursor replay; only transport is
+        // replaced. Assert the public payload, not merely Runtime's running flag.
+        let (runtime, backend) = runtime_and_backend();
+        let created = runtime
+            .create_worker(task_request("nested public overlap"))
+            .unwrap();
+        let owner = context(&backend, &created.worker_ref);
+        let child = internal_worker_ref("child", None);
+        let grandchild = internal_worker_ref("grandchild", Some("child"));
+        let mut nested =
+            internal_worker_snapshot(grandchild.clone(), protocol::WorkerStatus::Running, vec![]);
+        nested.state = Some(running(7));
+        let mut older =
+            internal_worker_snapshot(child.clone(), protocol::WorkerStatus::Running, vec![nested]);
+        older.state = Some(running(3));
+        let _ = owner
+            .publish_protocol_event(parent_snapshot(vec![older.clone()]))
+            .unwrap();
+        let finished = |sequence, id: &str| protocol::WorkerStateSnapshot {
+            state_sequence: sequence,
+            last_finished_submission_request_id: Some(id.into()),
+            ..protocol::WorkerStateSnapshot::initial()
+        };
+        let child_finished = finished(4, "child-finished");
+        let grandchild_finished = finished(8, "grandchild-finished");
+        for (worker, state) in [
+            (&child, &child_finished),
+            (&grandchild, &grandchild_finished),
+        ] {
+            let mut event = protocol::Event::InternalWorker {
+                worker: worker.clone(),
+                event: Box::new(protocol::Event::WorkerState {
+                    snapshot: state.clone(),
+                }),
+            };
+            if worker == &grandchild {
+                event = protocol::Event::InternalWorker {
+                    worker: child.clone(),
+                    event: Box::new(event),
+                };
+            }
+            let _ = owner.publish_protocol_event(event).unwrap();
+        }
+        let cursor = runtime
+            .worker_observation_cursor_now(&created.worker_ref)
+            .unwrap();
+        let published_children = |event: protocol::Event| {
+            let _ = owner.publish_protocol_event(event).unwrap();
+            let events = runtime
+                .read_worker_observation_events(&created.worker_ref, cursor.clone())
+                .unwrap();
+            let protocol::Event::Snapshot {
+                internal_workers, ..
+            } = &events.last().unwrap().payload
+            else {
+                panic!("expected public full snapshot");
+            };
+            internal_workers.clone()
+        };
+        let result = published_children(parent_snapshot(vec![older.clone()]));
+        assert_eq!(result[0].state, Some(child_finished.clone()));
+        assert_eq!(result[0].status, protocol::WorkerStatus::Idle);
+        assert_eq!(
+            result[0].internal_workers[0].state,
+            Some(grandchild_finished.clone())
+        );
+        let mut unavailable = older.clone();
+        unavailable.state = None;
+        // An unavailable ancestor closes descendants but must not erase a
+        // higher nested high-water mark delivered in that same snapshot.
+        let grandchild_newer = finished(10, "grandchild-next");
+        unavailable.internal_workers[0].state = Some(grandchild_newer.clone());
+        let result = published_children(parent_snapshot(vec![unavailable]));
+        assert!(result[0].state.is_none());
+        assert_eq!(
+            result[0].internal_workers[0].state,
+            Some(grandchild_newer.clone())
+        );
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .worker(&created.worker_ref)
+                .unwrap()
+                .active_execution()
+                .unwrap()
+                .internal_workers
+                .has_running_worker()
+        );
+        let result = published_children(parent_snapshot(vec![older.clone()]));
+        assert!(result[0].state.is_none());
+        assert!(result[0].internal_workers[0].state.is_none());
+        let mut recovered = older.clone();
+        recovered.state = Some(child_finished.clone());
+        // The child's fresh observation cannot bypass its grandchild's own fence.
+        let result = published_children(parent_snapshot(vec![recovered.clone()]));
+        assert_eq!(result[0].state, Some(child_finished));
+        assert!(result[0].internal_workers[0].state.is_none());
+        recovered.internal_workers[0].state = Some(grandchild_finished);
+        let result = published_children(parent_snapshot(vec![recovered.clone()]));
+        assert!(result[0].internal_workers[0].state.is_none());
+        recovered.internal_workers[0].state = Some(grandchild_newer.clone());
+        let result = published_children(parent_snapshot(vec![recovered]));
+        assert_eq!(result[0].internal_workers[0].state, Some(grandchild_newer));
+        // A terminal membership snapshot removes the old session's high-water state.
+        assert!(published_children(parent_snapshot(vec![])).is_empty());
+        older.worker = internal_worker_ref("replacement", None);
+        older.internal_workers.clear();
+        let result = published_children(parent_snapshot(vec![older]));
+        assert_eq!(result[0].state, Some(running(3)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registry_overlap_publication_and_reconnect_agree_on_nested_completion() {
+        use worker::spawn::registry::observation_fixture;
+        // Production registry forwarders/reconnect reduction -> execution-owned
+        // Runtime publication -> public cursor. Only source transport is injected.
+        for service in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (runtime, backend) = runtime_and_backend();
+            let created = runtime
+                .create_worker(task_request("registry overlap consumer"))
+                .unwrap();
+            let owner = context(&backend, &created.worker_ref);
+            let cursor = runtime
+                .worker_observation_cursor_now(&created.worker_ref)
+                .unwrap();
+            let reconnect =
+                observation_fixture::exercise_snapshot_overlap(root.path(), service, |event| {
+                    let _ = owner.publish_protocol_event(event).unwrap();
+                })
+                .await;
+            let events = runtime
+                .read_worker_observation_events(&created.worker_ref, cursor.clone())
+                .unwrap();
+            let protocol::Event::InternalWorker { event, .. } = &events.last().unwrap().payload
+            else {
+                panic!("expected forwarded source event");
+            };
+            let protocol::Event::Snapshot {
+                internal_workers, ..
+            } = &**event
+            else {
+                panic!("expected public child snapshot");
+            };
+            assert_eq!(
+                serde_json::to_value(internal_workers).unwrap(),
+                serde_json::to_value(&reconnect.internal_workers).unwrap()
+            );
+            let child = &internal_workers[0];
+            let grandchild = &child.internal_workers[0];
+            for (snapshot, sequence, marker) in
+                [(child, 4, "child-run"), (grandchild, 31, "grandchild-run")]
+            {
+                let state = snapshot.state.as_ref().unwrap();
+                assert_eq!(state.catalog_status(), protocol::WorkerStatus::Idle);
+                assert_eq!(state.state_sequence, sequence);
+                assert_eq!(
+                    state.last_finished_submission_request_id.as_deref(),
+                    Some(marker)
+                );
+            }
+            let _ = owner
+                .publish_protocol_event(parent_snapshot(vec![reconnect.clone()]))
+                .unwrap();
+            let events = runtime
+                .read_worker_observation_events(&created.worker_ref, cursor)
+                .unwrap();
+            let protocol::Event::Snapshot {
+                internal_workers, ..
+            } = &events.last().unwrap().payload
+            else {
+                panic!("expected public reconnect snapshot");
+            };
+            assert_eq!(
+                serde_json::to_value(internal_workers).unwrap(),
+                serde_json::to_value(vec![reconnect]).unwrap()
+            );
+            assert!(
+                !runtime
+                    .lock()
+                    .unwrap()
+                    .worker(&created.worker_ref)
+                    .unwrap()
+                    .active_execution()
+                    .unwrap()
+                    .internal_workers
+                    .has_running_worker()
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

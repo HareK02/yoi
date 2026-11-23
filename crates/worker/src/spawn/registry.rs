@@ -806,7 +806,7 @@ impl SpawnedWorkerRegistry {
                         );
                         {
                             let mut snapshot = published.snapshot.lock().unwrap();
-                            snapshot.error = Some(error);
+                            snapshot.snapshot.error = Some(error);
                             super::published::invalidate(&mut snapshot);
                         }
                         let _ = parent_tx.send(Event::InternalWorkerObservationUnavailable {
@@ -906,7 +906,7 @@ impl SpawnedWorkerRegistry {
                         );
                         {
                             let mut snapshot = published.snapshot.lock().unwrap();
-                            snapshot.error = Some(error);
+                            snapshot.snapshot.error = Some(error);
                             super::published::invalidate(&mut snapshot);
                         }
                         let _ = parent_tx.send(Event::InternalWorkerObservationUnavailable {
@@ -989,7 +989,7 @@ impl SpawnedWorkerRegistry {
             .iter()
             .filter(|record| record.session.visibility() == InternalWorkerVisibility::ParentClient)
             .map(|record| {
-                let mut snapshot = record.published.snapshot.lock().unwrap().clone();
+                let mut snapshot = record.published.snapshot.lock().unwrap().snapshot.clone();
                 snapshot.worker.parent_session_id = parent_session_id.clone();
                 snapshot
             })
@@ -1003,7 +1003,7 @@ impl SpawnedWorkerRegistry {
                     record.session.visibility() == InternalWorkerVisibility::ParentClient
                 })
                 .map(|record| {
-                    let mut snapshot = record.published.snapshot.lock().unwrap().clone();
+                    let mut snapshot = record.published.snapshot.lock().unwrap().snapshot.clone();
                     snapshot.worker.parent_session_id = parent_session_id.clone();
                     snapshot
                 }),
@@ -1216,8 +1216,8 @@ fn publish_initial_internal_snapshot(
         return;
     }
     let mut snapshot = published.snapshot.lock().unwrap();
-    snapshot.worker = worker.clone();
-    let Some(event) = internal_worker_live_snapshot(snapshot.clone()) else {
+    snapshot.snapshot.worker = worker.clone();
+    let Some(event) = internal_worker_live_snapshot(snapshot.snapshot.clone()) else {
         return;
     };
     let _ = parent_tx.send(Event::InternalWorker {
@@ -1938,6 +1938,72 @@ mod tests {
         );
     }
 
+    /// Connects both real forwarders to the reconnect projection. The source
+    /// session fixture injects deterministic overlap; no Runtime/UI is involved.
+    #[tokio::test]
+    async fn reconnect_projection_keeps_nested_completion_across_overlapping_parent_snapshots() {
+        let root = TempDir::new().unwrap();
+        for service in [false, true] {
+            let mut forwarded = Vec::new();
+            let reconnect =
+                observation_fixture::exercise_snapshot_overlap(root.path(), service, |event| {
+                    forwarded.push(event)
+                })
+                .await;
+            // Assert the reconnect result independently of fixture construction.
+            let child = &reconnect.internal_workers[0];
+            let mut child_finished: protocol::WorkerStateSnapshot =
+                protocol::WorkerStatus::Idle.into();
+            child_finished.state_sequence = 4;
+            child_finished.last_finished_submission_request_id = Some("child-run".into());
+            let mut grandchild_finished = child_finished.clone();
+            grandchild_finished.state_sequence = 31;
+            grandchild_finished.last_finished_submission_request_id = Some("grandchild-run".into());
+            assert_eq!(
+                child.state.as_ref(),
+                Some(&child_finished),
+                "service={service}"
+            );
+            assert_eq!(child.status, protocol::WorkerStatus::Idle);
+            assert_eq!(
+                child.internal_workers[0].state.as_ref(),
+                Some(&grandchild_finished),
+                "service={service}"
+            );
+            assert_eq!(
+                child.internal_workers[0].status,
+                protocol::WorkerStatus::Idle
+            );
+            assert_eq!(
+                forwarded.len(),
+                5,
+                "paired baseline plus all overlap events"
+            );
+            // The consumer must still see the real overlap, not a normalized
+            // replacement event that could conceal a downstream rollback.
+            let Event::InternalWorker { event, .. } = forwarded.last().unwrap() else {
+                panic!("expected forwarded child event");
+            };
+            let Event::Snapshot {
+                internal_workers, ..
+            } = event.as_ref()
+            else {
+                panic!("expected overlapping full Snapshot");
+            };
+            let old_child = &internal_workers[0];
+            assert_eq!(old_child.state.as_ref().unwrap().state_sequence, 3);
+            assert_eq!(old_child.status, protocol::WorkerStatus::Running);
+            assert_eq!(
+                old_child.internal_workers[0]
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .state_sequence,
+                30
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_snapshot_excludes_buffered_child_state_history_and_deltas() {
         let registry = registry();
@@ -1984,7 +2050,7 @@ mod tests {
         drop(guard);
         // The reconnect baseline is the exact published prefix, not the child's
         // newer Idle/history state followed by buffered older output.
-        let mut replay = snapshot;
+        let mut replay = super::super::published::PublishedSnapshot::new(snapshot);
         for _ in 0..3 {
             let Event::InternalWorker { event, .. } =
                 tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
@@ -1997,9 +2063,9 @@ mod tests {
             super::super::published::apply(&mut replay, &event, &record.session);
         }
         let current = registry.internal_worker_snapshots().pop().unwrap();
-        assert_eq!(replay.status, current.status);
-        assert_eq!(replay.session, current.session);
-        assert_eq!(replay.in_flight, current.in_flight);
+        assert_eq!(replay.snapshot.status, current.status);
+        assert_eq!(replay.snapshot.session, current.session);
+        assert_eq!(replay.snapshot.in_flight, current.in_flight);
         assert_eq!(current.status, protocol::WorkerStatus::Idle);
         assert_eq!(current.session.entries.len(), 1);
     }
@@ -2499,6 +2565,6 @@ mod tests {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "registry_observation_fixture.rs"]
 pub mod observation_fixture;

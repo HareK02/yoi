@@ -1,9 +1,11 @@
 //! Cross-crate registry/consumer fixture, excluded from default product builds.
-//! The session state owner and both registry forwarders are real; only their
-//! transport receiver is substituted to deterministically force loss/closure.
+//! Both registry forwarders and the published projection are real. A substituted
+//! transport receiver forces loss/closure or injects overlapping state snapshots.
+//! Loss uses the session state owner; overlap controls independent source sequences.
 use super::*;
 use crate::internal_worker::{
-    InternalWorkerSessionStatus, test_internal_worker_session_with_greeting,
+    InternalWorkerSessionHandle, InternalWorkerSessionStatus,
+    test_internal_worker_session_with_greeting,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -27,17 +29,104 @@ pub async fn exercise(
     .expect("registry/consumer fixture deadline")
 }
 
-async fn exercise_inner(
+/// Deliver deterministic full-snapshot/live overlap through either production
+/// registry forwarder. `root` must be an existing isolated fixture directory.
+/// `consume` receives, in stream order, the paired initial child Snapshot, a
+/// parent Snapshot containing Running descendants, the child's Idle(seq4) and
+/// grandchild's Idle(seq31) completion events, and the overlapping old parent
+/// Snapshot. Each callback runs after the registry has applied that event.
+///
+/// Returns the normalized reconnect projection after overlap, without injecting
+/// Shutdown/loss into the consumer. Nested IDs are `nested-session` and
+/// `grandchild-session`; their finished request IDs are `child-run` and
+/// `grandchild-run`. The top-level session ID comes from the session fixture.
+/// Transport/state delivery is injected; registry reduction and forwarding are
+/// real. Consumers may connect their own production reducer via the callback.
+pub async fn exercise_snapshot_overlap(
     root: &std::path::Path,
     service: bool,
-    loss: Loss,
+    consume: impl FnMut(Event),
+) -> InternalWorkerSnapshot {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        exercise_snapshot_overlap_inner(root, service, consume),
+    )
+    .await
+    .expect("registry snapshot overlap fixture deadline")
+}
+
+async fn exercise_snapshot_overlap_inner(
+    root: &std::path::Path,
+    service: bool,
     mut consume: impl FnMut(Event),
-) -> (InternalWorkerSnapshot, Option<InternalWorkerSnapshot>) {
+) -> InternalWorkerSnapshot {
+    let RegistryFixture {
+        registry,
+        child_tx,
+        mut parent_rx,
+        ..
+    } = setup(root, service).await;
+    consume(parent_rx.recv().await.unwrap()); // paired initial snapshot
+    let mut parent = registry.internal_worker_snapshots().pop().unwrap();
+    parent.state.as_mut().unwrap().state_sequence = 12;
+    let mut child = parent.clone();
+    child.worker.session_id = "nested-session".into();
+    child.worker.parent_session_id = Some(parent.worker.session_id.clone());
+    child.status = protocol::WorkerStatus::Running;
+    let mut running: protocol::WorkerStateSnapshot = protocol::WorkerStatus::Running.into();
+    running.state_sequence = 3;
+    child.state = Some(running);
+    let mut grandchild = child.clone();
+    grandchild.worker.session_id = "grandchild-session".into();
+    grandchild.worker.parent_session_id = Some(child.worker.session_id.clone());
+    grandchild.state.as_mut().unwrap().state_sequence = 30;
+    child.internal_workers = vec![grandchild.clone()];
+    parent.internal_workers = vec![child.clone()];
+    let mut child_finished: protocol::WorkerStateSnapshot = protocol::WorkerStatus::Idle.into();
+    child_finished.state_sequence = 4;
+    child_finished.last_finished_submission_request_id = Some("child-run".into());
+    let mut grandchild_finished = child_finished.clone();
+    grandchild_finished.state_sequence = 31;
+    grandchild_finished.last_finished_submission_request_id = Some("grandchild-run".into());
+    let events = [
+        internal_worker_live_snapshot(parent.clone()).unwrap(),
+        Event::InternalWorker {
+            worker: child.worker.clone(),
+            event: Box::new(Event::WorkerState {
+                snapshot: child_finished,
+            }),
+        },
+        Event::InternalWorker {
+            worker: child.worker,
+            event: Box::new(Event::InternalWorker {
+                worker: grandchild.worker,
+                event: Box::new(Event::WorkerState {
+                    snapshot: grandchild_finished,
+                }),
+            }),
+        },
+        internal_worker_live_snapshot(parent).unwrap(),
+    ];
+    for event in events {
+        child_tx.send(event).unwrap();
+        consume(parent_rx.recv().await.unwrap());
+    }
+    registry.internal_worker_snapshots().pop().unwrap()
+}
+
+struct RegistryFixture {
+    registry: Arc<SpawnedWorkerRegistry>,
+    source: InternalWorkerSessionHandle,
+    child_tx: broadcast::Sender<Event>,
+    parent_rx: broadcast::Receiver<Event>,
+}
+
+async fn setup(root: &std::path::Path, service: bool) -> RegistryFixture {
     let registry = SpawnedWorkerRegistry::new_internal(
         "parent".into(),
         SharedScope::new(manifest::Scope::empty()),
     );
-    let (parent_tx, mut parent_rx) = broadcast::channel(64);
+    let (parent_tx, parent_rx) = broadcast::channel(64);
     registry.attach_parent_protocol(parent_tx, "parent-session".into());
     let (source, _source_tx) = test_internal_worker_session_with_greeting(
         InternalWorkerVisibility::ParentClient,
@@ -126,6 +215,26 @@ async fn exercise_inner(
             .push(record.clone());
         registry.start_protocol_forwarding(record);
     }
+    RegistryFixture {
+        registry,
+        source,
+        child_tx,
+        parent_rx,
+    }
+}
+
+async fn exercise_inner(
+    root: &std::path::Path,
+    service: bool,
+    loss: Loss,
+    mut consume: impl FnMut(Event),
+) -> (InternalWorkerSnapshot, Option<InternalWorkerSnapshot>) {
+    let RegistryFixture {
+        registry,
+        source,
+        child_tx,
+        mut parent_rx,
+    } = setup(root, service).await;
     consume(parent_rx.recv().await.unwrap());
     source.force_status(InternalWorkerSessionStatus::Running);
     child_tx
