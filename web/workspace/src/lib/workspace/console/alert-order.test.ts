@@ -85,7 +85,7 @@ function snapshot(
         context_window: 100,
         context_tokens: 20,
       },
-      state: { last_command_id: 0, state: { kind: "idle" } },
+      state: { state_sequence: 0, last_command_id: 0, state: { kind: "idle" } },
       session: {
         entries,
         pending_submissions: {

@@ -12,6 +12,8 @@ use worker_runtime::execution::{
 // published Profile projection; leave Worker creation/control to the real Runtime.
 #[derive(Default)]
 struct LaunchExecutionBackend {
+    snapshot_script: Mutex<std::collections::VecDeque<Option<protocol::WorkerStateSnapshot>>>,
+    snapshot_script_worker: Mutex<Option<String>>,
     lose_initial_ack: std::sync::atomic::AtomicBool,
     fail_stop: std::sync::atomic::AtomicBool,
     execution: DeterministicExecutionBackend,
@@ -187,6 +189,38 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
                 .insert(claim.alias.clone(), binding);
         }
         self.execution.spawn_worker(request)
+    }
+
+    fn restore_worker(
+        &self,
+        request: worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.execution.restore_worker(request)
+    }
+
+    fn worker_snapshot(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> Option<protocol::Event> {
+        if self
+            .snapshot_script_worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|id| id == &worker.worker_id.to_string())
+            && let Some(snapshot) = self.snapshot_script.lock().unwrap().pop_front()
+        {
+            let snapshot = snapshot?;
+            let execution = self
+                .execution
+                .contexts
+                .lock()
+                .unwrap()
+                .get(worker)
+                .cloned()?;
+            *execution.state.lock().unwrap() = snapshot;
+        }
+        self.execution.worker_snapshot(worker)
     }
 
     fn dispatch_input(
@@ -1177,3 +1211,295 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
 
 // Real Runtime creation and SQLite finalization fail independently; only Stop is
 // injected. Reconciliation must retain the create reservation while absence is unknown.
+
+// The execution boundary is deterministic; both Backend adapters, Runtime detail
+// refresh/publication, HTTP conversion (remote), and assignment persistence are real.
+#[tokio::test(flavor = "multi_thread")]
+async fn assignment_rejects_live_running_and_unavailable_despite_catalog_idle() {
+    for remote in [false, true] {
+        for unavailable in [false, true] {
+            let f = LaunchFixture::new(remote).await;
+            let ticket = f.ticket();
+            let mut create = f.payload("", "live-assignment", "builtin:companion", false);
+            create["initial_submit"] = json!([]);
+            let (status, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+            assert_eq!(status, StatusCode::OK, "{worker}");
+            let id = worker["worker_id"].as_str().unwrap();
+            let mut running = protocol::WorkerStateSnapshot::initial();
+            running.state_sequence = 1;
+            running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Running,
+            ));
+            f.backend
+                .snapshot_script
+                .lock()
+                .unwrap()
+                .push_back(if unavailable { None } else { Some(running) });
+            let (status, error) = f.assign(&ticket, &worker, "reject-live").await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "remote={remote} unavailable={unavailable}: {error}"
+            );
+            assert!(
+                f.api
+                    .store
+                    .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(f.backend.submits_for(id).is_empty());
+            assert_eq!(f.backend.creates_for(id).len(), 1);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assignment_rechecks_live_state_after_initial_idle_before_unchanged_commit() {
+    for remote in [false, true] {
+        let f = LaunchFixture::new(remote).await;
+        let ticket = f.ticket();
+        let mut create = f.payload("", "assignment-race", "builtin:companion", false);
+        create["initial_submit"] = json!([]);
+        let (status, worker) = f.post(TEST_WORKSPACE_ID, create).await;
+        assert_eq!(status, StatusCode::OK, "{worker}");
+        let mut running = protocol::WorkerStateSnapshot::initial();
+        running.state_sequence = 1;
+        running.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+            protocol::WorkerRunState::Running,
+        ));
+        *f.backend.snapshot_script.lock().unwrap() = [
+            Some(protocol::WorkerStateSnapshot::initial()),
+            Some(running),
+        ]
+        .into();
+        let (status, error) = f.assign(&ticket, &worker, "changed-before-commit").await;
+        assert_eq!(status, StatusCode::CONFLICT, "remote={remote}: {error}");
+        assert!(f.backend.snapshot_script.lock().unwrap().is_empty());
+        assert!(
+            f.api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
+                .unwrap()
+                .is_none()
+        );
+        let claim = f
+            .api
+            .store
+            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "changed-before-commit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.claim_state, "failed");
+        assert!(claim.assignment_id.is_none());
+        assert!(
+            f.backend
+                .submits_for(worker["worker_id"].as_str().unwrap())
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn known_worker_list_and_details_follow_embedded_and_remote_execution() {
+    for remote in [false, true] {
+        let f = LaunchFixture::new(remote).await;
+        f.backend.execution.accept_restores();
+        let mut create = f.payload("", "list-controller", "builtin:companion", false);
+        create["initial_submit"] = json!([]);
+        create["authorization"] = serde_json::to_value(test_worker_operation_authorization(&[(
+            "worker",
+            &["worker.list", "worker.restore"],
+        )]))
+        .unwrap();
+        let (status, controller) = f.post(TEST_WORKSPACE_ID, create).await;
+        assert_eq!(status, StatusCode::OK, "{controller}");
+        let controller =
+            RuntimeWorkerRef::new(&f.runtime_id, controller["worker_id"].as_str().unwrap());
+        let mut create = f.payload("", "list-subject", "builtin:companion", false);
+        create["initial_submit"] = json!([]);
+        let (status, subject) = f.post(TEST_WORKSPACE_ID, create).await;
+        assert_eq!(status, StatusCode::OK, "{subject}");
+        let subject = RuntimeWorkerRef::new(&f.runtime_id, subject["worker_id"].as_str().unwrap());
+        f.api
+            .store
+            .create_worker_control_grant(&WorkerControlGrantRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                grant_id: "list-execution".into(),
+                controller: controller.clone(),
+                subject: subject.clone(),
+                relation: "spawned".into(),
+                origin: "fixture".into(),
+                permissions: vec!["send_input".into(), "restore".into()],
+                operation_id: "list-execution".into(),
+                created_at: now_registry_timestamp(),
+                revoked_at: None,
+            })
+            .unwrap();
+        for (sequence, status, expected) in [
+            (
+                1,
+                protocol::WorkerStatus::Idle,
+                server_api::WorkerListState::Idle,
+            ),
+            (
+                2,
+                protocol::WorkerStatus::Running,
+                server_api::WorkerListState::Running,
+            ),
+            (
+                3,
+                protocol::WorkerStatus::Paused,
+                server_api::WorkerListState::Paused,
+            ),
+            (
+                4,
+                protocol::WorkerStatus::Idle,
+                server_api::WorkerListState::Idle,
+            ),
+        ] {
+            let mut snapshot: protocol::WorkerStateSnapshot = status.into();
+            snapshot.state_sequence = sequence;
+            f.backend.execution.publish_worker_state(&subject, snapshot);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let listed = list_known_workers(
+                        State(f.api.clone()),
+                        AxumPath(ScopedWorkspacePath {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                        }),
+                        ticket_check_headers(&controller),
+                    )
+                    .await
+                    .unwrap()
+                    .0;
+                    assert_eq!(listed.items.len(), 1);
+                    if listed.items[0].state == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("list must reflect current execution over both host adapters");
+        }
+        *f.backend.snapshot_script_worker.lock().unwrap() = Some(subject.worker_id.clone());
+        f.backend.snapshot_script.lock().unwrap().push_back(None);
+        let unavailable = list_known_workers(
+            State(f.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            ticket_check_headers(&controller),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            unavailable.items[0].state,
+            server_api::WorkerListState::Unavailable
+        );
+        // Reconnection replays the execution-owned latest snapshot, without a
+        // new Run or a fabricated catalog state/sequence.
+        f.backend.execution.publish_worker_state(
+            &subject,
+            protocol::WorkerStateSnapshot {
+                state_sequence: 4,
+                ..protocol::WorkerStateSnapshot::initial()
+            },
+        );
+        let recovered = list_known_workers(
+            State(f.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            ticket_check_headers(&controller),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            recovered.items[0].state,
+            server_api::WorkerListState::Idle,
+            "reconnected snapshot must restore observation without fabricating Idle from the catalog"
+        );
+        let get_details = || {
+            known_worker_details(
+                State(f.api.clone()),
+                AxumPath(ScopedRuntimeWorkerPath {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    worker: subject.clone(),
+                }),
+                ticket_check_headers(&controller),
+            )
+        };
+        let empty = get_details().await.unwrap().0;
+        assert_eq!(empty.workdir_connections, Some(vec![]));
+        f.api
+            .runtime
+            .stop_worker(
+                &subject,
+                WorkerLifecycleRequest {
+                    stop_intent: None,
+                    reason: Some("list restore token check".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let stopped = get_details().await.unwrap().0;
+        assert_eq!(stopped.state, server_api::WorkerListState::Stopped);
+        let token = stopped.restore_observation_token.unwrap();
+        let restored = restore_known_worker(
+            State(f.api.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: subject.clone(),
+            }),
+            ticket_check_headers(&controller),
+            server_api::WorkerRestoreRequest {
+                expected_observation_token: token.clone(),
+                request_id: "list-restore".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .0
+        .result;
+        assert_eq!(
+            restored.state,
+            server_api::WorkerRestoreState::Accepted,
+            "{restored:?}"
+        );
+        f.api
+            .runtime
+            .stop_worker(
+                &subject,
+                WorkerLifecycleRequest {
+                    stop_intent: None,
+                    reason: None,
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let stale = restore_known_worker(
+            State(f.api.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: subject.clone(),
+            }),
+            ticket_check_headers(&controller),
+            server_api::WorkerRestoreRequest {
+                expected_observation_token: token,
+                request_id: "stale-list-restore".into(),
+            },
+        )
+        .await;
+        assert!(
+            stale.is_err(),
+            "remote={remote}: old detail token cannot survive ABA: {stale:?}"
+        );
+        assert_eq!(
+            stale.unwrap_err().into_response().status(),
+            StatusCode::CONFLICT
+        );
+    }
+}

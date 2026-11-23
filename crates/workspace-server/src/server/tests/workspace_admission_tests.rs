@@ -62,7 +62,10 @@ impl Fixture {
                 .bind_core_worker_execution_grant(&grant)
                 .unwrap();
             runtime.workers.lock().unwrap().push(InternalWorkerSummary {
+                last_finished_submission_request_id: None,
+                observation: runtime_api::WorkerObservationState::Unavailable,
                 restore_observation_token: None,
+                lifecycle: Some(protocol::WorkerLifecycleState::Active),
                 worker: RuntimeWorkerRef::new(WorkdirlessFixtureRuntime::RUNTIME_ID, worker),
                 host_id: "fixture-host".into(),
                 display_name: worker.into(),
@@ -184,6 +187,8 @@ impl Fixture {
             workspace_id: TEST_WORKSPACE_ID.into(),
             workdir_id: id.clone(),
             provider_instance_id: id.clone(),
+            session_credential_digest: Some(crate::auth::token_hash(&"a".repeat(64))),
+            reconnect_deadline_at: None,
             display_name: id.clone(),
             permissions: if capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY {
                 "read_only"
@@ -248,6 +253,7 @@ impl Fixture {
                 generation: 1,
                 expires_at: None,
                 capabilities,
+                access_fenced: std::sync::atomic::AtomicBool::new(false),
                 admission: Arc::new(tokio::sync::Semaphore::new(16)),
                 shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 sender,

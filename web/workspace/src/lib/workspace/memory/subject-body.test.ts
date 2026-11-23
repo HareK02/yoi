@@ -67,7 +67,7 @@ function available(state = "stopped") {
         state,
         worker_state: state === "stopped"
           ? null
-          : { last_command_id: 1, state: { kind: "idle" } },
+          : { state_sequence: 0, last_command_id: 1, state: { kind: "idle" } },
         restore_observation_token: "observation-1",
       },
     },

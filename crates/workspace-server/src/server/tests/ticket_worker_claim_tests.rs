@@ -780,3 +780,135 @@ async fn claim_restore_recovery_scenario(legacy_equal_binding: bool, missing_int
         "manual claims and denied input must not generate a Submit"
     );
 }
+
+#[tokio::test]
+async fn assignment_rejects_unusable_observation_and_non_active_lifecycle_without_rebind() {
+    use protocol::WorkerLifecycleState;
+    use runtime_api::WorkerObservationState;
+    for lifecycle in [
+        WorkerLifecycleState::NotStarted,
+        WorkerLifecycleState::AwaitingRestore,
+        WorkerLifecycleState::Creating,
+        WorkerLifecycleState::Restoring,
+        WorkerLifecycleState::Stopping,
+        WorkerLifecycleState::RecoveryRequired,
+        WorkerLifecycleState::Stopped,
+        WorkerLifecycleState::Active,
+    ] {
+        let fixture = manual_worker_assignment_fixture().await;
+        {
+            let mut workers = fixture.runtime.workers.lock().unwrap();
+            let observed = workers
+                .iter_mut()
+                .find(|w| w.worker == fixture.worker)
+                .unwrap();
+            observed.lifecycle = Some(lifecycle);
+            if lifecycle == WorkerLifecycleState::Active {
+                observed.observation = WorkerObservationState::Unavailable;
+            }
+        }
+        let error = claim(
+            &fixture,
+            manual_worker_assignment_request(&fixture, "unusable-observation"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::CONFLICT,
+            "{lifecycle:?}"
+        );
+        assert_eq!(*fixture.runtime.restore_attempts.lock().unwrap(), 0);
+        assert!(
+            fixture
+                .api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn assignment_rebind_rechecks_new_execution_state_before_commit() {
+    let mut fixture = manual_worker_assignment_fixture().await;
+    let workers = fixture.runtime.workers.clone();
+    fixture.runtime.lifecycle_callback = Some(Arc::new(move |id| {
+        let mut workers = workers.lock().unwrap();
+        let observed = workers
+            .iter_mut()
+            .find(|w| w.worker.worker_id == id)
+            .unwrap();
+        let mut snapshot = protocol::WorkerStateSnapshot::initial();
+        snapshot.state_sequence = 1;
+        snapshot.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+            protocol::WorkerRunState::Running,
+        ));
+        observed.worker_state = Some(snapshot);
+        observed.observation = runtime_api::WorkerObservationState::Current { state_sequence: 1 };
+    }));
+    fixture
+        .api
+        .runtime
+        .register_or_replace(fixture.runtime.clone());
+    let error = claim(
+        &fixture,
+        manual_worker_assignment_request(&fixture, "running-after-rebind"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+    assert!(*fixture.runtime.restore_attempts.lock().unwrap() > 0);
+    assert!(
+        fixture
+            .api
+            .store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .unwrap()
+            .is_none()
+    );
+    let operation = fixture
+        .api
+        .store
+        .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "running-after-rebind")
+        .unwrap()
+        .unwrap();
+    assert!(operation.assignment_id.is_none());
+}
+
+#[tokio::test]
+async fn assignment_rejects_missing_snapshot_or_mismatched_source_sequence() {
+    for missing in [false, true] {
+        let fixture = manual_worker_assignment_fixture().await;
+        {
+            let mut workers = fixture.runtime.workers.lock().unwrap();
+            let observed = workers
+                .iter_mut()
+                .find(|w| w.worker == fixture.worker)
+                .unwrap();
+            if missing {
+                observed.worker_state = None;
+            } else {
+                observed.observation =
+                    runtime_api::WorkerObservationState::Current { state_sequence: 99 };
+            }
+        }
+        let error = claim(
+            &fixture,
+            manual_worker_assignment_request(&fixture, "invalid-source-snapshot"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+        assert_eq!(*fixture.runtime.restore_attempts.lock().unwrap(), 0);
+        assert!(
+            fixture
+                .api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}

@@ -116,7 +116,19 @@ fn assign_and_submit(
         "use the one Worker just created, not a replacement"
     );
     let worker = workers[0];
-    let connections = worker["workdir_connections"].as_array().unwrap();
+    assert!(worker.get("workdir_connections").is_none());
+    assert!(worker["worker"].as_str().unwrap().starts_with("W-"));
+    let details_id = format!("{prefix}-details");
+    let Some(details) = success(request, &details_id) else {
+        return Some(call(
+            request,
+            &details_id,
+            "WorkerDetails",
+            json!({"target":worker["target"]}),
+        ));
+    };
+    assert_eq!(details["target"], worker["target"]);
+    let connections = details["workdir_connections"].as_array().unwrap();
     let attachments = spawn["workdir_attachments"].as_array().unwrap();
     assert_eq!(connections.len(), attachments.len());
     let bindings: Vec<_> = connections.iter().map(|connection| {

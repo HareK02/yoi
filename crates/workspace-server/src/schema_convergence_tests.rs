@@ -101,7 +101,7 @@ mod schema_convergence {
     }
 
     fn assert_obsolete_jobs_discarded(conn: &Connection) {
-        assert_eq!(current_schema_version(conn).unwrap(), 138);
+        assert_eq!(current_schema_version(conn).unwrap(), LATEST_SCHEMA_VERSION);
         backend_job_current::verify(conn).unwrap();
         for table in ["backend_jobs", "backend_job_attempts"] {
             assert!(stored_fixture_rows(conn, table).is_empty(), "{table}");
@@ -160,7 +160,7 @@ mod schema_convergence {
                 let schema = schema_rows(&conn);
                 let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
                 assert_eq!(plan.current_schema_version, 103);
-                assert_eq!(plan.target_schema_version, 138);
+                assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
                 assert_eq!(
                     plan.migrations,
                     expected_retained_migration_chain()
@@ -173,10 +173,13 @@ mod schema_convergence {
                                 (131, crate::launch_policy::MIGRATION_NAME),
                                 (133, crate::subject_policy::MIGRATION_NAME),
                                 (134, backend_job_finalizing::MIGRATION_NAME),
-                                (135, subject_release_recording_store::MIGRATION_NAME),
+                                (135, subject_release_input_handoff_store::MIGRATION_NAME),
                                 (136, launch_policy_identity_migration::MIGRATION_NAME),
                                 (137, worker_lifecycle_notifications::MIGRATION_NAME),
                                 (138, notification_routing::merge_requests::MIGRATION_NAME),
+                                (139, backend_job_result_application::MIGRATION_NAME),
+                                (140, backend_job_recording_input::MIGRATION_NAME),
+                                (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME),
                             ]
                             .into_iter()
                             .map(|(version, name)| {
@@ -202,7 +205,7 @@ mod schema_convergence {
                     assert_obsolete_jobs_discarded(conn);
                     assert_current_job_constraints(conn);
                     fresh.with_conn(|c| {
-                        assert_eq!(current_schema_version(c)?, 138);
+                        assert_eq!(current_schema_version(c)?, LATEST_SCHEMA_VERSION);
                         backend_job_current::verify(c)
                     })?;
                     let mut expected = history.clone();

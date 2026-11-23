@@ -31,7 +31,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 toml = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

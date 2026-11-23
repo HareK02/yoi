@@ -29,9 +29,10 @@ export type SourceStatus = {
   state: "missing" | "unavailable";
   history_href: string | null;
 };
-export type RetainedRecording = {
+export type InputHandoffStatus = "pending" | "admitted" | "subject_deleted";
+export type InputHandoffObservation = {
   producer: "released" | "removing" | "removed";
-  completed: boolean;
+  status: InputHandoffStatus;
   cause:
     | "recording_disabled"
     | "source_unavailable"
@@ -80,7 +81,7 @@ export type JournalResponses = {
     {
       journal: JournalMetadata;
       unreflected_sources: boolean;
-      retained_recording: RetainedRecording | null;
+      input_handoff: InputHandoffObservation | null;
       original_source: SourceStatus;
     }
   >;
@@ -235,10 +236,10 @@ function sourceStatus(value: unknown): SourceStatus {
     history_href: href,
   };
 }
-function retainedRecording(value: unknown): RetainedRecording | null {
+function inputHandoff(value: unknown): InputHandoffObservation | null {
   if (value === null) return null;
   const v = object(value);
-  const completed = boolean(v.completed);
+  const status = choice(v.status, ["pending", "admitted", "subject_deleted"]);
   const cause = v.cause === null ? null : choice(
     v.cause,
     [
@@ -251,12 +252,12 @@ function retainedRecording(value: unknown): RetainedRecording | null {
       "storage_unavailable",
     ] as const,
   );
-  if (completed && cause !== null) {
-    throw new Error("Completed recording has a pending cause");
+  if (status !== "pending" && cause !== null) {
+    throw new Error("Terminal input handoff has a pending cause");
   }
   return {
     producer: choice(v.producer, ["released", "removing", "removed"]),
-    completed,
+    status,
     cause,
   };
 }
@@ -320,7 +321,7 @@ export function parseJournalResponse<K extends keyof JournalResponses>(
         return {
           journal,
           unreflected_sources: boolean(i.unreflected_sources),
-          retained_recording: retainedRecording(i.retained_recording),
+          input_handoff: inputHandoff(i.input_handoff),
           original_source: sourceStatus(i.original_source),
         };
       });

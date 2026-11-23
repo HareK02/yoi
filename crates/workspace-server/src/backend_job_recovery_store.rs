@@ -104,15 +104,36 @@ pub(super) fn history(
         .collect()
 }
 
+/// Application settlement is an independent, immutable consumer fact. It may
+/// arrive while the exact cleanup owner is stopping/fencing execution. Compare
+/// every execution, result, failure, cleanup and history field as before, but do
+/// not let those two projection columns revoke unrelated recovery ownership.
+fn same_recovery_snapshot(
+    actual: &BackendJobAttemptRecord,
+    expected: &BackendJobAttemptRecord,
+) -> bool {
+    let mut actual = actual.clone();
+    actual.result_application_disposition = expected.result_application_disposition;
+    actual.result_application_recorded_at = expected.result_application_recorded_at.clone();
+    actual == *expected
+}
+
 pub(super) fn require_history(
     conn: &Connection,
     workspace: &str,
     expected: &[BackendJobAttemptRecord],
     owner: &BackendJobAttemptRecord,
 ) -> Result<()> {
+    let actual = history(conn, workspace, &owner.job_id)?;
     if owner.workspace_id != workspace
-        || !expected.contains(owner)
-        || history(conn, workspace, &owner.job_id)? != expected
+        || !expected
+            .iter()
+            .any(|attempt| same_recovery_snapshot(attempt, owner))
+        || actual.len() != expected.len()
+        || !actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| same_recovery_snapshot(actual, expected))
     {
         return Err(Error::InvalidInput(
             "Backend Job full attempt history or exact execution owner changed".into(),
@@ -145,7 +166,7 @@ pub(super) fn record(
 
         let job = read_backend_job(&tx,workspace,&expected.job_id)?.ok_or_else(||Error::InvalidInput("Backend Job missing".into()))?;
         let current = read_backend_job_attempt(&tx,workspace,&expected.job_id,&expected.attempt_id)?.ok_or_else(||Error::InvalidInput("Backend Job attempt missing".into()))?;
-        if workspace != expected.workspace_id || current != *expected || job.current_attempt != expected.attempt || job.input_digest != expected.input_digest || job.state != BackendJobState::Pending || expected.state.terminal() {
+        if workspace != expected.workspace_id || !same_recovery_snapshot(&current, expected) || job.current_attempt != expected.attempt || job.input_digest != expected.input_digest || job.state != BackendJobState::Pending || expected.state.terminal() {
             return Err(Error::InvalidInput("Backend Job reconciliation owner changed".into()));
         }
         subject_deletion_store::require_job_admission(&tx,workspace,&job.request)?;
@@ -318,7 +339,9 @@ fn require_retained_owner(
     let attempt =
         read_backend_job_attempt(conn, workspace, &expected.job_id, &expected.attempt_id)?;
     if workspace != expected.workspace_id
-        || attempt.as_ref() != Some(expected)
+        || !attempt
+            .as_ref()
+            .is_some_and(|actual| same_recovery_snapshot(actual, expected))
         || job.input_digest != expected.input_digest
     {
         return Err(Error::RepositoryConflict(
@@ -438,7 +461,11 @@ pub(super) fn has_fence(
 ) -> Result<bool> {
     let current =
         read_backend_job_attempt(conn, workspace, &expected.job_id, &expected.attempt_id)?;
-    if workspace != expected.workspace_id || current.as_ref() != Some(expected) {
+    if workspace != expected.workspace_id
+        || !current
+            .as_ref()
+            .is_some_and(|actual| same_recovery_snapshot(actual, expected))
+    {
         return Ok(false);
     }
     // This is a different fact from an execution termination receipt. The same
@@ -1159,6 +1186,136 @@ mod tests {
     }
 
     #[test]
+    fn application_settlement_does_not_revoke_cleanup_history_or_execution_fence() {
+        for settle_before_claim in [true, false] {
+            let (_dir, store, reserved) = fixture();
+            let bound = bind_fixture_owner(&store, &reserved);
+            store.with_conn(|conn| {
+                conn.execute("UPDATE backend_job_attempts SET worker_id='019a4ea8-0000-7000-8000-000000000003' WHERE attempt_id=?1", params![bound.attempt_id])?;
+                Ok(())
+            }).unwrap();
+            let failed = store
+                .finish_backend_job_attempt(
+                    "workspace",
+                    "accepted",
+                    &bound.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "execution_failed",
+                    "original cause",
+                    NOW,
+                )
+                .unwrap();
+            let settle = || {
+                store
+                    .record_backend_job_result_application(
+                        "workspace",
+                        &failed,
+                        &reserved.job.intent_fingerprint,
+                        JobResultApplicationDisposition::NotRequired,
+                        NOW,
+                    )
+                    .unwrap();
+            };
+            let history = store
+                .list_backend_job_attempts("workspace", "accepted")
+                .unwrap();
+            if settle_before_claim {
+                settle();
+            }
+            let (executing, acquired) = store
+                .claim_backend_job_worker_cleanup_owned("workspace", &history, &failed, NOW)
+                .unwrap();
+            assert!(acquired);
+            let history = store
+                .list_backend_job_attempts("workspace", "accepted")
+                .unwrap();
+            if !settle_before_claim {
+                settle();
+            }
+            let (controller, host) = evidence(&executing);
+            store
+                .record_backend_job_execution_fence(
+                    "workspace",
+                    &executing,
+                    &controller,
+                    &host,
+                    NOW,
+                )
+                .unwrap();
+            assert!(
+                store
+                    .has_backend_job_execution_fence("workspace", &executing)
+                    .unwrap()
+            );
+            // Independent application progress cannot admit a changed execution,
+            // result, failure, cleanup state or a different history snapshot.
+            for changed in [
+                {
+                    let mut row = executing.clone();
+                    row.runtime_run_id = Some("foreign".into());
+                    row
+                },
+                {
+                    let mut row = executing.clone();
+                    row.input_digest = "foreign".into();
+                    row
+                },
+                {
+                    let mut row = executing.clone();
+                    row.state = BackendJobAttemptState::Completed;
+                    row
+                },
+                {
+                    let mut row = executing.clone();
+                    row.failure_detail = Some("changed".into());
+                    row
+                },
+                {
+                    let mut row = executing.clone();
+                    row.result_digest = Some("changed".into());
+                    row
+                },
+                {
+                    let mut row = executing.clone();
+                    row.worker_cleanup_state = Some(BackendJobWorkerCleanupState::Pending);
+                    row
+                },
+            ] {
+                assert!(
+                    store
+                        .with_conn(|conn| require_history(conn, "workspace", &history, &changed))
+                        .is_err()
+                );
+            }
+            assert!(
+                store
+                    .with_conn(|conn| require_history(conn, "workspace", &[], &executing))
+                    .is_err()
+            );
+            let completed = store
+                .finish_backend_job_worker_cleanup_owned(
+                    "workspace",
+                    &history,
+                    &executing,
+                    BackendJobWorkerCleanupState::Completed,
+                    None,
+                    None,
+                    NOW,
+                )
+                .unwrap();
+            assert_eq!(
+                completed.result_application_disposition,
+                Some(JobResultApplicationDisposition::NotRequired)
+            );
+            assert_eq!(
+                completed.result_application_recorded_at.as_deref(),
+                Some(NOW)
+            );
+            assert_eq!(completed.failure_detail, failed.failure_detail);
+        }
+    }
+
+    #[test]
     fn terminal_executing_cleanup_probe_commits_without_changing_failure_and_rejects_stale_owner() {
         let (dir, store, reserved) = fixture();
         let owner = bind_fixture_owner(&store, &reserved);
@@ -1638,6 +1795,71 @@ mod tests {
             store
                 .record_backend_job_execution_fence("workspace", &owner, &controller, &host, NOW)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn interrupted_job_retry_is_discovered_after_finalization_and_reopen() {
+        let (dir, store, reserved) = fixture();
+        let failed = store
+            .finish_backend_job_attempt(
+                "workspace",
+                "accepted",
+                &reserved.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "journal_attempt_fenced",
+                "saved input remains",
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            failed.worker_cleanup_state,
+            Some(BackendJobWorkerCleanupState::Completed)
+        );
+        assert_eq!(
+            store
+                .finalize_backend_job("workspace", "accepted", NOW)
+                .unwrap()
+                .state,
+            BackendJobState::Failed
+        );
+        drop(store);
+        let store =
+            SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+        let retry = store
+            .list_recoverable_backend_job_attempts("workspace", 100)
+            .unwrap();
+        assert_eq!(retry, vec![failed]);
+        let next = store
+            .reserve_backend_job_retry("workspace", "accepted", NOW)
+            .unwrap();
+        assert_eq!(next.attempt.attempt, 2);
+        assert_eq!(next.job.input_digest, reserved.job.input_digest);
+        assert_eq!(
+            store
+                .list_recoverable_backend_job_attempts("workspace", 100)
+                .unwrap(),
+            vec![next.attempt.clone()]
+        );
+        store
+            .finish_backend_job_attempt(
+                "workspace",
+                "accepted",
+                &next.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "execution_rejected",
+                "not an interrupted partial",
+                NOW,
+            )
+            .unwrap();
+        store
+            .finalize_backend_job("workspace", "accepted", NOW)
+            .unwrap();
+        assert!(
+            store
+                .list_recoverable_backend_job_attempts("workspace", 100)
+                .unwrap()
+                .is_empty()
         );
     }
 

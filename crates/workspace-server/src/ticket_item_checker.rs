@@ -441,6 +441,8 @@ mod tests {
             failure_category: None,
             failure_detail: None,
             failure_cause: None,
+            result_application_disposition: None,
+            result_application_recorded_at: None,
             worker_cleanup_state: None,
             worker_cleanup_failure_category: None,
             worker_cleanup_failure_detail: None,

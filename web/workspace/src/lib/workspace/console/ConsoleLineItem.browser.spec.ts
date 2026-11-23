@@ -119,7 +119,7 @@ function reconnectSnapshot(text: string): Event {
         context_tokens: 20,
       },
       state: {
-        last_command_id: 0,
+        state_sequence: 0, last_command_id: 0,
         state: { kind: "busy", state: { kind: "run", state: "running" } },
       },
       in_flight: {

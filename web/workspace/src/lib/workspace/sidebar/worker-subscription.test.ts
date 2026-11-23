@@ -88,14 +88,14 @@ function event(
 Deno.test('Worker list state uses the authoritative live snapshot separately from lifecycle', () => {
   const active = worker('runtime-a', 'worker-1');
   active.worker_state = {
-    last_command_id: 1,
+    state_sequence: 0, last_command_id: 1,
     state: { kind: 'busy', state: { kind: 'run', state: 'paused' } },
   };
   assertEquals(liveWorkerState(active), 'paused');
 
   const unavailable = worker('runtime-a', 'worker-2', false, 'unavailable');
   unavailable.worker_state = {
-    last_command_id: 2,
+    state_sequence: 0, last_command_id: 2,
     state: { kind: 'busy', state: { kind: 'run', state: 'running' } },
   };
   assertEquals(liveWorkerState(unavailable), 'unknown');
@@ -112,6 +112,39 @@ Deno.test('Worker list state uses the authoritative live snapshot separately fro
   unavailable.worker_state = null;
   unavailable.state = 'stopped';
   assertEquals(liveWorkerState(unavailable), 'stopped');
+});
+
+Deno.test('workspace Worker projection preserves Runtime lifecycle separately from last catalog status', () => {
+  const projection = createWorkspaceWorkersProjection();
+  const observed = { ...worker('runtime-a', 'worker-1'), lifecycle: 'awaiting_restore' as const, state: 'running' as const };
+  applyWorkspaceWorkersFrame(projection, snapshot('subscription-1', [observed]));
+  const current = projection.workers.get(key('runtime-a', 'worker-1'));
+  assertEquals(current?.lifecycle, 'awaiting_restore');
+  assertEquals(current?.state, 'running');
+  applyWorkspaceWorkersFrame(projection, event('subscription-1', {
+    event: 'worker_upserted', data: { worker: { ...observed, lifecycle: 'restoring' } },
+  }));
+  assertEquals(projection.workers.get(key('runtime-a', 'worker-1'))?.lifecycle, 'restoring');
+});
+
+Deno.test('registry-only Worker snapshots and updates do not infer stopped lifecycle', () => {
+  const projection = createWorkspaceWorkersProjection();
+  const registryOnly: SubscriptionWorker = {
+    ...worker('runtime-a', 'worker-1', false, 'unavailable'), state: 'stopped',
+  };
+  applyWorkspaceWorkersFrame(projection, snapshot('subscription-1', [registryOnly]));
+  const current = projection.workers.get(key('runtime-a', 'worker-1'));
+  assertEquals(current?.lifecycle, undefined);
+  assertEquals(current?.state, 'stopped');
+  assertEquals(liveWorkerState(current!), 'unknown');
+  applyWorkspaceWorkersFrame(projection, event('subscription-1', {
+    event: 'worker_upserted', data: { worker: { ...registryOnly, lifecycle: 'stopped' } },
+  }));
+  assertEquals(projection.workers.get(key('runtime-a', 'worker-1'))?.lifecycle, 'stopped');
+  applyWorkspaceWorkersFrame(projection, event('subscription-1', {
+    event: 'worker_upserted', data: { worker: registryOnly },
+  }));
+  assertEquals(projection.workers.get(key('runtime-a', 'worker-1'))?.lifecycle, undefined);
 });
 
 Deno.test('workspace Worker snapshot keeps equal local ids from different Runtimes', () => {

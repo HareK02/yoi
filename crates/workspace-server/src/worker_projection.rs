@@ -519,6 +519,7 @@ mod tests {
         state: protocol::subscription::SubscriptionWorkerState,
     ) -> protocol::subscription::SubscriptionWorker {
         protocol::subscription::SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: protocol::subscription::SubscriptionWorkerId::new("worker-a").unwrap(),
             runtime_id: Some("runtime-a".to_string()),
@@ -532,6 +533,65 @@ mod tests {
             profile: None,
             job: None,
             workdir_attachments: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_and_update_preserve_explicit_unavailable_observation() {
+        use crate::runtime_subscription::BrokerSubscriptionEvent;
+        use protocol::subscription::{
+            SubscriptionEventPayload, SubscriptionSnapshot, SubscriptionWorkerAvailability,
+            SubscriptionWorkerState,
+        };
+        let (store, service, _temp) = fixture().await;
+        store
+            .upsert_worker_registry(&worker("runtime-a", "worker-a"))
+            .unwrap();
+        let operations = service.replace_runtime("runtime-a").await;
+        for snapshot in [false, true] {
+            service
+                .seed_observation_async(
+                    "runtime-a",
+                    &observation(SubscriptionWorkerState::Idle),
+                    "1",
+                )
+                .await
+                .unwrap();
+            let mut unavailable = observation(SubscriptionWorkerState::Idle);
+            unavailable.availability = SubscriptionWorkerAvailability::Unavailable;
+            let event = if snapshot {
+                BrokerSubscriptionEvent::Snapshot {
+                    snapshot: SubscriptionSnapshot::Workers {
+                        workers: vec![unavailable],
+                    },
+                }
+            } else {
+                BrokerSubscriptionEvent::Event {
+                    payload: SubscriptionEventPayload::WorkerUpserted {
+                        worker: unavailable,
+                    },
+                }
+            };
+            service
+                .apply_broker_event_owned_async("runtime-a", event, operations.clone())
+                .await
+                .unwrap();
+            let mut subscription = service.subscribe_ordered_async(10).await.unwrap();
+            let records = subscription.take_snapshot();
+            let saved = records[0].observation.as_ref().unwrap();
+            assert_eq!(
+                saved.availability,
+                SubscriptionWorkerAvailability::Unavailable
+            );
+            assert_eq!(
+                saved.worker.availability,
+                SubscriptionWorkerAvailability::Unavailable
+            );
+            assert_eq!(
+                saved.worker.state,
+                SubscriptionWorkerState::Idle,
+                "retained display status is not freshness"
+            );
         }
     }
 

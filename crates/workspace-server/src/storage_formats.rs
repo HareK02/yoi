@@ -87,6 +87,8 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     verify_publication_shape(conn, current)?;
     verify_connection_observation_shape(conn, current)?;
     verify_worker_lifecycle_shape(conn, current)?;
+    verify_job_recording_shape(conn, current)?;
+    verify_external_session_shape(conn, current)?;
     let tail = failure_tail(conn, current, &rows)?;
     verify_failure_shape(conn, current, tail)?;
     let journal = tail == FailureTail::Journal || current >= 127;
@@ -403,17 +405,17 @@ impl FailureTail {
                 (124, super::WORKER_CREATE_FAILURE_MIGRATION_NAME),
                 (125, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
                 (126, super::SERVICE_OUTCOME_MIGRATION_NAME),
-                (127, super::journal_removal_store::MIGRATION_NAME),
+                (127, super::worker_input_handoff_store::MIGRATION_NAME),
             ],
             Self::Retained => vec![
                 (124, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
                 (125, super::SERVICE_OUTCOME_MIGRATION_NAME),
                 (126, super::RETAINED_STARTUP_MIGRATION_NAME),
-                (127, super::journal_removal_store::MIGRATION_NAME),
+                (127, super::worker_input_handoff_store::MIGRATION_NAME),
             ],
             Self::Journal => vec![
-                (124, super::journal_removal_store::MIGRATION_NAME),
-                (127, super::journal_removal_store::RETAINED_BRIDGE_NAME),
+                (124, super::worker_input_handoff_store::MIGRATION_NAME),
+                (127, super::worker_input_handoff_store::RETAINED_BRIDGE_NAME),
             ],
         });
         tail.push((128, super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME));
@@ -422,13 +424,19 @@ impl FailureTail {
         tail.push((131, crate::launch_policy::MIGRATION_NAME));
         tail.push((133, crate::subject_policy::MIGRATION_NAME));
         tail.push((134, super::backend_job_finalizing::MIGRATION_NAME));
-        tail.push((135, super::subject_release_recording_store::MIGRATION_NAME));
+        tail.push((
+            135,
+            super::subject_release_input_handoff_store::MIGRATION_NAME,
+        ));
         tail.push((136, super::launch_policy_identity_migration::MIGRATION_NAME));
         tail.push((137, super::worker_lifecycle_notifications::MIGRATION_NAME));
         tail.push((
             138,
             super::notification_routing::merge_requests::MIGRATION_NAME,
         ));
+        tail.push((139, super::backend_job_result_application::MIGRATION_NAME));
+        tail.push((140, super::backend_job_recording_input::MIGRATION_NAME));
+        tail.push((141, super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -469,7 +477,7 @@ fn failure_tail(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Resu
         .find(|row| row.0 == 124 && row.1 != super::SCHEMA_BASELINE_NAME)
     {
         return match name.as_str() {
-            super::journal_removal_store::MIGRATION_NAME => Ok(FailureTail::Journal),
+            super::worker_input_handoff_store::MIGRATION_NAME => Ok(FailureTail::Journal),
             super::WORKER_CREATE_FAILURE_MIGRATION_NAME => Ok(FailureTail::Canonical),
             super::backend_job_recovery_store::CAUSE_MIGRATION_NAME => Ok(FailureTail::Retained),
             _ => Err(invalid("unrecognized schema-124 identity")),
@@ -637,6 +645,46 @@ fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> R
         .collect();
     if actual != expected {
         return Err(invalid("Service outcome receipt/shape mismatch"));
+    }
+    Ok(())
+}
+
+fn verify_external_session_shape(conn: &Connection, current: i64) -> Result<()> {
+    if current < 141 {
+        for column in ["session_credential_digest", "reconnect_deadline_at"] {
+            if super::column_exists(conn, "external_workdir_grants", column)? {
+                return Err(invalid(
+                    "External session columns before their migration receipt",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    static EXPECTED: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let expected = EXPECTED
+        .get_or_init(|| {
+            (|| {
+                let reference = reference_base()?;
+                super::install_external_workdir_session_columns(&reference)?;
+                Ok::<_, Error>(
+                    snapshot(&reference)?
+                        .into_iter()
+                        .filter(|(_, object)| {
+                            object.0 == "table" && object.1 == "external_workdir_grants"
+                        })
+                        .collect(),
+                )
+            })()
+            .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(invalid)?;
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| object.0 == "table" && object.1 == "external_workdir_grants")
+        .collect();
+    if &actual != expected {
+        return Err(invalid("External sharing session receipt/shape mismatch"));
     }
     Ok(())
 }
@@ -959,7 +1007,7 @@ fn legacy_shape(conn: &Connection) -> Result<Shape> {
 fn journal_removal_extension() -> Result<(Shape, Vec<String>)> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch("CREATE TABLE worker_removal_operations(operation_id TEXT,plan_id TEXT,input_fingerprint TEXT,workspace_id TEXT,runtime_id TEXT,worker_id TEXT,state TEXT);")?;
-    reference.execute_batch(super::journal_removal_store::SCHEMA_SQL)?;
+    reference.execute_batch(super::worker_input_handoff_store::SCHEMA_SQL)?;
     let mut shape = snapshot(&reference)?;
     let table = shape
         .remove("worker_removal_operations")
@@ -1122,7 +1170,79 @@ fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
         }
         *fields = declarations(fields.clone())?;
     }
+    if current >= 139 {
+        let mut extension = application_reference()?;
+        let (_, _, fields) = extension.remove("backend_job_attempts").unwrap();
+        let (_, _, target) = shape
+            .get_mut("backend_job_attempts")
+            .ok_or_else(|| invalid("missing attempt table"))?;
+        for column in [
+            "word:result_application_disposition",
+            "word:result_application_recorded_at",
+        ] {
+            let declaration = declaration(&fields, column)?;
+            let sql = if column.ends_with("disposition") {
+                "result_application_disposition TEXT CHECK(result_application_disposition IS NULL OR result_application_disposition IN ('applied','not_required'))"
+            } else {
+                "result_application_recorded_at TEXT CHECK((result_application_disposition IS NULL AND result_application_recorded_at IS NULL) OR (result_application_disposition IS NOT NULL AND result_application_recorded_at IS NOT NULL AND length(trim(result_application_recorded_at))>0))"
+            };
+            if tokens(sql)? != declaration {
+                return Err(invalid("application reference drift"));
+            }
+            append_reference_column(target, sql)?;
+        }
+        shape.extend(extension);
+    }
     Ok(shape)
+}
+
+fn application_reference() -> Result<Shape> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch("CREATE TABLE backend_job_attempts(dummy TEXT);")?;
+    reference.execute_batch(super::backend_job_result_application::SCHEMA)?;
+    snapshot(&reference)
+}
+
+fn verify_job_recording_shape(conn: &Connection, current: i64) -> Result<()> {
+    let actual = snapshot(conn)?;
+    let mut expected = application_reference()?;
+    let (_, _, fields) = expected.remove("backend_job_attempts").unwrap();
+    for name in [
+        "word:result_application_disposition",
+        "word:result_application_recorded_at",
+    ] {
+        let found = actual
+            .get("backend_job_attempts")
+            .and_then(|(_, _, fields)| declaration(fields, name).ok());
+        if current >= 139 {
+            if found != Some(declaration(&fields, name)?) {
+                return Err(invalid("Job application column drift"));
+            }
+        } else if found.is_some() {
+            return Err(invalid("Job application before receipt"));
+        }
+    }
+    for (name, object) in expected {
+        if actual.get(&name) != (current >= 139).then_some(&object) {
+            return Err(invalid("Job application trigger receipt/shape mismatch"));
+        }
+    }
+    let recording = extension_shape(super::backend_job_recording_input::SCHEMA_SQL)?;
+    let tables: BTreeSet<_> = recording.values().map(|object| object.1.clone()).collect();
+    let found: Shape = actual
+        .into_iter()
+        .filter(|(_, object)| tables.contains(&object.1))
+        .collect();
+    if found
+        != if current >= 140 {
+            recording
+        } else {
+            Shape::new()
+        }
+    {
+        return Err(invalid("Job recording input receipt/shape mismatch"));
+    }
+    Ok(())
 }
 
 // Canonical snapshots end every declaration with a comma. Reuse that synthetic
@@ -1477,7 +1597,7 @@ mod failure_format_tests {
 
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
-        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138,
+        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141,
     ];
 
     #[test]

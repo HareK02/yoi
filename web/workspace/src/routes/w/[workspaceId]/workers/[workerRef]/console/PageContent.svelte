@@ -1514,7 +1514,7 @@
                             context_window: 0,
                             context_tokens: 0,
                         },
-                        state: { last_command_id: 0, state: { kind: "idle" } },
+                        state: { state_sequence: 0, last_command_id: 0, state: { kind: "idle" } },
                         in_flight: { responses: [], commands: [] },
                         internal_workers: [],
                     },

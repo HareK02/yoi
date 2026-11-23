@@ -238,20 +238,19 @@ impl StoppedWorkerTemplate {
             &serde_json::to_vec(&record.restore_guard)
                 .map_err(|_| reject("invalid restore guard"))?,
         )?;
-        if record.status != WorkerStatus::Stopped
-            || guard.active_request_id.is_some()
+        if guard.active_request_id.is_some()
             || guard.owners.values().any(|owner| owner.receipt.is_none())
         {
             return Err(reject("Worker is not settled and stopped"));
         }
-        let PersistedWorkerExecutionState::Available(execution) = &record.execution_state else {
-            return Err(reject("pending or unavailable execution metadata"));
+        let PersistedWorkerExecutionState::Stopped(Some(execution)) = &record.execution_state
+        else {
+            return Err(reject(
+                "Worker is not stopped with trusted execution metadata",
+            ));
         };
         // A stopped aggregate may retain the empty historical binding marker.
         // It is deliberately not copied to the installed Worker.
-        if execution.restore_intent != WorkerRestoreIntent::Explicit {
-            return Err(reject("Worker requires explicit restore"));
-        }
         if !record.workdir_attachments.is_empty() || !record.logical_workdir_attachments.is_empty()
         {
             return Err(reject("attachments are unsupported"));
@@ -409,13 +408,12 @@ impl StoppedWorkerTemplate {
                 workspace_id: Some(self.workspace_id.clone()),
                 workdir_attachments: Vec::new(),
                 logical_workdir_attachments: Vec::new(),
-                execution_state: PersistedWorkerExecutionState::Available(
+                execution_state: PersistedWorkerExecutionState::Stopped(Some(
                     PersistedWorkerExecution {
                         request,
                         binding: None,
-                        restore_intent: WorkerRestoreIntent::Explicit,
                     },
-                ),
+                )),
             };
             WorkerAggregateRecord::from_persisted(&worker)
                 .validate(&store.worker_dir(&self.worker_id).join(WORKER_FILE))
@@ -488,7 +486,9 @@ impl StoppedWorkerTemplate {
         if self.template_version != TEMPLATE_VERSION
             || !matches!(
                 self.runtime_schema_version,
-                RESTORE_ADMISSION_SCHEMA_VERSION | SCHEMA_VERSION
+                RESTORE_ADMISSION_SCHEMA_VERSION
+                    | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
+                    | SCHEMA_VERSION
             )
         {
             return Err(reject("unsupported template schema"));

@@ -105,6 +105,33 @@ Deno.test('generated subscription validator accepts an external Workdir Worker',
   assert(result.ok, `external Workdir Worker was rejected: ${JSON.stringify(result)}`);
 });
 
+Deno.test('generated Worker lifecycle validation preserves unknown observations without inferring stopped', () => {
+  for (const lifecycle of [
+    undefined, null, 'not_started', 'awaiting_restore', 'active', 'stopped',
+    'creating', 'restoring', 'stopping', 'recovery_required',
+  ]) {
+    const frame = subscribedFrame({
+      snapshot: { topic: 'workers', data: { workers: [{
+        worker_id: 'worker-1', runtime_id: 'runtime-1', availability: 'unavailable',
+        state: 'stopped', has_running_internal_workers: false,
+        ...(lifecycle === undefined ? {} : { lifecycle }),
+      }] } },
+    });
+    const result = decode(frame);
+    assert(result.ok, `lifecycle observation rejected: ${JSON.stringify(result)}`);
+    assertEquals(result.value, frame);
+  }
+  for (const lifecycle of ['unknown', 'running', 'future_lifecycle', 0, {}]) {
+    const result = decode(subscribedFrame({
+      snapshot: { topic: 'workers', data: { workers: [{
+        worker_id: 'worker-1', availability: 'observed', state: 'stopped',
+        has_running_internal_workers: false, lifecycle,
+      }] } },
+    }));
+    assert(!result.ok, `invalid lifecycle accepted: ${JSON.stringify(lifecycle)}`);
+  }
+});
+
 Deno.test('Rust-serialized compatibility fixtures satisfy the generated Browser contract', () => {
   for (const fixture of RUST_SERIALIZED_SUBSCRIPTION_FRAME_FIXTURES) {
     const result = decode(fixture);

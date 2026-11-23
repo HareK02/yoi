@@ -64,7 +64,7 @@ function worker(state = "stopped", token = "generation-1") {
     workdir_attachments: [],
     worker_state: state === "stopped"
       ? null
-      : { last_command_id: 0, state: { kind: "idle" as const } },
+      : { state_sequence: 0, last_command_id: 0, state: { kind: "idle" as const } },
   };
 }
 function frame(current: ReturnType<typeof worker>): SubscriptionFrame {

@@ -64,6 +64,18 @@ async fn initialized_with_rewrite(
     mpsc::UnboundedReceiver<()>,
     Arc<tokio::sync::Notify>,
 ) {
+    initialized_with_options(temp, rewrite, false).await
+}
+
+async fn initialized_with_options(
+    temp: &TempDir,
+    rewrite: Option<HeldRewrite>,
+    flow_enabled: bool,
+) -> (
+    Initialized,
+    mpsc::UnboundedReceiver<()>,
+    Arc<tokio::sync::Notify>,
+) {
     let (starts, started) = mpsc::unbounded_channel();
     let finish = Arc::new(tokio::sync::Notify::new());
     let client = HeldProvider {
@@ -73,6 +85,7 @@ async fn initialized_with_rewrite(
     let mut manifest = manifest::WorkerManifest::from_toml(
         "[worker]\nname='command-test'\n[model]\nscheme='anthropic'\nmodel_id='scripted'\n[engine]\n[scope]\nallow=[]",
     ).unwrap();
+    manifest.feature.flow.enabled = flow_enabled;
     manifest.compaction = Some(manifest::CompactionConfig {
         retained_tokens: 0,
         ..Default::default()
@@ -119,10 +132,10 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
         .expect("command test deadline")
 }
 
-async fn wait_idle(events: &mut broadcast::Receiver<Event>) {
+async fn wait_idle(events: &mut broadcast::Receiver<Event>, newer_than: u64) {
     bounded(async {
         loop {
-            if matches!(events.recv().await.unwrap(), Event::WorkerState { snapshot } if snapshot.state == WorkerState::Idle) { break; }
+            if matches!(events.recv().await.unwrap(), Event::WorkerState { snapshot } if snapshot.state == WorkerState::Idle && snapshot.state_sequence > newer_than) { break; }
         }
     }).await;
 }
@@ -177,7 +190,7 @@ async fn queued_host_commands_allocate_only_after_external_dequeue_admission() {
         );
         acknowledge_command(
             &handle.working_event_tx,
-            &handle.shared_state,
+            &endpoint.shared_state,
             expected_id,
             kind,
             WorkerCommandDisposition::Accepted,
@@ -216,14 +229,14 @@ async fn pending_exact_retry_joins_original_reply_and_completed_retry_has_no_sec
     assert!(poll!(&mut retry).is_pending());
     acknowledge_command(
         &handle.working_event_tx,
-        &handle.shared_state,
+        &endpoint.shared_state,
         7,
         WorkerCommandKind::Cancel,
         WorkerCommandDisposition::Accepted,
     );
     let original = bounded(first).await.unwrap();
     assert_eq!(bounded(retry).await.unwrap(), original);
-    handle.shared_state.transition(WorkerState::Idle);
+    endpoint.shared_state.transition(WorkerState::Idle);
     let replay = handle.send_command(method);
     tokio::pin!(replay);
     assert!(poll!(&mut replay).is_pending());
@@ -288,7 +301,7 @@ async fn public_commands_preserve_invalid_retry_conflict_stale_and_host_admissio
     // Allow normal completion, then verify Cancel's invalid state is correlated,
     // not mistaken for enqueue success or compact's disposition.
     finish.notify_one();
-    wait_idle(&mut events).await;
+    wait_idle(&mut events, invalid.state.state_sequence).await;
     let cancel = bounded(handle.send_host_command(WorkerCommandKind::Cancel))
         .await
         .unwrap();
@@ -319,7 +332,7 @@ async fn accepted_cancel_retry_after_run_exit_replays_without_new_history_or_sta
         accepted.state.state,
         WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Cancelling))
     ));
-    wait_idle(&mut events).await;
+    wait_idle(&mut events, accepted.state.state_sequence).await;
     let entries = handle.committed_entries();
     assert!(entries.iter().any(|entry| matches!(entry, LogEntry::Extension { domain, .. } if domain == "worker.pending_activations.v1")));
     let state = handle.shared_state.snapshot();
@@ -397,7 +410,8 @@ async fn unrelated_broadcast_acknowledgements_cannot_satisfy_direct_command_repl
     tokio::pin!(response);
     assert!(poll!(&mut response).is_pending());
     for _ in 0..1024 {
-        let _ = handle.send_event(Event::CommandAcknowledged {
+        // Internal fault injection stays behind the private Controller boundary.
+        let _ = handle.working_event_tx.send(Event::CommandAcknowledged {
             acknowledgement: WorkerCommandAcknowledgement {
                 command_id: 42,
                 command: WorkerCommandKind::Pause,
@@ -413,7 +427,7 @@ async fn unrelated_broadcast_acknowledgements_cannot_satisfy_direct_command_repl
     ));
     acknowledge_command(
         &handle.working_event_tx,
-        &handle.shared_state,
+        &endpoint.shared_state,
         42,
         WorkerCommandKind::Pause,
         WorkerCommandDisposition::InvalidState,
@@ -443,7 +457,7 @@ async fn shutdown_exact_retry_reaches_handler_and_replays_recorded_admission() {
         ));
         acknowledge_command(
             &handle.working_event_tx,
-            &handle.shared_state,
+            &endpoint.shared_state,
             9,
             WorkerCommandKind::Shutdown,
             WorkerCommandDisposition::Accepted,
@@ -555,7 +569,7 @@ async fn compact_admission_precedes_completion_and_deferred_ids_do_not_stale_hos
         .unwrap();
     bounded(starts.recv()).await.unwrap();
     finish.notify_one();
-    wait_idle(&mut events).await;
+    wait_idle(&mut events, 0).await;
     let compact = bounded(handle.send_host_command(WorkerCommandKind::Compact))
         .await
         .unwrap();
@@ -591,7 +605,7 @@ async fn compact_admission_precedes_completion_and_deferred_ids_do_not_stale_hos
     ));
     assert!(poll!(&mut deferred).is_pending());
     rewrite_finish.notify_one();
-    wait_idle(&mut events).await;
+    wait_idle(&mut events, compact.state.state_sequence).await;
     let deferred = bounded(deferred).await.unwrap();
     assert_eq!(deferred.command_id, 5_000);
     assert_eq!(deferred.disposition, WorkerCommandDisposition::InvalidState);
@@ -676,7 +690,7 @@ async fn bounded_wait_timeout_does_not_reissue_and_original_request_can_still_re
     );
     reject_invalid_command_state(
         &handle.working_event_tx,
-        &handle.shared_state,
+        &endpoint.shared_state,
         envelope,
         kind,
     );
@@ -686,4 +700,129 @@ async fn bounded_wait_timeout_does_not_reissue_and_original_request_can_still_re
         acknowledgement.disposition,
         WorkerCommandDisposition::InvalidState
     );
+}
+
+#[tokio::test]
+async fn protocol_snapshot_and_live_submit_completion_share_source_sequence() {
+    let temp = TempDir::new().unwrap();
+    let _sandbox =
+        crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+    let (endpoint, mut started, finish) = initialized(&temp).await;
+    let (handle, report, task) = endpoint.publish().await.unwrap();
+    let mut streams = crate::ipc::protocol_session::subscribe_worker_protocol_session(&handle);
+    let Event::Snapshot { state: initial, .. } = streams.snapshot_event else {
+        panic!("expected protocol snapshot");
+    };
+    assert_eq!(initial, protocol::WorkerStateSnapshot::initial());
+    let request_id = "sequence-submit";
+    handle
+        .send(Method::submit_text(request_id, "held run"))
+        .await
+        .unwrap();
+    bounded(started.recv()).await.unwrap();
+    let running = bounded(async {
+        loop {
+            if let Event::WorkerState { snapshot } = streams.events.recv().await.unwrap()
+                && matches!(
+                    snapshot.state,
+                    WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running))
+                )
+            {
+                break snapshot;
+            }
+        }
+    })
+    .await;
+    assert_eq!(running.state_sequence, initial.state_sequence + 1);
+    assert_eq!(
+        running.last_command_id, 0,
+        "Submit does not issue lifecycle command IDs"
+    );
+    let reconnect = crate::ipc::protocol_session::subscribe_worker_protocol_session(&handle);
+    assert!(matches!(reconnect.snapshot_event, Event::Snapshot { state, .. } if state == running));
+    assert_eq!(handle.shared_state.snapshot(), running);
+
+    finish.notify_one();
+    let finished = bounded(async {
+        loop {
+            if let Event::WorkerState { snapshot } = streams.events.recv().await.unwrap()
+                && snapshot.last_finished_submission_request_id.as_deref() == Some(request_id)
+            {
+                break snapshot;
+            }
+        }
+    })
+    .await;
+    assert_eq!(finished.state_sequence, running.state_sequence + 1);
+    assert_eq!(finished.state, WorkerState::Idle);
+    assert_eq!(finished.last_command_id, 0);
+    assert_eq!(handle.shared_state.snapshot(), finished);
+    assert!(matches!(handle.snapshot_event(), Event::Snapshot { state, .. } if state == finished));
+    shutdown(handle, report, task).await;
+}
+
+#[tokio::test]
+async fn command_only_snapshot_mutation_is_published_before_effects_and_retries_do_not_advance() {
+    let temp = TempDir::new().unwrap();
+    let _sandbox =
+        crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+    let (mut endpoint, _, _) = initialized(&temp).await;
+    let handle = endpoint.handle.clone();
+    let mut events = handle.subscribe();
+    let method = Method::Pause {
+        command: WorkerCommandEnvelope::new(80),
+    };
+    handle.send(method.clone()).await.unwrap();
+    assert!(matches!(
+        bounded(endpoint.method_rx.recv()).await,
+        Some(Method::Pause { .. })
+    ));
+    let Event::WorkerState { snapshot: admitted } = events.try_recv().unwrap() else {
+        panic!("command admission must publish its snapshot mutation");
+    };
+    assert_eq!(admitted.state_sequence, 1);
+    assert_eq!(admitted.last_command_id, 80);
+    assert_eq!(admitted.state, WorkerState::Idle);
+    assert!(matches!(handle.snapshot_event(), Event::Snapshot { state, .. } if state == admitted));
+    acknowledge_command(
+        &handle.working_event_tx,
+        &endpoint.shared_state,
+        80,
+        WorkerCommandKind::Pause,
+        WorkerCommandDisposition::InvalidState,
+    );
+    assert!(
+        matches!(events.try_recv().unwrap(), Event::CommandAcknowledged { acknowledgement } if acknowledgement.state == admitted)
+    );
+
+    handle.send(method).await.unwrap();
+    handle.send(Method::ListWorkers).await.unwrap();
+    assert!(matches!(
+        bounded(endpoint.method_rx.recv()).await,
+        Some(Method::ListWorkers)
+    ));
+    assert!(
+        matches!(events.try_recv().unwrap(), Event::CommandAcknowledged { acknowledgement } if acknowledgement.state == admitted)
+    );
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(handle.shared_state.snapshot(), admitted);
+}
+
+#[tokio::test]
+async fn controller_initialization_owns_flow_transition_configuration() {
+    for enabled in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let _sandbox =
+            crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let (endpoint, _, _) = initialized_with_options(&temp, None, enabled).await;
+        assert_eq!(
+            endpoint.handle.shared_state.flow_transition_enabled(),
+            enabled
+        );
+        let (handle, report, task) = endpoint.publish().await.unwrap();
+        shutdown(handle, report, task).await;
+    }
 }

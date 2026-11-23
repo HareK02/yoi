@@ -539,6 +539,7 @@ fn project_registry_worker(
         worker
     } else {
         SubscriptionWorker {
+            lifecycle: None,
             restore_observation_token: None,
             worker_id: protocol::subscription::SubscriptionWorkerId::new(
                 record.registry.worker.worker_id.clone(),
@@ -713,6 +714,7 @@ mod tests {
 
     fn external_worker() -> SubscriptionWorker {
         SubscriptionWorker {
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: worker_id(),
             runtime_id: Some("runtime-1".to_string()),
@@ -841,6 +843,25 @@ mod tests {
             worker.workdir_attachments,
             external_worker().workdir_attachments
         );
+        let mut unavailable = external_worker();
+        unavailable.availability =
+            protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+        store
+            .apply_worker_registry_observation("workspace-1", "runtime-1", &unavailable, "4")
+            .unwrap();
+        let unavailable = store
+            .worker_registry_projection("workspace-1", &worker_ref)
+            .unwrap()
+            .unwrap();
+        let projected =
+            project_registry_workers_async(store.clone(), "workspace-1".into(), vec![unavailable])
+                .await
+                .unwrap();
+        assert_eq!(
+            projected[0].availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Unavailable
+        );
+
         let mut unresolved = committed;
         unresolved
             .observation

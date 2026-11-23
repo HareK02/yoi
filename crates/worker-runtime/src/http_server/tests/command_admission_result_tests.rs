@@ -5,6 +5,11 @@ use protocol::{WorkerCommandDisposition as D, WorkerCommandKind as K, WorkerComm
 
 struct CommandBackend(Mutex<WorkerExecutionResult>);
 impl WorkerExecutionBackend for CommandBackend {
+    fn worker_snapshot(&self, _worker_ref: &WorkerRef) -> Option<protocol::Event> {
+        Some(protocol::Event::WorkerState {
+            snapshot: protocol::WorkerStateSnapshot::initial(),
+        })
+    }
     fn backend_id(&self) -> &str {
         "command-result-http"
     }

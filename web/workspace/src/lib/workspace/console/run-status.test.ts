@@ -164,7 +164,7 @@ Deno.test("new invoke and legacy snapshot reset run activity", () => {
           greeting: { text: "", profile: "" },
           state: {
 
-            last_command_id: 0,
+            state_sequence: 0, last_command_id: 0,
             state: { kind: "idle" },
           },
           in_flight: {},
@@ -198,21 +198,21 @@ Deno.test("WorkerRunStatus presentation follows compaction and busy state", () =
     trigger: "request_threshold",
   } as const;
   const maintenance = {
-    last_command_id: 7,
+    state_sequence: 0, last_command_id: 7,
     state: {
       kind: "busy",
       state: { kind: "maintenance", state: "compacting" },
     },
   } as const;
   const run = {
-    last_command_id: 7,
+    state_sequence: 0, last_command_id: 7,
     state: {
       kind: "busy",
       state: { kind: "run", state: "running" },
     },
   } as const;
   const idle = {
-    last_command_id: 7,
+    state_sequence: 0, last_command_id: 7,
     state: { kind: "idle" },
   } as const;
 

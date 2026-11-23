@@ -387,13 +387,14 @@ async fn compact_maintenance_rejects_release_until_the_real_rewrite_boundary_exi
         .unwrap()
         .unwrap();
     assert!(reserve(&controller.handle).await.is_err());
+    let compacting = controller.handle.shared_state.snapshot();
     assert!(matches!(
-        controller.handle.shared_state.snapshot().state,
+        compacting.state,
         WorkerState::Busy(WorkerBusyState::Maintenance(_))
     ));
     rewrite_finish.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop { if matches!(events.recv().await.unwrap(), Event::WorkerState { snapshot } if snapshot.state == WorkerState::Idle) { break; } }
+        loop { if matches!(events.recv().await.unwrap(), Event::WorkerState { snapshot } if snapshot.state == WorkerState::Idle && snapshot.state_sequence > compacting.state_sequence) { break; } }
     }).await.unwrap();
     let guard = reserve(&controller.handle).await.unwrap();
     drop(guard);
@@ -432,12 +433,12 @@ async fn queued_or_actor_staged_work_cannot_pass_the_exclusive_ack_boundary() {
         .unwrap();
     let pending = prepared.worker().pending_submission_handle();
     let buffer = prepared.worker().notify_buffer_handle();
-    let shared = Arc::new(WorkerSharedState::new(
+    let shared = WorkerStateOwner::new(
         "queue-boundary".into(),
         prepared.worker().segment_id(),
         String::new(),
         build_greeting(prepared.worker()),
-    ));
+    );
     let control =
         crate::subject_release::ReleaseControl::new(prepared.worker().mutation_authority());
     for condition in [

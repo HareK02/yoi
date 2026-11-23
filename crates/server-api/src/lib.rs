@@ -744,6 +744,8 @@ impl_openapi_schema!(
     WorkerRestoreRequest,
     WorkerControlSubject,
     WorkerControlRecord,
+    WorkerListState,
+    WorkerControlDetails,
     WorkerControlListResponse,
     WorkspaceWorkerDiscoveryQuery,
     WorkspaceWorkerSubject,
@@ -2183,6 +2185,19 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkerControlListResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
+    async fn worker_control_details(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+    ) -> Result<WorkerControlDetails, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/permissions/{permission}",
         status = 204,
@@ -3671,7 +3686,7 @@ pub trait ServerApi {
     )]
     async fn external_workdir_grant_create(
         &self,
-        #[extension] actor: RequestActor,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: ExternalWorkdirGrantCreateRequest,
     ) -> Result<ExternalWorkdirGrantResponse, WorkdirManagementApiError>;
@@ -10160,6 +10175,9 @@ pub struct RuntimeWorkerSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Runtime-owned lifecycle, absent when no Runtime observation is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<protocol::WorkerLifecycleState>,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<serde_json::Value>,
@@ -10810,11 +10828,44 @@ pub struct WorkerControlSubject {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerControlRecord {
-    pub workdir_connections: Vec<CurrentWorkerWorkdirAttachmentItem>,
     pub subject: WorkerControlSubject,
+    pub worker: String,
+    pub display_name: String,
+    pub state: WorkerListState,
     pub relation: String,
-    pub origin: String,
     pub permissions: Vec<String>,
+}
+
+/// A display projection, never an admission decision or a second state owner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerListState {
+    Idle,
+    Running,
+    Pausing,
+    Paused,
+    Cancelling,
+    Maintenance,
+    NotStarted,
+    AwaitingRestore,
+    Stopped,
+    Creating,
+    Restoring,
+    Stopping,
+    RecoveryRequired,
+    Failed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerControlDetails {
+    pub subject: WorkerControlSubject,
+    pub worker: String,
+    pub state: WorkerListState,
+    /// None means no binding-read permission, not an empty attachment set.
+    pub workdir_connections: Option<Vec<CurrentWorkerWorkdirAttachmentItem>>,
+    pub restore_observation_token: Option<String>,
     pub summary: WorkerLaunchWorkerSummary,
 }
 
@@ -10822,6 +10873,8 @@ pub struct WorkerControlRecord {
 #[serde(deny_unknown_fields)]
 pub struct WorkerControlListResponse {
     pub workspace_id: String,
+    #[schemars(range(min = 1, max = 500_usize))]
+    pub limit: usize,
     pub items: Vec<WorkerControlRecord>,
     pub truncated: bool,
 }
@@ -10900,7 +10953,7 @@ pub enum WorkerRemovalState {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRemovalPhase {
     AwaitingQuiescence,
-    Recording,
+    InputHandoff,
     AwaitingEffectsEnd,
     Released,
     Completed,
@@ -11429,8 +11482,9 @@ pub struct WorkerSummary {
     /// Freshness of the Runtime observation used to construct `worker_state`.
     /// `Unavailable` means no current controller snapshot is being asserted.
     pub availability: protocol::subscription::SubscriptionWorkerAvailability,
-    /// Runtime catalog lifecycle compatibility state. Live foreground state, when
-    /// available, is carried separately in `worker_state`.
+    /// Runtime-owned lifecycle, absent when no Runtime observation is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<protocol::WorkerLifecycleState>,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -11478,6 +11532,9 @@ pub struct WorkerLaunchWorkerSummary {
     pub singleton_key: Option<String>,
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Runtime-owned lifecycle, absent when no Runtime observation is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<protocol::WorkerLifecycleState>,
     pub state: String,
     pub last_seen_at: Option<String>,
     pub pinned: bool,
@@ -14183,7 +14240,7 @@ mod tests {
             let wire = serde_json::json!({
                 "removed": false, "runtime_id": "runtime-a", "worker_id": "worker-a",
                 "operation_id": "original-operation", "state": state,
-                "phase": "recording", "cause": cause,
+                "phase": "input_handoff", "cause": cause,
             });
             let response: WorkerRemoveResponse = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(response.status_code(), 202);
@@ -14214,6 +14271,7 @@ mod tests {
     fn worker_launch_summary() -> WorkerLaunchWorkerSummary {
         WorkerLaunchWorkerSummary {
             runtime_id: "runtime-a".to_string(),
+            lifecycle: Some(protocol::WorkerLifecycleState::Active),
             worker_id: "worker-a".to_string(),
             host_id: "host-a".to_string(),
             display_name: "Worker A".to_string(),
@@ -16014,6 +16072,7 @@ mod openapi_artifact_tests {
             "merge_request_reviewer_child_register",
             "runtime_resource_fetch",
             "worker_control_authorize",
+            "worker_control_details",
             "worker_control_cancel",
             "worker_control_input",
             "worker_control_list",

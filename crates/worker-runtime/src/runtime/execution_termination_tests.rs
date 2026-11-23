@@ -117,7 +117,7 @@ fn stop_termination_rejects_missing_wrong_operation_run_worker_and_feature_failu
                 .unwrap()
                 .worker(&worker.worker_ref)
                 .unwrap()
-                .pending_stop
+                .pending_stop()
                 .unwrap()
                 .operation_id,
             operation_id
@@ -193,7 +193,7 @@ fn stop_termination_cleanup_error_retains_join_without_settling_stop_or_overwrit
             .unwrap()
             .worker(&worker.worker_ref)
             .unwrap()
-            .pending_stop
+            .pending_stop()
             .unwrap()
             .operation_id,
         operation_id

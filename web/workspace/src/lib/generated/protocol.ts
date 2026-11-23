@@ -92,6 +92,8 @@ context?: string | null, };
 
 export type WorkerStatus = "idle" | "running" | "paused" | "stopped";
 
+export type WorkerLifecycleState = "not_started" | "awaiting_restore" | "active" | "stopped" | "creating" | "restoring" | "stopping" | "recovery_required";
+
 export type WorkerCommandEnvelope = { command_id: number, };
 
 export type WorkerCommandKind = "resume" | "cancel" | "pause" | "compact" | "shutdown";
@@ -121,6 +123,12 @@ export type WorkerBusyState = { "kind": "run", "state": WorkerRunState } | { "ki
 export type WorkerState = { "kind": "idle" } | { "kind": "busy", "state": WorkerBusyState };
 
 export type WorkerStateSnapshot = {
+/**
+ * Source-authored ordering within one Worker execution. Snapshot and live
+ * delivery may overlap; receivers compare source sequences only within that execution.
+ * Advances on changes to any snapshot field, independently of command IDs.
+ */
+state_sequence: number,
 /**
  * Highest lifecycle command id observed by this controller instance.
  */
@@ -333,7 +341,12 @@ export type InternalWorkerSnapshot = { worker: InternalWorkerRef, session: Sessi
  * Public execution metadata for this child. Older snapshots and service
  * workers may omit it; clients must never substitute the parent's values.
  */
-greeting?: Greeting | null, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
+greeting?: Greeting | null,
+/**
+ * Exact execution-owned state and source sequence. Absent when the source is
+ * unavailable; catalog status cannot reconstruct a live snapshot.
+ */
+state?: WorkerStateSnapshot | null, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
 
 export type Alert = {
 /**
@@ -436,7 +449,12 @@ availability: SubscriptionWorkerAvailability,
  */
 worker_state?: WorkerStateSnapshot | null,
 /**
- * Runtime catalog lifecycle compatibility projection; not foreground-state authority.
+ * Runtime-owned lifecycle when observed; absent for registry-only membership.
+ * Never inferred from the last catalog status or transport availability.
+ */
+lifecycle?: WorkerLifecycleState | null,
+/**
+ * Last Runtime catalog status; not current execution-lifecycle authority.
  */
 state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null,
 /**
@@ -519,4 +537,4 @@ in_flight?: InFlightSnapshot,
  * Parent-owned Internal Worker sessions visible to this client.
  * Service-private Internal Workers are deliberately excluded.
  */
-internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, prefix: string, request_id?: string | null, context?: CompletionContext | null, entries: Array<CompletionEntry>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compaction_progress", "data": { compaction: InFlightCompaction | null, } } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, event: Event, } } | { "event": "internal_worker_observation_unavailable", "data": { worker: InternalWorkerRef, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, prefix: string, request_id?: string | null, context?: CompletionContext | null, entries: Array<CompletionEntry>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compaction_progress", "data": { compaction: InFlightCompaction | null, } } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };

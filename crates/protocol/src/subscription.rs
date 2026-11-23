@@ -708,7 +708,11 @@ pub struct SubscriptionWorker {
     /// absent until an authoritative Worker snapshot/event has been applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<crate::WorkerStateSnapshot>,
-    /// Runtime catalog lifecycle compatibility projection; not foreground-state authority.
+    /// Runtime-owned lifecycle when observed; absent for registry-only membership.
+    /// Never inferred from the last catalog status or transport availability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<crate::WorkerLifecycleState>,
+    /// Last Runtime catalog status; not current execution-lifecycle authority.
     pub state: SubscriptionWorkerState,
     #[serde(default)]
     pub has_running_internal_workers: bool,
@@ -1003,8 +1007,62 @@ mod tests {
         SubscriptionId::new("subscription-1").unwrap()
     }
 
+    #[test]
+    fn worker_projection_preserves_lifecycle_separately_from_catalog_status() {
+        let mut worker = worker("worker-1");
+        worker.state = SubscriptionWorkerState::Running;
+        worker.lifecycle = Some(crate::WorkerLifecycleState::AwaitingRestore);
+        let value = serde_json::to_value(&worker).unwrap();
+        assert_eq!(value["state"], "running");
+        assert_eq!(value["lifecycle"], "awaiting_restore");
+        let decoded: SubscriptionWorker = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded, worker);
+
+        let mut unknown = value.clone();
+        unknown.as_object_mut().unwrap().remove("lifecycle");
+        let decoded: SubscriptionWorker = serde_json::from_value(unknown).unwrap();
+        assert_eq!(decoded.lifecycle, None);
+        let mut invalid = value;
+        invalid["lifecycle"] = "running".into();
+        assert!(serde_json::from_value::<SubscriptionWorker>(invalid).is_err());
+    }
+
+    #[test]
+    fn registry_only_worker_does_not_infer_lifecycle_from_catalog_status() {
+        for state in [
+            SubscriptionWorkerState::Running,
+            SubscriptionWorkerState::Stopped,
+        ] {
+            for availability in [
+                SubscriptionWorkerAvailability::Observed,
+                SubscriptionWorkerAvailability::Unavailable,
+            ] {
+                let mut worker = worker("worker-1");
+                worker.state = state;
+                worker.availability = availability;
+                worker.lifecycle = None;
+                let value = serde_json::to_value(&worker).unwrap();
+                assert!(value.get("lifecycle").is_none());
+                let decoded: SubscriptionWorker = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(decoded.lifecycle, None);
+                assert_eq!(decoded.state, state);
+                let mut explicit_null = value;
+                explicit_null["lifecycle"] = serde_json::Value::Null;
+                let decoded: SubscriptionWorker = serde_json::from_value(explicit_null).unwrap();
+                assert_eq!(decoded.lifecycle, None);
+                assert!(
+                    serde_json::to_value(decoded)
+                        .unwrap()
+                        .get("lifecycle")
+                        .is_none()
+                );
+            }
+        }
+    }
+
     fn worker(value: &str) -> SubscriptionWorker {
         SubscriptionWorker {
+            lifecycle: Some(crate::WorkerLifecycleState::Active),
             restore_observation_token: None,
             worker_id: worker_id(value),
             runtime_id: None,

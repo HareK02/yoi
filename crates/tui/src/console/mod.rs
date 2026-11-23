@@ -603,11 +603,7 @@ impl RetainedSnapshotSocket {
                     context_tokens: 0,
                     context_usage: None,
                 },
-                state: protocol::WorkerStateSnapshot {
-                    last_command_id: 0,
-                    last_finished_submission_request_id: None,
-                    state: protocol::WorkerState::Idle,
-                },
+                state: protocol::WorkerStateSnapshot::initial(),
                 in_flight: protocol::InFlightSnapshot::default(),
                 internal_workers: Vec::new(),
             })?),

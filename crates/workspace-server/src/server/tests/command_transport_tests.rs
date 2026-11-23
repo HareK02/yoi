@@ -16,6 +16,7 @@ fn command_fixture() -> (
             generation: 1,
             expires_at: None,
             capabilities: workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
+            access_fenced: std::sync::atomic::AtomicBool::new(false),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,
@@ -190,6 +191,53 @@ async fn terminal_output_retains_same_binding_for_current_page_replay() {
         assert_eq!(reader.await.unwrap().unwrap(), page(0, b"end", true));
     }
     assert_eq!(session.active_commands.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn fenced_connection_rejects_a_late_result_and_never_dispatches_more_data() {
+    let (session, mut receiver) = command_fixture();
+    session.active_commands.lock().await.insert(
+        "external".into(),
+        Arc::new(ExternalProviderCommandState::new(CommandHandle(
+            "provider".into(),
+        ))),
+    );
+    let request = workdir::CommandOutputRequest {
+        handle: CommandHandle("external".into()),
+        cursor: 0,
+        limit: 3,
+        wait: true,
+    };
+    let caller = {
+        let session = session.clone();
+        let request = request.clone();
+        tokio::spawn(async move { session.command_output(request).await })
+    };
+    let (_, response) = receive(&mut receiver).await;
+    let mut registry = ExternalProviderRegistry::default();
+    assert!(registry.connected(session.connection.clone()).is_none());
+    registry.fence("command-grant", 1);
+    response
+        .send(Ok(WorkdirSessionOperationResult::CommandOutput(page(
+            0, b"old", true,
+        ))))
+        .unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), caller)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        error.classification_source(),
+        workdir::WorkdirError::OutcomeUnknown(_)
+    ));
+    assert!(session.command_output(request).await.is_err());
+    assert!(
+        receiver.try_recv().is_err(),
+        "a fenced session cannot replay onto any provider"
+    );
+    assert!(registry.disconnect("command-grant", 1).is_some());
+    assert!(registry.connection("command-grant").is_none());
 }
 
 #[tokio::test]

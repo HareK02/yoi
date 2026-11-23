@@ -97,6 +97,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<FeatureInvocationStatus>(&cfg, &mut output);
     push_decl::<FeatureInvocationResult>(&cfg, &mut output);
     push_decl::<WorkerStatus>(&cfg, &mut output);
+    push_decl::<crate::WorkerLifecycleState>(&cfg, &mut output);
     push_decl::<WorkerCommandEnvelope>(&cfg, &mut output);
     push_decl::<WorkerCommandKind>(&cfg, &mut output);
     push_decl::<WorkerCommandDisposition>(&cfg, &mut output);
@@ -303,6 +304,7 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
     let external_workdir_id = SubscriptionWorkdirId::new("fixture-external-workdir")
         .expect("fixture external Workdir id must be valid");
     let worker = SubscriptionWorker {
+        lifecycle: Some(crate::WorkerLifecycleState::Active),
         restore_observation_token: Some("fixture-restore-observation".into()),
         worker_id: worker_id.clone(),
         runtime_id: Some("fixture-runtime".to_string()),
@@ -384,6 +386,7 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
                             entries: Vec::new(),
                         },
                         greeting: Some(greeting),
+                        state: Some(WorkerStateSnapshot::initial()),
                         status: WorkerStatus::Idle,
                         error: None,
                         in_flight: InFlightSnapshot::default(),

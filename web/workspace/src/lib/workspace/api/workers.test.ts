@@ -31,6 +31,7 @@ import {
   parseBrowserWorkspaceOrchestratorResponse,
   parseCreateWorkspaceWorkerRequest,
   parseWorkerLaunchOptionsResponse,
+  parseWorkerLaunchWorkerSummary,
   parseWorkerSummary,
 } from "./workers.ts";
 import { loadJson } from "./http.ts";
@@ -79,6 +80,73 @@ Deno.test("Worker summaries omit the removed management capabilities field", () 
   assertEquals("capabilities" in created.worker, false);
 });
 
+Deno.test("Worker API parsers preserve lifecycle independently of catalog status", () => {
+  for (
+    const lifecycle of [
+      "not_started",
+      "awaiting_restore",
+      "active",
+      "stopped",
+      "creating",
+      "restoring",
+      "stopping",
+      "recovery_required",
+    ]
+  ) {
+    const summary = parseWorkerSummary({
+      ...worker,
+      resource_key: "W-1",
+      availability: "observed",
+      state: "running",
+      lifecycle,
+    });
+    assertEquals(summary.lifecycle, lifecycle);
+    assertEquals(summary.state, "running");
+    assertEquals(parseWorkerLaunchWorkerSummary({ ...worker, lifecycle }).lifecycle, lifecycle);
+  }
+  for (const availability of ["observed", "unavailable"]) {
+    for (const state of ["running", "stopped"]) {
+      for (const lifecycle of [undefined, null]) {
+        const parsed = parseWorkerSummary({
+          ...worker,
+          resource_key: "W-1",
+          availability,
+          state,
+          ...(lifecycle === undefined ? {} : { lifecycle }),
+        });
+        assertEquals(parsed.lifecycle, lifecycle);
+        assertEquals(parsed.state, state);
+        assertEquals(
+          parseWorkerLaunchWorkerSummary({
+            ...worker,
+            state,
+            ...(lifecycle === undefined ? {} : { lifecycle }),
+          }).lifecycle,
+          lifecycle,
+        );
+      }
+    }
+  }
+  for (const lifecycle of ["running", "unknown", 0, {}]) {
+    assertThrows(
+      () =>
+        parseWorkerSummary({
+          ...worker,
+          resource_key: "W-1",
+          availability: "observed",
+          lifecycle,
+        }),
+      Error,
+      "lifecycle is invalid",
+    );
+    assertThrows(
+      () => parseWorkerLaunchWorkerSummary({ ...worker, lifecycle }),
+      Error,
+      "lifecycle is invalid",
+    );
+  }
+});
+
 Deno.test("Worker summary parser enforces observation freshness", () => {
   const unavailable = {
     ...worker,
@@ -95,7 +163,7 @@ Deno.test("Worker summary parser enforces observation freshness", () => {
       parseWorkerSummary({
         ...unavailable,
         worker_state: {
-          last_command_id: 0,
+          state_sequence: 0, last_command_id: 0,
           state: { kind: "idle" },
         },
       }),
@@ -123,12 +191,14 @@ const workerStates = [
 
 Deno.test("Worker summary parser preserves the optional submission completion fence in every state", () => {
   for (const state of workerStates) {
-    for (const completion of [
-      {},
-      { last_finished_submission_request_id: null },
-      { last_finished_submission_request_id: "completed-submit" },
-    ]) {
-      const snapshot = { last_command_id: 7, ...completion, state };
+    for (
+      const completion of [
+        {},
+        { last_finished_submission_request_id: null },
+        { last_finished_submission_request_id: "completed-submit" },
+      ]
+    ) {
+      const snapshot = { state_sequence: 0, last_command_id: 7, ...completion, state };
       const parsed = parseWorkerSummary({
         ...worker,
         resource_key: "W-1",
@@ -144,32 +214,34 @@ Deno.test("Worker summary parser validates submission completion fences without 
   for (const state of workerStates) {
     for (const invalid of [0, false, {}, [], "x".repeat(65_537)]) {
       assertThrows(
-        () => parseWorkerSummary({
-          ...worker,
-          resource_key: "W-1",
-          availability: "observed",
-          worker_state: {
-            last_command_id: 7,
-            last_finished_submission_request_id: invalid,
-            state,
-          },
-        }),
+        () =>
+          parseWorkerSummary({
+            ...worker,
+            resource_key: "W-1",
+            availability: "observed",
+            worker_state: {
+              state_sequence: 0, last_command_id: 7,
+              last_finished_submission_request_id: invalid,
+              state,
+            },
+          }),
         Error,
         "worker_state.last_finished_submission_request_id",
       );
     }
     assertThrows(
-      () => parseWorkerSummary({
-        ...worker,
-        resource_key: "W-1",
-        availability: "observed",
-        worker_state: {
-          last_command_id: 7,
-          last_finished_submission_request_id: "completed-submit",
-          state,
-          unexpected: true,
-        },
-      }),
+      () =>
+        parseWorkerSummary({
+          ...worker,
+          resource_key: "W-1",
+          availability: "observed",
+          worker_state: {
+            state_sequence: 0, last_command_id: 7,
+            last_finished_submission_request_id: "completed-submit",
+            state,
+            unexpected: true,
+          },
+        }),
       Error,
       "unknown field unexpected",
     );
@@ -178,17 +250,18 @@ Deno.test("Worker summary parser validates submission completion fences without 
 
 Deno.test("Console Worker API loading accepts a completed submission snapshot", async () => {
   const snapshot = {
-    last_command_id: 0,
+    state_sequence: 0, last_command_id: 0,
     last_finished_submission_request_id: "completed-submit",
     state: { kind: "idle" },
   };
   const result = await loadJson(
-    () => Promise.resolve(Response.json({
-      ...worker,
-      resource_key: "W-1",
-      availability: "observed",
-      worker_state: snapshot,
-    })),
+    () =>
+      Promise.resolve(Response.json({
+        ...worker,
+        resource_key: "W-1",
+        availability: "observed",
+        worker_state: snapshot,
+      })),
     "/api/w/workspace-a/workers/W-1",
     undefined,
     parseWorkerSummary,
@@ -327,7 +400,8 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
       relative_cwd: null,
     }],
     feature_connections: {},
-    authorization: { kind: "assignment", assignment: null }, control_operation_id: "create-op",
+    authorization: { kind: "assignment", assignment: null },
+    control_operation_id: "create-op",
   };
 
   assertEquals(parseCreateWorkspaceWorkerRequest(request), request);
@@ -340,47 +414,101 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
     parseCreateWorkspaceWorkerRequest({ ...request, authorization: undefined }).authorization,
     { kind: "assignment", assignment: null },
   );
-  for (const assignment of [
-    { grants: [], exclusions: [], revoked: false },
-    { grants: [{ kind: "set", value: "conversation" }], exclusions: [], revoked: true },
-  ]) {
+  for (
+    const assignment of [
+      { grants: [], exclusions: [], revoked: false },
+      { grants: [{ kind: "set", value: "conversation" }], exclusions: [], revoked: true },
+    ]
+  ) {
     const authorization = { kind: "assignment", assignment };
     assertEquals(
       parseCreateWorkspaceWorkerRequest({ ...request, authorization }).authorization,
       authorization,
     );
   }
-  for (const policy_authorization_key of [
-    "auth-key", "1", " key ", "x".repeat(512), "é".repeat(256), "🔑".repeat(128),
-  ]) {
+  for (
+    const policy_authorization_key of [
+      "auth-key",
+      "1",
+      " key ",
+      "x".repeat(512),
+      "é".repeat(256),
+      "🔑".repeat(128),
+    ]
+  ) {
     const authorization = { kind: "policy", policy_id: "coder", policy_authorization_key };
-    assertEquals(parseCreateWorkspaceWorkerRequest({ ...request, authorization }).authorization, authorization);
+    assertEquals(
+      parseCreateWorkspaceWorkerRequest({ ...request, authorization }).authorization,
+      authorization,
+    );
   }
-  for (const policy_authorization_key of [
-    undefined, null, 1, false, {}, [], "", "x".repeat(513), "é".repeat(257),
-    "🔑".repeat(129), "bad\nkey", "bad\u0000key", "bad\u007fkey", "bad\u0085key",
-  ]) {
-    assertThrows(() => parseCreateWorkspaceWorkerRequest({
-      ...request, authorization: { kind: "policy", policy_id: "coder", policy_authorization_key },
-    }), Error, "policy_authorization_key");
+  for (
+    const policy_authorization_key of [
+      undefined,
+      null,
+      1,
+      false,
+      {},
+      [],
+      "",
+      "x".repeat(513),
+      "é".repeat(257),
+      "🔑".repeat(129),
+      "bad\nkey",
+      "bad\u0000key",
+      "bad\u007fkey",
+      "bad\u0085key",
+    ]
+  ) {
+    assertThrows(
+      () =>
+        parseCreateWorkspaceWorkerRequest({
+          ...request,
+          authorization: { kind: "policy", policy_id: "coder", policy_authorization_key },
+        }),
+      Error,
+      "policy_authorization_key",
+    );
   }
-  for (const authorization of [
-    { kind: "policy", policy_id: "coder", policy_revision: 1 },
-    { kind: "policy", policy_id: "coder", policy_revision: "auth-key" },
-    { kind: "policy", policy_id: "coder", policy_authorization_key: "auth-key", policy_revision: 1 },
-  ]) {
-    assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, authorization }), Error,
-      "unknown field policy_revision");
+  for (
+    const authorization of [
+      { kind: "policy", policy_id: "coder", policy_revision: 1 },
+      { kind: "policy", policy_id: "coder", policy_revision: "auth-key" },
+      {
+        kind: "policy",
+        policy_id: "coder",
+        policy_authorization_key: "auth-key",
+        policy_revision: 1,
+      },
+    ]
+  ) {
+    assertThrows(
+      () => parseCreateWorkspaceWorkerRequest({ ...request, authorization }),
+      Error,
+      "unknown field policy_revision",
+    );
   }
-  for (const authorization of [null, { kind: "human", assignment: null }, { kind: "default" },
-    { kind: "policy", policy_id: "coder", policy_authorization_key: "auth-key", assignment: {} },
-    { kind: "policy", policy_id: "bad.id", policy_authorization_key: "auth-key" }]) {
-    assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, authorization }), Error,
+  for (
+    const authorization of [null, { kind: "human", assignment: null }, { kind: "default" }, {
+      kind: "policy",
+      policy_id: "coder",
+      policy_authorization_key: "auth-key",
+      assignment: {},
+    }, { kind: "policy", policy_id: "bad.id", policy_authorization_key: "auth-key" }]
+  ) {
+    assertThrows(
+      () => parseCreateWorkspaceWorkerRequest({ ...request, authorization }),
+      Error,
       authorization && "policy_id" in authorization && authorization.policy_id === "bad.id"
-        ? "policy_id" : "authorization");
+        ? "policy_id"
+        : "authorization",
+    );
   }
-  assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, execution_grant: {} }), Error,
-    "unknown field execution_grant");
+  assertThrows(
+    () => parseCreateWorkspaceWorkerRequest({ ...request, execution_grant: {} }),
+    Error,
+    "unknown field execution_grant",
+  );
   assertEquals(
     parseCreateWorkspaceWorkerRequest({
       ...request,
@@ -433,36 +561,109 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
 });
 
 Deno.test("Worker launch request preserves typed Feature invocations and rejects unsafe values", () => {
-  const invocation = { invocation_id: "invoke-1", identity: "test/run", name: "run", arguments: [
-    { name: "path", value: { kind: "string", value: "資料/a b" } },
-    { name: "count", value: { kind: "integer", value: 1 } },
-    { name: "enabled", value: { kind: "boolean", value: true } },
-  ] };
-  const request = { runtime_id: "runtime-a", display_name: "Worker A", profile: "builtin:coder",
-    initial_submit: [{ kind: "feature_invoke", invocation }], workdir_attachments: [], feature_connections: {}, authorization: { kind: "assignment", assignment: null }, control_operation_id: "create-op" };
+  const invocation = {
+    invocation_id: "invoke-1",
+    identity: "test/run",
+    name: "run",
+    arguments: [
+      { name: "path", value: { kind: "string", value: "資料/a b" } },
+      { name: "count", value: { kind: "integer", value: 1 } },
+      { name: "enabled", value: { kind: "boolean", value: true } },
+    ],
+  };
+  const request = {
+    runtime_id: "runtime-a",
+    display_name: "Worker A",
+    profile: "builtin:coder",
+    initial_submit: [{ kind: "feature_invoke", invocation }],
+    workdir_attachments: [],
+    feature_connections: {},
+    authorization: { kind: "assignment", assignment: null },
+    control_operation_id: "create-op",
+  };
   assertEquals(parseCreateWorkspaceWorkerRequest(request).initial_submit, request.initial_submit);
-  assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, initial_submit: [{ kind: "feature_invoke", invocation: {
-    ...invocation, arguments: [{ name: "count", value: { kind: "integer", value: 9007199254740992 } }],
-  } }] }), Error, "safe integer");
-  assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, initial_submit: [{ kind: "feature_invoke", invocation: {
-    ...invocation, extra: true,
-  } }] }), Error, "unknown field extra");
+  assertThrows(
+    () =>
+      parseCreateWorkspaceWorkerRequest({
+        ...request,
+        initial_submit: [{
+          kind: "feature_invoke",
+          invocation: {
+            ...invocation,
+            arguments: [{ name: "count", value: { kind: "integer", value: 9007199254740992 } }],
+          },
+        }],
+      }),
+    Error,
+    "safe integer",
+  );
+  assertThrows(
+    () =>
+      parseCreateWorkspaceWorkerRequest({
+        ...request,
+        initial_submit: [{
+          kind: "feature_invoke",
+          invocation: {
+            ...invocation,
+            extra: true,
+          },
+        }],
+      }),
+    Error,
+    "unknown field extra",
+  );
 });
 
 Deno.test("Worker catalog preserves typed saved removal observations across reloads", () => {
   const summary = { ...worker, state: "stopped", resource_key: "W-1", availability: "observed" };
-  for (const [state, cause] of [["held", "recording_disabled"], ["waiting", "job_pending"], ["held", "source_unavailable"], ["held", "ownership_unknown"], ["held", "job_failed"], ["held", "execution_unconfirmed"], ["held", "storage_unavailable"]]) {
-    const removal = { operation_id: "original-operation", state, phase: "recording", cause };
-    assertEquals(parseWorkerSummary(JSON.parse(JSON.stringify({ ...summary, removal }))).removal, removal);
+  for (
+    const [state, cause] of [
+      ["held", "recording_disabled"],
+      ["waiting", "job_pending"],
+      ["held", "source_unavailable"],
+      ["held", "ownership_unknown"],
+      ["held", "job_failed"],
+      ["held", "execution_unconfirmed"],
+      ["held", "storage_unavailable"],
+    ]
+  ) {
+    const removal = { operation_id: "original-operation", state, phase: "input_handoff", cause };
+    assertEquals(
+      parseWorkerSummary(JSON.parse(JSON.stringify({ ...summary, removal }))).removal,
+      removal,
+    );
   }
-  for (const phase of ["awaiting_quiescence", "recording", "awaiting_effects_end", "released", "completed"]) {
+  for (
+    const phase of [
+      "awaiting_quiescence",
+      "input_handoff",
+      "awaiting_effects_end",
+      "released",
+      "completed",
+    ]
+  ) {
     const removal = { operation_id: "original-operation", state: "waiting", phase };
     assertEquals(parseWorkerSummary({ ...summary, removal }).removal, removal);
   }
   assertEquals(parseWorkerSummary(summary).removal, undefined);
-  for (const invalid of [{ state: "removed" }, { phase: "discarded" }, { cause: "retry" }, { operation_id: "" }, { body: "must not leak" }]) {
-    assertThrows(() => parseWorkerSummary({ ...summary, removal: {
-      state: "held", phase: "recording", operation_id: "original-operation", ...invalid,
-    } }), Error, "removal");
+  for (
+    const invalid of [{ state: "removed" }, { phase: "discarded" }, { cause: "retry" }, {
+      operation_id: "",
+    }, { body: "must not leak" }]
+  ) {
+    assertThrows(
+      () =>
+        parseWorkerSummary({
+          ...summary,
+          removal: {
+            state: "held",
+            phase: "input_handoff",
+            operation_id: "original-operation",
+            ...invalid,
+          },
+        }),
+      Error,
+      "removal",
+    );
   }
 });

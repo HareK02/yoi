@@ -557,9 +557,8 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         worker_id: old.worker_id.clone(),
         binding_id: old_host.writer_binding_id().unwrap().into(),
     };
-    // Perturb only the Job projection after real checkpoint/attempt completion.
-    // Body release must retain this unresolved recording responsibility rather
-    // than borrowing Job completion as its own quiescence or ownership proof.
+    // Already reflected history must still enter a finite owning Job on release.
+    // Real checkpoint/attempt completion is not an input handoff receipt.
     let recorded = api
         .store
         .list_backend_journal_jobs(TEST_WORKSPACE_ID, &old_attr.session_id, None, 100)
@@ -587,17 +586,6 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         assert!(actual.contains("User chose B rather than A"));
         assert!(actual.contains("Partial B implementation"));
     }
-    let uncertain_job = &recorded[0].request.job_id;
-    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
-    let saved_result: (String, String) = conn.query_row(
-        "SELECT result_json,result_digest FROM backend_jobs WHERE workspace_id=?1 AND job_id=?2",
-        rusqlite::params![TEST_WORKSPACE_ID, uncertain_job], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap();
-    conn.execute(
-        "UPDATE backend_jobs SET state='pending',result_json=NULL,result_digest=NULL WHERE workspace_id=?1 AND job_id=?2",
-        rusqlite::params![TEST_WORKSPACE_ID, uncertain_job],
-    )
-    .unwrap();
     let incomplete = json!({
         "worker":old,"binding_id":old_binding.binding_id,"operation_id":"connected-incomplete-release",
     });
@@ -618,17 +606,15 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     );
     let recording = api
         .config_store
-        .get_release_journal_recording(TEST_WORKSPACE_ID, &old)
+        .get_subject_release_input_handoff(TEST_WORKSPACE_ID, &old)
         .unwrap()
         .unwrap();
-    assert!(recording.released && !recording.recording.completed);
-    assert!(!recording.recording.members.is_empty());
-    conn.execute(
-        "UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4 WHERE workspace_id=?1 AND job_id=?2",
-        rusqlite::params![TEST_WORKSPACE_ID, uncertain_job, saved_result.0, saved_result.1],
-    )
-    .unwrap();
-    // Replay the same release, resuming recording without reclaiming the body.
+    assert!(
+        recording.released
+            && recording.handoff.handoff_status == crate::store::InputHandoffStatus::Admitted
+    );
+    assert!(!recording.handoff.members.is_empty());
+    // Replay the same release without reopening the terminal input handoff or body.
     let release =
         subjektiv_journal::release_subject(&api, serde_json::from_value(incomplete).unwrap())
             .unwrap();
@@ -1623,8 +1609,8 @@ async fn seed_unstarted_pending_head(
         "status": "stopped",
         "workspace_id": TEST_WORKSPACE_ID,
         "execution_state": {
-            "state": "available",
-            "execution": { "request": request, "restore_intent": "explicit" },
+            "state": "not_started",
+            "execution": { "request": request, "binding": null },
         },
     });
     std::fs::write(
@@ -1940,6 +1926,8 @@ async fn connected_restore_fixture_with_pending_head(
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(record["execution_state"]["state"], "not_started");
+        assert!(record["execution_state"]["execution"]["binding"].is_null());
         assert!(record["restore_guard"]["execution_termination"].is_null());
         assert!(probe.handles.lock().unwrap().is_empty());
         assert!(probe.stops.lock().unwrap().is_empty());
@@ -2229,7 +2217,7 @@ async fn confirmed_restore_preserves_attribution_with_revoked_host_trust_but_pro
         owner["operation_id"], operation,
         "the durable operation identity must survive accepted replay and read denial"
     );
-    assert_eq!(record["execution_state"]["state"], "available");
+    assert_eq!(record["execution_state"]["state"], "runnable");
     assert!(
         !owner["receipt"].is_null(),
         "successful Restore must retain its Accepted receipt"

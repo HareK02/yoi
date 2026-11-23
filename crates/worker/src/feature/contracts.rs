@@ -40,7 +40,7 @@ pub(crate) fn validate_launch_selection(
 }
 
 pub const WORKER_CONTROL_SERVICE_ID: &str = "worker.control";
-pub const WORKER_CONTROL_SERVICE_VERSION: &str = "1";
+pub const WORKER_CONTROL_SERVICE_VERSION: &str = "2";
 pub const WORKER_LIFECYCLE_SERVICE_ID: &str = "worker.lifecycle";
 pub const WORKER_LIFECYCLE_SERVICE_VERSION: &str = "1";
 
@@ -71,6 +71,11 @@ pub enum WorkerControlStopKind {
 pub trait WorkerControlService: Send + Sync {
     fn workspace_id(&self) -> &str;
     async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError>;
+    async fn worker_details(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
     async fn send_input(
         &self,
         subject: WorkerControlSubject,

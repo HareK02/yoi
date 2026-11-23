@@ -379,10 +379,11 @@ impl ControllerFixture {
             record.workspace_id.as_deref(),
             Some(self.workspace_scope.workspace_id.as_str())
         );
-        let crate::fs_store::PersistedWorkerExecutionState::Available(execution) =
-            record.execution_state
-        else {
-            panic!("seed catalog must retain its original available execution request");
+        use crate::fs_store::PersistedWorkerExecutionState;
+        let execution = match record.execution_state {
+            PersistedWorkerExecutionState::Runnable(execution)
+            | PersistedWorkerExecutionState::Stopped(Some(execution)) => execution,
+            _ => panic!("seed catalog must retain its original trusted execution request"),
         };
         assert_eq!(execution.request, self.create_request);
     }

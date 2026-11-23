@@ -5084,10 +5084,7 @@ mod tests {
             failure.facts().cause(),
             &protocol::control_failure::RuntimeControlCause::ExecutionRejected
         );
-        assert_eq!(
-            *backend.inputs.lock().unwrap(),
-            vec![created.worker_ref.clone()]
-        );
+        assert!(backend.inputs.lock().unwrap().is_empty());
 
         #[cfg(feature = "ws-server")]
         {
@@ -6026,10 +6023,13 @@ mod ws_tests {
                 .get(worker_ref)
                 .unwrap()
                 .clone();
-            let observation = execution
+            let crate::execution::WorkerObservationPublication::Published(observation) = execution
                 .context
                 .publish_protocol_event(event.clone())
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("fixture requires active publication")
+            };
             // The fixture publishes separately to Runtime history and to this
             // Controller's attached streams, just like the backend event relay.
             execution
@@ -6396,6 +6396,7 @@ mod ws_tests {
                 .unwrap()
                 .worker_state
                 .expect("connected test Worker must expose its initial state");
+            snapshot.state_sequence += 1;
             snapshot.state = protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             ));
@@ -6424,7 +6425,8 @@ mod ws_tests {
                 ..
             }) if delivered_subscription_id == subscription_id
                 && worker.worker_id.as_str() == worker_ref.worker_id.to_string()
-                && worker.state == protocol::subscription::SubscriptionWorkerState::Idle
+                && worker.state == protocol::subscription::SubscriptionWorkerState::Running
+                && worker.lifecycle == Some(protocol::WorkerLifecycleState::Active)
                 && matches!(
                     worker.worker_state,
                     Some(protocol::WorkerStateSnapshot {

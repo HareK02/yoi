@@ -43,8 +43,8 @@ impl Tail {
                 (126, OLD_SERVICE_NAME, OLD_SERVICE_DDL),
                 (
                     127,
-                    journal_removal_store::MIGRATION_NAME,
-                    journal_removal_store::SCHEMA_SQL,
+                    worker_input_handoff_store::MIGRATION_NAME,
+                    worker_input_handoff_store::SCHEMA_SQL,
                 ),
             ],
             Self::Published => [
@@ -53,8 +53,8 @@ impl Tail {
                 (126, RETAINED_STARTUP_MIGRATION_NAME, STARTUP_DDL),
                 (
                     127,
-                    journal_removal_store::MIGRATION_NAME,
-                    journal_removal_store::SCHEMA_SQL,
+                    worker_input_handoff_store::MIGRATION_NAME,
+                    worker_input_handoff_store::SCHEMA_SQL,
                 ),
             ],
         }
@@ -796,7 +796,7 @@ fn assert_journal_bridge_plan(plan: &WorkspaceSchemaMigrationPlan) {
             .iter()
             .map(|step| (step.version, step.name.as_str()))
             .collect::<Vec<_>>(),
-        [(127, journal_removal_store::RETAINED_BRIDGE_NAME)]
+        [(127, worker_input_handoff_store::RETAINED_BRIDGE_NAME)]
             .into_iter()
             .chain(
                 MIGRATIONS
@@ -966,7 +966,7 @@ fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_
             fixture(&path, tail, 126, origin);
             let conn = Connection::open(&path).unwrap();
             configure_sqlite(&conn).unwrap();
-            journal_removal_store::migrate_to_v127(&conn).unwrap();
+            worker_input_handoff_store::migrate_to_v127(&conn).unwrap();
             migrate_ticket_plan_retirement_v127_to_v128(&conn).unwrap();
             conn.execute_batch("CREATE TRIGGER interrupt_publication_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=129 BEGIN SELECT RAISE(ABORT,'injected publication receipt interruption'); END;").unwrap();
             let before_schema = schema(&conn);

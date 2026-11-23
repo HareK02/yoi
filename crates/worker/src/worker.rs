@@ -807,6 +807,10 @@ pub enum WorkspaceServerOperation {
         result_id: String,
     },
     WorkerControlList,
+    WorkerControlDetails {
+        runtime_id: String,
+        worker_id: String,
+    },
     WorkerControlAuthorize {
         runtime_id: String,
         worker_id: String,
@@ -1009,6 +1013,14 @@ fn workspace_server_operation_request(
         ))),
         WorkspaceServerOperation::WorkerControlList => Ok(WorkspaceRequest::get(format!(
             "{base}/worker-control/workers"
+        ))),
+        WorkspaceServerOperation::WorkerControlDetails {
+            runtime_id,
+            worker_id,
+        } => Ok(WorkspaceRequest::get(format!(
+            "{base}/worker-control/workers/{}/{}",
+            encode_workspace_path_segment(&runtime_id),
+            encode_workspace_path_segment(&worker_id)
         ))),
         WorkspaceServerOperation::WorkerControlAuthorize {
             runtime_id,

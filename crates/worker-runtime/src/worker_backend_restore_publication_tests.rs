@@ -37,13 +37,12 @@ mod publication {
                 created_at_ms: None,
                 status: crate::catalog::WorkerStatus::Stopped,
                 last_finished_submission_request_id: None,
-                execution_state: PersistedWorkerExecutionState::Available(
+                execution_state: PersistedWorkerExecutionState::Stopped(Some(
                     PersistedWorkerExecution {
                         request: create,
                         binding: None,
-                        restore_intent: crate::catalog::WorkerRestoreIntent::Explicit,
                     },
-                ),
+                )),
                 workspace_id: Some(
                     fixture
                         .request

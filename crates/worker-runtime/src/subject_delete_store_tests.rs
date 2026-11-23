@@ -3,8 +3,9 @@ fn subject_delete_schema14_migration_adds_exclusion_store_without_changing_worke
     for with_fence in [false, true] {
         let (_temp, store, worker, path) = canonical_worker_store();
         let root = store.root.clone();
-        let mut legacy =
-            serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
+        let mut legacy = legacy_lifecycle_document(
+            serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap(),
+        );
         legacy["schema_version"] = serde_json::json!(RESTORE_REPAIR_SCHEMA_VERSION);
         legacy
             .as_object_mut()
@@ -41,6 +42,7 @@ fn subject_delete_schema14_migration_adds_exclusion_store_without_changing_worke
         assert_eq!(fs::read(&path).unwrap(), before);
         let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
         legacy["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+        migrate_v18_lifecycle(&mut legacy, &path).unwrap();
         legacy["workdir_attachments_guard"] = serde_json::to_value(
             &opened
                 .store

@@ -1,18 +1,13 @@
 import { assertEquals } from "jsr:@std/assert@1.0.19";
 import { chromium } from "npm:playwright@1.59.1";
-import {
-  startOwnedProcesses,
-  stopOwnedProcesses,
-} from "../../../../tools/web-ux/src/processes.ts";
+import { startOwnedProcesses, stopOwnedProcesses } from "../../../../tools/web-ux/src/processes.ts";
 
 // Real static Web build and shared owned-process harness. API/stream fixtures
 // prove rendering and browser interaction, not Backend persistence or authority.
 Deno.test("Worker removal receipts retain Workers and expose saved progress after reload", async () => {
   const before = Deno.args.includes("--before");
   const root = new URL("../../../../", import.meta.url).pathname;
-  const output = `${root}web/workspace/.svelte-kit/removal-review/${
-    before ? "before" : "after"
-  }/`;
+  const output = `${root}web/workspace/.svelte-kit/removal-review/${before ? "before" : "after"}/`;
   await Deno.mkdir(output, { recursive: true });
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
@@ -57,8 +52,7 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
               if (message.type() === "error") errors.push(message.text());
             });
             page.on("requestfailed", (request) => {
-              const message =
-                `${request.failure()?.errorText} ${request.url()}`;
+              const message = `${request.failure()?.errorText} ${request.url()}`;
               // The test deliberately reloads the document. Production catalog
               // refresh also aborts superseded GETs; no mutation is retried.
               if (
@@ -134,7 +128,7 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
               {
                 operation_id: `removal-${"long-operation-identity-".repeat(8)}`,
                 state: "waiting",
-                phase: "recording",
+                phase: "input_handoff",
                 cause: "job_pending",
               },
               {
@@ -179,9 +173,7 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
                     diagnostics: [],
                     items: deleted ? [] : [{
                       ...worker,
-                      ...(!before && active >= 0
-                        ? { removal: observations[active] }
-                        : {}),
+                      ...(!before && active >= 0 ? { removal: observations[active] } : {}),
                     }],
                   },
                 }),
@@ -303,9 +295,8 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
                 false,
               );
             };
-            let documentStatus =
-              (await page.goto(`${base}/w/${workspace}/workers`))?.status() ??
-                null;
+            let documentStatus = (await page.goto(`${base}/w/${workspace}/workers`))?.status() ??
+              null;
             assertEquals(documentStatus, 200);
             await page.getByRole("button", {
               name: `Delete ${worker.display_name}`,
@@ -366,16 +357,16 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
                 const [cause, phase, label] of [
                   [
                     "recording_disabled",
-                    "recording",
+                    "input_handoff",
                     "Journal recording disabled",
                   ],
-                  ["source_unavailable", "recording", "Source unavailable"],
+                  ["source_unavailable", "input_handoff", "Source unavailable"],
                   [
                     "ownership_unknown",
                     "awaiting_quiescence",
                     "Ownership unknown",
                   ],
-                  ["job_failed", "recording", "Journal job failed"],
+                  ["job_failed", "input_handoff", "Journal job failed"],
                   [
                     "storage_unavailable",
                     "awaiting_effects_end",

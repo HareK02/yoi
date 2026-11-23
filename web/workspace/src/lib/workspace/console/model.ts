@@ -205,6 +205,9 @@ export type ConsoleProjection = {
   appliedTaskCallIds: ReadonlySet<string>;
   status: string | null;
   workerState: WorkerStateSnapshot | null;
+  observationUnavailable: boolean;
+  /** None／無効化後も同一sessionの古い観測を拒否するhigh-water。 */
+  observationStateSequence: number;
   compaction: InFlightCompaction | null;
   usage: string | null;
   runActivity: RunActivityStats;
@@ -313,6 +316,8 @@ export function emptyConsoleProjection(): ConsoleProjection {
     appliedTaskCallIds: new Set(),
     status: null,
     workerState: null,
+    observationUnavailable: false,
+    observationStateSequence: 0,
     compaction: null,
     usage: null,
     runActivity: emptyRunActivityStats(),
@@ -982,13 +987,28 @@ function projectInternalWorkerSnapshot(
   snapshot: InternalWorkerSnapshot,
   eventId: string,
   cwd: string | null,
+  previous?: ConsoleProjection,
 ): InternalWorkerProjection {
   let console = snapshotProjectionFromSession(
     `${eventId}:internal:${snapshot.worker.session_id}:snapshot`,
     snapshot.session,
     cwd,
   );
-  console.status = snapshot.status;
+  // 親のsequenceは子の鮮度を証明しない。同一sessionのhigh-waterだけを使う。
+  if (previous) {
+    console.workerState = previous.workerState;
+    console.status = previous.status;
+    console.observationUnavailable = previous.observationUnavailable;
+    console.observationStateSequence = previous.observationStateSequence;
+  }
+  if (
+    snapshot.state &&
+    snapshot.state.state_sequence >= console.observationStateSequence
+  ) {
+    // paired親snapshotだけが無効化済みの子観測を回復できる。
+    console.observationUnavailable = false;
+    applyWorkerStateSnapshot(console, snapshot.state);
+  }
   console.runActivity = restoredRunActivity(snapshot.session.entries);
   console.workerMetadata = snapshot.greeting
     ? metadataFromGreeting(snapshot.greeting)
@@ -1017,10 +1037,20 @@ function projectInternalWorkerSnapshot(
     });
   }
   console.internalWorkers = (snapshot.internal_workers ?? []).map((child) =>
-    projectInternalWorkerSnapshot(child, eventId, cwd)
+    projectInternalWorkerSnapshot(
+      child,
+      eventId,
+      cwd,
+      previous?.internalWorkers.find((known) =>
+        known.worker.session_id === child.worker.session_id
+      )?.console,
+    )
   );
   if (snapshot.in_flight?.compaction) {
     console = applyInFlightCompaction(console, snapshot.in_flight.compaction);
+  }
+  if (!snapshot.state || console.observationUnavailable) {
+    invalidateObservation(console);
   }
   return { worker: snapshot.worker, console };
 }
@@ -1143,8 +1173,24 @@ function applyWorkerStateSnapshot(
   projection: ConsoleProjection,
   incoming: WorkerStateSnapshot,
 ): void {
+  if (
+    projection.observationUnavailable ||
+    incoming.state_sequence < projection.observationStateSequence
+  ) return;
+  projection.observationStateSequence = incoming.state_sequence;
   projection.workerState = incoming;
   projection.status = workerStatusFromState(incoming);
+}
+
+function invalidateObservation(projection: ConsoleProjection): void {
+  projection.observationUnavailable = true;
+  projection.status = null;
+  projection.workerState = null;
+  projection.internalWorkers = projection.internalWorkers.map((child) => {
+    const console = { ...child.console };
+    invalidateObservation(console);
+    return { ...child, console };
+  });
 }
 
 export function applyProtocolEvent(
@@ -1152,6 +1198,11 @@ export function applyProtocolEvent(
   envelope: ConsoleEventInput,
 ): ConsoleProjection {
   const event = envelope.event;
+  if (
+    projection.observationUnavailable &&
+    (event.event === "worker_state" || event.event === "snapshot" ||
+      event.event === "internal_worker")
+  ) return projection;
   const next: ConsoleProjection = {
     lines: [...projection.lines],
     tasks: [...projection.tasks],
@@ -1159,6 +1210,8 @@ export function applyProtocolEvent(
     appliedTaskCallIds: projection.appliedTaskCallIds,
     status: projection.status,
     workerState: projection.workerState,
+    observationUnavailable: projection.observationUnavailable,
+    observationStateSequence: projection.observationStateSequence,
     compaction: projection.compaction,
     usage: projection.usage,
     runActivity: applyRunActivityEvent(
@@ -1345,7 +1398,14 @@ export function applyProtocolEvent(
         `${envelope.eventId}:snapshot-command`,
       );
       next.internalWorkers = (event.data.internal_workers ?? []).map((worker) =>
-        projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
+        projectInternalWorkerSnapshot(
+          worker,
+          envelope.eventId,
+          next.cwd,
+          projection.internalWorkers.find((known) =>
+            known.worker.session_id === worker.worker.session_id
+          )?.console,
+        )
       );
       const retained = retainSnapshotAlerts(projection, next);
       next.lines = retained.lines;
@@ -1388,6 +1448,17 @@ export function applyProtocolEvent(
       if (existingIndex >= 0) next.internalWorkers[existingIndex] = updated;
       else next.internalWorkers.push(updated);
       return refreshCompactionActivity(next, event.data.worker);
+    }
+    case "internal_worker_observation_unavailable": {
+      next.internalWorkers = next.internalWorkers.map((child) => {
+        if (child.worker.session_id !== event.data.worker.session_id) {
+          return child;
+        }
+        const console = { ...child.console };
+        invalidateObservation(console);
+        return { ...child, console };
+      });
+      break;
     }
     case "internal_worker_removed": {
       const existingIndex = next.internalWorkers.findIndex((worker) =>
@@ -1476,6 +1547,7 @@ export function applyProtocolEvent(
       next.workerMetadata = metadataWithoutContext(next.workerMetadata);
       break;
     case "shutdown":
+      invalidateObservation(next);
       next.status = "shutdown";
       break;
   }
@@ -2423,7 +2495,9 @@ function applyTaskTool(
   if (projection.appliedTaskCallIds.has(callId)) return;
   // Fence task mutations, not tool-row reconciliation or corrected results.
   // Copy on write so previously returned projections remain unchanged.
-  projection.appliedTaskCallIds = new Set(projection.appliedTaskCallIds).add(callId);
+  projection.appliedTaskCallIds = new Set(projection.appliedTaskCallIds).add(
+    callId,
+  );
   const state = applyTaskToolCall(
     { tasks: projection.tasks, nextTaskId: projection.taskNextId },
     name,
@@ -2463,6 +2537,8 @@ function snapshotProjectionFromSession(
     appliedTaskCallIds: new Set(),
     status: null,
     workerState: null,
+    observationUnavailable: false,
+    observationStateSequence: 0,
     compaction: null,
     usage: null,
     runActivity: emptyRunActivityStats(),

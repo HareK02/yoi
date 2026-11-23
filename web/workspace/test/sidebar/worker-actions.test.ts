@@ -587,7 +587,7 @@ Deno.test("sidebar Delete accepts HTTP 202 but retains the Worker and saved oper
     const removal = {
       operation_id: "original-removal-operation",
       state,
-      phase: "recording" as const,
+      phase: "input_handoff" as const,
       cause: state === "held" ? "job_failed" as const : "job_pending" as const,
     };
     const receipt = {

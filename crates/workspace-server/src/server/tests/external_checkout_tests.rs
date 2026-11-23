@@ -53,6 +53,7 @@ async fn external_checkout_diagnostics_preserve_mutation_outcome_and_read_failur
                     generation: 1,
                     expires_at: None,
                     capabilities: workdir::WorkdirSessionCapabilities::ALL,
+                    access_fenced: std::sync::atomic::AtomicBool::new(false),
                     admission: Arc::new(tokio::sync::Semaphore::new(16)),
                     shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     sender,

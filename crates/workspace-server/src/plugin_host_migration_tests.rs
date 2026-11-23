@@ -12,7 +12,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
     assert!(!table_exists(&conn, "plugin_invocations").unwrap());
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 108);
-    assert_eq!(plan.target_schema_version, 138);
+    assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
     // No schema-132 migration is registered between launch and Subject policies.
     assert_eq!(
         plan.migrations
@@ -21,7 +21,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
             .collect::<Vec<_>>(),
         [
             109, 110, 111, 112, 113, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 133, 134,
-            135, 136, 137, 138
+            135, 136, 137, 138, 139, 140, 141
         ]
     );
     let expected_history: Vec<_> = history
@@ -65,19 +65,28 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
                     .find(|(version, _)| *version == 127)
                     .unwrap()
                     .1,
-                journal_removal_store::MIGRATION_NAME
+                worker_input_handoff_store::MIGRATION_NAME
             );
             assert_eq!(
-                &upgraded[upgraded.len() - 8..],
+                &upgraded[upgraded.len() - 11..],
                 &[
                     (130, backend_job_current::MIGRATION_NAME.into()),
                     (131, crate::launch_policy::MIGRATION_NAME.into()),
                     (133, crate::subject_policy::MIGRATION_NAME.into()),
                     (134, backend_job_finalizing::MIGRATION_NAME.into()),
-                    (135, subject_release_recording_store::MIGRATION_NAME.into()),
+                    (
+                        135,
+                        subject_release_input_handoff_store::MIGRATION_NAME.into()
+                    ),
                     (136, launch_policy_identity_migration::MIGRATION_NAME.into()),
                     (137, worker_lifecycle_notifications::MIGRATION_NAME.into()),
-                    (138, notification_routing::merge_requests::MIGRATION_NAME.into()),
+                    (
+                        138,
+                        notification_routing::merge_requests::MIGRATION_NAME.into()
+                    ),
+                    (139, backend_job_result_application::MIGRATION_NAME.into()),
+                    (140, backend_job_recording_input::MIGRATION_NAME.into()),
+                    (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
                 ]
             );
             assert_eq!(
