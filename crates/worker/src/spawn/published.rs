@@ -7,11 +7,52 @@
 
 use crate::internal_worker::InternalWorkerSessionHandle;
 use protocol::{Event, InFlightBlock, InternalWorkerSnapshot, SessionSnapshotEntryData as Data};
-use std::sync::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 use tokio::sync::broadcast;
 
+/// Keep source high-water marks even while the public observation is unavailable.
+/// This metadata is local to the paired published stream, not another state owner.
+#[derive(Default)]
+struct ObservationHistory {
+    sequence: u64,
+    children: HashMap<String, ObservationHistory>,
+    removed: HashSet<String>,
+}
+
+impl ObservationHistory {
+    fn new(snapshot: &InternalWorkerSnapshot) -> Self {
+        Self {
+            sequence: snapshot
+                .state
+                .as_ref()
+                .map_or(0, |state| state.state_sequence),
+            children: snapshot
+                .internal_workers
+                .iter()
+                .map(|child| (child.worker.session_id.clone(), Self::new(child)))
+                .collect(),
+            removed: HashSet::new(),
+        }
+    }
+}
+
+pub(super) struct PublishedSnapshot {
+    pub snapshot: InternalWorkerSnapshot,
+    history: ObservationHistory,
+}
+
+impl PublishedSnapshot {
+    pub(super) fn new(snapshot: InternalWorkerSnapshot) -> Self {
+        let history = ObservationHistory::new(&snapshot);
+        Self { snapshot, history }
+    }
+}
+
 pub(super) struct PublishedProtocol {
-    pub snapshot: Mutex<InternalWorkerSnapshot>,
+    pub snapshot: Mutex<PublishedSnapshot>,
     pub events: Mutex<Option<broadcast::Receiver<Event>>>,
 }
 
@@ -20,7 +61,7 @@ impl PublishedProtocol {
     pub fn new(source: &InternalWorkerSessionHandle, worker: protocol::InternalWorkerRef) -> Self {
         let (initial, events) = source.subscribe_protocol();
         Self {
-            snapshot: Mutex::new(InternalWorkerSnapshot {
+            snapshot: Mutex::new(PublishedSnapshot::new(InternalWorkerSnapshot {
                 worker,
                 session: initial.session,
                 greeting: initial.greeting,
@@ -29,21 +70,84 @@ impl PublishedProtocol {
                 error: initial.error,
                 in_flight: initial.in_flight,
                 internal_workers: initial.internal_workers,
-            }),
+            })),
             events: Mutex::new(Some(events)),
         }
     }
 }
 
-pub(super) fn invalidate(snapshot: &mut InternalWorkerSnapshot) {
+pub(super) fn invalidate(published: &mut PublishedSnapshot) {
+    invalidate_node(&mut published.snapshot);
+}
+
+fn invalidate_node(snapshot: &mut InternalWorkerSnapshot) {
     snapshot.state = None;
     for child in &mut snapshot.internal_workers {
-        invalidate(child);
+        invalidate_node(child);
+    }
+}
+
+/// A full snapshot supplies membership, but each descendant supplies its own
+/// source ordering. In particular, the parent's sequence says nothing about a
+/// child's completion marker. Only a paired snapshot may reopen a closed child.
+fn merge_children(
+    current: &mut Vec<InternalWorkerSnapshot>,
+    incoming: &[InternalWorkerSnapshot],
+    history: &mut ObservationHistory,
+) {
+    let mut previous = std::mem::take(current)
+        .into_iter()
+        .map(|child| (child.worker.session_id.clone(), child))
+        .collect::<HashMap<_, _>>();
+    let mut histories = std::mem::take(&mut history.children);
+    history.removed.clear();
+    for next in incoming {
+        let id = &next.worker.session_id;
+        let old = previous.remove(id);
+        let mut child_history = histories.remove(id).unwrap_or_else(|| {
+            old.as_ref()
+                .map(ObservationHistory::new)
+                .unwrap_or_default()
+        });
+        let mut merged = next.clone();
+        if let Some(old) = old {
+            let mut children = old.internal_workers.clone();
+            merge_children(&mut children, &next.internal_workers, &mut child_history);
+            match &next.state {
+                Some(state) if state.state_sequence < child_history.sequence => merged = old,
+                Some(state) => child_history.sequence = state.state_sequence,
+                None => {}
+            }
+            merged.internal_workers = children;
+        } else {
+            child_history = ObservationHistory::new(next);
+        }
+        // Explicit absence is not an older state. It closes the whole subtree
+        // without discarding the high-water marks needed by a later recovery.
+        if merged.state.is_none() {
+            invalidate_node(&mut merged);
+        }
+        history.children.insert(id.clone(), child_history);
+        current.push(merged);
     }
 }
 
 pub(super) fn apply(
+    published: &mut PublishedSnapshot,
+    event: &Event,
+    source: &InternalWorkerSessionHandle,
+) {
+    apply_event(
+        &mut published.snapshot,
+        &mut published.history,
+        event,
+        source,
+    );
+}
+
+fn apply_event(
     snapshot: &mut InternalWorkerSnapshot,
+    history: &mut ObservationHistory,
     event: &Event,
     source: &InternalWorkerSessionHandle,
 ) {
@@ -57,12 +161,8 @@ pub(super) fn apply(
     {
         return;
     }
-    let incoming = match event {
-        Event::Snapshot { state, .. } | Event::WorkerState { snapshot: state } => Some(state),
-        _ => None,
-    };
-    if let (Some(current), Some(incoming)) = (&snapshot.state, incoming)
-        && incoming.state_sequence < current.state_sequence
+    if let Event::WorkerState { snapshot: incoming } = event
+        && incoming.state_sequence < history.sequence
     {
         return;
     }
@@ -74,14 +174,18 @@ pub(super) fn apply(
             in_flight,
             internal_workers,
         } => {
-            snapshot.session = session.clone();
-            snapshot.greeting = Some(greeting.clone());
-            snapshot.status = state.catalog_status();
-            snapshot.state = Some(state.clone());
-            snapshot.in_flight = in_flight.clone();
-            snapshot.internal_workers = internal_workers.clone();
+            merge_children(&mut snapshot.internal_workers, internal_workers, history);
+            if state.state_sequence >= history.sequence {
+                history.sequence = state.state_sequence;
+                snapshot.session = session.clone();
+                snapshot.greeting = Some(greeting.clone());
+                snapshot.status = state.catalog_status();
+                snapshot.state = Some(state.clone());
+                snapshot.in_flight = in_flight.clone();
+            }
         }
         Event::WorkerState { snapshot: state } => {
+            history.sequence = state.state_sequence;
             snapshot.status = state.catalog_status();
             snapshot.state = Some(state.clone());
             if snapshot.status != protocol::WorkerStatus::Running {
@@ -92,7 +196,7 @@ pub(super) fn apply(
         }
         Event::Shutdown => {
             snapshot.status = protocol::WorkerStatus::Stopped;
-            invalidate(snapshot);
+            invalidate_node(snapshot);
             snapshot.in_flight = Default::default();
         }
         Event::Error { message, .. } => snapshot.error = Some(message.clone()),
@@ -297,12 +401,19 @@ pub(super) fn apply(
         }
         Event::Command { event } => apply_command(&mut snapshot.in_flight.commands, event),
         Event::InternalWorker { worker, event } => {
+            if history.removed.contains(&worker.session_id) {
+                return;
+            }
             if let Some(child) = snapshot
                 .internal_workers
                 .iter_mut()
                 .find(|child| child.worker.session_id == worker.session_id)
             {
-                apply(child, event, source);
+                let child_history = history
+                    .children
+                    .entry(worker.session_id.clone())
+                    .or_insert_with(|| ObservationHistory::new(child));
+                apply_event(child, child_history, event, source);
             } else if let Event::Snapshot {
                 session,
                 greeting,
@@ -311,7 +422,7 @@ pub(super) fn apply(
                 internal_workers,
             } = event.as_ref()
             {
-                snapshot.internal_workers.push(InternalWorkerSnapshot {
+                let child = InternalWorkerSnapshot {
                     worker: worker.clone(),
                     session: session.clone(),
                     greeting: Some(greeting.clone()),
@@ -320,7 +431,11 @@ pub(super) fn apply(
                     error: None,
                     in_flight: in_flight.clone(),
                     internal_workers: internal_workers.clone(),
-                });
+                };
+                history
+                    .children
+                    .insert(worker.session_id.clone(), ObservationHistory::new(&child));
+                snapshot.internal_workers.push(child);
             }
         }
         Event::InternalWorkerObservationUnavailable { worker } => {
@@ -329,15 +444,23 @@ pub(super) fn apply(
                 .iter_mut()
                 .find(|child| child.worker.session_id == worker.session_id)
             {
-                invalidate(child);
+                invalidate_node(child);
             }
         }
-        Event::InternalWorkerRemoved { worker } => snapshot
-            .internal_workers
-            .retain(|child| child.worker.session_id != worker.session_id),
+        Event::InternalWorkerRemoved { worker } => {
+            snapshot
+                .internal_workers
+                .retain(|child| child.worker.session_id != worker.session_id);
+            history.children.remove(&worker.session_id);
+            history.removed.insert(worker.session_id.clone());
+        }
         _ => {}
     }
 }
+
+#[cfg(test)]
+#[path = "published_tests.rs"]
+mod tests;
 
 fn committed_entries(
     source: &InternalWorkerSessionHandle,

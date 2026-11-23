@@ -206,6 +206,8 @@ export type ConsoleProjection = {
   status: string | null;
   workerState: WorkerStateSnapshot | null;
   observationUnavailable: boolean;
+  /** None／無効化後も同一sessionの古い観測を拒否するhigh-water。 */
+  observationStateSequence: number;
   compaction: InFlightCompaction | null;
   usage: string | null;
   runActivity: RunActivityStats;
@@ -315,6 +317,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     status: null,
     workerState: null,
     observationUnavailable: false,
+    observationStateSequence: 0,
     compaction: null,
     usage: null,
     runActivity: emptyRunActivityStats(),
@@ -984,13 +987,28 @@ function projectInternalWorkerSnapshot(
   snapshot: InternalWorkerSnapshot,
   eventId: string,
   cwd: string | null,
+  previous?: ConsoleProjection,
 ): InternalWorkerProjection {
   let console = snapshotProjectionFromSession(
     `${eventId}:internal:${snapshot.worker.session_id}:snapshot`,
     snapshot.session,
     cwd,
   );
-  if (snapshot.state) applyWorkerStateSnapshot(console, snapshot.state);
+  // 親のsequenceは子の鮮度を証明しない。同一sessionのhigh-waterだけを使う。
+  if (previous) {
+    console.workerState = previous.workerState;
+    console.status = previous.status;
+    console.observationUnavailable = previous.observationUnavailable;
+    console.observationStateSequence = previous.observationStateSequence;
+  }
+  if (
+    snapshot.state &&
+    snapshot.state.state_sequence >= console.observationStateSequence
+  ) {
+    // paired親snapshotだけが無効化済みの子観測を回復できる。
+    console.observationUnavailable = false;
+    applyWorkerStateSnapshot(console, snapshot.state);
+  }
   console.runActivity = restoredRunActivity(snapshot.session.entries);
   console.workerMetadata = snapshot.greeting
     ? metadataFromGreeting(snapshot.greeting)
@@ -1019,12 +1037,21 @@ function projectInternalWorkerSnapshot(
     });
   }
   console.internalWorkers = (snapshot.internal_workers ?? []).map((child) =>
-    projectInternalWorkerSnapshot(child, eventId, cwd)
+    projectInternalWorkerSnapshot(
+      child,
+      eventId,
+      cwd,
+      previous?.internalWorkers.find((known) =>
+        known.worker.session_id === child.worker.session_id
+      )?.console,
+    )
   );
   if (snapshot.in_flight?.compaction) {
     console = applyInFlightCompaction(console, snapshot.in_flight.compaction);
   }
-  if (!snapshot.state) invalidateObservation(console);
+  if (!snapshot.state || console.observationUnavailable) {
+    invalidateObservation(console);
+  }
   return { worker: snapshot.worker, console };
 }
 
@@ -1148,9 +1175,9 @@ function applyWorkerStateSnapshot(
 ): void {
   if (
     projection.observationUnavailable ||
-    (projection.workerState &&
-      incoming.state_sequence < projection.workerState.state_sequence)
+    incoming.state_sequence < projection.observationStateSequence
   ) return;
+  projection.observationStateSequence = incoming.state_sequence;
   projection.workerState = incoming;
   projection.status = workerStatusFromState(incoming);
 }
@@ -1184,6 +1211,7 @@ export function applyProtocolEvent(
     status: projection.status,
     workerState: projection.workerState,
     observationUnavailable: projection.observationUnavailable,
+    observationStateSequence: projection.observationStateSequence,
     compaction: projection.compaction,
     usage: projection.usage,
     runActivity: applyRunActivityEvent(
@@ -1370,7 +1398,14 @@ export function applyProtocolEvent(
         `${envelope.eventId}:snapshot-command`,
       );
       next.internalWorkers = (event.data.internal_workers ?? []).map((worker) =>
-        projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
+        projectInternalWorkerSnapshot(
+          worker,
+          envelope.eventId,
+          next.cwd,
+          projection.internalWorkers.find((known) =>
+            known.worker.session_id === worker.worker.session_id
+          )?.console,
+        )
       );
       const retained = retainSnapshotAlerts(projection, next);
       next.lines = retained.lines;
@@ -2503,6 +2538,7 @@ function snapshotProjectionFromSession(
     status: null,
     workerState: null,
     observationUnavailable: false,
+    observationStateSequence: 0,
     compaction: null,
     usage: null,
     runActivity: emptyRunActivityStats(),
