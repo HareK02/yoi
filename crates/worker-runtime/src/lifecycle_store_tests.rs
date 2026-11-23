@@ -401,6 +401,11 @@ fn schema17_historical_receipts_survive_without_becoming_current_execution() {
     }
     old_worker["execution_metadata_available"] = serde_json::json!(true);
     old_worker["restore_observation_token"] = token.clone();
+    old_worker["worker_state"] = serde_json::json!({
+        "last_command_id": 23,
+        "last_finished_submission_request_id": "retained-submission",
+        "state": {"kind": "busy", "state": {"kind": "run", "state": "paused"}}
+    });
     let restore_id = WorkerLifecycleOperationId::new();
     let restore_receipt = serde_json::json!({"state": "accepted", "worker": old_worker, "reason_code": null, "message": null});
     document["restore_guard"]["owners"]["old-restore"] = serde_json::json!({
@@ -449,6 +454,9 @@ fn schema17_historical_receipts_survive_without_becoming_current_execution() {
         restored_receipt["worker"]["profile_source"],
         restore_receipt["worker"]["profile_source"]
     );
+    let mut expected_snapshot = restore_receipt["worker"]["worker_state"].clone();
+    expected_snapshot["state_sequence"] = serde_json::json!(0);
+    assert_eq!(restored_receipt["worker"]["worker_state"], expected_snapshot);
     let mut restored_stop = disk["restore_guard"]["stop_owners"]["old-stop"]["receipt"].clone();
     assert_eq!(restored_stop["lifecycle"], "stopped");
     restored_stop.as_object_mut().unwrap().remove("lifecycle");

@@ -10053,7 +10053,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         workspace_id,
                         runtime_id,
                         worker,
-                        SubscriptionWorkerAvailability::Observed,
+                        worker.availability,
                         observed_at,
                     )?
                 } else {
@@ -10098,7 +10098,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 workspace_id,
                 runtime_id,
                 worker,
-                SubscriptionWorkerAvailability::Observed,
+                worker.availability,
                 observed_at,
             )?;
             let changed_workers = if changed { vec![identity] } else { Vec::new() };

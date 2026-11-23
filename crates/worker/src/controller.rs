@@ -21,7 +21,7 @@ use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::runtime::dir::RuntimeDir;
 use crate::segment_log_sink::SegmentLogSink;
-use crate::shared_state::{WorkerCommandAdmission, WorkerSharedState};
+use crate::shared_state::{WorkerCommandAdmission, WorkerSharedState, WorkerStateOwner};
 use crate::shutdown_after_idle::{
     ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
     take_shutdown_request_after_status,
@@ -363,9 +363,41 @@ impl WorkerHandle {
         }
     }
 
-    /// Broadcast an event to all listeners.
-    pub fn send_event(&self, event: Event) -> Result<usize, broadcast::error::SendError<Event>> {
-        self.working_event_tx.send(event)
+    /// Publish a Host diagnostic without granting execution-state event authority.
+    ///
+    /// State snapshots, including child-wrapped snapshots, can only originate
+    /// from their execution owner, never from a cloned handle.
+    ///
+    /// ```compile_fail,E0599
+    /// fn spoof(handle: &worker::WorkerHandle, snapshot: protocol::WorkerStateSnapshot) {
+    ///     handle.send_event(protocol::Event::WorkerState { snapshot });
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// fn spoof_child(handle: &worker::WorkerHandle, worker: protocol::InternalWorkerRef,
+    ///                snapshot: protocol::WorkerStateSnapshot) {
+    ///     handle.send_event(protocol::Event::InternalWorker {
+    ///         worker, event: Box::new(protocol::Event::WorkerState { snapshot }),
+    ///     });
+    /// }
+    /// ```
+    ///
+    /// Even the diagnostic API cannot publish an otherwise valid Snapshot.
+    ///
+    /// ```compile_fail,E0308
+    /// fn spoof_snapshot(handle: &worker::WorkerHandle, session: protocol::SessionSnapshot,
+    ///                   greeting: protocol::Greeting, state: protocol::WorkerStateSnapshot) {
+    ///     handle.publish_alert(protocol::Event::Snapshot {
+    ///         session, greeting, state, in_flight: Default::default(), internal_workers: vec![],
+    ///     });
+    /// }
+    /// ```
+    pub fn publish_alert(
+        &self,
+        alert: protocol::Alert,
+    ) -> Result<usize, broadcast::error::SendError<Event>> {
+        self.working_event_tx.send(Event::Alert(alert))
     }
 
     /// Emit a user-facing alert. Thin wrapper over `Alerter::alert`.
@@ -419,7 +451,7 @@ async fn release_requested(shared_state: &WorkerSharedState) {
 
 fn acknowledge_command(
     working_event_tx: &broadcast::Sender<Event>,
-    shared_state: &WorkerSharedState,
+    shared_state: &WorkerStateOwner,
     command_id: u64,
     command: WorkerCommandKind,
     disposition: WorkerCommandDisposition,
@@ -430,7 +462,7 @@ fn acknowledge_command(
 
 fn reject_invalid_command_state(
     working_event_tx: &broadcast::Sender<Event>,
-    shared_state: &WorkerSharedState,
+    shared_state: &WorkerStateOwner,
     envelope: WorkerCommandEnvelope,
     command: WorkerCommandKind,
 ) {
@@ -444,7 +476,7 @@ fn reject_invalid_command_state(
 }
 
 async fn set_controller_state(
-    shared_state: &Arc<WorkerSharedState>,
+    shared_state: &WorkerStateOwner,
     working_event_tx: &broadcast::Sender<Event>,
     state: WorkerState,
 ) -> protocol::WorkerStateSnapshot {
@@ -456,7 +488,7 @@ async fn set_controller_state(
 }
 
 fn publish_context_usage(
-    shared_state: &Arc<WorkerSharedState>,
+    shared_state: &WorkerStateOwner,
     working_event_tx: &broadcast::Sender<Event>,
     tokens: Option<u64>,
     source: protocol::ContextTokenSource,
@@ -467,7 +499,7 @@ fn publish_context_usage(
 }
 
 async fn set_controller_status(
-    shared_state: &Arc<WorkerSharedState>,
+    shared_state: &WorkerStateOwner,
     working_event_tx: &broadcast::Sender<Event>,
     status: WorkerStatus,
 ) {
@@ -481,7 +513,7 @@ async fn set_controller_status(
 
 async fn finish_controller_run<C, St>(
     worker: &mut Worker<C, St>,
-    shared_state: &Arc<WorkerSharedState>,
+    shared_state: &WorkerStateOwner,
     working_event_tx: &broadcast::Sender<Event>,
     new_status: WorkerStatus,
     finished_submission_request_id: Option<String>,
@@ -684,6 +716,7 @@ pub struct WorkerController;
 pub(crate) struct InitializedWorkerController<C: LlmClient, St: Store> {
     pub(crate) worker: Worker<C, St>,
     pub(crate) handle: WorkerHandle,
+    pub(crate) shared_state: WorkerStateOwner,
     method_rx: ControllerReceiver,
     shutdown_tx: oneshot::Sender<ControllerShutdownReport>,
     shutdown_rx: ShutdownReceiver,
@@ -971,13 +1004,16 @@ impl WorkerController {
             .await
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let greeting = build_greeting(&worker);
-        let shared_state = Arc::new(WorkerSharedState::new(
+        let shared_state = WorkerStateOwner::new(
             worker.manifest().worker.name.clone(),
             worker.segment_id(),
             manifest_toml,
             greeting,
-        ));
+        );
         shared_state.set_feature_invocations(worker.feature_invocations());
+        if worker.manifest().feature.flow.enabled {
+            shared_state.enable_flow_transition();
+        }
         let usage_state = shared_state.clone();
         let usage_events = working_event_tx.clone();
         worker.engine_mut().on_usage(move |event| {
@@ -1004,7 +1040,7 @@ impl WorkerController {
         let handle = WorkerHandle {
             method_tx,
             working_event_tx: working_event_tx.clone(),
-            shared_state: shared_state.clone(),
+            shared_state: shared_state.reader(),
             runtime_dir: runtime_dir.clone(),
             alerter: alerter.clone(),
             in_flight: in_flight.clone(),
@@ -1022,7 +1058,8 @@ impl WorkerController {
         Ok(InitializedWorkerController {
             worker,
             handle,
-            method_rx: ControllerReceiver::new(method_rx, shared_state, working_event_tx),
+            method_rx: ControllerReceiver::new(method_rx, shared_state.clone(), working_event_tx),
+            shared_state,
             shutdown_tx,
             shutdown_rx,
             registry_reclaim,
@@ -1069,6 +1106,7 @@ where
         let Self {
             mut worker,
             handle,
+            shared_state,
             method_rx,
             shutdown_tx,
             shutdown_rx,
@@ -1077,7 +1115,6 @@ where
         } = self;
         let PreparedControllerPublication { command_observer } = publication;
         let runtime_dir = handle.runtime_dir.clone();
-        let shared_state = handle.shared_state.clone();
         let working_event_tx = handle.working_event_tx.clone();
         let spawned_registry = handle.spawned_registry.clone();
 
@@ -2362,7 +2399,7 @@ fn reject_method_while_attention_locked(
     method: &Method,
     working_event_tx: &broadcast::Sender<Event>,
     message: &str,
-    shared_state: &WorkerSharedState,
+    shared_state: &WorkerStateOwner,
 ) -> bool {
     if let Some((envelope, kind)) = commands::command_identity(method)
         && kind != WorkerCommandKind::Shutdown
@@ -2424,7 +2461,7 @@ async fn controller_loop<C, St>(
     mut worker: Worker<C, St>,
     mut method_rx: ControllerReceiver,
     working_event_tx: broadcast::Sender<Event>,
-    shared_state: Arc<WorkerSharedState>,
+    shared_state: WorkerStateOwner,
     _runtime_dir: Arc<RuntimeDir>,
     cancel_tx: mpsc::Sender<()>,
     pause_tx: mpsc::Sender<()>,
@@ -3275,7 +3312,7 @@ async fn drive_turn<F, St>(
     working_event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     pause_tx: &mpsc::Sender<()>,
-    shared_state: &Arc<WorkerSharedState>,
+    shared_state: &WorkerStateOwner,
     mut input_commit: Option<(oneshot::Receiver<()>, crate::worker::PendingSubmission)>,
     notify_buffer: &NotifyBuffer,
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
@@ -3663,7 +3700,7 @@ where
                     }
                     None => {
                         let _ = cancel_tx.try_send(());
-                        shared_state.transition(WorkerState::Idle);
+                        set_controller_state(shared_state, working_event_tx, WorkerState::Idle).await;
                         return (WorkerStatus::Idle, false, false);
                     }
                 }
@@ -4674,7 +4711,7 @@ mod tests {
 
     #[test]
     fn context_usage_publication_updates_reconnect_state_and_live_clients() {
-        let shared_state = Arc::new(WorkerSharedState::new(
+        let shared_state = WorkerStateOwner::new(
             "worker".into(),
             session_store::new_segment_id(),
             String::new(),
@@ -4690,7 +4727,7 @@ mod tests {
                 context_tokens: 0,
                 context_usage: None,
             },
-        ));
+        );
         let (events, mut receiver) = broadcast::channel(4);
 
         publish_context_usage(
@@ -4868,7 +4905,7 @@ mod tests {
         _cancel_rx: mpsc::Receiver<()>,
         pause_tx: mpsc::Sender<()>,
         _pause_rx: mpsc::Receiver<()>,
-        shared_state: Arc<WorkerSharedState>,
+        shared_state: WorkerStateOwner,
         notify_buffer: NotifyBuffer,
         pending_submissions: crate::worker::PendingSubmissionHandle<session_store::FsStore>,
         _temp: TempDir,
@@ -4880,7 +4917,7 @@ mod tests {
         let (working_event_tx, _) = broadcast::channel::<Event>(16);
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
         let (pause_tx, pause_rx) = mpsc::channel::<()>(1);
-        let shared_state = Arc::new(WorkerSharedState::new(
+        let shared_state = WorkerStateOwner::new(
             "child-worker".to_string(),
             session_store::new_segment_id(),
             String::new(),
@@ -4896,7 +4933,7 @@ mod tests {
                 reasoning: None,
                 context_usage: None,
             },
-        ));
+        );
         let notify_buffer = NotifyBuffer::new();
         let pending_submissions =
             crate::worker::PendingSubmissionHandle::for_test(&temp.path().join("pending-sessions"));
@@ -5379,6 +5416,11 @@ mod tests {
         assert_eq!(status, WorkerStatus::Idle);
         assert!(!shutdown);
 
+        let admitted = events.try_recv().expect("command identity publication");
+        assert!(matches!(admitted, Event::WorkerState { snapshot }
+            if snapshot.state_sequence == 2
+                && snapshot.last_command_id == command.command_id
+                && matches!(snapshot.state, WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)))));
         let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
             .await
             .expect("event timeout")

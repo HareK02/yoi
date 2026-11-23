@@ -9,6 +9,65 @@ use crate::feature::contracts::{
 use session_store::{LogEntry, Store, SystemItem};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
+#[derive(Debug)]
+struct RuntimeListClient {
+    limit: usize,
+}
+impl WorkspaceClient for RuntimeListClient {
+    fn workspace_id(&self) -> Option<&str> {
+        Some("workspace-test")
+    }
+    fn kind(&self) -> &str {
+        "runtime-list-fixture"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn authorize_operation_scope(
+        &self,
+        _: &str,
+        _: &server_api::authorization::PermissionResource,
+    ) -> Result<Option<server_api::authorization::PermissionResource>, WorkspaceClientError> {
+        Ok(None)
+    }
+    fn execute(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        assert!(request.path.ends_with("/worker-control/workers"));
+        Ok(WorkspaceResponse { status: 200, content_type: None, body: json!({
+            "limit":self.limit, "truncated":false, "items":[{
+                "subject":{"runtime_id":"r", "worker_id":"parent"}, "worker":"W-1",
+                "display_name":"parent", "state":"idle", "relation":"peer", "permissions":["observe"]
+            }]
+        }).to_string() })
+    }
+}
+async fn mixed_list(registry: Arc<SpawnedWorkerRegistry>, limit: usize) -> Value {
+    let mut pending = Vec::new();
+    let mut hooks = crate::HookRegistryBuilder::default();
+    let report = crate::feature::FeatureRegistryBuilder::new()
+        .with_module(
+            crate::feature::builtin::manage_worker::manage_worker_feature(
+                Arc::new(RuntimeListClient { limit }),
+                Some(registry),
+                false,
+            ),
+        )
+        .install_into_pending(&mut pending, &mut hooks);
+    assert!(report.reports[0].installed);
+    let (_, tool) = pending
+        .into_iter()
+        .map(|definition| definition())
+        .find(|(meta, _)| meta.name == "WorkerList")
+        .unwrap();
+    let output = tool
+        .execute("{}", agen::tool::ToolExecutionContext::direct())
+        .await
+        .unwrap();
+    serde_json::from_str(output.content.as_deref().unwrap()).unwrap()
+}
+
 #[derive(Clone)]
 struct HeldChild(Arc<Semaphore>);
 #[async_trait]
@@ -131,6 +190,16 @@ async fn actual_spawn_delivers_to_busy_and_idle_internal_parent_before_model_sup
                 ends.recv().await.unwrap();
                 assert_eq!(parent.wait_until_idle().await, InternalWorkerSessionStatus::Idle);
             }
+            let mixed = mixed_list(fixture.registry.clone(), 10).await;
+            assert_eq!(mixed["items"].as_array().unwrap().len(), 2);
+            assert_eq!(mixed["items"][0]["state"], "idle", "child activity must not change the Runtime parent's input-state projection");
+            assert_eq!(mixed["items"][1]["target"], json!({"kind":"sub_worker", "name":"leaf"}));
+            assert_eq!(mixed["items"][1]["relation"], "direct_child");
+            assert_eq!(mixed["items"][1]["state"], "running");
+            assert!(mixed["items"][1].get("summary").is_none());
+            let bounded = mixed_list(fixture.registry.clone(), 1).await;
+            assert_eq!(bounded["items"].as_array().unwrap().len(), 1);
+            assert_eq!(bounded["truncated"], true);
             child_gate.add_permits(1);
             assert_eq!(leaf.session.wait_until_idle().await, InternalWorkerSessionStatus::Idle);
             if busy { parent_client.release_second.notify_one(); }

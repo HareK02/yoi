@@ -449,6 +449,15 @@ enum WorkerExecutionPublicationState {
     Discarded,
 }
 
+/// Acceptance is not publication: candidates have no observation-bus sequence yet.
+#[cfg(feature = "ws-server")]
+#[derive(Clone, Debug)]
+#[must_use]
+pub enum WorkerObservationPublication {
+    Buffered,
+    Published(WorkerObservationEvent),
+}
+
 /// Publication boundary for protocol observations bound to Worker identity.
 ///
 /// Restore candidates buffer events until the execution commit to the catalog succeeds.
@@ -464,6 +473,8 @@ pub struct WorkerExecutionContext {
         Option<Arc<dyn Fn(WorkerLifecycleOperationId) -> Result<(), RuntimeError> + Send + Sync>>,
     #[cfg(feature = "ws-server")]
     observation_publisher: WorkerObservationPublisher,
+    #[cfg(feature = "ws-server")]
+    observation_invalidator: Option<Arc<dyn Fn(&str) -> Result<(), RuntimeError> + Send + Sync>>,
     #[cfg(feature = "ws-server")]
     publication_state: Arc<Mutex<WorkerExecutionPublicationState>>,
     #[cfg(all(test, feature = "ws-server"))]
@@ -481,6 +492,7 @@ impl WorkerExecutionContext {
             restore_progress: None,
             restore_repair_authorizer: None,
             observation_publisher,
+            observation_invalidator: None,
             #[cfg(test)]
             flush_fault: Arc::default(),
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Active)),
@@ -497,6 +509,7 @@ impl WorkerExecutionContext {
             restore_progress: None,
             restore_repair_authorizer: None,
             observation_publisher,
+            observation_invalidator: None,
             #[cfg(test)]
             flush_fault: Arc::default(),
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Pending(
@@ -684,10 +697,27 @@ impl WorkerExecutionContext {
     pub(crate) fn discard_candidate(&self) {}
 
     #[cfg(feature = "ws-server")]
+    pub(crate) fn with_observation_invalidator(
+        mut self,
+        invalidator: Arc<dyn Fn(&str) -> Result<(), RuntimeError> + Send + Sync>,
+    ) -> Self {
+        self.observation_invalidator = Some(invalidator);
+        self
+    }
+
+    #[cfg(feature = "ws-server")]
+    pub fn invalidate_observation(&self, message: &str) -> Result<(), RuntimeError> {
+        match &self.observation_invalidator {
+            Some(invalidate) => invalidate(message),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "ws-server")]
     pub fn publish_observation(
         &self,
         payload: protocol::Event,
-    ) -> Result<WorkerObservationEvent, RuntimeError> {
+    ) -> Result<WorkerObservationPublication, RuntimeError> {
         let mut state = self
             .publication_state
             .lock()
@@ -696,15 +726,12 @@ impl WorkerExecutionContext {
             WorkerExecutionPublicationState::Pending(events)
             | WorkerExecutionPublicationState::Activating(events) => {
                 events.push_back(payload.clone());
-                Ok(WorkerObservationEvent::new(
-                    0,
-                    self.worker_ref.clone(),
-                    payload,
-                ))
+                Ok(WorkerObservationPublication::Buffered)
             }
             WorkerExecutionPublicationState::Active => {
                 drop(state);
                 (self.observation_publisher)(self.worker_ref.clone(), payload)
+                    .map(WorkerObservationPublication::Published)
             }
             WorkerExecutionPublicationState::Discarded => Err(RuntimeError::InvalidRequest(
                 "Worker execution candidate was discarded".to_string(),
@@ -716,7 +743,7 @@ impl WorkerExecutionContext {
     pub fn publish_protocol_event(
         &self,
         payload: protocol::Event,
-    ) -> Result<WorkerObservationEvent, RuntimeError> {
+    ) -> Result<WorkerObservationPublication, RuntimeError> {
         self.publish_observation(payload)
     }
 }
@@ -1709,21 +1736,24 @@ mod tests {
             }),
         );
 
-        context
-            .publish_protocol_event(protocol::Event::TextDelta {
-                text: "before commit".to_string(),
-            })
-            .unwrap();
+        assert!(matches!(
+            context
+                .publish_protocol_event(protocol::Event::TextDelta {
+                    text: "before commit".to_string(),
+                })
+                .unwrap(),
+            WorkerObservationPublication::Buffered
+        ));
         assert!(observed.lock().unwrap().is_empty());
 
         context.activate_candidate().unwrap();
         assert_eq!(observed.lock().unwrap().len(), 1);
 
-        context
+        assert!(matches!(context
             .publish_protocol_event(protocol::Event::TextDelta {
                 text: "after commit".to_string(),
             })
-            .unwrap();
+            .unwrap(), WorkerObservationPublication::Published(event) if event.sequence == 1));
         assert_eq!(observed.lock().unwrap().len(), 2);
     }
 

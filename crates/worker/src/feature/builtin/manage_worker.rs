@@ -72,15 +72,27 @@ impl WorkspaceWorkerControlService {
                 Ok(serde_json::json!({
                     "subject": { "kind": "sub_worker", "name": internal.worker_name },
                     "relation": "direct_child",
-                    "origin": "sub_worker_spawn",
                     "permissions": ["send_input", "stop", "observe"],
-                    "summary": {
-                        "display_name": internal.worker_name,
-                        "status": format!("{:?}", internal.session.status()).to_lowercase(),
-                    }
+                    "display_name": internal.worker_name,
+                    "state": subworker_list_state(internal.session.status()),
                 }))
             })
             .collect()
+    }
+}
+
+fn subworker_list_state(
+    status: crate::internal_worker::InternalWorkerSessionStatus,
+) -> server_api::WorkerListState {
+    use crate::internal_worker::InternalWorkerSessionStatus as I;
+    use server_api::WorkerListState as S;
+    match status {
+        I::Idle => S::Idle,
+        I::Running => S::Running,
+        I::Paused => S::Paused,
+        I::Stopping => S::Stopping,
+        I::Stopped => S::Stopped,
+        I::Failed => S::Failed,
     }
 }
 
@@ -115,7 +127,8 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             WorkspaceResponse {
                 content_type: None,
                 status: 200,
-                body: serde_json::json!({ "items": [] }).to_string(),
+                body: serde_json::json!({ "items": [], "limit": 500, "truncated": false })
+                    .to_string(),
             }
         };
         if !response.is_success() {
@@ -128,6 +141,15 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     "invalid Workspace control response: {error}"
                 ))
             })?;
+        let limit = payload
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|limit| (1..=500).contains(limit))
+            .ok_or_else(|| {
+                WorkspaceClientError::Request(
+                    "invalid Workspace control response: missing or invalid limit".into(),
+                )
+            })? as usize;
         let items = payload
             .get_mut("items")
             .and_then(serde_json::Value::as_array_mut)
@@ -171,12 +193,40 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 items.push(worker);
             }
         }
+        if items.len() > limit {
+            items.truncate(limit);
+            payload["truncated"] = serde_json::Value::Bool(true);
+        }
         Ok(WorkspaceResponse {
             content_type: response.content_type,
             status: response.status,
             body: serde_json::to_string(&payload)
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
         })
+    }
+
+    async fn worker_details(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if !self.runtime_worker_control {
+            return Err(WorkspaceClientError::Unavailable(
+                "Runtime Worker details are unavailable".into(),
+            ));
+        }
+        self.client.authorize_operation(
+            "worker.list",
+            &PermissionResource::Workspace {
+                workspace_id: self.workspace_id.clone(),
+            },
+        )?;
+        self.client.execute_server_operation(
+            crate::worker::WorkspaceServerOperation::WorkerControlDetails {
+                runtime_id,
+                worker_id,
+            },
+        )
     }
 
     async fn send_input(
@@ -719,6 +769,21 @@ enum WorkerTargetInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct WorkerDetailsInput {
+    target: RuntimeWorkerTargetInput,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RuntimeWorkerTargetInput {
+    RuntimeWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WorkerRestoreInput {
     /// Exact Worker target returned by WorkerList; self is not accepted.
     target: WorkerTargetInput,
@@ -804,6 +869,7 @@ struct WorkspaceWorkerTool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerOperation {
     List,
+    Details,
     Spawn,
     SendInput,
     Notify,
@@ -814,8 +880,9 @@ enum WorkerOperation {
 }
 
 impl WorkerOperation {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::List,
+        Self::Details,
         Self::Spawn,
         Self::SendInput,
         Self::Notify,
@@ -828,6 +895,7 @@ impl WorkerOperation {
     fn tool_name(self) -> &'static str {
         match self {
             Self::List => "WorkerList",
+            Self::Details => "WorkerDetails",
             Self::Spawn => "WorkerSpawn",
             Self::SendInput => "WorkerSendInput",
             Self::Notify => "WorkerNotify",
@@ -841,7 +909,10 @@ impl WorkerOperation {
     fn description(self) -> &'static str {
         match self {
             Self::List => {
-                "List only known Runtime Workers and direct SubWorkers granted to the current Worker. Reuse each returned target unchanged in Worker control tools."
+                "List only known Runtime Workers and direct SubWorkers granted to the current Worker. State describes the target itself, not child activity or Ticket handling, and never authorizes an operation. Reuse each returned target unchanged. Runtime detail failure fails the list rather than asserting Idle. Use WorkerDetails for live Workdir bindings and Restore observation tokens; Workspace discovery is separate."
+            }
+            Self::Details => {
+                "Read current details of a Runtime target selected from WorkerList under its current control grant. Returns all live Workdir attachment alias/working_directory_id/connection_id for explicit TicketWorkerAssign selection when binding-read permission exists (null is not an empty set), plus the current Restore observation token when permitted. This read is not an operation receipt or a grant; effects recheck state, permissions and fences. Refresh before a new Restore intent, not for replay of an unknown outcome."
             }
             Self::Spawn => {
                 "Spawn an ordinary Backend/Runtime Worker with zero or more existing Workdir attachments. Worker creation, TicketWorkerAssign, and subsequent WorkerSendInput are independent operations. For Ticket implementation work, create with empty initial_submit, assign the existing Worker, then send the work request only after confirmed assignment. Continuing an existing MR as another authorized Worker uses the MR's separate SetMergeRequestWorker binding, not replacement of the Ticket implementation assignment; obtain the required resource/operation grants through the ordinary launch path, never a Ticketless bypass of a refusal. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission, with an optional Flow segment. Selecting a profile or Flow does not grant review authority. Omit authorization to use the shared worker_default; an explicit assignment (including empty) or Policy selection is forwarded without fallback. profile must be a source-qualified builtin: or project: selector; Profile selection does not grant permissions. Reuse operation_id and the full input after an unknown outcome."
@@ -857,7 +928,7 @@ impl WorkerOperation {
                 "Stop a known Runtime Worker when allowed. Stop is independent of Ticket conclusion: it does not end unfinished work, remove retained session records, release attachments, or delete Workdirs."
             }
             Self::Restore => {
-                "Restore a stopped Backend/Runtime Worker session in the current Workspace. Supply expected_observation_token from WorkerList; a conflict requires refreshing and deliberate new intent. New requests default to the durable Tool call ID. For explicit recovery of an unknown/pending outcome, supply the reported request_id and the original token unchanged; never create a new intent or automatically retry."
+                "Restore a stopped Backend/Runtime Worker session in the current Workspace. Supply expected_observation_token from a fresh WorkerDetails observation; a conflict requires refreshing and deliberate new intent. New requests default to the durable Tool call ID. For explicit recovery of an unknown/pending outcome, supply the reported request_id and the original token unchanged; never create a new intent or automatically retry."
             }
             Self::Remove => {
                 "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Conclusion, stopping, retention/removal, attachment release, and Workdir deletion are separate decisions. Removal releases attachments but preserves Workdir materialization. Supply a bounded reason; Backend validation and retention are authoritative. HTTP 202 / removed:false is a saved removal intent, not deletion: waiting or held retains the Worker, history and writer. Inspect operation_id, phase and typed cause in the result and current Worker observation; do not force discard, infer completion, or create a new removal intent to retry."
@@ -878,6 +949,20 @@ impl Tool for WorkspaceWorkerTool {
                 parse::<WorkerListInput>(input_json, "WorkerList")?;
                 self.control
                     .list_workers()
+                    .await
+                    .map_err(control_tool_error)?
+            }
+            WorkerOperation::Details => {
+                let input = parse::<WorkerDetailsInput>(input_json, "WorkerDetails")?;
+                let RuntimeWorkerTargetInput::RuntimeWorker {
+                    runtime_id,
+                    worker_id,
+                } = input.target;
+                self.control
+                    .worker_details(
+                        authority_id(&runtime_id, "runtime_id")?,
+                        authority_id(&worker_id, "worker_id")?,
+                    )
                     .await
                     .map_err(control_tool_error)?
             }
@@ -1253,6 +1338,20 @@ fn tool_output(
             },
         ));
     }
+    if operation == WorkerOperation::Details {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&response.body).map_err(|_| invalid_worker_target_response())?;
+        let subject: server_api::WorkerControlSubject =
+            serde_json::from_value(payload["subject"].take())
+                .map_err(|_| invalid_worker_target_response())?;
+        payload["subject"] = serde_json::json!({ "kind": "runtime_worker", "runtime_id": subject.runtime_id, "worker_id": subject.worker_id });
+        project_worker_target(&mut payload)?;
+        return Ok(ToolOutput {
+            summary: "WorkerDetails completed".into(),
+            content: Some(payload.to_string()),
+            attachments: Vec::new(),
+        });
+    }
     if operation == WorkerOperation::List {
         let mut payload: serde_json::Value =
             serde_json::from_str(&response.body).map_err(|_| invalid_worker_target_response())?;
@@ -1484,6 +1583,9 @@ fn worker_tool_contribution(
         WorkerOperation::List => {
             definition::<WorkerListInput>(operation, control, runtime_worker_control)
         }
+        WorkerOperation::Details => {
+            definition::<WorkerDetailsInput>(operation, control, runtime_worker_control)
+        }
         WorkerOperation::Spawn => {
             definition::<WorkerSpawnInput>(operation, control, runtime_worker_control)
         }
@@ -1628,6 +1730,7 @@ mod tests {
                 });
             }
             let is_worker_list = request.path.ends_with("/worker-control/workers");
+            let is_worker_details = request.path.ends_with("/runtime-a/worker-a");
             let is_worker_input = request.path.ends_with("/input");
             let is_worker_lifecycle =
                 request.path.ends_with("/cancel") || request.path.ends_with("/stop");
@@ -1637,6 +1740,7 @@ mod tests {
                 status: 200,
                 body: if is_worker_list {
                     serde_json::json!({
+                        "limit":500, "truncated":false,
                         "items": [
                             {
                                 "subject": {
@@ -1644,7 +1748,7 @@ mod tests {
                                     "worker_id": "worker-a"
                                 },
                                 "permissions": ["observe"],
-                                "summary": { "status": "idle" }
+                                "worker": "W-7", "display_name": "fixture", "state": "running", "relation": "created"
                             },
                             {
                                 "subject": {
@@ -1652,11 +1756,16 @@ mod tests {
                                     "worker_id": "worker-a"
                                 },
                                 "permissions": ["observe"],
-                                "summary": { "status": "idle" }
+                                "worker": "W-7", "display_name": "fixture", "state": "running", "relation": "created"
                             }
                         ]
                     })
                     .to_string()
+                } else if is_worker_details {
+                    serde_json::json!({ "subject": {"runtime_id":"runtime-a", "worker_id":"worker-a"},
+                        "worker":"W-7", "state":"running", "restore_observation_token":"observed-token",
+                        "workdir_connections":[{"alias":"main", "working_directory_id":"wd-1", "connection_id":"conn-1", "capabilities":[]}]
+                    }).to_string()
                 } else if is_worker_input {
                     serde_json::to_string(&server_api::RuntimeWorkerInputResult {
                         command: None,
@@ -1742,6 +1851,14 @@ mod tests {
                 status: 200,
                 body: serde_json::json!({ "items": [] }).to_string(),
             })
+        }
+
+        async fn worker_details(
+            &self,
+            _: String,
+            _: String,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            unreachable!("direct children have no Runtime details")
         }
 
         async fn send_input(
@@ -2355,6 +2472,16 @@ mod tests {
                 "worker_id": "worker-a"
             })
         );
+        assert_eq!(value["items"][0]["worker"], "W-7");
+        assert_eq!(value["items"][0]["state"], "running");
+        for hidden in [
+            "summary",
+            "workdir_connections",
+            "restore_observation_token",
+            "origin",
+        ] {
+            assert!(value["items"][0].get(hidden).is_none());
+        }
         assert_eq!(client.requests.lock().unwrap().len(), 1);
         WorkspaceWorkerTool {
             operation: WorkerOperation::SendInput,
@@ -2375,6 +2502,47 @@ mod tests {
             client.requests.lock().unwrap()[1]
                 .path
                 .ends_with("/runtime-a/worker-a/input")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_details_uses_exact_list_target_and_exposes_current_bindings_and_restore_token()
+    {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let control = test_control(client.clone());
+        let listed =
+            tool_output(WorkerOperation::List, control.list_workers().await.unwrap()).unwrap();
+        let list: serde_json::Value =
+            serde_json::from_str(listed.content.as_deref().unwrap()).unwrap();
+        let output = WorkspaceWorkerTool {
+            operation: WorkerOperation::Details,
+            control,
+            runtime_worker_control: true,
+        }
+        .execute(
+            &serde_json::json!({"target":list["items"][0]["target"]}).to_string(),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(details["target"], list["items"][0]["target"]);
+        assert!(details.get("subject").is_none());
+        assert_eq!(details["workdir_connections"][0]["connection_id"], "conn-1");
+        assert_eq!(details["restore_observation_token"], "observed-token");
+        assert!(
+            client.requests.lock().unwrap()[1]
+                .path
+                .ends_with("/runtime-a/worker-a")
+        );
+        let auth = client.authorizations.lock().unwrap();
+        assert!(auth.iter().all(|a| a.operation == "worker.list"));
+        assert!(
+            serde_json::from_value::<WorkerDetailsInput>(
+                serde_json::json!({"target":{"kind":"sub_worker","name":"child"}})
+            )
+            .is_err()
         );
     }
 
@@ -2738,6 +2906,7 @@ mod tests {
             WorkerOperation::ALL.map(WorkerOperation::tool_name),
             [
                 "WorkerList",
+                "WorkerDetails",
                 "WorkerSpawn",
                 "WorkerSendInput",
                 "WorkerNotify",

@@ -742,6 +742,9 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                                 client.worker_control_list(workspace_id).await,
                             )
                         }
+                        WorkspaceServerOperation::WorkerControlDetails { runtime_id, worker_id } => generated_workspace_response(
+                            client.worker_control_details(workspace_id, runtime_id, worker_id).await,
+                        ),
                         WorkspaceServerOperation::WorkerControlAuthorize {
                             runtime_id,
                             worker_id,

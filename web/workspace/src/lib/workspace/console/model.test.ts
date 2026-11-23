@@ -54,7 +54,7 @@ Deno.test("restored run stats replace live estimates in both Console modes", () 
 
 function workerState(status: WorkerStatus): WorkerStateSnapshot {
   return {
-    last_command_id: 0,
+    state_sequence: 0, last_command_id: 0,
     state: status === "idle" ? { kind: "idle" } : {
       kind: "busy",
       state: {
@@ -394,15 +394,15 @@ Deno.test("console routing projects live errors but not completion replies", () 
 Deno.test("Worker state events replace state while acknowledgement replay does not", () => {
   const projector = createConsoleProjector();
   const running: WorkerStateSnapshot = {
-    last_command_id: 2,
+    state_sequence: 0, last_command_id: 2,
     state: { kind: "busy", state: { kind: "run", state: "running" } },
   };
   const freshIdle: WorkerStateSnapshot = {
-    last_command_id: 0,
+    state_sequence: 0, last_command_id: 0,
     state: { kind: "idle" },
   };
   const paused: WorkerStateSnapshot = {
-    last_command_id: 3,
+    state_sequence: 0, last_command_id: 3,
     state: { kind: "busy", state: { kind: "run", state: "paused" } },
   };
   let projection = projector.append([
@@ -4241,4 +4241,415 @@ Deno.test("typed Feature invocations remain visible in live and restored user me
     arguments: [{ name: "path", value: { kind: "string" as const, value: "資料/a b" } }],
   } };
   assertEquals(segmentsToText([segment]), '/run(path="資料/a b")');
+});
+
+Deno.test("internal observation loss fences queued states until a paired parent snapshot", () => {
+  for (const shutdown of [false, true]) {
+    const projector = createConsoleProjector();
+    const worker = {
+      session_id: "child",
+      name: "child",
+      parent_session_id: "parent",
+      kind: "sub_worker",
+    } as const;
+    const state: WorkerStateSnapshot = {
+      state_sequence: 4,
+      last_command_id: 0,
+      state: { kind: "busy", state: { kind: "run", state: "running" } },
+    };
+    const event = {
+      event: "internal_worker",
+      data: {
+        worker,
+        event: { event: "worker_state", data: { snapshot: state } },
+      },
+    } as const;
+    const before = projector.append([{ eventId: "running", event }]);
+    assertEquals(before.internalWorkers[0].console.status, "running");
+    const ordinary = projector.append([{
+      eventId: "diagnostic",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          event: {
+            event: "error",
+            data: { code: "internal", message: "ordinary diagnostic" },
+          },
+        },
+      },
+    }]);
+    assertEquals(ordinary.internalWorkers[0].console.status, "running");
+    const invalidation: Event = shutdown
+      ? {
+        event: "internal_worker",
+        data: { worker, event: { event: "shutdown" } },
+      }
+      : { event: "internal_worker_observation_unavailable", data: { worker } };
+    let projection = projector.append([{
+      eventId: "lost",
+      event: invalidation,
+    }]);
+    assertEquals(projection.internalWorkers[0].console.status, shutdown ? "shutdown" : null);
+    assertEquals(before.internalWorkers[0].console.status, "running");
+    projection = projector.append([{ eventId: "queued", event }]);
+    assertEquals(projection.internalWorkers[0].console.workerState, null);
+    const snapshot = snapshotEvent("/repo");
+    if (snapshot.event !== "snapshot") {
+      throw new Error("snapshot fixture expected");
+    }
+    snapshot.data.internal_workers = [{
+      worker,
+      state: null,
+      status: "running",
+      session: canonicalSession([]),
+      in_flight: { blocks: [] },
+      internal_workers: [],
+    }];
+    projector.append([{ eventId: "reconnect-unavailable", event: snapshot }]);
+    projection = projector.append([{
+      eventId: "queued-after-reconnect",
+      event,
+    }]);
+    assertEquals(projection.internalWorkers[0].console.status, null);
+    snapshot.data.internal_workers[0].state = state;
+    projection = projector.append([{
+      eventId: "reconnect-current",
+      event: snapshot,
+    }]);
+    assertEquals(projection.internalWorkers[0].console.status, "running");
+  }
+});
+
+function orderedChildSnapshot(
+  sessionId: string,
+  state: WorkerStateSnapshot | null,
+  children: NonNullable<SnapshotEvent["data"]["internal_workers"]> = [],
+): NonNullable<SnapshotEvent["data"]["internal_workers"]>[number] {
+  return {
+    worker: {
+      session_id: sessionId,
+      name: sessionId,
+      parent_session_id: null,
+      kind: "sub_worker",
+    },
+    state,
+    status: "running",
+    session: canonicalSession([]),
+    in_flight: { blocks: [] },
+    internal_workers: children,
+  };
+}
+
+function sequencedState(
+  sequence: number,
+  status: WorkerStatus,
+  marker?: string,
+): WorkerStateSnapshot {
+  return {
+    ...workerState(status),
+    state_sequence: sequence,
+    last_finished_submission_request_id: marker,
+  };
+}
+
+function parentWithChildren(
+  children: NonNullable<SnapshotEvent["data"]["internal_workers"]>,
+  sequence = 0,
+): SnapshotEvent {
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.state = sequencedState(sequence, "idle");
+  snapshot.data.internal_workers = children;
+  return snapshot;
+}
+
+Deno.test("full parent snapshots preserve independent child and nested completion observations", () => {
+  for (const parentSequence of [0, 100]) {
+    const projector = createConsoleProjector();
+    const grandchild = orderedChildSnapshot(
+      "grandchild",
+      sequencedState(30, "running"),
+    );
+    const child = orderedChildSnapshot("child", sequencedState(3, "running"), [
+      grandchild,
+    ]);
+    const initial = parentWithChildren([child]);
+    projector.append([{ eventId: "initial", event: initial }]);
+    const childDone = sequencedState(4, "idle", "child-finished");
+    const grandchildDone = sequencedState(31, "idle", "grandchild-finished");
+    const before = projector.append([
+      {
+        eventId: "child-done",
+        event: {
+          event: "internal_worker",
+          data: {
+            worker: child.worker,
+            event: { event: "worker_state", data: { snapshot: childDone } },
+          },
+        },
+      },
+      {
+        eventId: "grandchild-done",
+        event: {
+          event: "internal_worker",
+          data: {
+            worker: child.worker,
+            event: {
+              event: "internal_worker",
+              data: {
+                worker: grandchild.worker,
+                event: {
+                  event: "worker_state",
+                  data: { snapshot: grandchildDone },
+                },
+              },
+            },
+          },
+        },
+      },
+    ]);
+    // 子のsequenceより新しい親も、子の鮮度を保証しない。
+    const after = projector.append([{
+      eventId: "overlap",
+      event: parentWithChildren([child], parentSequence),
+    }]);
+    assertEquals(after.internalWorkers[0].console.workerState, childDone);
+    assertEquals(after.internalWorkers[0].console.status, "idle");
+    assertEquals(
+      after.internalWorkers[0].console.internalWorkers[0].console.workerState,
+      grandchildDone,
+    );
+    assertEquals(before.internalWorkers[0].console.workerState, childDone);
+    const advanced = projector.append([{
+      eventId: "fresh",
+      event: parentWithChildren([
+        orderedChildSnapshot(
+          "child",
+          sequencedState(5, "running", "child-finished"),
+          [grandchild],
+        ),
+      ], parentSequence),
+    }]);
+    assertEquals(advanced.internalWorkers[0].console.status, "running");
+    assertEquals(
+      advanced.internalWorkers[0].console.workerState?.state_sequence,
+      5,
+    );
+    assertEquals(
+      advanced.internalWorkers[0].console.internalWorkers[0].console
+        .workerState,
+      grandchildDone,
+    );
+  }
+});
+
+Deno.test("None and invalidation retain child fences until a current paired snapshot", () => {
+  for (const loss of ["none", "unavailable", "shutdown"] as const) {
+    const projector = createConsoleProjector();
+    const grandchild = orderedChildSnapshot(
+      "grandchild",
+      sequencedState(40, "idle", "nested-done"),
+    );
+    const child = orderedChildSnapshot(
+      "child",
+      sequencedState(4, "idle", "done"),
+      [grandchild],
+    );
+    projector.append([{
+      eventId: "initial",
+      event: parentWithChildren([child]),
+    }]);
+    const lost: Event = loss === "none"
+      ? parentWithChildren([orderedChildSnapshot("child", null, [grandchild])])
+      : loss === "unavailable"
+      ? {
+        event: "internal_worker_observation_unavailable",
+        data: { worker: child.worker },
+      }
+      : {
+        event: "internal_worker",
+        data: { worker: child.worker, event: { event: "shutdown" } },
+      };
+    projector.append([{ eventId: "lost", event: lost }]);
+    const stale = projector.append([{
+      eventId: "stale-paired",
+      event: parentWithChildren([
+        orderedChildSnapshot("child", sequencedState(3, "running"), [
+          grandchild,
+        ]),
+      ]),
+    }]);
+    assertEquals(stale.internalWorkers[0].console.workerState, null);
+    assertEquals(stale.internalWorkers[0].console.observationStateSequence, 4);
+    assertEquals(
+      stale.internalWorkers[0].console.internalWorkers[0].console.workerState,
+      null,
+    );
+    const lateSnapshot = parentWithChildren([grandchild]);
+    lateSnapshot.data.state = sequencedState(99, "running");
+    for (
+      const event of [
+        {
+          event: "worker_state",
+          data: { snapshot: sequencedState(99, "running") },
+        },
+        lateSnapshot,
+        {
+          event: "error",
+          data: { code: "internal", message: "diagnostic only" },
+        },
+      ] as Event[]
+    ) {
+      const late = projector.append([{
+        eventId: "late",
+        event: {
+          event: "internal_worker",
+          data: { worker: child.worker, event },
+        },
+      }]);
+      assertEquals(late.internalWorkers[0].console.workerState, null);
+      assertEquals(late.internalWorkers[0].console.observationStateSequence, 4);
+    }
+    // Noneもhigh-waterを消さない。上の拒否されたseq99はfenceを進めない。
+    projector.append([{
+      eventId: "none-again",
+      event: parentWithChildren([
+        orderedChildSnapshot("child", null, [grandchild]),
+      ]),
+    }]);
+    const recovered = projector.append([{
+      eventId: "paired-current",
+      event: parentWithChildren([child]),
+    }]);
+    assertEquals(recovered.internalWorkers[0].console.workerState, child.state);
+    assertEquals(
+      recovered.internalWorkers[0].console.observationUnavailable,
+      false,
+    );
+    assertEquals(
+      recovered.internalWorkers[0].console.internalWorkers[0].console
+        .workerState,
+      grandchild.state,
+    );
+    const newer = projector.append([{
+      eventId: "paired-newer",
+      event: parentWithChildren([
+        orderedChildSnapshot("child", sequencedState(5, "running"), [
+          grandchild,
+        ]),
+      ]),
+    }]);
+    assertEquals(
+      newer.internalWorkers[0].console.workerState?.state_sequence,
+      5,
+    );
+  }
+});
+
+Deno.test("snapshot reconciliation keeps session replacement and terminal removal semantics", () => {
+  const projector = createConsoleProjector();
+  const old = orderedChildSnapshot(
+    "old",
+    sequencedState(100, "idle", "old-done"),
+  );
+  projector.append([{ eventId: "old", event: parentWithChildren([old]) }]);
+  projector.append([{
+    eventId: "remove",
+    event: { event: "internal_worker_removed", data: { worker: old.worker } },
+  }]);
+  const late = projector.append([{
+    eventId: "late",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker: old.worker,
+        event: {
+          event: "worker_state",
+          data: { snapshot: sequencedState(101, "running") },
+        },
+      },
+    },
+  }]);
+  assertEquals(late.internalWorkers.length, 0);
+  const replacement = orderedChildSnapshot(
+    "replacement",
+    sequencedState(1, "running"),
+  );
+  replacement.worker.name = old.worker.name;
+  const current = projector.append([{
+    eventId: "replacement",
+    event: parentWithChildren([replacement]),
+  }]);
+  assertEquals(
+    current.internalWorkers[0].console.workerState,
+    replacement.state,
+  );
+  const restored = projector.append([{
+    eventId: "authoritative",
+    event: parentWithChildren([old]),
+  }]);
+  assertEquals(restored.internalWorkers[0].console.workerState, old.state);
+  assertEquals(restored.removedInternalWorkers, {});
+});
+
+Deno.test("nested None stays authoritative independently of a newer parent child state", () => {
+  const projector = createConsoleProjector();
+  const done = sequencedState(40, "idle", "nested-done");
+  const nested = orderedChildSnapshot("nested", done);
+  const parent = (state: WorkerStateSnapshot | null, sequence: number) =>
+    parentWithChildren([
+      orderedChildSnapshot("child", sequencedState(sequence, "running"), [
+        orderedChildSnapshot("nested", state),
+      ]),
+    ]);
+  projector.append([{ eventId: "initial", event: parent(done, 1) }]);
+  const unavailable = projector.append([{
+    eventId: "nested-none",
+    event: parent(null, 2),
+  }]);
+  assertEquals(unavailable.internalWorkers[0].console.status, "running");
+  assertEquals(
+    unavailable.internalWorkers[0].console.internalWorkers[0].console.status,
+    null,
+  );
+  const stale = projector.append([{
+    eventId: "nested-stale",
+    event: parent(sequencedState(39, "running"), 3),
+  }]);
+  assertEquals(stale.internalWorkers[0].console.workerState?.state_sequence, 3);
+  assertEquals(
+    stale.internalWorkers[0].console.internalWorkers[0].console.workerState,
+    null,
+  );
+  const late = projector.append([{
+    eventId: "nested-late",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker: stale.internalWorkers[0].worker,
+        event: {
+          event: "internal_worker",
+          data: {
+            worker: nested.worker,
+            event: {
+              event: "worker_state",
+              data: { snapshot: sequencedState(99, "running") },
+            },
+          },
+        },
+      },
+    },
+  }]);
+  assertEquals(
+    late.internalWorkers[0].console.internalWorkers[0].console.workerState,
+    null,
+  );
+  const recovered = projector.append([{
+    eventId: "nested-recovered",
+    event: parent(done, 4),
+  }]);
+  assertEquals(
+    recovered.internalWorkers[0].console.internalWorkers[0].console.workerState,
+    done,
+  );
 });

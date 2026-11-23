@@ -270,7 +270,7 @@ function workerStateSnapshot(
   const snapshot = record(value, label);
   exact(
     snapshot,
-    ["last_command_id", "last_finished_submission_request_id", "state"],
+    ["state_sequence", "last_command_id", "last_finished_submission_request_id", "state"],
     label,
   );
   const lastFinishedSubmissionRequestId = optional(
@@ -283,6 +283,7 @@ function workerStateSnapshot(
   if (kind === "idle") {
     exact(state, ["kind"], `${label}.state`);
     return {
+      state_sequence: unsignedInteger(snapshot.state_sequence, `${label}.state_sequence`),
       last_command_id: unsignedInteger(
         snapshot.last_command_id,
         `${label}.last_command_id`,
@@ -303,6 +304,7 @@ function workerStateSnapshot(
     (busyKind === "maintenance" && busyState === "compacting")
   ) {
     return {
+      state_sequence: unsignedInteger(snapshot.state_sequence, `${label}.state_sequence`),
       last_command_id: unsignedInteger(
         snapshot.last_command_id,
         `${label}.last_command_id`,

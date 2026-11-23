@@ -640,13 +640,30 @@ pub struct CreateWorkerRequest {
     pub backend_job: Option<BackendJobExecutionBinding>,
 }
 
+/// Usability of the snapshot from the Runtime-owned current execution.
+/// Source sequences order snapshots within that execution; they are not operation authority.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerObservationState {
+    #[default]
+    Unavailable,
+    Current {
+        state_sequence: u64,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub lifecycle: WorkerLifecycleState,
+    /// Unavailable unless a usable current-execution snapshot is explicitly observed.
+    #[serde(default)]
+    pub observation: WorkerObservationState,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<u64>,
@@ -2282,6 +2299,41 @@ mod tests {
         }
 
         async fn get_worker(&self, worker_id: String) -> Result<WorkerResponse, RuntimeApiError> {
+            if worker_id == "observed worker" {
+                let worker_id = "01968f08-2122-7000-8000-000000000001".parse().unwrap();
+                return Ok(WorkerResponse {
+                    worker: WorkerSummary {
+                        last_finished_submission_request_id: None,
+                        restore_observation_token: None,
+                        worker_ref: WorkerRef { worker_id },
+                        worker_id,
+                        lifecycle: WorkerLifecycleState::Active,
+                        observation: WorkerObservationState::Current {
+                            state_sequence: u64::MAX,
+                        },
+                        status: WorkerStatus::Running,
+                        created_at_ms: None,
+                        execution_metadata_available: true,
+                        worker_state: None,
+                        workspace_id: None,
+                        workdir_attachments: Vec::new(),
+                        profile: ProfileSelector::Builtin("default".into()),
+                        display_name: None,
+                        profile_source: ProfileSourceArchiveRef {
+                            id: "profile".into(),
+                            digest: "digest".into(),
+                            size_bytes: 0,
+                            source_graph: ProfileSourceGraphSummary {
+                                source_count: 0,
+                                total_source_bytes: 0,
+                                entrypoints: BTreeMap::new(),
+                                import_count: 0,
+                            },
+                        },
+                        config_bundle: None,
+                    },
+                });
+            }
             if worker_id == "management" {
                 use workdir::management_failure::{
                     WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
@@ -2786,6 +2838,17 @@ mod tests {
             .await
             .unwrap();
         assert!(workers.workers.is_empty());
+        let observed = client.get_worker("observed worker".into()).await.unwrap();
+        assert_eq!(
+            observed.worker.observation,
+            WorkerObservationState::Current {
+                state_sequence: u64::MAX
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&observed).unwrap()["worker"]["observation"],
+            serde_json::json!({"kind": "current", "state_sequence": u64::MAX})
+        );
         let error = client
             .get_worker("missing worker".to_string())
             .await

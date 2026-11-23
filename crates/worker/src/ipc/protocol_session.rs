@@ -178,6 +178,73 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_snapshot_overlap_retains_source_sequences_and_finished_identity() {
+        let owner = crate::shared_state::WorkerStateOwner::new(
+            "subscribe-test".into(),
+            session_store::new_segment_id(),
+            String::new(),
+            protocol::Greeting {
+                worker_name: "subscribe-test".into(),
+                cwd: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                scope_summary: String::new(),
+                tools: Vec::new(),
+                context_window: 0,
+                context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
+            },
+        );
+        let (events, _) = broadcast::channel(4);
+        let (snapshot, mut receiver) = subscribe_before_snapshot(
+            || events.subscribe(),
+            || {
+                let running = owner.transition(protocol::WorkerState::Busy(
+                    protocol::WorkerBusyState::Run(protocol::WorkerRunState::Running),
+                ));
+                events
+                    .send(Event::WorkerState { snapshot: running })
+                    .unwrap();
+                let finished = owner.finish_submission_run(
+                    protocol::WorkerState::Idle,
+                    "finished-during-snapshot".into(),
+                );
+                events
+                    .send(Event::WorkerState { snapshot: finished })
+                    .unwrap();
+                owner.snapshot()
+            },
+        );
+        assert_eq!(snapshot.state_sequence, 2);
+        assert_eq!(snapshot.last_command_id, 0);
+        assert_eq!(
+            snapshot.last_finished_submission_request_id.as_deref(),
+            Some("finished-during-snapshot")
+        );
+        let Event::WorkerState { snapshot: older } = receiver.try_recv().unwrap() else {
+            panic!("expected Running");
+        };
+        assert_eq!(older.state_sequence, 1);
+        assert!(
+            older.state_sequence < snapshot.state_sequence,
+            "queued old state is identifiable without reusing command IDs"
+        );
+        assert_eq!(older.last_command_id, snapshot.last_command_id);
+        assert_eq!(older.last_finished_submission_request_id, None);
+        let Event::WorkerState {
+            snapshot: duplicate,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected completed snapshot");
+        };
+        assert_eq!(
+            duplicate, snapshot,
+            "snapshot/live overlap preserves exact source sequence and content"
+        );
+    }
+
+    #[test]
     fn context_publication_between_subscription_and_snapshot_cannot_be_missed() {
         let (events, _) = broadcast::channel(4);
         let context_tokens = std::cell::Cell::new(20_u64);

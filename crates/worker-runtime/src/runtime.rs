@@ -1470,14 +1470,16 @@ impl Runtime {
             let worker_ref = WorkerRef::new(worker_id);
 
             let durable_request = durable_create_worker_request(&request);
+            let execution_owner = WorkerLifecycleOperationId::new();
             let record = WorkerRecord {
                 workdir_attachments_guard: WorkdirAttachmentsGuard::default(),
                 restore_guard: RestoreGuard::default(),
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
                 execution: WorkerExecutionState::Creating(CreateOperation {
-                    operation_id: Some(WorkerLifecycleOperationId::new()),
+                    operation_id: Some(execution_owner),
                     snapshot: None,
+                    observation_valid: true,
                     internal_workers: InternalWorkerActivityProjection::default(),
                 }),
                 last_finished_submission_request_id: None,
@@ -1506,7 +1508,7 @@ impl Runtime {
                 worker_ref: worker_ref.clone(),
                 request,
                 workspace_scope: scope.cloned(),
-                context: self.execution_context(worker_ref.clone()),
+                context: self.execution_context(worker_ref.clone(), execution_owner),
                 workdir_attachments: BTreeMap::new(),
                 config_bundle,
             };
@@ -1866,13 +1868,71 @@ impl Runtime {
         }
         state.ensure_workspace_owner(scope, true)?;
         state.persist_runtime_snapshot()?;
-        Ok(state.worker(worker_ref)?.detail())
+        drop(state);
+        self.worker_detail(worker_ref)
     }
 
     /// Fetch Worker detail.  The supplied [`WorkerRef`] must match this Runtime.
     pub fn worker_detail(&self, worker_ref: &WorkerRef) -> Result<WorkerDetail, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _guard = match operation_lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(RuntimeError::StatePoisoned),
+        };
+        let (backend, owner) = {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            (
+                state.execution_backend.clone(),
+                worker
+                    .active_execution()
+                    .filter(|active| active.observation_valid)
+                    .and_then(|active| active.owner),
+            )
+        };
+        #[cfg(feature = "ws-server")]
+        if _guard.is_some()
+            && let Some(owner) = owner
+        {
+            let snapshot = backend.and_then(|backend| backend.worker_snapshot(worker_ref));
+            let mut state = self.lock()?;
+            if let Some(snapshot) = snapshot {
+                let incoming = match &snapshot {
+                    protocol::Event::WorkerState { snapshot }
+                    | protocol::Event::Snapshot {
+                        state: snapshot, ..
+                    } => Some(snapshot),
+                    _ => None,
+                };
+                let refreshed = incoming
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidRequest("backend returned no state snapshot".into())
+                    })
+                    .and_then(|snapshot| state.commit_response_snapshot(worker_ref, snapshot));
+                if let Err(error) = refreshed {
+                    tracing::warn!(worker_id = %worker_ref.worker_id, %error, "fresh Worker detail unavailable");
+                    state.invalidate_owned_observation(
+                        worker_ref,
+                        owner,
+                        "fresh snapshot could not be committed",
+                    )?;
+                }
+            } else {
+                state.invalidate_owned_observation(
+                    worker_ref,
+                    owner,
+                    "current execution snapshot unavailable",
+                )?;
+            }
+        }
+        #[cfg(not(feature = "ws-server"))]
+        let _ = (backend, owner);
         let state = self.lock()?;
-        let worker = state.worker(worker_ref)?;
+        let mut worker = state.worker(worker_ref)?.clone();
+        if _guard.is_none() {
+            worker.invalidate_observation();
+        }
         Ok(worker.detail())
     }
 
@@ -2655,7 +2715,7 @@ impl Runtime {
             worker_ref,
             operation.operation_id,
             operation.mode,
-            self.restore_candidate_execution_context(worker_ref.clone()),
+            self.restore_candidate_execution_context(worker_ref.clone(), operation.operation_id),
         )
         .unwrap();
         if source_repair_possible {
@@ -2959,10 +3019,13 @@ impl Runtime {
                     .get(&api.workspace_id)
                     .map(|server_id| RuntimeWorkspaceScope::new(&api.workspace_id, server_id))
             });
-            let candidate_context = worker
-                .restore_candidate_context()
-                .clone()
-                .unwrap_or_else(|| self.restore_candidate_execution_context(worker_ref.clone()));
+            let candidate_context =
+                worker
+                    .restore_candidate_context()
+                    .clone()
+                    .unwrap_or_else(|| {
+                        self.restore_candidate_execution_context(worker_ref.clone(), operation_id)
+                    });
             // First-head repair needs the original launch Prompt material. Use
             // only the exact cached snapshot, never current Profile resolution;
             // ordinary saved-head restore still works without that cache.
@@ -3461,7 +3524,8 @@ impl Runtime {
     }
 
     fn ensure_worker_operation_settled(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        state.refresh_uncertain_worker_write(worker_ref)?;
         state.ensure_subject_not_reserved(worker_ref, false)?;
         let worker = state.worker(worker_ref)?;
         if let Some(operation) = worker.pending_lifecycle_operation_name() {
@@ -3676,7 +3740,19 @@ impl Runtime {
             let state = self.lock()?;
             state.ensure_running()?;
             state.ensure_worker_ref(worker_ref)?;
-            state.worker(worker_ref)?;
+            if state.worker(worker_ref)?.active_execution().is_none() {
+                let result = WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Input,
+                    "Worker has no current Active execution; restore explicitly",
+                );
+                return Err(RuntimeError::WorkerExecutionRejected {
+                    worker_id: worker_ref.worker_id,
+                    operation: result.operation,
+                    outcome: result.outcome,
+                    message: result.message_or_default(),
+                    result,
+                });
+            }
             state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
                     worker_id: worker_ref.worker_id,
@@ -3765,20 +3841,16 @@ impl Runtime {
         let notification = dispatch_result.notification.clone();
         let mut state = self.lock()?;
         state.ensure_running()?;
-        let worker = state.worker_mut(worker_ref)?;
         if dispatch_result.command.is_none()
             && let Some(snapshot) = dispatch_result.worker_state.as_ref()
         {
-            let _ = worker.apply_worker_state(snapshot);
+            state.commit_response_snapshot(worker_ref, snapshot)?;
         }
-        let status = worker.status();
+        let status = state.worker(worker_ref)?.status();
         #[cfg(feature = "ws-server")]
         if let Some(payload) = input_protocol_event(&input) {
             state.push_worker_observation_event(worker_ref.clone(), payload);
         }
-        state.persist_runtime_snapshot()?;
-        state.persist_worker(&worker_ref.worker_id)?;
-        state.publish_worker_upsert(worker_ref.worker_id)?;
 
         Ok(WorkerInteractionAck {
             command,
@@ -4257,7 +4329,7 @@ impl Runtime {
         state.refresh_uncertain_worker_write(worker_ref)?;
         let mut candidate = state.worker(worker_ref)?.clone();
         candidate.execution_bound = true;
-        candidate.handoff_active(initial_worker_state);
+        candidate.handoff_active(initial_worker_state)?;
         if let Some(snapshot) = result.worker_state.as_ref() {
             let _ = candidate.apply_worker_state(snapshot);
         }
@@ -4533,11 +4605,7 @@ impl Runtime {
             return Ok(());
         };
         let mut state = self.lock()?;
-        let worker = state.worker_mut(worker_ref)?;
-        worker.apply_worker_state(&snapshot);
-        state.persist_runtime_snapshot()?;
-        state.persist_worker(&worker_ref.worker_id)?;
-        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state.commit_response_snapshot(worker_ref, &snapshot)?;
         Ok(())
     }
 
@@ -5161,13 +5229,43 @@ impl Runtime {
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
-        let backend = {
+        let (backend, owner) = {
             let state = self.lock()?;
-            state.worker(worker_ref)?;
-            state.execution_backend.clone()
+            let worker = state.worker(worker_ref)?;
+            let owner = worker
+                .active_execution()
+                .filter(|active| active.observation_valid)
+                .and_then(|active| active.owner)
+                .ok_or_else(|| RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id,
+                    message: "current observation has no usable Active execution stream".into(),
+                })?;
+            (state.execution_backend.clone(), owner)
         };
         if let Some(backend) = backend {
-            if let Some(snapshot) = backend.worker_snapshot(worker_ref) {
+            if let Some(mut snapshot) = backend.worker_snapshot(worker_ref) {
+                let mut state = self.lock()?;
+                let incoming = match &mut snapshot {
+                    protocol::Event::WorkerState { snapshot }
+                    | protocol::Event::Snapshot {
+                        state: snapshot, ..
+                    } => snapshot,
+                    _ => {
+                        return Err(RuntimeError::InvalidRequest(
+                            "backend returned no state snapshot".into(),
+                        ));
+                    }
+                };
+                if !state.worker(worker_ref)?.accepts_observation_owner(owner) {
+                    return Err(RuntimeError::WorkerExecutionUnavailable {
+                        worker_id: worker_ref.worker_id,
+                        message: "snapshot execution changed".into(),
+                    });
+                }
+                state.commit_response_snapshot(worker_ref, incoming)?;
+                if let Some(current) = state.worker(worker_ref)?.worker_state() {
+                    *incoming = current;
+                }
                 return Ok(snapshot);
             }
         }
@@ -5203,8 +5301,8 @@ impl Runtime {
         Ok(self.lock()?.observation_tx.subscribe())
     }
 
-    /// Append a Worker protocol event to the observation bus.
-    #[cfg(feature = "ws-server")]
+    /// Test injection bypasses execution capability checks; never used by production.
+    #[cfg(all(feature = "ws-server", any(test, feature = "test-support")))]
     pub fn observe_worker_event(
         &self,
         worker_ref: &WorkerRef,
@@ -5265,32 +5363,48 @@ impl Runtime {
     }
 
     #[cfg(feature = "ws-server")]
-    fn execution_context(&self, worker_ref: WorkerRef) -> crate::execution::WorkerExecutionContext {
+    fn execution_context(
+        &self,
+        worker_ref: WorkerRef,
+        owner: WorkerLifecycleOperationId,
+    ) -> crate::execution::WorkerExecutionContext {
+        self.owned_execution_context(worker_ref, owner, false)
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn owned_execution_context(
+        &self,
+        worker_ref: WorkerRef,
+        owner: WorkerLifecycleOperationId,
+        candidate: bool,
+    ) -> crate::execution::WorkerExecutionContext {
         let runtime = Arc::downgrade(&self.inner);
-        crate::execution::WorkerExecutionContext::new(
-            worker_ref,
-            Arc::new(move |worker_ref, payload| {
-                let runtime = runtime.upgrade().ok_or(RuntimeError::RuntimeStopped)?;
-                let mut state = runtime.lock().map_err(|_| RuntimeError::StatePoisoned)?;
-                state.ensure_worker_ref(&worker_ref)?;
-                let worker_state_changed =
-                    state.project_protocol_event_to_worker_state(&worker_ref, &payload);
-                let activity_changed =
-                    state.project_internal_worker_activity(&worker_ref, &payload);
-                if worker_state_changed {
-                    state.persist_runtime_snapshot()?;
-                    state.persist_worker(&worker_ref.worker_id)?;
-                }
-                if worker_state_changed || activity_changed {
-                    state.publish_worker_upsert(worker_ref.worker_id)?;
-                }
-                Ok(state.push_worker_observation_event(worker_ref, payload))
-            }),
-        )
+        let publisher = Arc::new(move |worker_ref: WorkerRef, payload| {
+            let runtime = runtime.upgrade().ok_or(RuntimeError::RuntimeStopped)?;
+            let mut state = runtime.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+            state.publish_owned_observation(&worker_ref, owner, payload)
+        });
+        let runtime = Arc::downgrade(&self.inner);
+        let invalidated_worker = worker_ref.clone();
+        let invalidator = Arc::new(move |message: &str| {
+            let runtime = runtime.upgrade().ok_or(RuntimeError::RuntimeStopped)?;
+            let mut state = runtime.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+            state.invalidate_owned_observation(&invalidated_worker, owner, message)
+        });
+        let context = if candidate {
+            crate::execution::WorkerExecutionContext::candidate(worker_ref, publisher)
+        } else {
+            crate::execution::WorkerExecutionContext::new(worker_ref, publisher)
+        };
+        context.with_observation_invalidator(invalidator)
     }
 
     #[cfg(not(feature = "ws-server"))]
-    fn execution_context(&self, worker_ref: WorkerRef) -> crate::execution::WorkerExecutionContext {
+    fn execution_context(
+        &self,
+        worker_ref: WorkerRef,
+        _owner: WorkerLifecycleOperationId,
+    ) -> crate::execution::WorkerExecutionContext {
         crate::execution::WorkerExecutionContext::new(worker_ref)
     }
 
@@ -5310,38 +5424,20 @@ impl Runtime {
     fn restore_candidate_execution_context(
         &self,
         worker_ref: WorkerRef,
+        owner: WorkerLifecycleOperationId,
     ) -> crate::execution::WorkerExecutionContext {
-        let runtime = Arc::downgrade(&self.inner);
         let progress = self.restore_progress_notifier(worker_ref.clone());
         let repair = self.restore_repair_authorizer(worker_ref.clone());
-        crate::execution::WorkerExecutionContext::candidate(
-            worker_ref,
-            Arc::new(move |worker_ref, payload| {
-                let runtime = runtime.upgrade().ok_or(RuntimeError::RuntimeStopped)?;
-                let mut state = runtime.lock().map_err(|_| RuntimeError::StatePoisoned)?;
-                state.ensure_worker_ref(&worker_ref)?;
-                let worker_state_changed =
-                    state.project_protocol_event_to_worker_state(&worker_ref, &payload);
-                let activity_changed =
-                    state.project_internal_worker_activity(&worker_ref, &payload);
-                if worker_state_changed {
-                    state.persist_runtime_snapshot()?;
-                    state.persist_worker(&worker_ref.worker_id)?;
-                }
-                if worker_state_changed || activity_changed {
-                    state.publish_worker_upsert(worker_ref.worker_id)?;
-                }
-                Ok(state.push_worker_observation_event(worker_ref, payload))
-            }),
-        )
-        .with_restore_progress(progress)
-        .with_restore_repair_authorizer(repair)
+        self.owned_execution_context(worker_ref, owner, true)
+            .with_restore_progress(progress)
+            .with_restore_repair_authorizer(repair)
     }
 
     #[cfg(not(feature = "ws-server"))]
     fn restore_candidate_execution_context(
         &self,
         worker_ref: WorkerRef,
+        _owner: WorkerLifecycleOperationId,
     ) -> crate::execution::WorkerExecutionContext {
         let progress = self.restore_progress_notifier(worker_ref.clone());
         let repair = self.restore_repair_authorizer(worker_ref.clone());
@@ -5819,16 +5915,6 @@ impl Runtime {
         // a retry could replay Accepted after a failed publication activation.
         // Activation follows this pending decision; terminal success is still absent.
         debug_assert!(status.is_active());
-        let mut worker_state = worker_state;
-        if worker_state.last_finished_submission_request_id.is_none() {
-            // The restored controller starts with fresh live state, but this
-            // historical fence proves that a previously accepted Submit Run
-            // already returned. Preserve it across process reconstruction so
-            // durable consumers can finish post-restart cleanup without
-            // waiting for an old request to run again.
-            worker_state.last_finished_submission_request_id =
-                candidate.last_finished_submission_request_id.clone();
-        }
         candidate.retain_candidate_snapshot(worker_state);
         if let Some(pending) = candidate.pending_restore_mut() {
             pending.commit = RestoreCommitFact::Committed;
@@ -6920,6 +7006,8 @@ struct RuntimeState {
     // Ephemeral write barrier, not authority: only canonical reread + sync can
     // release it. Prevents another mutation from persisting an older projection.
     unreconciled_worker_writes: std::collections::BTreeSet<WorkerId>,
+    #[cfg(test)]
+    fail_next_observation_publication: bool,
     subject_delete_worker_fences: BTreeMap<WorkerId, SubjectDeleteWorkerFence>,
     subject_create_recovery_fences: BTreeMap<WorkerId, SubjectCreateRecoveryFence>,
     subject_release_operations: BTreeMap<
@@ -6962,6 +7050,8 @@ impl RuntimeState {
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             unreconciled_worker_writes: Default::default(),
+            #[cfg(test)]
+            fail_next_observation_publication: false,
             subject_delete_worker_fences: BTreeMap::new(),
             subject_create_recovery_fences: BTreeMap::new(),
             subject_release_operations: BTreeMap::new(),
@@ -6999,6 +7089,8 @@ impl RuntimeState {
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             unreconciled_worker_writes: Default::default(),
+            #[cfg(test)]
+            fail_next_observation_publication: false,
             subject_delete_worker_fences: BTreeMap::new(),
             subject_create_recovery_fences: BTreeMap::new(),
             subject_release_operations: BTreeMap::new(),
@@ -7051,6 +7143,8 @@ impl RuntimeState {
             next_diagnostic_id,
             workers,
             unreconciled_worker_writes: Default::default(),
+            #[cfg(test)]
+            fail_next_observation_publication: false,
             subject_delete_worker_fences: persisted.subject_delete_worker_fences,
             subject_create_recovery_fences: persisted.subject_create_recovery_fences,
             subject_release_operations: persisted
@@ -7600,7 +7694,12 @@ impl RuntimeState {
             worker_id,
             runtime_id: None,
             resource_key: None,
-            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: if worker.worker_state().is_some() && worker.active_execution().is_some()
+            {
+                protocol::subscription::SubscriptionWorkerAvailability::Observed
+            } else {
+                protocol::subscription::SubscriptionWorkerAvailability::Unavailable
+            },
             worker_state: worker.worker_state().clone(),
             state: subscription_worker_state(worker.status()),
             lifecycle: Some(worker.lifecycle()),
@@ -7616,6 +7715,12 @@ impl RuntimeState {
     }
 
     fn publish_worker_upsert(&mut self, worker_id: WorkerId) -> Result<(), RuntimeError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_observation_publication) {
+            return Err(RuntimeError::InvalidRequest(
+                "injected Worker observation publication failure".into(),
+            ));
+        }
         let worker = self
             .workers
             .get(&worker_id)
@@ -7863,15 +7968,30 @@ impl RuntimeState {
         activity: &mut InternalWorkerActivityProjection,
         snapshot: &protocol::InternalWorkerSnapshot,
     ) {
+        Self::internal_worker_snapshot_observations(activity, snapshot, false);
+    }
+
+    fn internal_worker_snapshot_observations(
+        activity: &mut InternalWorkerActivityProjection,
+        snapshot: &protocol::InternalWorkerSnapshot,
+        ancestor_unavailable: bool,
+    ) {
+        let unavailable = ancestor_unavailable || snapshot.state.is_none();
         activity.workers.insert(
             snapshot.worker.session_id.clone(),
             InternalWorkerActivity {
-                status: Some(snapshot.status),
+                observation_unavailable: unavailable,
+                snapshot: if unavailable {
+                    None
+                } else {
+                    snapshot.state.clone()
+                },
+                state_sequence: snapshot.state.as_ref().map(|state| state.state_sequence),
                 parent_session_id: snapshot.worker.parent_session_id.clone(),
             },
         );
         for child in &snapshot.internal_workers {
-            Self::internal_worker_snapshot_statuses(activity, child);
+            Self::internal_worker_snapshot_observations(activity, child, unavailable);
         }
     }
 
@@ -7944,9 +8064,24 @@ impl RuntimeState {
             .entry(worker.session_id.clone())
             .and_modify(|activity| activity.parent_session_id = worker.parent_session_id.clone())
             .or_insert_with(|| InternalWorkerActivity {
-                status: None,
+                observation_unavailable: false,
+                snapshot: None,
+                state_sequence: None,
                 parent_session_id: worker.parent_session_id.clone(),
             });
+    }
+
+    fn invalidate_internal_worker_observation(
+        activity: &mut InternalWorkerActivityProjection,
+        worker: &protocol::InternalWorkerRef,
+    ) {
+        Self::touch_internal_worker_activity(activity, worker);
+        for session in Self::internal_worker_subtree_ids(activity, &worker.session_id) {
+            if let Some(current) = activity.workers.get_mut(&session) {
+                current.observation_unavailable = true;
+                current.snapshot = None;
+            }
+        }
     }
 
     fn project_internal_worker_event(
@@ -7954,26 +8089,41 @@ impl RuntimeState {
         worker: &protocol::InternalWorkerRef,
         event: &protocol::Event,
     ) {
-        if activity.removed_workers.contains_key(&worker.session_id) {
+        if activity.removed_workers.contains_key(&worker.session_id)
+            || activity
+                .workers
+                .get(&worker.session_id)
+                .is_some_and(|state| state.observation_unavailable)
+        {
             return;
         }
         match event {
+            protocol::Event::Shutdown => {
+                Self::invalidate_internal_worker_observation(activity, worker)
+            }
+            protocol::Event::InternalWorkerObservationUnavailable { worker: child } => {
+                Self::invalidate_internal_worker_observation(activity, child)
+            }
             protocol::Event::Snapshot {
                 state,
                 internal_workers,
                 ..
             } => {
+                let previous = activity.clone();
                 Self::clear_internal_worker_subtree(activity, &worker.session_id);
                 activity.workers.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
-                        status: Some(state.catalog_status()),
+                        observation_unavailable: false,
+                        snapshot: Some(state.clone()),
+                        state_sequence: Some(state.state_sequence),
                         parent_session_id: worker.parent_session_id.clone(),
                     },
                 );
                 for child in internal_workers {
                     Self::internal_worker_snapshot_statuses(activity, child);
                 }
+                Self::retain_newer_internal_states(activity, &previous);
             }
             protocol::Event::InternalWorker {
                 worker: nested_worker,
@@ -7989,15 +8139,113 @@ impl RuntimeState {
                 Self::remove_internal_worker_subtree(activity, removed_worker);
             }
             protocol::Event::WorkerState { snapshot } => {
+                if let Some(old) = activity.workers.get(&worker.session_id) {
+                    if old
+                        .state_sequence
+                        .is_some_and(|sequence| sequence > snapshot.state_sequence)
+                    {
+                        return;
+                    }
+                }
                 activity.workers.insert(
                     worker.session_id.clone(),
                     InternalWorkerActivity {
-                        status: Some(snapshot.catalog_status()),
+                        observation_unavailable: false,
+                        snapshot: Some(snapshot.clone()),
+                        state_sequence: Some(snapshot.state_sequence),
                         parent_session_id: worker.parent_session_id.clone(),
                     },
                 );
             }
             _ => Self::touch_internal_worker_activity(activity, worker),
+        }
+    }
+
+    fn retain_newer_internal_states(
+        activity: &mut InternalWorkerActivityProjection,
+        previous: &InternalWorkerActivityProjection,
+    ) {
+        for (session, current) in &mut activity.workers {
+            if let Some(old) = previous.workers.get(session) {
+                if current.observation_unavailable {
+                    current.state_sequence = current.state_sequence.max(old.state_sequence);
+                }
+            }
+            if let Some(old) = previous.workers.get(session)
+                && let (Some(old_sequence), Some(current_sequence)) =
+                    (old.state_sequence, current.state_sequence)
+                && old_sequence > current_sequence
+            {
+                if !current.observation_unavailable {
+                    current.snapshot = old.snapshot.clone();
+                    current.observation_unavailable = old.observation_unavailable;
+                }
+                current.state_sequence = old.state_sequence;
+            }
+        }
+    }
+
+    // The public payload and the activity projection must observe the same child
+    // high-water marks. A parent's sequence cannot order its independent children.
+    fn reconcile_internal_snapshot(
+        activity: &InternalWorkerActivityProjection,
+        snapshot: &mut protocol::InternalWorkerSnapshot,
+    ) {
+        if let Some(incoming) = &snapshot.state
+            && let Some(previous) = activity.workers.get(&snapshot.worker.session_id)
+            && previous
+                .state_sequence
+                .is_some_and(|sequence| sequence > incoming.state_sequence)
+        {
+            snapshot.state = previous.snapshot.clone();
+        }
+        if let Some(state) = &snapshot.state {
+            snapshot.status = state.catalog_status();
+        }
+        for child in &mut snapshot.internal_workers {
+            Self::reconcile_internal_snapshot(activity, child);
+        }
+    }
+
+    fn reconcile_internal_payload(
+        activity: &InternalWorkerActivityProjection,
+        payload: &mut protocol::Event,
+    ) {
+        match payload {
+            protocol::Event::Snapshot {
+                internal_workers, ..
+            } => {
+                for child in internal_workers {
+                    Self::reconcile_internal_snapshot(activity, child);
+                }
+            }
+            protocol::Event::InternalWorker { worker, event } => {
+                if activity.removed_workers.contains_key(&worker.session_id)
+                    || activity
+                        .workers
+                        .get(&worker.session_id)
+                        .is_some_and(|previous| previous.observation_unavailable)
+                {
+                    // Queued events cannot recover a closed child stream. Only a
+                    // paired ancestor snapshot may reopen it at its high-water mark.
+                    *payload = protocol::Event::InternalWorkerObservationUnavailable {
+                        worker: worker.clone(),
+                    };
+                    return;
+                }
+                if let protocol::Event::WorkerState { snapshot }
+                | protocol::Event::Snapshot {
+                    state: snapshot, ..
+                } = &mut **event
+                    && let Some(previous) = activity.workers.get(&worker.session_id)
+                    && let Some(latest) = &previous.snapshot
+                    && latest.state_sequence > snapshot.state_sequence
+                {
+                    *snapshot = latest.clone();
+                }
+                Self::reconcile_internal_payload(activity, event);
+            }
+            _ => {}
         }
     }
 
@@ -8007,13 +8255,18 @@ impl RuntimeState {
     ) -> bool {
         let was_running = activity.has_running_worker();
         match event {
+            protocol::Event::InternalWorkerObservationUnavailable { worker } => {
+                Self::invalidate_internal_worker_observation(activity, worker)
+            }
             protocol::Event::Snapshot {
                 internal_workers, ..
             } => {
+                let previous = activity.clone();
                 activity.clear();
                 for child in internal_workers {
                     Self::internal_worker_snapshot_statuses(activity, child);
                 }
+                Self::retain_newer_internal_states(activity, &previous);
             }
             protocol::Event::InternalWorker { worker, event } => {
                 Self::project_internal_worker_event(activity, worker, event);
@@ -8039,6 +8292,176 @@ impl RuntimeState {
             .is_some_and(|activity| Self::update_internal_worker_activity(activity, event))
     }
 
+    fn commit_response_snapshot(
+        &mut self,
+        worker_ref: &WorkerRef,
+        snapshot: &protocol::WorkerStateSnapshot,
+    ) -> Result<(), RuntimeError> {
+        self.refresh_uncertain_worker_write(worker_ref)?;
+        let current = self.worker(worker_ref)?;
+        let active =
+            current
+                .active_execution()
+                .ok_or_else(|| RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id,
+                    message: "response snapshot has no current Active execution".into(),
+                })?;
+        if snapshot.state_sequence == active.snapshot.state_sequence && snapshot != &active.snapshot
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "conflicting Worker response source sequence".into(),
+            ));
+        }
+        let was_valid = active.observation_valid;
+        let mut candidate = current.clone();
+        if !candidate.apply_worker_state(snapshot) {
+            return Ok(());
+        }
+        // A response observes this endpoint, but cannot repair a disconnected live tail.
+        if !was_valid {
+            candidate.invalidate_observation();
+        }
+        let durable = candidate.restore_guard.observation_token
+            != current.restore_guard.observation_token
+            || candidate.last_finished_submission_request_id
+                != current.last_finished_submission_request_id;
+        if durable {
+            if let Err(error) = self.persist_worker_record_with_fence(&candidate) {
+                self.worker_mut(worker_ref)?.invalidate_observation();
+                if let Err(publication) = self.publish_worker_upsert(worker_ref.worker_id) {
+                    tracing::error!(%publication, "failed response observation could not be published unavailable");
+                }
+                return Err(error);
+            }
+        }
+        self.workers.insert(worker_ref.worker_id, candidate);
+        if let Err(error) = self.publish_worker_upsert(worker_ref.worker_id) {
+            self.worker_mut(worker_ref)?.invalidate_observation();
+            if let Err(publication) = self.publish_worker_upsert(worker_ref.worker_id) {
+                tracing::error!(%publication, "response publication failure remains unavailable");
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn invalidate_owned_observation(
+        &mut self,
+        worker_ref: &WorkerRef,
+        owner: WorkerLifecycleOperationId,
+        message: &str,
+    ) -> Result<(), RuntimeError> {
+        let worker = self.worker_mut(worker_ref)?;
+        if !worker.owns_observation_context(owner) {
+            return Err(RuntimeError::WorkerExecutionUnavailable {
+                worker_id: worker_ref.worker_id,
+                message: "observation owner is no longer current".into(),
+            });
+        }
+        worker.invalidate_observation();
+        tracing::warn!(worker_id = %worker_ref.worker_id, %owner, %message,
+            "Worker observation invalidated; an owner snapshot is required");
+        self.publish_worker_upsert(worker_ref.worker_id)?;
+        self.push_worker_observation_event(
+            worker_ref.clone(),
+            protocol::Event::Error {
+                code: protocol::ErrorCode::Internal,
+                message: "Worker observation is unavailable; obtain a fresh snapshot".into(),
+            },
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn publish_owned_observation(
+        &mut self,
+        worker_ref: &WorkerRef,
+        owner: WorkerLifecycleOperationId,
+        mut payload: protocol::Event,
+    ) -> Result<WorkerObservationEvent, RuntimeError> {
+        self.refresh_uncertain_worker_write(worker_ref)?;
+        let current = self.worker(worker_ref)?;
+        if !current.accepts_observation_owner(owner) {
+            return Err(RuntimeError::WorkerExecutionUnavailable {
+                worker_id: worker_ref.worker_id,
+                message: "observation owner is no longer current".into(),
+            });
+        }
+        let mut candidate = current.clone();
+        let incoming = match &mut payload {
+            protocol::Event::WorkerState { snapshot }
+            | protocol::Event::Snapshot {
+                state: snapshot, ..
+            } => Some(snapshot),
+            _ => None,
+        };
+        if let Some(incoming) = incoming {
+            if let Some(active) = current.observation_execution() {
+                if incoming.state_sequence == active.snapshot.state_sequence
+                    && incoming != &active.snapshot
+                {
+                    let error = RuntimeError::InvalidRequest(
+                        "conflicting Worker state source sequence".into(),
+                    );
+                    if let Err(invalidation) = self.invalidate_owned_observation(
+                        worker_ref,
+                        owner,
+                        "conflicting source sequence",
+                    ) {
+                        tracing::error!(%invalidation, "conflicting observation could not be invalidated");
+                    }
+                    return Err(error);
+                }
+                // Full snapshots retain non-state content, but their state uses the same
+                // source sequence as live events and command responses.
+                if incoming.state_sequence < active.snapshot.state_sequence {
+                    *incoming = active.snapshot.clone();
+                }
+            }
+            candidate.apply_owned_observation(incoming);
+        }
+        if let Some(activity) = candidate.observation_activity_mut() {
+            Self::reconcile_internal_payload(activity, &mut payload);
+        }
+        let activity_changed = candidate
+            .observation_activity_mut()
+            .is_some_and(|activity| Self::update_internal_worker_activity(activity, &payload));
+        let change = WorkerObservationChange {
+            projection: candidate.worker_state() != current.worker_state() || activity_changed,
+            durable: candidate.restore_guard.observation_token
+                != current.restore_guard.observation_token
+                || candidate.last_finished_submission_request_id
+                    != current.last_finished_submission_request_id,
+        };
+        if change.durable {
+            if let Err(error) = self.persist_worker_record_with_fence(&candidate) {
+                // Preserve the original candidate outside memory until canonical refresh
+                // discharges an unknown-outcome fence. Never publish its durable facts.
+                if let Err(invalidation) = self.invalidate_owned_observation(
+                    worker_ref,
+                    owner,
+                    "durable state commit failed",
+                ) {
+                    tracing::error!(%invalidation, "failed durable observation could not be invalidated");
+                }
+                return Err(error);
+            }
+        }
+        self.workers.insert(worker_ref.worker_id, candidate);
+        if change.projection || change.durable {
+            if let Err(error) = self.publish_worker_upsert(worker_ref.worker_id) {
+                if let Err(invalidation) =
+                    self.invalidate_owned_observation(worker_ref, owner, "state publication failed")
+                {
+                    tracing::error!(%invalidation, "failed observation publication could not be invalidated");
+                }
+                return Err(error);
+            }
+        }
+        Ok(self.push_worker_observation_event(worker_ref.clone(), payload))
+    }
+
     fn project_protocol_event_to_worker_state(
         &mut self,
         worker_ref: &WorkerRef,
@@ -8058,9 +8481,17 @@ impl RuntimeState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WorkerObservationChange {
+    projection: bool,
+    durable: bool,
+}
+
 #[derive(Debug, Clone)]
 struct InternalWorkerActivity {
-    status: Option<protocol::WorkerStatus>,
+    observation_unavailable: bool,
+    snapshot: Option<protocol::WorkerStateSnapshot>,
+    state_sequence: Option<u64>,
     parent_session_id: Option<String>,
 }
 
@@ -8082,9 +8513,11 @@ impl InternalWorkerActivityProjection {
     }
 
     fn has_running_worker(&self) -> bool {
-        self.workers
-            .values()
-            .any(|worker| worker.status == Some(protocol::WorkerStatus::Running))
+        self.workers.values().any(|worker| {
+            worker.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.catalog_status() == protocol::WorkerStatus::Running
+            })
+        })
     }
 }
 
@@ -8546,11 +8979,18 @@ impl WorkerRecord {
         let Some(active) = self.active_execution() else {
             return false;
         };
-        if active.snapshot.state != incoming.state {
+        if incoming.state_sequence < active.snapshot.state_sequence
+            || (incoming == &active.snapshot && active.observation_valid)
+        {
+            return false;
+        }
+        if active.snapshot.state_sequence != incoming.state_sequence {
             self.restore_guard.rotate();
         }
         self.remember_finished_submission(incoming);
-        self.active_execution_mut().expect("Active update").snapshot = incoming.clone();
+        let active = self.active_execution_mut().expect("Active update");
+        active.snapshot = incoming.clone();
+        active.observation_valid = true;
         true
     }
 
@@ -8591,9 +9031,11 @@ impl WorkerRecord {
             worker_id: self.worker_id,
             status: self.status(),
             lifecycle: self.lifecycle(),
+            observation: self.observation_state(),
             created_at_ms: self.created_at_ms,
             execution_metadata_available: self.execution_metadata_available(),
             worker_state: self.worker_state().clone(),
+            last_finished_submission_request_id: self.last_finished_submission_request_id.clone(),
             workspace_id: self.workspace_id.clone(),
             workdir_attachments: self.workdir_attachments.clone(),
             profile: self.profile.clone(),
@@ -8610,10 +9052,12 @@ impl WorkerRecord {
             worker_id: self.worker_id,
             status: self.status(),
             lifecycle: self.lifecycle(),
+            observation: self.observation_state(),
             created_at_ms: self.created_at_ms,
             execution_metadata_available: self.execution_metadata_available(),
             execution_reconstructed: self.execution_reconstructed,
             worker_state: self.worker_state().clone(),
+            last_finished_submission_request_id: self.last_finished_submission_request_id.clone(),
             workspace_id: self.workspace_id.clone(),
             workdir_attachments: self.workdir_attachments.clone(),
             profile: self.profile.clone(),
@@ -8680,6 +9124,7 @@ impl WorkerRecord {
                         WorkerLifecycleOperation::Create(CreateOperation {
                             operation_id: create.operation_id,
                             snapshot: None,
+                            observation_valid: false,
                             internal_workers: InternalWorkerActivityProjection::default(),
                         }),
                         create.request,
@@ -9806,6 +10251,7 @@ mod tests {
         protocol::InternalWorkerSnapshot {
             worker,
             status,
+            state: Some(status.into()),
             greeting: None,
             session: protocol::SessionSnapshot {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
@@ -9866,7 +10312,10 @@ mod tests {
             };
             RuntimeState::update_internal_worker_activity(&mut activity, &replay);
             assert_eq!(
-                activity.workers["command-child"].status,
+                activity.workers["command-child"]
+                    .snapshot
+                    .as_ref()
+                    .map(protocol::WorkerStateSnapshot::catalog_status),
                 Some(protocol::WorkerStatus::Running)
             );
         }
@@ -10786,6 +11235,8 @@ mod tests {
         restore_requests: Mutex<Vec<WorkerExecutionRestoreRequest>>,
         #[cfg(feature = "ws-server")]
         restore_event: Mutex<Option<protocol::Event>>,
+        #[cfg(feature = "ws-server")]
+        create_event: Mutex<Option<protocol::Event>>,
         config_bundles: Mutex<Vec<Option<ConfigBundle>>>,
         workspace_config_fetches: Mutex<Vec<WorkspaceConfigFetchRequest>>,
         workspace_config_results: Mutex<Vec<WorkspaceConfigFetchResult>>,
@@ -10841,7 +11292,14 @@ mod tests {
         ) -> Result<crate::observation::WorkerObservationEvent, RuntimeError> {
             let contexts = self.contexts.lock().unwrap();
             let context = contexts.get(&worker_ref.worker_id).expect("context stored");
-            context.publish_protocol_event(protocol::Event::TextDelta { text: text.into() })
+            match context
+                .publish_protocol_event(protocol::Event::TextDelta { text: text.into() })?
+            {
+                crate::execution::WorkerObservationPublication::Published(event) => Ok(event),
+                crate::execution::WorkerObservationPublication::Buffered => Err(
+                    RuntimeError::InvalidRequest("test requires published observation".into()),
+                ),
+            }
         }
     }
 
@@ -11016,6 +11474,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.config_bundle.clone());
+            #[cfg(feature = "ws-server")]
+            self.set_worker_snapshot(
+                &request.worker_ref,
+                protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStateSnapshot::initial(),
+                },
+            );
+            #[cfg(feature = "ws-server")]
+            if let Some(event) = self.create_event.lock().unwrap().take() {
+                self.set_worker_snapshot(&request.worker_ref, event.clone());
+                request.context.publish_protocol_event(event).unwrap();
+            }
             self.contexts
                 .lock()
                 .unwrap()
@@ -11093,7 +11563,15 @@ mod tests {
                 .unwrap()
                 .push(request.operation_id);
             #[cfg(feature = "ws-server")]
+            self.set_worker_snapshot(
+                &request.worker_ref,
+                protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStateSnapshot::initial(),
+                },
+            );
+            #[cfg(feature = "ws-server")]
             if let Some(event) = self.restore_event.lock().unwrap().take() {
+                self.set_worker_snapshot(&request.worker_ref, event.clone());
                 request.context.publish_protocol_event(event).unwrap();
             }
             let restore_gate = self.restore_gate.lock().unwrap().clone();
@@ -15010,19 +15488,34 @@ mod tests {
         let request = runtime.test_restore_request(&worker.worker_ref);
         {
             let mut state = runtime.lock().unwrap();
-            for status in [
+            for (index, status) in [
                 protocol::WorkerStatus::Running,
                 protocol::WorkerStatus::Idle,
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 assert!(state.project_protocol_event_to_worker_state(
                     &worker.worker_ref,
                     &protocol::Event::WorkerState {
-                        snapshot: status.into()
+                        snapshot: protocol::WorkerStateSnapshot {
+                            state_sequence: index as u64 + 1,
+                            ..status.into()
+                        }
                     }
                 ));
                 state.persist_worker(&worker.worker_id).unwrap();
             }
         }
+        backend.set_worker_snapshot(
+            &worker.worker_ref,
+            protocol::Event::WorkerState {
+                snapshot: protocol::WorkerStateSnapshot {
+                    state_sequence: 2,
+                    ..protocol::WorkerStatus::Idle.into()
+                },
+            },
+        );
         assert_eq!(
             runtime
                 .worker_detail(&worker.worker_ref)
@@ -16478,7 +16971,10 @@ mod tests {
             let gate = Arc::new(RestoreGate::default());
             *backend.activation_gate.lock().unwrap() = Some(gate.clone());
             *backend.restore_event.lock().unwrap() = Some(protocol::Event::WorkerState {
-                snapshot: protocol::WorkerStatus::Running.into(),
+                snapshot: protocol::WorkerStateSnapshot {
+                    state_sequence: 1,
+                    ..protocol::WorkerStatus::Running.into()
+                },
             });
             let restoring_runtime = runtime.clone();
             let restoring_ref = worker.worker_ref.clone();
@@ -16519,16 +17015,11 @@ mod tests {
                     .receipt
                     .is_none()
             );
-            // Live protocol state and settled catalog state are deliberately
-            // different during activation. Persistence must remain readable.
+            let unavailable = runtime.worker_detail(&worker.worker_ref).unwrap();
+            assert!(unavailable.worker_state.is_none());
             assert_eq!(
-                runtime
-                    .worker_detail(&worker.worker_ref)
-                    .unwrap()
-                    .worker_state
-                    .unwrap()
-                    .catalog_status(),
-                protocol::WorkerStatus::Running
+                unavailable.observation,
+                crate::catalog::WorkerObservationState::Unavailable
             );
             *backend.activation_gate.lock().unwrap() = None;
             let accepted = runtime
@@ -16691,7 +17182,8 @@ mod tests {
         let cursor = runtime
             .worker_observation_cursor_now(&worker.worker_ref)
             .unwrap();
-        let actual = runtime.execution_context(worker.worker_ref.clone());
+        let operation_id = WorkerLifecycleOperationId::new();
+        let actual = runtime.execution_context(worker.worker_ref.clone(), operation_id);
         let fail_once = Arc::new(AtomicBool::new(true));
         let failure = fail_once.clone();
         let context = WorkerExecutionContext::candidate(
@@ -16702,10 +17194,12 @@ mod tests {
                         "injected publication failure".into(),
                     ));
                 }
-                actual.publish_observation(event)
+                match actual.publish_observation(event)? {
+                    crate::execution::WorkerObservationPublication::Published(event) => Ok(event),
+                    crate::execution::WorkerObservationPublication::Buffered => unreachable!(),
+                }
             }),
         );
-        let operation_id = WorkerLifecycleOperationId::new();
         runtime
             .begin_restore_operation(
                 &worker.worker_ref,
@@ -16740,9 +17234,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        backend
-            .publish_text_delta(&worker.worker_ref, "second")
-            .unwrap();
+        assert!(matches!(
+            backend.contexts.lock().unwrap()[&worker.worker_id]
+                .publish_protocol_event(protocol::Event::TextDelta {
+                    text: "second".into()
+                })
+                .unwrap(),
+            crate::execution::WorkerObservationPublication::Buffered
+        ));
         let retry = runtime
             .restore_worker_operation(
                 &worker.worker_ref,
@@ -16799,7 +17298,10 @@ mod tests {
             .lock()
             .unwrap()
             .replace(protocol::Event::WorkerState {
-                snapshot: protocol::WorkerStatus::Running.into(),
+                snapshot: protocol::WorkerStateSnapshot {
+                    state_sequence: 1,
+                    ..protocol::WorkerStatus::Running.into()
+                },
             });
         let gate = Arc::new(RestoreGate::default());
         *backend.restore_gate.lock().unwrap() = Some(gate.clone());
@@ -16827,6 +17329,15 @@ mod tests {
         gate.release();
         let result = restoring.join().unwrap().unwrap();
         assert_eq!(result.state, WorkerRestoreState::Accepted);
+        backend.set_worker_snapshot(
+            &worker.worker_ref,
+            protocol::Event::WorkerState {
+                snapshot: protocol::WorkerStateSnapshot {
+                    state_sequence: 1,
+                    ..protocol::WorkerStatus::Running.into()
+                },
+            },
+        );
         let committed = runtime.worker_detail(&worker.worker_ref).unwrap();
         assert_eq!(committed.status, WorkerStatus::Running);
         assert_eq!(
@@ -16871,12 +17382,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_replaces_worker_state_with_each_full_snapshot() {
-        let (runtime, _) = runtime_and_backend();
+    fn runtime_orders_full_snapshots_by_source_state_sequence() {
+        let (runtime, backend) = runtime_and_backend();
         let detail = runtime
             .create_worker(task_request("state replacement"))
             .unwrap();
         let running = protocol::WorkerStateSnapshot {
+            state_sequence: 2,
             state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                 protocol::WorkerRunState::Running,
             )),
@@ -16892,6 +17404,12 @@ mod tests {
                 },
             ));
         }
+        backend.set_worker_snapshot(
+            &detail.worker_ref,
+            protocol::Event::WorkerState {
+                snapshot: running.clone(),
+            },
+        );
         assert_eq!(
             runtime
                 .worker_detail(&detail.worker_ref)
@@ -16901,8 +17419,9 @@ mod tests {
         );
 
         let fresh = protocol::WorkerStateSnapshot {
+            state_sequence: 3,
             state: protocol::WorkerState::Idle,
-            last_command_id: 0,
+            last_command_id: 2,
             last_finished_submission_request_id: None,
         };
         {
@@ -16914,6 +17433,12 @@ mod tests {
                 },
             ));
         }
+        backend.set_worker_snapshot(
+            &detail.worker_ref,
+            protocol::Event::WorkerState {
+                snapshot: fresh.clone(),
+            },
+        );
         let after = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(after.status, WorkerStatus::Idle);
         assert_eq!(after.worker_state, Some(fresh));
@@ -17361,7 +17886,10 @@ mod tests {
                     reasoning: None,
                     context_usage: None,
                 },
-                state: protocol::WorkerStatus::Running.into(),
+                state: protocol::WorkerStateSnapshot {
+                    state_sequence: 1,
+                    ..protocol::WorkerStatus::Running.into()
+                },
                 in_flight: protocol::InFlightSnapshot {
                     block_ids: Vec::new(),
                     blocks: Vec::new(),
@@ -17394,11 +17922,12 @@ mod tests {
     #[cfg(feature = "ws-server")]
     #[test]
     fn observation_snapshot_fails_closed_when_backend_snapshot_is_unavailable() {
-        let runtime = runtime_with_backend();
+        let (runtime, backend) = runtime_and_backend();
         let detail = runtime
             .create_worker(task_request("snapshot unavailable"))
             .unwrap();
 
+        backend.snapshots.lock().unwrap().remove(&detail.worker_id);
         assert!(matches!(
             runtime
                 .worker_observation_snapshot(&detail.worker_ref)
@@ -18793,6 +19322,7 @@ mod tests {
                 protocol::SubmissionDisposition::Started,
             )
             .with_worker_state(protocol::WorkerStateSnapshot {
+                state_sequence: 1,
                 state: protocol::WorkerState::Idle,
                 // Production Submit Run does not consume a lifecycle command
                 // id, so this intentionally remains zero.
@@ -18834,7 +19364,7 @@ mod tests {
             .expect("automatic restore publishes fresh Worker state");
         assert_eq!(restored_state.last_command_id, 0);
         assert_eq!(
-            restored_state
+            restored_detail
                 .last_finished_submission_request_id
                 .as_deref(),
             Some("job-attempt-request")
@@ -19710,7 +20240,8 @@ mod tests {
                     &worker.worker_ref,
                     operation,
                     WorkerRestoreMode::Explicit,
-                    runtime.restore_candidate_execution_context(worker.worker_ref.clone()),
+                    runtime
+                        .restore_candidate_execution_context(worker.worker_ref.clone(), operation),
                 )
                 .unwrap();
             if let Some(fault) = fault {
@@ -19886,7 +20417,10 @@ mod tests {
                     &worker.worker_ref,
                     operation_id,
                     WorkerRestoreMode::Explicit,
-                    runtime.restore_candidate_execution_context(worker.worker_ref.clone()),
+                    runtime.restore_candidate_execution_context(
+                        worker.worker_ref.clone(),
+                        operation_id,
+                    ),
                 )
                 .unwrap();
             runtime_store(&runtime)
@@ -20071,7 +20605,7 @@ mod tests {
             &worker.worker_ref,
             operation_id,
             WorkerRestoreMode::Explicit,
-            runtime.restore_candidate_execution_context(worker.worker_ref.clone()),
+            runtime.restore_candidate_execution_context(worker.worker_ref.clone(), operation_id),
         );
 
         assert!(matches!(
@@ -20329,4 +20863,5 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(missing_root);
     }
+    include!("runtime/observation_tests.rs");
 }

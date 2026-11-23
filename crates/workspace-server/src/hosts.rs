@@ -344,6 +344,10 @@ pub struct InternalWorkerImplementationSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InternalWorkerSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_submission_request_id: Option<String>,
+    #[serde(default)]
+    pub observation: runtime_api::WorkerObservationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_observation_token: Option<String>,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
@@ -379,6 +383,34 @@ pub struct InternalWorkerSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+impl InternalWorkerSummary {
+    /// Assignment requires a usable snapshot from the current Active execution.
+    /// Catalog status and retained projection availability are not admission authority.
+    pub(crate) fn is_current_idle(&self) -> bool {
+        self.lifecycle == Some(protocol::WorkerLifecycleState::Active)
+            && matches!(
+                (&self.observation, &self.worker_state),
+                (
+                    runtime_api::WorkerObservationState::Current { state_sequence },
+                    Some(snapshot)
+                ) if *state_sequence == snapshot.state_sequence && snapshot.state == protocol::WorkerState::Idle
+            )
+    }
+}
+
+fn observation_availability(
+    observation: &runtime_api::WorkerObservationState,
+) -> protocol::subscription::SubscriptionWorkerAvailability {
+    match observation {
+        runtime_api::WorkerObservationState::Current { .. } => {
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        }
+        runtime_api::WorkerObservationState::Unavailable => {
+            protocol::subscription::SubscriptionWorkerAvailability::Unavailable
+        }
+    }
 }
 
 impl From<RuntimeDiagnostic> for server_api::Diagnostic {
@@ -3460,6 +3492,7 @@ impl EmbeddedWorkerRuntime {
             true,
         );
         InternalWorkerSummary {
+            observation: summary.observation.clone(),
             restore_observation_token: summary.restore_observation_token.clone(),
             lifecycle: Some(summary.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
@@ -3474,13 +3507,14 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: observation_availability(&summary.observation),
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
             )
             .to_string(),
             execution_reconstructed: false,
+            last_finished_submission_request_id: None,
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -3506,6 +3540,7 @@ impl EmbeddedWorkerRuntime {
             true,
         );
         InternalWorkerSummary {
+            observation: detail.observation.clone(),
             restore_observation_token: detail.restore_observation_token.clone(),
             lifecycle: Some(detail.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
@@ -3520,10 +3555,11 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: observation_availability(&detail.observation),
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             execution_reconstructed: detail.execution_reconstructed,
+            last_finished_submission_request_id: detail.last_finished_submission_request_id.clone(),
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -6279,6 +6315,7 @@ impl RemoteWorkerRuntime {
             false,
         );
         InternalWorkerSummary {
+            observation: summary.observation.clone(),
             restore_observation_token: summary.restore_observation_token.clone(),
             lifecycle: Some(summary.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
@@ -6293,13 +6330,14 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: observation_availability(&summary.observation),
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
             )
             .to_string(),
             execution_reconstructed: false,
+            last_finished_submission_request_id: None,
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -6323,6 +6361,7 @@ impl RemoteWorkerRuntime {
             false,
         );
         InternalWorkerSummary {
+            observation: detail.observation.clone(),
             restore_observation_token: detail.restore_observation_token.clone(),
             lifecycle: Some(detail.lifecycle),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
@@ -6337,10 +6376,11 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: observation_availability(&detail.observation),
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             execution_reconstructed: detail.execution_reconstructed,
+            last_finished_submission_request_id: detail.last_finished_submission_request_id.clone(),
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -9203,6 +9243,8 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
 pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
     let host_id = host_id.into();
     InternalWorkerSummary {
+        last_finished_submission_request_id: None,
+        observation: runtime_api::WorkerObservationState::Unavailable,
         restore_observation_token: None,
         lifecycle: None,
         worker: RuntimeWorkerRef::new("placeholder", "worker-placeholder"),
@@ -10868,6 +10910,8 @@ mod tests {
                 runtime_id: runtime_id.to_string(),
                 host_id: host_id.to_string(),
                 workers: vec![InternalWorkerSummary {
+                    last_finished_submission_request_id: None,
+                    observation: runtime_api::WorkerObservationState::Unavailable,
                     restore_observation_token: None,
                     lifecycle: None,
                     worker: RuntimeWorkerRef::new(runtime_id, worker_id),

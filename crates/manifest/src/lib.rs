@@ -1197,7 +1197,8 @@ struct LegacyMemoryConfig {
     consolidation_threshold_bytes: Option<u64>,
 }
 
-const RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 4;
+const RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 5;
+const MERGE_REQUEST_READINESS_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 4;
 const MEMORY_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 3;
 const PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 2;
 
@@ -1254,6 +1255,7 @@ pub fn read_persisted_worker_manifest_snapshot(
             ))
         })?;
         if version != RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION
+            && version != MERGE_REQUEST_READINESS_MANIFEST_SNAPSHOT_SCHEMA_VERSION
             && version != MEMORY_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION
             && version != PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION
         {
@@ -1286,13 +1288,36 @@ pub fn read_persisted_worker_manifest_snapshot(
         if version == PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
             migrate_legacy_manifest_authority(&mut manifest)?;
         }
-        if version != RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
+        if version <= MEMORY_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
             migrate_legacy_memory_settings_counter(&mut manifest)?;
+        }
+        if version <= MERGE_REQUEST_READINESS_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
+            migrate_legacy_merge_request_readiness(&mut manifest)?;
         }
         return validate_persisted_worker_manifest(serde_json::from_value(manifest)?);
     }
 
     migrate_legacy_resolved_manifest_snapshot(snapshot)
+}
+
+// The retired operation has no replacement capability. Only old persisted
+// snapshots may drop its boolean supply flag; all other constraints stay intact.
+fn migrate_legacy_merge_request_readiness(
+    manifest: &mut serde_json::Value,
+) -> Result<(), serde_json::Error> {
+    if let Some(config) = manifest
+        .get_mut("feature")
+        .and_then(|feature| feature.get_mut("merge_request"))
+        .and_then(serde_json::Value::as_object_mut)
+        && let Some(flag) = config.remove("readiness_check")
+        && !flag.is_boolean()
+    {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy Merge Request readiness flag must be a boolean",
+        )));
+    }
+    Ok(())
 }
 
 fn validate_persisted_worker_manifest(
@@ -1486,6 +1511,7 @@ fn migrate_legacy_resolved_manifest_snapshot(
     feature.insert("memory".to_string(), resolved);
     migrate_legacy_manifest_authority(&mut snapshot)?;
     migrate_legacy_memory_settings_counter(&mut snapshot)?;
+    migrate_legacy_merge_request_readiness(&mut snapshot)?;
     validate_persisted_worker_manifest(serde_json::from_value(snapshot)?)
 }
 
@@ -1509,6 +1535,110 @@ permission = "write"
 "#;
 
     #[test]
+    fn persisted_readiness_flag_migration_preserves_other_manifest_constraints() {
+        let mut manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        manifest.feature.filesystem_write.enabled = false;
+        manifest.feature.bash.enabled = false;
+        manifest.feature.merge_request = MergeRequestFeatureConfig {
+            review: true,
+            comment: true,
+            ..Default::default()
+        };
+        for version in [None, Some(2), Some(3), Some(4)] {
+            for readiness in [false, true] {
+                let mut value = serde_json::to_value(&manifest).unwrap();
+                if version.is_none() {
+                    value["feature"]["memory"] =
+                        serde_json::json!({"enabled": false, "staging": false});
+                }
+                let snapshot = match version {
+                    None => value,
+                    Some(version) => {
+                        serde_json::json!({"schema_version": version, "manifest": value})
+                    }
+                };
+                let expected = read_persisted_worker_manifest_snapshot(snapshot.clone()).unwrap();
+                let mut old = snapshot;
+                let saved = if version.is_some() {
+                    &mut old["manifest"]
+                } else {
+                    &mut old
+                };
+                saved["feature"]["merge_request"]["readiness_check"] = readiness.into();
+                let restored = read_persisted_worker_manifest_snapshot(old).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&restored).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+                assert!(!restored.feature.merge_request.complete);
+                let rewritten = write_persisted_worker_manifest_snapshot(&restored).unwrap();
+                assert_eq!(rewritten["schema_version"], 5);
+                assert!(
+                    rewritten["manifest"]["feature"]["merge_request"]
+                        .get("readiness_check")
+                        .is_none()
+                );
+                let reread = read_persisted_worker_manifest_snapshot(rewritten).unwrap();
+                assert_eq!(
+                    serde_json::to_value(reread).unwrap(),
+                    serde_json::to_value(restored).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readiness_flag_is_rejected_in_current_manifests_and_snapshots() {
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        for readiness in [false, true] {
+            let mut current = write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+            current["schema_version"] = 5.into();
+            current["manifest"]["feature"]["merge_request"]["readiness_check"] = readiness.into();
+            assert!(serde_json::from_value::<WorkerManifest>(current["manifest"].clone()).is_err());
+            assert!(read_persisted_worker_manifest_snapshot(current).is_err());
+            assert!(
+                WorkerManifest::from_toml(&format!(
+                    "{MINIMAL_REQUIRED}\n[feature.merge_request]\nreadiness_check = {readiness}\n"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_readiness_migration_rejects_malformed_and_unknown_fields() {
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        for version in [None, Some(2), Some(3), Some(4), Some(5)] {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(0),
+                serde_json::json!("false"),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let mut value = serde_json::to_value(&manifest).unwrap();
+                if version.is_none() {
+                    value["feature"]["memory"] =
+                        serde_json::json!({"enabled": false, "staging": false});
+                }
+                value["feature"]["merge_request"]["readiness_check"] = invalid;
+                let old = match version {
+                    None => value,
+                    Some(version) => {
+                        serde_json::json!({"schema_version": version, "manifest": value})
+                    }
+                };
+                assert!(read_persisted_worker_manifest_snapshot(old).is_err());
+            }
+        }
+        let mut old = write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+        old["schema_version"] = 4.into();
+        old["manifest"]["feature"]["merge_request"]["readiness_check"] = true.into();
+        old["manifest"]["feature"]["merge_request"]["unexpected_operation"] = true.into();
+        assert!(read_persisted_worker_manifest_snapshot(old).is_err());
+    }
+
+    #[test]
     fn manifest_and_persisted_snapshots_reject_removed_permissions() {
         let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         for policy in [
@@ -1521,7 +1651,7 @@ permission = "write"
             value["permissions"] = policy;
             let error = serde_json::from_value::<WorkerManifest>(value.clone()).unwrap_err();
             assert!(error.to_string().contains("permissions"), "{error}");
-            for version in [None, Some(2), Some(3), Some(4)] {
+            for version in [None, Some(2), Some(3), Some(4), Some(5)] {
                 let snapshot = match version {
                     None => value.clone(),
                     Some(version) => {
@@ -1547,7 +1677,7 @@ permission = "write"
         let mut value = serde_json::to_value(&manifest).unwrap();
         value["permissions"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<WorkerManifest>(value.clone()).is_err());
-        for version in [None, Some(2), Some(3), Some(4)] {
+        for version in [None, Some(2), Some(3), Some(4), Some(5)] {
             let mut saved = value.clone();
             if version.is_none() {
                 saved["feature"]["memory"] = serde_json::json!({"enabled":false, "staging":false});
@@ -2079,7 +2209,7 @@ model_id = "claude-sonnet-4-20250514"
                 Some(settings)
             );
             let current = write_persisted_worker_manifest_snapshot(&restored).unwrap();
-            assert_eq!(current["schema_version"], 4);
+            assert_eq!(current["schema_version"], 5);
             for namespace in ["memory", "subjektiv"] {
                 assert_eq!(
                     current["manifest"]["feature"][namespace]["workspace_settings"],
@@ -2089,6 +2219,27 @@ model_id = "claude-sonnet-4-20250514"
                 );
             }
             read_persisted_worker_manifest_snapshot(current).unwrap();
+        }
+    }
+
+    #[test]
+    fn newer_persisted_snapshots_do_not_reapply_legacy_memory_counter_migration() {
+        let mut manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        manifest.feature.memory.profile.enabled = true;
+        manifest
+            .feature
+            .memory
+            .bind_workspace_settings(WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-1".into(),
+                language: "English".into(),
+            })
+            .unwrap();
+        for version in [4, 5] {
+            let mut snapshot = write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+            snapshot["schema_version"] = version.into();
+            snapshot["manifest"]["feature"]["memory"]["workspace_settings"]["settings_revision"] =
+                99.into();
+            assert!(read_persisted_worker_manifest_snapshot(snapshot).is_err());
         }
     }
 
@@ -2164,7 +2315,7 @@ model_id = "claude-sonnet-4-20250514"
             "Français"
         );
         let current = write_persisted_worker_manifest_snapshot(&migrated).unwrap();
-        assert_eq!(current["schema_version"], 4);
+        assert_eq!(current["schema_version"], 5);
         assert!(current["manifest"].get("memory").is_none());
 
         let mut disabled =
@@ -2206,7 +2357,7 @@ model_id = "claude-sonnet-4-20250514"
 
         let restored = read_persisted_worker_manifest_snapshot(versioned).unwrap();
         let current = write_persisted_worker_manifest_snapshot(&restored).unwrap();
-        assert_eq!(current["schema_version"], 4);
+        assert_eq!(current["schema_version"], 5);
         assert!(current["manifest"].get("plugins").is_none());
         assert!(current["manifest"]["feature"].get("plugins").is_none());
         assert!(current["manifest"]["feature"].get("workers").is_none());
@@ -2277,7 +2428,7 @@ model_id = "claude-sonnet-4-20250514"
 
         assert!(
             read_persisted_worker_manifest_snapshot(serde_json::json!({
-                "schema_version": 5,
+                "schema_version": 6,
                 "manifest": manifest,
             }))
             .is_err()

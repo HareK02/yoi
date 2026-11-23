@@ -8,6 +8,7 @@ autobins = false
 
 [features]
 default = []
+test-support = []
 
 [dependencies]
 error-contract.workspace = true

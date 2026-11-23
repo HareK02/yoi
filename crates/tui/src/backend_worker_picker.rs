@@ -715,6 +715,7 @@ mod tests {
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             lifecycle: Some(protocol::WorkerLifecycleState::Active),
             worker_state: Some(protocol::WorkerStateSnapshot {
+                state_sequence: 0,
                 state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                     protocol::WorkerRunState::Running,
                 )),
@@ -830,6 +831,7 @@ mod tests {
         ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
             worker_runtime::execution::WorkerExecutionSpawnResult::connected(
                 protocol::WorkerStateSnapshot {
+                    state_sequence: 0,
                     last_command_id: 0,
                     last_finished_submission_request_id: None,
                     state: protocol::WorkerState::Idle,
@@ -876,6 +878,7 @@ mod tests {
             } else {
                 WorkerExecutionSpawnResult::connected(
                     protocol::WorkerStateSnapshot {
+                        state_sequence: 0,
                         last_command_id: 0,
                         last_finished_submission_request_id: None,
                         state: protocol::WorkerState::Idle,
@@ -1451,6 +1454,7 @@ mod tests {
         short.display_name = short.label.clone();
         short.state = "idle".to_string();
         short.worker_state = Some(protocol::WorkerStateSnapshot {
+            state_sequence: 0,
             state: protocol::WorkerState::Idle,
             last_command_id: 0,
             last_finished_submission_request_id: None,

@@ -22,7 +22,7 @@ use crate::hook::{
     BeforeSessionRewrite, BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookError,
     HookErrorCategory, HookExecutionPolicy, HookPostToolAction, PostToolCall, RunCommitted,
     RunCommittedContext, SessionRewriteKind, ToolResultSummary, WorkerRestored,
-    WorkerRestoredContext,
+    WorkerRestoredContext, WorkerStopping, WorkerStoppingContext,
 };
 use crate::subjektiv::{SubjektivHostConnection, SubjektivHostError};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -405,6 +405,7 @@ pub(crate) fn freeze_compaction_journal(
 #[derive(Clone)]
 pub struct JournalRecordingFeature {
     host: SubjektivHostConnection,
+    requests: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 impl JournalRecordingFeature {
     pub fn new(host: SubjektivHostConnection) -> std::io::Result<Self> {
@@ -414,8 +415,45 @@ impl JournalRecordingFeature {
                 "Journal recording requires an explicit Host grant",
             ));
         }
-        Ok(Self { host })
+        Ok(Self {
+            host,
+            requests: Default::default(),
+        })
     }
+    async fn request_async(&self, reason: JournalRecordingReason) -> Result<(), HookError> {
+        // Host admission may wait on the same Subject gate held by an incoming
+        // Notify. Keep Controller method/receipt processing live during that I/O.
+        let feature = self.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut requests = self.requests.lock().await;
+        requests.retain(|task| !task.is_finished());
+        requests.push(tokio::task::spawn_blocking(move || {
+            let _ = send.send(feature.request(reason));
+        }));
+        drop(requests);
+        receive.await.map_err(|_| {
+            HookError::new(
+                HookErrorCategory::Dependency,
+                "Journal admission task unconfirmed; Host must reconcile saved public history",
+            )
+        })?
+    }
+
+    async fn finish_requests(&self) -> Result<(), HookError> {
+        let mut requests = self.requests.lock().await;
+        while let Some(task) = requests.last_mut() {
+            let joined = task.await;
+            requests.pop();
+            joined.map_err(|_| {
+                HookError::new(
+                    HookErrorCategory::Dependency,
+                    "Journal admission task did not finish cleanly",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn request(&self, reason: JournalRecordingReason) -> Result<(), HookError> {
         self.host
             .authorize_operation("journal.recording.request")
@@ -462,6 +500,10 @@ impl FeatureModule for JournalRecordingFeature {
                 "record-restore",
                 FeatureHookPoint::WorkerRestored,
             ))
+            .with_hook(HookDeclaration::new(
+                "record-stop",
+                FeatureHookPoint::WorkerStopping,
+            ))
     }
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         context.hooks().add_post_tool_call(
@@ -484,6 +526,11 @@ impl FeatureModule for JournalRecordingFeature {
             HookExecutionPolicy::new(crate::hook::HookFailurePolicy::AttentionRequired, 30_000),
             self.clone(),
         )?;
+        context.hooks().add_worker_stopping(
+            "record-stop",
+            HookExecutionPolicy::fail_closed(),
+            self.clone(),
+        )?;
         Ok(())
     }
 }
@@ -494,7 +541,8 @@ impl Hook<PostToolCall> for JournalRecordingFeature {
             && !result.is_error
             && result.arguments.get("status").and_then(Value::as_str) == Some("completed")
         {
-            self.request(JournalRecordingReason::TaskCompleted)?;
+            self.request_async(JournalRecordingReason::TaskCompleted)
+                .await?;
         }
         Ok(HookPostToolAction::Continue)
     }
@@ -502,7 +550,8 @@ impl Hook<PostToolCall> for JournalRecordingFeature {
 #[async_trait]
 impl Hook<RunCommitted> for JournalRecordingFeature {
     async fn call(&self, _: &RunCommittedContext) -> Result<(), HookError> {
-        self.request(JournalRecordingReason::RunCommitted)
+        self.request_async(JournalRecordingReason::RunCommitted)
+            .await
     }
 }
 #[async_trait]
@@ -513,7 +562,8 @@ impl Hook<BeforeSessionRewrite> for JournalRecordingFeature {
     ) -> Result<BeforeSessionRewriteAction, HookError> {
         if context.kind == SessionRewriteKind::Compact {
             // Only admission/retention is awaited, not Journal generation.
-            self.request(JournalRecordingReason::BeforeCompact)?;
+            self.request_async(JournalRecordingReason::BeforeCompact)
+                .await?;
         }
         Ok(BeforeSessionRewriteAction::Continue)
     }
@@ -521,7 +571,15 @@ impl Hook<BeforeSessionRewrite> for JournalRecordingFeature {
 #[async_trait]
 impl Hook<WorkerRestored> for JournalRecordingFeature {
     async fn call(&self, _: &WorkerRestoredContext) -> Result<(), HookError> {
-        self.request(JournalRecordingReason::WorkerRestored)
+        self.request_async(JournalRecordingReason::WorkerRestored)
+            .await
+    }
+}
+
+#[async_trait]
+impl Hook<WorkerStopping> for JournalRecordingFeature {
+    async fn call(&self, _: &WorkerStoppingContext) -> Result<(), HookError> {
+        self.finish_requests().await
     }
 }
 
@@ -945,6 +1003,12 @@ mod tests {
         allowed: Mutex<Vec<&'static str>>,
         reads: std::sync::atomic::AtomicUsize,
         requests: std::sync::atomic::AtomicUsize,
+        recording_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
     }
     impl crate::subjektiv::SubjektivHost for ContextHost {
         fn settings(&self) -> crate::subjektiv::SubjektivHostSettings {
@@ -998,6 +1062,16 @@ mod tests {
         ) -> Result<JournalRecordingResponse, SubjektivHostError> {
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some((entered, release)) = self.recording_gate.lock().unwrap().take() {
+                let _ = entered.send(());
+                release
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .map_err(|_| {
+                        SubjektivHostError::Unavailable(
+                            "recording test admission was not released".into(),
+                        )
+                    })?;
+            }
             Ok(JournalRecordingResponse::NoNewSources)
         }
         fn memory(
@@ -1045,6 +1119,58 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recording_io_yields_and_cancelled_hook_retains_stop_join() {
+        let host = Arc::new(ContextHost::default());
+        *host.allowed.lock().unwrap() = vec!["journal.recording.request"];
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *host.recording_gate.lock().unwrap() = Some((entered, held));
+        let feature = JournalRecordingFeature::new(context_connection(host.clone())).unwrap();
+        let caller = feature.clone();
+        let request = tokio::spawn(async move {
+            caller
+                .request_async(JournalRecordingReason::RunCommitted)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !request.is_finished(),
+            "Controller lane must run before blocking Host admission finishes"
+        );
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(feature.requests.lock().await.len(), 1);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                feature.finish_requests()
+            )
+            .await
+            .is_err(),
+            "caller cancellation must not invent task termination"
+        );
+        assert_eq!(
+            feature.requests.lock().await.len(),
+            1,
+            "timed-out stop retains the same join"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), feature.finish_requests())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(feature.requests.lock().await.is_empty());
+        assert_eq!(
+            host.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no retry on cancellation"
+        );
     }
 
     #[tokio::test]
