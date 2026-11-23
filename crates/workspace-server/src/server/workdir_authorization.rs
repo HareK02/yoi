@@ -96,17 +96,13 @@ fn require(
 
 #[cfg(test)]
 fn authorize_permissions(
-    permissions: Option<&[ScopedPermission]>,
+    permissions: &[ScopedPermission],
     working_directory_id: &str,
     operation: &WorkdirSessionOperation,
 ) -> ApiResult<()> {
     if is_command_reconciliation(operation) {
         return Ok(());
     }
-    let Some(permissions) = permissions else {
-        // Non-Subject Workers retain the existing provider/Profile/attachment ceilings.
-        return Ok(());
-    };
     let check = |operation: &str, path: &WorkdirPath, recursive| {
         require(
             permissions,
@@ -162,10 +158,16 @@ fn authorize_accesses(
         WorkdirSessionOperation::CommandCancel(_) | WorkdirSessionOperation::CommandStatus(_) => {
             Ok(())
         }
-        // These contracts have additional targets, scopes or provider-resolved metadata.
-        // Deny explicitly until all their accesses can be mapped to scoped resources.
-        WorkdirSessionOperation::ScopeRulesOverlap(_)
-        | WorkdirSessionOperation::CheckoutObserve(_)
+        WorkdirSessionOperation::ScopeRulesOverlap(request) => {
+            // Comparison observes provider-resolved targets, not their contents or
+            // write authority. Check both targets as point reads even for write
+            // rules; providers retain scope/symlink ceilings and lease handling.
+            check(READ, &request.left.target, false)?;
+            check(READ, &request.right.target, false)
+        }
+        // Checkout contracts have additional targets, scopes or provider-resolved
+        // metadata. Deny until all their accesses map to scoped resources.
+        WorkdirSessionOperation::CheckoutObserve(_)
         | WorkdirSessionOperation::CheckoutExecute(_)
         | WorkdirSessionOperation::CheckoutSearch(_) => {
             Err(denied("operation has no scoped Subject resource mapping"))
@@ -228,7 +230,7 @@ mod tests {
     }
 
     fn allowed(grants: &[ScopedPermission], operation: &WorkdirSessionOperation) -> bool {
-        authorize_permissions(Some(grants), "wd", operation).is_ok()
+        authorize_permissions(grants, "wd", operation).is_ok()
     }
 
     fn read(target: &str) -> WorkdirSessionOperation {
@@ -299,12 +301,8 @@ mod tests {
                 "{operation:?}"
             );
             assert!(
-                authorize_permissions(
-                    Some(std::slice::from_ref(&read_grant)),
-                    "other-wd",
-                    &operation
-                )
-                .is_err()
+                authorize_permissions(std::slice::from_ref(&read_grant), "other-wd", &operation)
+                    .is_err()
             );
         }
         let writes = [
@@ -347,7 +345,6 @@ mod tests {
             assert!(!allowed(&[permission], &read("src/a")));
         }
         assert!(!allowed(&[], &read("src/a")));
-        assert!(authorize_permissions(None, "wd", &read("src/a")).is_ok());
     }
 
     #[test]
@@ -462,21 +459,41 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_checkout_and_scope_comparison_fail_closed_for_scoped_workers() {
+    fn scope_comparison_requires_point_reads_on_both_targets_not_write_authority() {
+        let comparison = |left: &str, right: &str| {
+            serde_json::from_value::<WorkdirSessionOperation>(json!({
+                "operation": "scope_rules_overlap",
+                "request": {
+                    "left": {"target": left, "permission": "write", "recursive": true},
+                    "right": {"target": right, "permission": "write", "recursive": true}
+                }
+            }))
+            .unwrap()
+        };
+        let operation = comparison("src", "other");
+        let grants = [grant(READ, "src", false), grant(READ, "other", false)];
+        assert!(allowed(&grants, &operation));
+        assert!(!allowed(&grants[..1], &operation));
+        assert!(!allowed(&grants[1..], &operation));
+        assert!(!allowed(&[], &operation));
+        assert!(!allowed(&[grant(WRITE, ".", true)], &operation));
+        assert!(authorize_permissions(&grants, "different-attachment", &operation).is_err());
+        assert!(!allowed(&grants, &comparison("src/nested", "other")));
+        // Absolute FsPaths are accepted on the provider wire but are not valid
+        // attachment-relative authorization resources, on either side.
+        for operation in [comparison("/outside", "src"), comparison("src", "/outside")] {
+            assert!(!allowed(&[grant(READ, ".", true)], &operation));
+        }
+    }
+
+    #[test]
+    fn unsupported_checkout_fails_closed() {
         let grants = [
             grant(READ, ".", true),
             grant(WRITE, ".", true),
             grant(COMMAND, ".", true),
         ];
         let operations = [
-            serde_json::from_value::<WorkdirSessionOperation>(json!({
-                "operation": "scope_rules_overlap",
-                "request": {
-                    "left": {"target": "src", "permission": "read", "recursive": true},
-                    "right": {"target": "private", "permission": "read", "recursive": true}
-                }
-            }))
-            .unwrap(),
             WorkdirSessionOperation::CheckoutObserve(path("src")),
             WorkdirSessionOperation::CheckoutExecute(workdir::CheckoutRequest {
                 target: path("src"),
@@ -496,7 +513,7 @@ mod tests {
         ];
         for operation in operations {
             assert!(!allowed(&grants, &operation));
-            assert!(authorize_permissions(None, "wd", &operation).is_ok());
+            assert!(!allowed(&[], &operation));
         }
     }
 

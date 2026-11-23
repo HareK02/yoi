@@ -18,7 +18,7 @@ fn scope(target: &str, permission: Permission) -> WorkdirToolScope {
     }
 }
 
-async fn verify_backend_delegation(source: WorkdirSessionHandle, capabilities: Caps) {
+pub(super) async fn verify_backend_delegation(source: WorkdirSessionHandle, capabilities: Caps) {
     // The same capability wrapper returned by both Backend attachment branches.
     let backend = WorkdirToolBroker::with_capabilities(source, capabilities);
     let session = backend.tool_session();

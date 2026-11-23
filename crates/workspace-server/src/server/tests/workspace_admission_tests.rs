@@ -1,4 +1,5 @@
 mod audit_tests;
+mod workdir_delegation_tests;
 
 use super::*;
 use sha2::Digest;
@@ -169,6 +170,14 @@ impl Fixture {
     }
 
     fn attach(&self, worker: &str) -> mpsc::Receiver<ExternalProviderCommand> {
+        self.attach_with_capabilities(worker, workdir::WorkdirSessionCapabilities::READ_ONLY)
+    }
+
+    fn attach_with_capabilities(
+        &self,
+        worker: &str,
+        capabilities: workdir::WorkdirSessionCapabilities,
+    ) -> mpsc::Receiver<ExternalProviderCommand> {
         let id = format!("external-{worker}");
         let grant = ExternalWorkdirGrantRecord {
             grant_id: id.clone(),
@@ -176,7 +185,12 @@ impl Fixture {
             workdir_id: id.clone(),
             provider_instance_id: id.clone(),
             display_name: id.clone(),
-            permissions: "read_only".into(),
+            permissions: if capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY {
+                "read_only"
+            } else {
+                "read_write"
+            }
+            .into(),
             created_by: "account-test".into(),
             created_at: "1".into(),
             expires_at: None,
@@ -217,7 +231,7 @@ impl Fixture {
                 worker: RuntimeWorkerRef::new("workdirless-runtime", worker),
                 workdir_id: id.clone(),
                 alias: "attachment".into(),
-                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                capabilities,
                 linked_at: "1".into(),
                 unlinked_at: None,
             })
@@ -233,7 +247,7 @@ impl Fixture {
                 provider_instance_id: id,
                 generation: 1,
                 expires_at: None,
-                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                capabilities,
                 admission: Arc::new(tokio::sync::Semaphore::new(16)),
                 shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 sender,
