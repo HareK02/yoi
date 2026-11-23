@@ -1,7 +1,9 @@
 //! Restored Runtime parent client -> installed public Worker tools -> signed loopback
 //! HTTP -> real SQLite grants -> live Runtime child -> canonical Session storage.
 //! Only the external model is fixed. P is restored without submitting a model turn;
-//! C stays live (this does not test child restore). Run with the normal Server lib target.
+//! C stays live (this does not test child restore). The same control assertions run
+//! with a continuous Runtime and with a cold API/Runtime reopen over the live backend.
+//! Run with the normal Server lib target.
 use super::*;
 use agen::tool::{Tool, ToolExecutionContext, ToolOutput};
 use futures::FutureExt;
@@ -207,12 +209,31 @@ impl Resources {
             .iter()
             .map(|(id, _)| id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        // stop_worker waits for shutdown completion and joins all execution-owned tasks.
+        // Use the live lifecycle owner, which retains confirmed Stop receipts.
+        // A fresh backend Stop cannot treat absence of an old controller as proof.
+        let runtime = self.api.as_ref().map(|api| api.runtime.clone());
         tokio::task::spawn_blocking(move || {
             use worker_runtime::execution::WorkerExecutionBackend;
             for worker in workers {
-                let result = execution.stop_worker(&worker);
-                assert!(result.is_accepted(), "cleanup {worker:?}: {result:?}");
+                if let Some(runtime) = runtime.as_ref() {
+                    let result = runtime
+                        .stop_worker(
+                            &RuntimeWorkerRef::new(
+                                EMBEDDED_RUNTIME_ID,
+                                worker.worker_id.to_string(),
+                            ),
+                            WorkerLifecycleRequest {
+                                stop_intent: None,
+                                reason: Some("fixture cleanup".into()),
+                                ticket_assignment: None,
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(result.state, InternalWorkerOperationState::Accepted);
+                } else {
+                    let result = execution.stop_worker(&worker);
+                    assert!(result.is_accepted(), "cleanup {worker:?}: {result:?}");
+                }
             }
         })
         .await
@@ -344,6 +365,15 @@ async fn call(tools: &BTreeMap<String, Arc<dyn Tool>>, name: &str, args: Value) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restored_runtime_parent_lists_and_inputs_existing_child() {
+    exercise_restored_parent_control(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopped_parent_restores_in_live_runtime_and_controls_existing_child() {
+    exercise_restored_parent_control(false).await;
+}
+
+async fn exercise_restored_parent_control(reopen_runtime: bool) {
     let root = connected_restore_tempdir();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -457,38 +487,41 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             handle(&captures, &parent).protocol_is_closed(),
             "stop must join the old parent controller"
         );
-        let server = resources.servers.pop().unwrap();
-        server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
-        shutdown_workspace_feature_storage(&api).await.unwrap();
-        resources.api.take();
-        drop(api);
-        drop(store);
-        assert!(
-            old_store.upgrade().is_none(),
-            "old API/store must be released before reopen"
-        );
+        if reopen_runtime {
+            let server = resources.servers.pop().unwrap();
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+            shutdown_workspace_feature_storage(&api).await.unwrap();
+            resources.api.take();
+            drop(api);
+            drop(store);
+            assert!(
+                old_store.upgrade().is_none(),
+                "old API/store must be released before reopen"
+            );
 
-        // Same DB and Runtime FS. No post-restart registry or grant seed.
-        let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
-        let mut api = WorkspaceApi::new_with_execution_backend(
-            config.clone(),
-            store,
-            resources.execution.clone(),
-        )
-        .await
-        .unwrap();
-        api.config.remote_runtime_sources = sources;
-        resources.api = Some(api.clone());
-        let listener = tokio::net::TcpListener::bind(base.strip_prefix("http://").unwrap())
+            // Same DB and Runtime FS. No post-restart registry or grant seed.
+            let store =
+                Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
+            api = WorkspaceApi::new_with_execution_backend(
+                config.clone(),
+                store,
+                resources.execution.clone(),
+            )
             .await
             .unwrap();
-        let server_api = api.clone();
-        resources.servers.push(tokio::spawn(async move {
-            axum::serve(listener, build_router(server_api))
+            api.config.remote_runtime_sources = sources;
+            resources.api = Some(api.clone());
+            let listener = tokio::net::TcpListener::bind(base.strip_prefix("http://").unwrap())
                 .await
-                .unwrap()
-        }));
+                .unwrap();
+            let server_api = api.clone();
+            resources.servers.push(tokio::spawn(async move {
+                axum::serve(listener, build_router(server_api))
+                    .await
+                    .unwrap()
+            }));
+        }
         let observation = api.runtime.worker(&parent).unwrap();
         let restored = api
             .runtime
