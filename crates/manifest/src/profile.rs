@@ -1838,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_async_chat_exposes_coordination_without_filesystem_authority() {
+    fn builtin_async_chat_keeps_compaction_and_coordination_without_filesystem_authority() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
             .with_workspace_base(tmp.path())
@@ -1850,6 +1850,20 @@ mod tests {
         let manifest = resolved.manifest;
         let feature = &manifest.feature;
         assert_eq!(manifest.engine.instruction, "role.async_chat");
+        let compaction = manifest
+            .compaction
+            .as_ref()
+            .expect("Subject conversations must remain compactable");
+        assert!(matches!(compaction.threshold, Some(1..)));
+        assert!(matches!(compaction.request_threshold, Some(1..)));
+        assert!(compaction.threshold <= compaction.request_threshold);
+        let standard = resolve_builtin_profile_artifact("builtin:default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.raw_artifact["compaction"], standard["compaction"],
+            "inherit only the shared compaction policy, not base filesystem authority"
+        );
         assert!(resolved.raw_artifact["scope"].is_null());
         assert!(resolved.raw_artifact["delegation_scope"].is_null());
         assert!(manifest.scope.allow.is_empty());

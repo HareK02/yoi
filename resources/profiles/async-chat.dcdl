@@ -5,6 +5,8 @@
     model = { ref = "codex-oauth/gpt-6.1-sol"; };
     engine = { instruction = "role.async_chat"; reasoning = "high"; };
     session = { record_event_trace = true; };
+    # Share context management without inheriting base filesystem scope or Features.
+    compaction = (import "./base.dcdl").compaction;
 
     feature = {
         filesystem = { enabled = false; };
