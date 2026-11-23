@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 18;
+pub(crate) const SCHEMA_VERSION: u32 = 19;
+const LIFECYCLE_SCHEMA_VERSION: u32 = 18;
 const ATTACHMENT_AUTHORITY_SCHEMA_VERSION: u32 = 17;
 const ATTACHMENT_SET_SCHEMA_VERSION: u32 = 16;
 const SESSION_ARCHIVE_SCHEMA_VERSION: u32 = 15;
@@ -977,11 +978,12 @@ fn plan_runtime_store_migration(
             | SESSION_ARCHIVE_SCHEMA_VERSION
             | ATTACHMENT_SET_SCHEMA_VERSION
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
+            | LIFECYCLE_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, {LIFECYCLE_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1311,6 +1313,7 @@ fn migrate_worker_record(
     mapping: Option<&LegacyWorkerIdentityMapping>,
     identity_path: &Path,
 ) -> Result<WorkerAggregateRecord, RuntimeError> {
+    migrate_v19_receipt_state_sequences(&mut identity_document, identity_path)?;
     if matches!(
         source_schema_version,
         EXECUTION_SCHEMA_VERSION
@@ -1321,6 +1324,7 @@ fn migrate_worker_record(
             | SESSION_ARCHIVE_SCHEMA_VERSION
             | ATTACHMENT_SET_SCHEMA_VERSION
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
+            | LIFECYCLE_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -1343,7 +1347,9 @@ fn migrate_worker_record(
         if source_schema_version < ATTACHMENT_AUTHORITY_SCHEMA_VERSION {
             migrate_v17_attachment_authority(&mut identity_document, identity_path)?;
         }
-        migrate_v18_lifecycle(&mut identity_document, identity_path)?;
+        if source_schema_version < LIFECYCLE_SCHEMA_VERSION {
+            migrate_v18_lifecycle(&mut identity_document, identity_path)?;
+        }
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let mut aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| runtime_store_corrupt(identity_path, error.to_string()))?;
@@ -1363,7 +1369,9 @@ fn migrate_worker_record(
         if source_schema_version < ATTACHMENT_AUTHORITY_SCHEMA_VERSION {
             migrate_v17_attachment_authority(&mut identity_document, identity_path)?;
         }
-        migrate_v18_lifecycle(&mut identity_document, identity_path)?;
+        if source_schema_version < LIFECYCLE_SCHEMA_VERSION {
+            migrate_v18_lifecycle(&mut identity_document, identity_path)?;
+        }
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let mut aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| {
@@ -1431,6 +1439,46 @@ fn migrate_worker_record(
     identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
     execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
     Ok(WorkerAggregateRecord::from_v8(identity, execution))
+}
+
+// Historical receipt snapshots have no live execution ordering to recover.
+// Initialize only their missing sequence; command IDs and completion fences are
+// independent evidence and must not be reset or used to invent that ordering.
+fn migrate_v19_receipt_state_sequences(
+    document: &mut serde_json::Value,
+    path: &Path,
+) -> Result<(), RuntimeError> {
+    for (owners_key, receipt_pointer) in
+        [("owners", "/receipt/worker"), ("stop_owners", "/receipt")]
+    {
+        let Some(owners) = document
+            .get_mut("restore_guard")
+            .and_then(|guard| guard.get_mut(owners_key))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        for owner in owners.values_mut() {
+            let Some(receipt) = owner.pointer_mut(receipt_pointer) else {
+                continue;
+            };
+            for snapshot_pointer in ["/worker_state", "/command/acknowledgement/state"] {
+                let Some(snapshot) = receipt
+                    .pointer_mut(snapshot_pointer)
+                    .filter(|snapshot| !snapshot.is_null())
+                else {
+                    continue;
+                };
+                let snapshot = snapshot.as_object_mut().ok_or_else(|| {
+                    runtime_store_corrupt(path, "legacy receipt snapshot must be an object".into())
+                })?;
+                snapshot
+                    .entry("state_sequence")
+                    .or_insert_with(|| serde_json::json!(0));
+            }
+        }
+    }
+    Ok(())
 }
 
 // Versioned conversion preserves old decisions, not evidence that never existed.
@@ -2123,6 +2171,7 @@ fn migrate_runtime_document(
             | SESSION_ARCHIVE_SCHEMA_VERSION
             | ATTACHMENT_SET_SCHEMA_VERSION
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
+            | LIFECYCLE_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2673,6 +2722,7 @@ fn migrate_runtime_store_in_place(
                     | SESSION_ARCHIVE_SCHEMA_VERSION
                     | ATTACHMENT_SET_SCHEMA_VERSION
                     | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
+                    | LIFECYCLE_SCHEMA_VERSION
             )
         {
             atomic_write_json(
@@ -4943,6 +4993,7 @@ mod tests {
 
     include!("subject_delete_store_tests.rs");
     include!("lifecycle_store_tests.rs");
+    include!("receipt_state_sequence_tests.rs");
 
     // Freeze the legacy input explicitly rather than asking the current writer
     // to emit old schema. Migration expectations remain current documents.
