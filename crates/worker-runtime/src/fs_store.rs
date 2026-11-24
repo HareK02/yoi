@@ -3386,6 +3386,7 @@ impl<'de> Deserialize<'de> for WorkerExecutionRecord {
                 request
                     .workdir_attachments
                     .push(WorkingDirectoryAttachmentClaim {
+                        provider: Default::default(),
                         alias,
                         working_directory_id: claim.working_directory_id,
                         relative_cwd: claim.relative_cwd,

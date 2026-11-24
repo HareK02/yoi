@@ -448,8 +448,27 @@ fn default_workdir_session_capabilities() -> workdir::WorkdirSessionCapabilities
     workdir::WorkdirSessionCapabilities::READ_ONLY
 }
 
+/// The Backend selects the owner of a Workdir session; Runtime must not infer it
+/// from an id prefix or fall back to a different provider after an open failure.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirAttachmentProvider {
+    /// Existing persisted claims refer to Runtime materializations.
+    #[default]
+    Runtime,
+    Workspace,
+}
+
+impl WorkdirAttachmentProvider {
+    pub fn is_runtime(&self) -> bool {
+        *self == Self::Runtime
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkingDirectoryAttachmentClaim {
+    #[serde(default, skip_serializing_if = "WorkdirAttachmentProvider::is_runtime")]
+    pub provider: WorkdirAttachmentProvider,
     /// Stable Worker-local routing key. This is not a Workdir id or display name.
     pub alias: workdir::WorkdirAttachmentAlias,
     pub working_directory_id: String,
@@ -2253,8 +2272,36 @@ mod tests {
     }
 
     #[test]
+    fn attachment_provider_wire_defaults_to_runtime_and_preserves_workspace() {
+        let legacy = serde_json::json!({
+            "alias": "source", "working_directory_id": "shared-source"
+        });
+        let claim: WorkingDirectoryAttachmentClaim =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(claim.provider, WorkdirAttachmentProvider::Runtime);
+        assert!(
+            serde_json::to_value(&claim)
+                .unwrap()
+                .get("provider")
+                .is_none()
+        );
+        let mut external = legacy.clone();
+        external["provider"] = serde_json::json!("workspace");
+        let claim: WorkingDirectoryAttachmentClaim = serde_json::from_value(external).unwrap();
+        assert_eq!(claim.provider, WorkdirAttachmentProvider::Workspace);
+        assert_eq!(
+            serde_json::to_value(claim).unwrap()["provider"],
+            "workspace"
+        );
+        let mut invalid = legacy;
+        invalid["provider"] = serde_json::json!("guess_from_id");
+        assert!(serde_json::from_value::<WorkingDirectoryAttachmentClaim>(invalid).is_err());
+    }
+
+    #[test]
     fn attachment_claim_serializes_backend_authored_capabilities() {
         let claim = WorkingDirectoryAttachmentClaim {
+            provider: Default::default(),
             alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
             working_directory_id: "workdir-main".to_string(),
             relative_cwd: None,

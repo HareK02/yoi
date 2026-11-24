@@ -1499,7 +1499,7 @@ impl Runtime {
                 ),
                 execution_bound: true,
                 workdir_attachments: Vec::new(),
-                logical_workdir_attachments: Vec::new(),
+                logical_workdir_attachments: request.workspace_workdir_attachments(),
             };
             state.workers.insert(worker_id, record);
             state.persist_runtime_snapshot()?;
@@ -9413,7 +9413,7 @@ pub(crate) fn logical_workdir_attachments_from_statuses(
     attachments: &[crate::catalog::WorkingDirectoryAttachmentStatus],
     claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
 ) -> Vec<LogicalWorkdirAttachment> {
-    attachments
+    let mut logical = attachments
         .iter()
         .map(|attachment| {
             let working_directory_id = &attachment.working_directory.summary.working_directory_id;
@@ -9435,7 +9435,23 @@ pub(crate) fn logical_workdir_attachments_from_statuses(
                 capabilities,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for claim in claims
+        .iter()
+        .filter(|claim| claim.provider == crate::catalog::WorkdirAttachmentProvider::Workspace)
+    {
+        if !logical
+            .iter()
+            .any(|attachment| attachment.alias == claim.alias)
+        {
+            logical.push(LogicalWorkdirAttachment {
+                alias: claim.alias.clone(),
+                working_directory_id: claim.working_directory_id.clone(),
+                capabilities: claim.capabilities,
+            });
+        }
+    }
+    logical
 }
 
 fn validate_logical_workdir_attachments(
@@ -9467,6 +9483,26 @@ fn validate_logical_workdir_attachments(
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
+    for claim in request
+        .workdir_attachments
+        .iter()
+        .filter(|claim| claim.provider == crate::catalog::WorkdirAttachmentProvider::Workspace)
+    {
+        if request.workspace_api.is_none() {
+            return Err(RuntimeError::InvalidRequest(
+                "Workspace Workdir attachments require a Workspace API binding".into(),
+            ));
+        }
+        if claim
+            .relative_cwd
+            .as_deref()
+            .is_some_and(|cwd| !cwd.trim().is_empty() && cwd.trim() != ".")
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Workspace Workdir attachments use the provider session cwd".into(),
+            ));
+        }
+    }
     if let Some(snapshot) = &request.plugin_execution {
         let valid = snapshot.plan.validate_canonical().is_ok()
             && snapshot.plan.fingerprint().ok().as_ref() == Some(&snapshot.fingerprint)
@@ -12116,6 +12152,7 @@ mod tests {
         );
         let mut create = scoped_task_request("conflicting attachment", "workspace-a");
         create.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            provider: Default::default(),
             alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
             working_directory_id: id.into(),
             relative_cwd: None,
@@ -13096,6 +13133,7 @@ mod tests {
             }];
             let request = record.request.as_mut().unwrap();
             request.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+                provider: Default::default(),
                 alias: alias.clone(),
                 working_directory_id: "local-workdir".into(),
                 relative_cwd: None,
@@ -13883,6 +13921,7 @@ mod tests {
         let mut request = task_request("idempotent");
         request.create_fingerprint = "sha256:input-1".to_string();
         request.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            provider: Default::default(),
             alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: "workdir-idempotent".to_string(),
             relative_cwd: None,
@@ -17738,6 +17777,7 @@ mod tests {
             });
         let mut request = task_request("uncertain create cleanup");
         request.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            provider: Default::default(),
             alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
             working_directory_id: "wd-uncertain".to_string(),
             relative_cwd: None,

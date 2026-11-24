@@ -266,8 +266,12 @@ fn default_workdir_session_capabilities() -> workdir::WorkdirSessionCapabilities
     workdir::WorkdirSessionCapabilities::READ_ONLY
 }
 
+pub use runtime_api::WorkdirAttachmentProvider;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryAttachmentClaim {
+    #[serde(default, skip_serializing_if = "WorkdirAttachmentProvider::is_runtime")]
+    pub provider: WorkdirAttachmentProvider,
     pub alias: workdir::WorkdirAttachmentAlias,
     pub working_directory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -362,6 +366,20 @@ pub struct CreateWorkerRequest {
     /// Backend-only immutable Job/attempt capability. Never inferred from Profile policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_job: Option<BackendJobExecutionBinding>,
+}
+
+impl CreateWorkerRequest {
+    pub(crate) fn workspace_workdir_attachments(&self) -> Vec<LogicalWorkdirAttachment> {
+        self.workdir_attachments
+            .iter()
+            .filter(|claim| claim.provider == WorkdirAttachmentProvider::Workspace)
+            .map(|claim| LogicalWorkdirAttachment {
+                alias: claim.alias.clone(),
+                working_directory_id: claim.working_directory_id.clone(),
+                capabilities: claim.capabilities,
+            })
+            .collect()
+    }
 }
 
 /// Last persisted Worker lifecycle status.

@@ -7304,6 +7304,31 @@ impl WorkspaceApi {
                 .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
                 .ok_or_else(|| Error::InvalidInput("unknown Workdir in this Workspace".into()))?;
             claim.capabilities = workdir_source_capabilities(self, &workdir)?;
+            claim.provider = match &workdir.source {
+                WorkdirRegistrySource::Repository { .. } => {
+                    runtime_api::WorkdirAttachmentProvider::Runtime
+                }
+                WorkdirRegistrySource::ExternalGrant { .. } => {
+                    // External providers own their root and session cwd.
+                    if claim
+                        .relative_cwd
+                        .as_deref()
+                        .is_some_and(|cwd| !cwd.trim().is_empty() && cwd.trim() != ".")
+                    {
+                        return Err(Error::InvalidInput(
+                            "External Workdir attachments use the provider session cwd".into(),
+                        )
+                        .into());
+                    }
+                    runtime_api::WorkdirAttachmentProvider::Workspace
+                }
+                WorkdirRegistrySource::WorkspaceConfig { .. } => {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Use the grant-bound Workspace config attachment operation".into(),
+                    )
+                    .into());
+                }
+            };
         }
         Ok(())
     }
@@ -36819,6 +36844,7 @@ async fn create_workspace_worker_authenticated_on_host(
                 )
             })?;
             Ok(WorkingDirectoryAttachmentClaim {
+                provider: Default::default(),
                 alias,
                 working_directory_id: selection.working_directory_id,
                 relative_cwd: selection.relative_cwd,

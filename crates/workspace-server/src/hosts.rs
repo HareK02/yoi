@@ -11284,6 +11284,7 @@ mod tests {
     fn runtime_create_request_serializes_only_canonical_workdir_attachments() {
         let mut request = embedded_spawn_request();
         request.resolved_workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            provider: Default::default(),
             alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: "workdir-1".to_string(),
             relative_cwd: Some("crates/yoi".to_string()),

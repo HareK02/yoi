@@ -14,6 +14,8 @@ use super::*;
 mod chat_delegation_connected;
 #[path = "chat_tests.rs"]
 mod chat_tests;
+#[path = "external_spawn_connected_tests.rs"]
+mod external_spawn_connected;
 #[path = "journal_native_authority_tests.rs"]
 mod journal_native_authority;
 #[path = "memory_native_authority_tests.rs"]

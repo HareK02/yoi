@@ -25280,6 +25280,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             resolved_workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachments: vec![
                 worker_runtime::catalog::WorkingDirectoryAttachmentClaim {
+                    provider: Default::default(),
                     alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
                     working_directory_id: "workdir-a".to_string(),
                     relative_cwd: relative_cwd.map(ToOwned::to_owned),
