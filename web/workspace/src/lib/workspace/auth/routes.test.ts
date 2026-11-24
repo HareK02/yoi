@@ -21,7 +21,15 @@ import {
 Deno.test("account uses the authenticated app shell, not the standalone auth entry shell", () => {
   assertEquals(String(isAuthPage("/account")), "false");
   assertEquals(String(isPublicPage("/account")), "false");
-  for (const path of ["/login", "/register", "/activate", "/login/device"]) {
+  for (
+    const path of [
+      "/login",
+      "/register",
+      "/activate",
+      "/account/add-passkey",
+      "/login/device",
+    ]
+  ) {
     assertEquals(String(isAuthPage(path)), "true", path);
     assertEquals(String(isPublicPage(path)), "true", path);
   }
@@ -68,6 +76,7 @@ Deno.test("return destination rejects external, ambiguous encoding and authentic
       "/login",
       "/register",
       "/activate",
+      "/account/add-passkey?code=not-a-url-secret",
       "/login/",
       "/login?returnTo=/account",
       "/login/device/",

@@ -456,9 +456,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       schema_version: 1,
       auth: {
         Passkey: {
-          rp_id: "127.0.0.1",
-          origin: `http://127.0.0.1:${port}`,
-          public_base_url: `http://127.0.0.1:${port}`,
+          public_urls: [`http://127.0.0.1:${port}`],
           cookie_name: "fixture",
         },
       },

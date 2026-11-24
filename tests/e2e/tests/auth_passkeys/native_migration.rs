@@ -29,7 +29,7 @@ fn native_ctap2_legacy_random_handle_residency_exclusion_and_other_authenticator
     let origin = format!("http://localhost:{}", reservation.local_addr()?.port());
     std::fs::write(
         &environment.server_config,
-        format!("[browser]\npublic_url = \"{origin}\"\n"),
+        format!("[browser]\npublic_urls = [\"{origin}\"]\n"),
     )?;
     environment.start_empty_backend()?;
     let admin =

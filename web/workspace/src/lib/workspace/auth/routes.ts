@@ -74,6 +74,7 @@ export function isPublicPage(path: string): boolean {
     "/login",
     "/register",
     "/activate",
+    "/account/add-passkey",
     "/login/device",
     "/hosting/setup",
   ]
@@ -82,7 +83,13 @@ export function isPublicPage(path: string): boolean {
 
 // 認証入口は独立したshellを使う。本人用/accountは通常のナビゲーションを残す。
 export function isAuthPage(path: string): boolean {
-  return ["/login", "/register", "/activate", "/login/device"]
+  return [
+    "/login",
+    "/register",
+    "/activate",
+    "/account/add-passkey",
+    "/login/device",
+  ]
     .includes(path);
 }
 

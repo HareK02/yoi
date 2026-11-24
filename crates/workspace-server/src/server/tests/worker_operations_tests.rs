@@ -84,10 +84,10 @@ async fn browser_operation_context(api: &WorkspaceApi) -> (WorkerOperationContex
         })
         .unwrap();
     let AuthConfig::Passkey {
+        public_urls,
         cookie_name,
-        origin,
-        ..
     } = &api.config.auth;
+    let origin = &public_urls[0];
     let mut headers = HeaderMap::new();
     headers.insert(ORIGIN, origin.parse().unwrap());
     headers.insert(
@@ -1848,4 +1848,51 @@ fn command_evidence_lifecycle_api_projection_retains_rejection_snapshot_as_obser
     let received: server_api::RuntimeWorkerLifecycleResult = serde_json::from_value(wire).unwrap();
     assert_eq!(received.command, Some(command));
     assert_eq!(received.state, server_api::WorkerOperationState::Rejected);
+}
+
+#[tokio::test]
+async fn browser_worker_operations_and_connections_recheck_exact_multiple_origin_allowlist() {
+    let root = tempfile::tempdir().unwrap();
+    let mut api = test_api(root.path()).await;
+    let AuthConfig::Passkey { public_urls, .. } = &mut api.config.auth;
+    public_urls.push("https://workspace.test".into());
+    let (context, _) = browser_operation_context(&api).await;
+    for (origin, allowed) in [
+        (None, false),
+        (Some("http://localhost:5173"), true),
+        (Some("https://WORKSPACE.TEST:443"), true),
+        (Some("https://workspace.test:8443"), false),
+        (Some("http://workspace.test"), false),
+        (Some("http://localhost:5174"), false),
+        (Some("https://workspace.test/path"), false),
+    ] {
+        let WorkerOperationContext::Browser { headers, source } = &context else {
+            unreachable!()
+        };
+        let mut headers = headers.clone();
+        headers.remove(ORIGIN);
+        if let Some(origin) = origin {
+            headers.insert(ORIGIN, origin.parse().unwrap());
+        }
+        let request = WorkerOperationContext::Browser {
+            headers,
+            source: source.clone(),
+        };
+        assert_eq!(
+            request.authorize_workspace(&api).await.is_ok(),
+            allowed,
+            "mutation/connection {origin:?}"
+        );
+        assert_eq!(
+            request.authorize_workspace_read(&api).await.is_ok(),
+            allowed || origin.is_none(),
+            "read {origin:?}"
+        );
+    }
+    let AuthConfig::Passkey { public_urls, .. } = &mut api.config.auth;
+    public_urls.clear();
+    assert!(
+        context.authorize_workspace(&api).await.is_err(),
+        "existing connection must not retain a removed origin"
+    );
 }

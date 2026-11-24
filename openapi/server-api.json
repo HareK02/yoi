@@ -8139,6 +8139,163 @@
           }
         ]
       },
+      "PasskeyAdditionCodeOptionsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "browser_origin": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "handle",
+          "code",
+          "browser_origin"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionCodeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_account_id": {
+            "type": "string"
+          },
+          "expected_authentication_reference": {
+            "type": "string"
+          },
+          "expected_user_id": {
+            "type": "string"
+          },
+          "target_origin": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_user_id",
+          "expected_account_id",
+          "expected_authentication_reference",
+          "target_origin"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionCodeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "issuance_id": {
+            "type": "string"
+          },
+          "target_origin": {
+            "type": "string"
+          },
+          "user": {
+            "$ref": "#/components/schemas/AuthenticatedUser"
+          }
+        },
+        "required": [
+          "user",
+          "issuance_id",
+          "code",
+          "target_origin",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionCodeRevokeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_account_id": {
+            "type": "string"
+          },
+          "expected_authentication_reference": {
+            "type": "string"
+          },
+          "expected_user_id": {
+            "type": "string"
+          },
+          "issuance_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_user_id",
+          "expected_account_id",
+          "expected_authentication_reference",
+          "issuance_id"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionCodeRevokeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "revoked": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "revoked"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionCodeStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at": {
+            "type": "string"
+          },
+          "issuance_id": {
+            "type": "string"
+          },
+          "target_origin": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuance_id",
+          "target_origin",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionCodeStatusResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PasskeyAdditionCodeStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "public_urls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "user": {
+            "$ref": "#/components/schemas/AuthenticatedUser"
+          }
+        },
+        "required": [
+          "user",
+          "public_urls"
+        ],
+        "type": "object"
+      },
       "PasskeyAdditionOptionsRequest": {
         "additionalProperties": false,
         "description": "Adds to the current actor. Expected identity/binding fields only fence stale UI;\nthey never select an owner or authorize an addition.",
@@ -25386,20 +25543,15 @@
                   "cookie_name": {
                     "type": "string"
                   },
-                  "origin": {
-                    "type": "string"
-                  },
-                  "public_base_url": {
-                    "type": "string"
-                  },
-                  "rp_id": {
-                    "type": "string"
+                  "public_urls": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
                   }
                 },
                 "required": [
-                  "rp_id",
-                  "origin",
-                  "public_base_url",
+                  "public_urls",
                   "cookie_name"
                 ],
                 "type": "object"
@@ -27157,7 +27309,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:74f1717db2a5db8eadaf3bed6b73a2182397e4e9468762790aeaf4e530139b69"
+    "x-yoi-source-digest": "sha256:c2a3dd0a1f7c2cac83dd2b81123491b389644df9fdcced6eb91a5718550c259c"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -27640,6 +27792,301 @@
           {
             "bearerAuth": []
           },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/auth/passkeys/addition-code": {
+      "get": {
+        "operationId": "auth_passkey_addition_code_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyAdditionCodeStatusResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "auth_passkey_addition_code_issue",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyAdditionCodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyAdditionCodeResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/auth/passkeys/addition-code/complete": {
+      "post": {
+        "operationId": "auth_passkey_addition_code_complete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthUserResponse"
+                }
+              }
+            },
+            "description": "Successful response",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetCookieHeader"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/passkeys/addition-code/options": {
+      "post": {
+        "operationId": "auth_passkey_addition_code_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyAdditionCodeOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyRegistrationOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/auth/passkeys/addition-code/revoke": {
+      "post": {
+        "operationId": "auth_passkey_addition_code_revoke",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyAdditionCodeRevokeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyAdditionCodeRevokeResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
           {
             "browserSession": []
           }

@@ -296,7 +296,7 @@ impl WorkerE2eEnvironment {
         }
         fs::write(
             &server_config,
-            "[browser]\npublic_url = \"http://localhost:5173\"\n",
+            "[browser]\npublic_urls = [\"http://localhost:5173\"]\n",
         )?;
         let binaries = worker_binary_provider_info()?;
         fs::write(

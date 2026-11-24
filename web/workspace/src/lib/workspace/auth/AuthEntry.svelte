@@ -139,6 +139,7 @@
     {:else if mode === 'register'}
       <a href={authEntryUrl('/login', destination)}>Log in with an existing account</a>
     {/if}
+    <a href="/account/add-passkey">Add a passkey with an addition code</a>
     <a href="/activate">Activate an account with a code</a>
     <a href={AUTHENTICATED_HOME}>Dashboard / Workspaces</a>
     <a href="/">Yoi home</a>

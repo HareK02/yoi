@@ -444,9 +444,7 @@ mod tests {
             embedded_runtime_store_root: root.join("runtime"),
             static_assets_dir: None,
             auth: crate::server::AuthConfig::Passkey {
-                rp_id: "localhost".into(),
-                origin: "http://localhost".into(),
-                public_base_url: "http://localhost".into(),
+                public_urls: vec!["http://localhost".into()],
                 cookie_name: "session".into(),
             },
             max_records: 10,

@@ -162,11 +162,10 @@ mod configuration_adoption_http_integration {
                 })
                 .unwrap();
             let AuthConfig::Passkey {
-                origin,
+                public_urls,
                 cookie_name,
-                ..
             } = &api.config.auth;
-            let origin = origin.clone();
+            let origin = public_urls[0].clone();
             let cookie = format!("{cookie_name}={COOKIE_TOKEN}");
 
             // Startup has already transferred native authority. Seed the current

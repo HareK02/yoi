@@ -176,7 +176,9 @@ pub(crate) use subject_release_input_handoff_store::{
 
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
-const LATEST_SCHEMA_VERSION: i64 = 141;
+#[path = "passkey_addition_code.rs"]
+mod passkey_addition_code;
+const LATEST_SCHEMA_VERSION: i64 = 142;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -660,6 +662,11 @@ const MIGRATIONS: &[Migration] = &[
         name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME,
         apply: migrate_external_workdir_sessions_v140_to_v141,
     },
+    Migration {
+        version: 142,
+        name: passkey_addition_code::MIGRATION_NAME,
+        apply: passkey_addition_code::migrate,
+    },
 ];
 
 // Both schema-103 identities shipped. Keep the alternate implementation and accept
@@ -963,6 +970,12 @@ pub enum PasskeyRegistrationTarget {
     Activation {
         user: UserRecord,
         issuance_id: String,
+    },
+    AdditionCode {
+        user: UserRecord,
+        issuance_id: String,
+        target_origin: String,
+        rp_id: String,
     },
     Addition {
         user: UserRecord,
@@ -2134,6 +2147,31 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<ActivationCodeIssue>;
     fn verify_activation_code(&self, handle: &str, code: &str)
     -> Result<PasskeyRegistrationTarget>;
+    fn addition_code_status(
+        &self,
+        user: &UserRecord,
+        session_hash: &str,
+    ) -> Result<Option<server_api::PasskeyAdditionCodeStatus>>;
+    fn issue_addition_code(
+        &self,
+        user: &UserRecord,
+        session_hash: &str,
+        origin: &str,
+        rp_id: &str,
+    ) -> Result<server_api::PasskeyAdditionCodeResponse>;
+    fn revoke_addition_code(
+        &self,
+        user: &UserRecord,
+        session_hash: &str,
+        issuance_id: &str,
+    ) -> Result<bool>;
+    fn verify_addition_code(
+        &self,
+        handle: &str,
+        code: &str,
+        origin: &str,
+        rp_id: &str,
+    ) -> Result<PasskeyRegistrationTarget>;
     fn is_user_pending_activation(&self, user_id: &str) -> Result<bool>;
     /// Checks an explicit grant for a currently existing user, not Workspace ownership.
     fn is_hosting_admin(&self, user_id: &str) -> Result<bool>;
@@ -8293,6 +8331,39 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         activation::verify(self, handle, code)
     }
 
+    fn addition_code_status(
+        &self,
+        user: &UserRecord,
+        session_hash: &str,
+    ) -> Result<Option<server_api::PasskeyAdditionCodeStatus>> {
+        passkey_addition_code::status(self, user, session_hash)
+    }
+    fn issue_addition_code(
+        &self,
+        user: &UserRecord,
+        session_hash: &str,
+        origin: &str,
+        rp_id: &str,
+    ) -> Result<server_api::PasskeyAdditionCodeResponse> {
+        passkey_addition_code::issue(self, user, session_hash, origin, rp_id)
+    }
+    fn revoke_addition_code(
+        &self,
+        user: &UserRecord,
+        session_hash: &str,
+        issuance_id: &str,
+    ) -> Result<bool> {
+        passkey_addition_code::revoke(self, user, session_hash, issuance_id)
+    }
+    fn verify_addition_code(
+        &self,
+        handle: &str,
+        code: &str,
+        origin: &str,
+        rp_id: &str,
+    ) -> Result<PasskeyRegistrationTarget> {
+        passkey_addition_code::verify(self, handle, code, origin, rp_id)
+    }
     fn is_user_pending_activation(&self, user_id: &str) -> Result<bool> {
         self.with_conn(|conn| activation::pending(conn, user_id))
     }
@@ -8385,6 +8456,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     activation::require_pending_target(tx, user, Some(issuance_id))?;
                     user
                 }
+                PasskeyRegistrationTarget::AdditionCode { user, issuance_id, target_origin, rp_id } => {
+                    passkey_addition_code::require_target(tx,user,issuance_id,target_origin,rp_id)?;
+                    user
+                }
                 PasskeyRegistrationTarget::Addition { user, authentication } => {
                     activation::require_active(tx, &user.user_id)?;
                     let current = tx.query_row(
@@ -8425,6 +8500,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "INSERT INTO passkey_addition_receipts(challenge_id, credential_id, user_id, authentication_reference) VALUES (?1, ?2, ?3, ?4)",
                     params![challenge_id, credential.credential_id, user.user_id, authentication.reference()],
                 )?;
+            }
+            if let PasskeyRegistrationTarget::AdditionCode { user, issuance_id, .. } = target {
+                if tx.execute("DELETE FROM passkey_addition_codes WHERE user_id=?1 AND issuance_id=?2", params![user.user_id,issuance_id])? != 1 {
+                    return Err(crate::auth::auth_error("passkey_addition_code_invalid", "addition issuance no longer exists"));
+                }
             }
             if let PasskeyRegistrationTarget::Activation { user, issuance_id } = target {
                 if tx.execute("DELETE FROM user_activations WHERE user_id=?1 AND issuance_id=?2", params![user.user_id, issuance_id])? != 1 {
@@ -17659,6 +17739,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(backend_job_result_application::SCHEMA)?;
     conn.execute_batch(backend_job_recording_input::SCHEMA_SQL)?;
     install_external_workdir_session_columns(conn)?;
+    conn.execute_batch(include_str!("passkey_addition_code_schema.sql"))?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!("fresh Ticket schema verification failed: {error}"))
     })?;
@@ -20209,10 +20290,16 @@ mod tests {
             let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
             assert_eq!(
                 plan.migrations,
-                vec![WorkspaceSchemaMigrationStep {
-                    version: 141,
-                    name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
-                }]
+                vec![
+                    WorkspaceSchemaMigrationStep {
+                        version: 141,
+                        name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
+                    },
+                    WorkspaceSchemaMigrationStep {
+                        version: 142,
+                        name: passkey_addition_code::MIGRATION_NAME.into(),
+                    }
+                ]
             );
             assert!(
                 !column_exists(
@@ -20351,7 +20438,7 @@ mod tests {
             conn.execute_batch("DROP TRIGGER reject_session_cleanup_fence;")
                 .unwrap();
             apply_migrations(&conn).unwrap();
-            assert_eq!(current_schema_version(&conn).unwrap(), 141);
+            assert_eq!(current_schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
             assert!(
                 crate::grant_cleanup_operation::read_intent(&conn, "legacy-ws", "legacy-online")
                     .unwrap()
@@ -22391,6 +22478,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 
     include!("activation_tests.rs");
     include!("schema_equivalence_tests.rs");
+    include!("passkey_addition_code_store_tests.rs");
     include!("schema_convergence_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
@@ -22952,6 +23040,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 141,
                 name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 142,
+                name: passkey_addition_code::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -23105,6 +23197,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     (139, backend_job_result_application::MIGRATION_NAME.into()),
                     (140, backend_job_recording_input::MIGRATION_NAME.into()),
                     (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
+                    (142, passkey_addition_code::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);

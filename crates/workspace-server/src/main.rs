@@ -20,6 +20,7 @@ use yoi_workspace_server::{
 #[derive(Debug)]
 enum Command {
     Serve(ServeOptions),
+    InitConfig { path: Option<PathBuf> },
     Migrate(MigrateOptions),
     BootstrapAuth(BootstrapAuthOptions),
     HostingAdmin(HostingAdminOptions),
@@ -92,6 +93,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match parse_command(&args)? {
         Command::Serve(options) => run_serve(options).await,
+        Command::InitConfig { path } => run_init_config(path),
         Command::Migrate(options) => run_migrate(options),
         Command::BootstrapAuth(options) => run_bootstrap_auth(options),
         Command::HostingAdmin(options) => run_hosting_admin(options),
@@ -107,6 +109,15 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     };
 
     match command.as_str() {
+        "init-config" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_init_config_help();
+                return Ok(Command::Help);
+            }
+            Ok(Command::InitConfig {
+                path: parse_init_config_options(rest)?,
+            })
+        }
         "migrate" => parse_migrate_options(rest).map(Command::Migrate),
         "bootstrap-auth" => parse_bootstrap_auth_options(rest).map(Command::BootstrapAuth),
         "hosting-admin" => {
@@ -129,7 +140,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `hosting-admin`, `bootstrap-auth`, `migrate`, `skills`, or `serve`"
+            "unknown command `{other}`; expected `hosting-admin`, `bootstrap-auth`, `migrate`, `skills`, `init-config`, or `serve`"
         ))),
     }
 }
@@ -475,6 +486,10 @@ async fn shutdown_signal() {
 
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     init_serve_tracing();
+    let host_config = match options.config.as_ref() {
+        Some(path) => ServerHostConfigFile::load_from_path(path)?,
+        None => ServerHostConfigFile::load_default()?,
+    };
     let database_path = ServerConfig::default_server_database_path();
     if let Some(parent) = database_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -503,10 +518,6 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
                 .ok_or_else(|| CliError("server database path has no parent".to_string()))?
                 .to_path_buf(),
         )
-    };
-    let host_config = match options.config.as_ref() {
-        Some(path) => ServerHostConfigFile::load_from_path(path)?,
-        None => ServerHostConfigFile::load_default()?,
     };
     let mut resolved = ResolvedWorkspaceBackendConfig::local_dev(
         &workspace_execution_root,
@@ -676,6 +687,47 @@ fn parse_migrate_options(args: &[String]) -> Result<MigrateOptions, CliError> {
     })
 }
 
+fn run_init_config(path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = path
+        .or_else(ServerHostConfigFile::default_path)
+        .ok_or_else(|| {
+            CliError("Server config directory is unavailable; specify --config <PATH>".into())
+        })?;
+    ServerHostConfigFile::create_template(&path)?;
+    println!(
+        "Created `{}`. Set [browser] public_urls to your actual browser origins before running serve; the commented example is not active.",
+        path.display()
+    );
+    Ok(())
+}
+
+fn parse_init_config_options(args: &[String]) -> Result<Option<PathBuf>, CliError> {
+    match args {
+        [] => Ok(None),
+        [flag, value]
+            if flag == "--config" && !value.trim().is_empty() && !value.starts_with('-') =>
+        {
+            Ok(Some(PathBuf::from(value)))
+        }
+        [arg] if arg.starts_with("--config=") => {
+            let value = value_after_equals(arg, "--config")?;
+            if value.trim().is_empty() {
+                return Err(CliError("--config requires a path".into()));
+            }
+            Ok(Some(PathBuf::from(value)))
+        }
+        _ => Err(CliError(
+            "expected `init-config [--config <PATH>]`; existing files are never overwritten".into(),
+        )),
+    }
+}
+
+fn print_init_config_help() {
+    println!(
+        "yoi-server init-config\n\nUsage:\n  yoi-server init-config [--config <PATH>]\n\nCreates a commented server.toml template at the explicit path or the Yoi config directory. Never overwrites existing files. Set browser.public_urls before starting the Server; generating the template does not enable any browser origin."
+    );
+}
+
 fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
     let mut listen = None;
     let mut config = None;
@@ -738,7 +790,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server hosting-admin --handle <HANDLE> [--create-user] [--database <PATH>]\n  yoi-server bootstrap-auth --handle <HANDLE> [--display-name <NAME>] [--label <LABEL>]\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server hosting-admin --handle <HANDLE> [--create-user] [--database <PATH>]\n  yoi-server bootstrap-auth --handle <HANDLE> [--display-name <NAME>] [--label <LABEL>]\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server init-config [--config <PATH>]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -762,13 +814,60 @@ fn print_skills_help() {
 
 fn print_serve_help() {
     println!(
-        "yoi-server serve\n\nUsage:\n  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves Workspaces recorded in the Yoi server DB. Host-level deployment settings are loaded from the explicit --config path or the canonical XDG yoi/server.toml path, and Runtime bindings are loaded from the Server DB.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n      --config <PATH>     Host-level Server config path\n  -h, --help              Print help"
+        "yoi-server serve\n\nUsage:\n  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves Workspaces recorded in the Yoi server DB. Host-level deployment settings are required at the explicit --config path or the Yoi config directory server.toml. Run init-config to create a template, then explicitly set browser.public_urls. Missing or invalid settings stop startup before opening the DB. Runtime bindings are loaded from the Server DB.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n      --config <PATH>     Host-level Server config path\n  -h, --help              Print help"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_config_accepts_only_an_optional_explicit_path() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        for input in [
+            vec!["init-config", "--config", "custom/server.toml"],
+            vec!["init-config", "--config=custom/server.toml"],
+        ] {
+            let Command::InitConfig { path } = parse_command(&args(&input)).unwrap() else {
+                panic!("expected init-config")
+            };
+            assert_eq!(path, Some(PathBuf::from("custom/server.toml")));
+        }
+        assert!(matches!(
+            parse_command(&args(&["init-config"])).unwrap(),
+            Command::InitConfig { path: None }
+        ));
+        for input in [
+            vec!["--config"],
+            vec!["--config="],
+            vec!["--config", ""],
+            vec!["--listen", "127.0.0.1:8787"],
+            vec!["server.toml"],
+            vec!["--force"],
+        ] {
+            assert!(
+                parse_init_config_options(&args(&input)).is_err(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_config_creates_an_inactive_template_and_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        run_init_config(Some(path.clone())).unwrap();
+        let template = std::fs::read(&path).unwrap();
+        assert!(ServerHostConfigFile::load_from_path(&path).is_err());
+        assert!(run_init_config(Some(path.clone())).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), template);
+    }
 
     #[test]
     fn removed_repository_local_commands_are_rejected() {
@@ -975,11 +1074,10 @@ mod tests {
     fn parse_cli_rejects_removed_server_global_runtime_trust_commands() {
         for command in ["identity", "trust-runtime"] {
             let error = parse_command(&[command.to_owned()]).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "unknown command `{command}`; expected `hosting-admin`, `bootstrap-auth`, `migrate`, `skills`, or `serve`"
-                )
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown command `{command}`"))
             );
         }
     }

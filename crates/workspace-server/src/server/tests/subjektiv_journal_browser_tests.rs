@@ -748,10 +748,10 @@ async fn journal_browser_cookie_read_post_retains_origin_check_for_non_owner_rea
         })
         .unwrap();
     let AuthConfig::Passkey {
-        origin,
+        public_urls,
         cookie_name,
-        ..
     } = &f.api.config.auth;
+    let origin = &public_urls[0];
     for (presented, expected) in [
         (None, StatusCode::FORBIDDEN),
         (Some("https://foreign.example"), StatusCode::FORBIDDEN),

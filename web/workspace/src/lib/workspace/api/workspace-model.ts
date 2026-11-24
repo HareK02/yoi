@@ -454,17 +454,16 @@ function authConfig(value: unknown, path: string): WorkspaceAuthConfig {
   const passkey = object(auth.Passkey, `${path}.Passkey`);
   exactKeys(
     passkey,
-    ["rp_id", "origin", "public_base_url", "cookie_name"],
+    ["public_urls", "cookie_name"],
     `${path}.Passkey`,
   );
   return {
     Passkey: {
-      rp_id: workspaceString(passkey.rp_id, `${path}.Passkey.rp_id`),
-      origin: workspaceString(passkey.origin, `${path}.Passkey.origin`),
-      public_base_url: workspaceString(
-        passkey.public_base_url,
-        `${path}.Passkey.public_base_url`,
-      ),
+      public_urls: array(passkey.public_urls, `${path}.Passkey.public_urls`)
+        .map(
+          (value, index) =>
+            workspaceString(value, `${path}.Passkey.public_urls[${index}]`),
+        ),
       cookie_name: workspaceString(
         passkey.cookie_name,
         `${path}.Passkey.cookie_name`,

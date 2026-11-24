@@ -88,9 +88,7 @@ impl Fixture {
             embedded_runtime_store_root: dir.path().join("runtime"),
             static_assets_dir: None,
             auth: AuthConfig::Passkey {
-                rp_id: "localhost".into(),
-                origin: "http://localhost:5173".into(),
-                public_base_url: "http://localhost:5173".into(),
+                public_urls: vec!["http://localhost:5173".into()],
                 cookie_name: "db_execution_session".into(),
             },
             max_records: 100,

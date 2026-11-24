@@ -245,9 +245,7 @@ Deno.test("workspace response requires the permission projection", () => {
     schema_version: 46,
     auth: {
       Passkey: {
-        rp_id: "example.test",
-        origin: "https://example.test",
-        public_base_url: "https://example.test",
+        public_urls: ["https://example.test"],
         cookie_name: "yoi_session",
       },
     },
@@ -330,10 +328,21 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
       }),
     ".expected_workspace_updated_at is too long",
   );
-  for (const parse of [parseWorkspaceDeletionPreflightResponse, parseWorkspaceDeletionOperationResponse]) {
-    const value = parse === parseWorkspaceDeletionPreflightResponse ? preflight : operation;
+  for (
+    const parse of [
+      parseWorkspaceDeletionPreflightResponse,
+      parseWorkspaceDeletionOperationResponse,
+    ]
+  ) {
+    const value = parse === parseWorkspaceDeletionPreflightResponse
+      ? preflight
+      : operation;
     assertThrows(
-      () => parse({ ...value, blockers: [{ ...operation.blockers[0], kind: "unknown_blocker" }] }),
+      () =>
+        parse({
+          ...value,
+          blockers: [{ ...operation.blockers[0], kind: "unknown_blocker" }],
+        }),
       ".kind is invalid",
     );
   }

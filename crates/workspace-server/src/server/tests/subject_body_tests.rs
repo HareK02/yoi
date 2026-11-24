@@ -142,10 +142,10 @@ async fn browser_subject_and_conversation_reads_allow_missing_origin_but_mutatio
         })
         .unwrap();
     let AuthConfig::Passkey {
+        public_urls,
         cookie_name,
-        origin,
-        ..
     } = &f.api.config.auth;
+    let origin = &public_urls[0];
     let browser_request = |method: &str, path: &str, body: Option<Value>, origin: Option<&str>| {
         let mut request = Request::builder()
             .method(method)

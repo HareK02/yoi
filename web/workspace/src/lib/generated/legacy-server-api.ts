@@ -39,12 +39,7 @@ export type WorkspaceCreateResponse = {
 };
 
 export type WorkspaceAuthConfig = {
-  "Passkey": {
-    rp_id: string;
-    origin: string;
-    public_base_url: string;
-    cookie_name: string;
-  };
+  "Passkey": { public_urls: Array<string>; cookie_name: string };
 };
 
 export type WorkspacePermissionSummary = {

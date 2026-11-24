@@ -360,9 +360,7 @@ impl ServerConfig {
             embedded_runtime_store_root,
             static_assets_dir: None,
             auth: AuthConfig::Passkey {
-                rp_id: "localhost".to_string(),
-                origin: "http://localhost:5173".to_string(),
-                public_base_url: "http://localhost:5173".to_string(),
+                public_urls: Vec::new(),
                 cookie_name: "yoi_workspace_session".to_string(),
             },
             max_records: 200,
@@ -442,12 +440,10 @@ impl ServerConfig {
     }
 
     fn plugin_control_plane_endpoints(&self) -> std::collections::BTreeSet<String> {
-        let AuthConfig::Passkey {
-            public_base_url, ..
-        } = &self.auth;
+        let AuthConfig::Passkey { public_urls, .. } = &self.auth;
         self.control_plane_endpoints
             .iter()
-            .chain(std::iter::once(public_base_url))
+            .chain(public_urls.iter())
             .chain(self.backend_base_url.iter())
             .chain(
                 self.remote_runtime_sources
@@ -3797,8 +3793,8 @@ async fn resolve_server_actor(
     api: &WorkspaceServerApi,
     headers: &HeaderMap,
 ) -> std::result::Result<Option<RequestActor>, Error> {
-    let cookie_name = auth_public_config(api.template.as_ref()).cookie_name;
-    resolve_request_actor(api.store.clone(), headers, &cookie_name).await
+    let cookie_name = auth_cookie_name(api.template.as_ref());
+    resolve_request_actor(api.store.clone(), headers, cookie_name).await
 }
 
 fn signed_request_target(uri: &Uri) -> &str {
@@ -4000,15 +3996,10 @@ async fn authorize_scoped_workspace_request(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
-    if cookie_authenticated && mutating {
-        let AuthConfig::Passkey { origin, .. } = &api.template.auth;
-        if origin
-            != request
-                .headers()
-                .get(ORIGIN)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-        {
+    if cookie_authenticated
+        && (mutating || request.headers().contains_key(axum::http::header::UPGRADE))
+    {
+        if !allowed_request_origin(&api.template, request.headers()) {
             return Err(repository_api_rejection(
                 &request_path,
                 StatusCode::FORBIDDEN,
@@ -4180,15 +4171,10 @@ async fn authorize_workspace_api_request(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
-    if cookie_authenticated && mutating {
-        let AuthConfig::Passkey { origin, .. } = &api.config.auth;
-        if origin
-            != request
-                .headers()
-                .get(ORIGIN)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-        {
+    if cookie_authenticated
+        && (mutating || request.headers().contains_key(axum::http::header::UPGRADE))
+    {
+        if !allowed_request_origin(&api.config, request.headers()) {
             return repository_api_rejection(
                 &request_path,
                 StatusCode::FORBIDDEN,
@@ -4237,7 +4223,8 @@ async fn enforce_server_cookie_mutation_origin(
     if matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
-    ) {
+    ) && !request.headers().contains_key(axum::http::header::UPGRADE)
+    {
         return next.run(request).await;
     }
     let actor = match resolve_server_actor(&api, request.headers()).await {
@@ -4248,12 +4235,7 @@ async fn enforce_server_cookie_mutation_origin(
         .as_ref()
         .is_some_and(|actor| matches!(actor.auth_method, ActorAuthMethod::BrowserSession))
     {
-        let AuthConfig::Passkey { origin, .. } = &api.template.auth;
-        let presented_origin = request
-            .headers()
-            .get(ORIGIN)
-            .and_then(|value| value.to_str().ok());
-        if presented_origin != Some(origin.as_str()) {
+        if !allowed_request_origin(&api.template, request.headers()) {
             return forbidden_server_response(
                 "cookie-authenticated mutations require the configured Browser origin",
             );
@@ -7844,7 +7826,7 @@ async fn attach_server_request_context(
         match resolve_request_actor(
             auth.store.clone(),
             request.headers(),
-            &auth_public_config(&auth.config).cookie_name,
+            auth_cookie_name(&auth.config),
         )
         .await
         {
@@ -7880,9 +7862,12 @@ async fn attach_server_request_context(
 }
 
 fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
-    let auth = auth_public_config(&service.auth_api().config);
+    let auth_api = service.auth_api();
+    let cookie_name = auth_cookie_name(&auth_api.config).to_owned();
     let service = Arc::new(service);
     let origin_context = Router::new()
+        .merge(server_api::server_api_axum::auth_passkey_addition_code_options(service.clone()))
+        .merge(server_api::server_api_axum::auth_passkey_addition_code_complete(service.clone()))
         .merge(server_api::server_api_axum::auth_activation_options(
             service.clone(),
         ))
@@ -7892,6 +7877,9 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         ))
         .layer(middleware::from_fn(attach_server_origin_context));
     let actor_context = Router::new()
+        .merge(server_api::server_api_axum::auth_passkey_addition_code_status(service.clone()))
+        .merge(server_api::server_api_axum::auth_passkey_addition_code_issue(service.clone()))
+        .merge(server_api::server_api_axum::auth_passkey_addition_code_revoke(service.clone()))
         .merge(server_api::server_api_axum::hosting_account_create(
             service.clone(),
         ))
@@ -7948,8 +7936,13 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         .merge(server_api::server_api_axum::auth_device_login_poll(service))
         .merge(origin_context)
         .merge(actor_context)
+        .layer(middleware::from_fn(attach_server_origin_context))
         .layer(middleware::from_fn_with_state(
-            auth,
+            auth_api,
+            enforce_auth_cookie_origin,
+        ))
+        .layer(middleware::from_fn_with_state(
+            cookie_name,
             append_session_marker_cookie,
         ))
         .layer(middleware::map_response(
@@ -7964,11 +7957,37 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         ))
 }
 
+async fn enforce_auth_cookie_origin(
+    State(api): State<ServerAuthApi>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) || request.headers().contains_key(axum::http::header::UPGRADE)
+    {
+        match resolve_actor(&api, request.headers()).await {
+            Ok(Some(actor))
+                if actor.auth_method == ActorAuthMethod::BrowserSession
+                    && !allowed_request_origin(&api.config, request.headers()) =>
+            {
+                return forbidden_server_response(
+                    "cookie-authenticated mutations require an allowed Browser origin",
+                );
+            }
+            Err(error) => return error.into_response(),
+            _ => {}
+        }
+    }
+    next.run(request).await
+}
+
 // The typed auth operations expose one Set-Cookie. At the HTTP boundary, pair only a real
 // session Set-Cookie with a non-authenticating expiry marker, including login and logout.
 // Mirroring its attributes keeps Secure/Path/Domain/SameSite aligned without a second policy.
 async fn append_session_marker_cookie(
-    State(auth): State<AuthPublicConfig>,
+    State(cookie_name): State<String>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -7981,7 +8000,7 @@ async fn append_session_marker_cookie(
             let value = value.to_str().ok()?;
             let (pair, attributes) = value.split_once(';')?;
             let (name, token) = pair.split_once('=')?;
-            if name != auth.cookie_name {
+            if name != cookie_name {
                 return None;
             }
             let max_age = attributes
@@ -9070,8 +9089,11 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn auth_config(
         &self,
+        context: server_api::ServerRequestContext,
     ) -> std::result::Result<AuthPublicConfig, server_api::RepositoryApiError> {
-        Ok(auth_public_config(&self.auth_api().config))
+        let headers = contract_request_headers(&context)?;
+        auth_config_for_request(&self.auth_api().config, &headers, None)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn auth_registration_policy(
@@ -9196,21 +9218,22 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::ActivationOptionsRequest,
     ) -> std::result::Result<PasskeyRegistrationOptionsResponse, server_api::RepositoryApiError>
     {
+        let headers = contract_request_headers(&context)?;
         let api = self.auth_api();
         api.store
             .db_executor()
             .run(move || {
                 // Validate the allowed WebAuthn origin before spending an attempt. Neither
                 // a browser cookie nor a bearer token can select this enrollment target.
-                let origin = request
-                    .browser_origin
-                    .as_deref()
-                    .or(context.origin.as_deref());
-                auth_config_for_origin(&api.config, origin)?;
+                let auth = auth_config_for_request(
+                    &api.config,
+                    &headers,
+                    request.browser_origin.as_deref(),
+                )?;
                 let target = api
                     .store
                     .verify_activation_code(&request.handle, &request.code)?;
-                start_passkey_registration(&api, &HeaderMap::new(), origin, target)
+                start_passkey_registration(&api, &headers, Some(&auth.origin), target)
             })
             .await
             .map_err(ApiError::into_repository_api_error)
@@ -9218,17 +9241,24 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn auth_activation_complete(
         &self,
+        context: server_api::ServerRequestContext,
         request: PasskeyRegistrationCompleteRequest,
     ) -> std::result::Result<
         server_api::server_api_responses::AuthActivationComplete,
         server_api::RepositoryApiError,
     > {
+        let headers = contract_request_headers(&context)?;
         let api = self.auth_api();
         let (body, header_set_cookie) = api
             .store
             .db_executor()
             .run(move || {
-                complete_passkey_enrollment(&api, request, EnrollmentCompletion::Activation)
+                complete_passkey_enrollment(
+                    &api,
+                    request,
+                    EnrollmentCompletion::Activation,
+                    &headers,
+                )
             })
             .await
             .map_err(ApiError::into_repository_api_error)?;
@@ -9253,13 +9283,11 @@ impl server_api::ServerApi for ServerApiContractService {
     async fn auth_passkey_registration_options(
         &self,
         context: server_api::ServerRequestContext,
-        mut request: PasskeyRegistrationOptionsRequest,
+        request: PasskeyRegistrationOptionsRequest,
     ) -> std::result::Result<PasskeyRegistrationOptionsResponse, server_api::RepositoryApiError>
     {
-        if request.browser_origin.is_none() {
-            request.browser_origin = context.origin;
-        }
-        post_passkey_registration_options(State(self.auth_api()), HeaderMap::new(), Json(request))
+        let headers = contract_request_headers(&context)?;
+        post_passkey_registration_options(State(self.auth_api()), headers, Json(request))
             .await
             .map(|Json(response)| response)
             .map_err(ApiError::into_repository_api_error)
@@ -9267,20 +9295,178 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn auth_passkey_registration_complete(
         &self,
+        context: server_api::ServerRequestContext,
         request: PasskeyRegistrationCompleteRequest,
     ) -> std::result::Result<
         server_api::server_api_responses::AuthPasskeyRegistrationComplete,
         server_api::RepositoryApiError,
     > {
+        let headers = contract_request_headers(&context)?;
         let api = self.auth_api();
         let (body, header_set_cookie) = api
             .store
             .db_executor()
-            .run(move || complete_passkey_registration(&api, request))
+            .run(move || complete_passkey_registration(&api, request, &headers))
             .await
             .map_err(ApiError::into_repository_api_error)?;
         Ok(
             server_api::server_api_responses::AuthPasskeyRegistrationComplete::Status200 {
+                body,
+                header_set_cookie,
+            },
+        )
+    }
+
+    async fn auth_passkey_addition_code_status(
+        &self,
+        context: server_api::ServerRequestContext,
+    ) -> std::result::Result<
+        server_api::PasskeyAdditionCodeStatusResponse,
+        server_api::RepositoryApiError,
+    > {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let (user, binding) = addition_code_owner(&api, &headers, false)?;
+                let PasskeyAuthenticationBinding::BrowserSession(hash) = binding else {
+                    unreachable!()
+                };
+                let active = api.store.addition_code_status(&user, &hash)?;
+                let AuthConfig::Passkey { public_urls, .. } = &api.config.auth;
+                Ok::<_, ApiError>(server_api::PasskeyAdditionCodeStatusResponse {
+                    user: user_response(user),
+                    public_urls: public_urls.clone(),
+                    active,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_addition_code_issue(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::PasskeyAdditionCodeRequest,
+    ) -> std::result::Result<server_api::PasskeyAdditionCodeResponse, server_api::RepositoryApiError>
+    {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let (user, binding) = addition_code_owner(&api, &headers, true)?;
+                require_expected_passkey_owner(
+                    &user,
+                    &binding,
+                    &request.expected_user_id,
+                    &request.expected_account_id,
+                    &request.expected_authentication_reference,
+                )?;
+                let auth = auth_config_for_origin(&api.config, Some(&request.target_origin))?;
+                let PasskeyAuthenticationBinding::BrowserSession(hash) = binding else {
+                    unreachable!()
+                };
+                Ok::<_, ApiError>(api.store.issue_addition_code(
+                    &user,
+                    &hash,
+                    &auth.origin,
+                    &auth.rp_id,
+                )?)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_addition_code_revoke(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::PasskeyAdditionCodeRevokeRequest,
+    ) -> std::result::Result<
+        server_api::PasskeyAdditionCodeRevokeResponse,
+        server_api::RepositoryApiError,
+    > {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let (user, binding) = addition_code_owner(&api, &headers, true)?;
+                require_expected_passkey_owner(
+                    &user,
+                    &binding,
+                    &request.expected_user_id,
+                    &request.expected_account_id,
+                    &request.expected_authentication_reference,
+                )?;
+                let PasskeyAuthenticationBinding::BrowserSession(hash) = binding else {
+                    unreachable!()
+                };
+                Ok::<_, ApiError>(server_api::PasskeyAdditionCodeRevokeResponse {
+                    revoked: api
+                        .store
+                        .revoke_addition_code(&user, &hash, &request.issuance_id)?,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_addition_code_options(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::PasskeyAdditionCodeOptionsRequest,
+    ) -> std::result::Result<PasskeyRegistrationOptionsResponse, server_api::RepositoryApiError>
+    {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let auth =
+                    auth_config_for_request(&api.config, &headers, Some(&request.browser_origin))?;
+                let target = api.store.verify_addition_code(
+                    &request.handle,
+                    &request.code,
+                    &auth.origin,
+                    &auth.rp_id,
+                )?;
+                let PasskeyRegistrationTarget::AdditionCode { user, .. } = &target else {
+                    unreachable!()
+                };
+                require_addition_code_cookie_owner(&api, &headers, user)?;
+                start_passkey_registration(&api, &headers, Some(&auth.origin), target)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_addition_code_complete(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: PasskeyRegistrationCompleteRequest,
+    ) -> std::result::Result<
+        server_api::server_api_responses::AuthPasskeyAdditionCodeComplete,
+        server_api::RepositoryApiError,
+    > {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        let (body, header_set_cookie) = api
+            .store
+            .db_executor()
+            .run(move || {
+                complete_passkey_enrollment(
+                    &api,
+                    request,
+                    EnrollmentCompletion::AdditionCode,
+                    &headers,
+                )
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(
+            server_api::server_api_responses::AuthPasskeyAdditionCodeComplete::Status200 {
                 body,
                 header_set_cookie,
             },
@@ -9393,7 +9579,12 @@ impl server_api::ServerApi for ServerApiContractService {
             .store
             .db_executor()
             .run(move || {
-                complete_passkey_enrollment(&api, request, EnrollmentCompletion::Addition(&headers))
+                complete_passkey_enrollment(
+                    &api,
+                    request,
+                    EnrollmentCompletion::Addition(&headers),
+                    &headers,
+                )
             })
             .await
             .map_err(ApiError::into_repository_api_error)?;
@@ -9408,12 +9599,10 @@ impl server_api::ServerApi for ServerApiContractService {
     async fn auth_passkey_login_options(
         &self,
         context: server_api::ServerRequestContext,
-        mut request: PasskeyLoginOptionsRequest,
+        request: PasskeyLoginOptionsRequest,
     ) -> std::result::Result<PasskeyLoginOptionsResponse, server_api::RepositoryApiError> {
-        if request.browser_origin.is_none() {
-            request.browser_origin = context.origin;
-        }
-        post_passkey_login_options(State(self.auth_api()), HeaderMap::new(), Json(request))
+        let headers = contract_request_headers(&context)?;
+        post_passkey_login_options(State(self.auth_api()), headers, Json(request))
             .await
             .map(|Json(response)| response)
             .map_err(ApiError::into_repository_api_error)
@@ -9421,16 +9610,18 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn auth_passkey_login_complete(
         &self,
+        context: server_api::ServerRequestContext,
         request: PasskeyLoginCompleteRequest,
     ) -> std::result::Result<
         server_api::server_api_responses::AuthPasskeyLoginComplete,
         server_api::RepositoryApiError,
     > {
+        let headers = contract_request_headers(&context)?;
         let api = self.auth_api();
         let (body, header_set_cookie) = api
             .store
             .db_executor()
-            .run(move || complete_passkey_login(&api, request))
+            .run(move || complete_passkey_login(&api, request, &headers))
             .await
             .map_err(ApiError::into_repository_api_error)?;
         Ok(
@@ -9456,20 +9647,25 @@ impl server_api::ServerApi for ServerApiContractService {
         context: server_api::ServerRequestContext,
         request: DeviceLoginApproveRequest,
     ) -> std::result::Result<DeviceLoginApproveResponse, server_api::RepositoryApiError> {
-        let actor = context.actor.ok_or_else(|| {
-            server_api::RepositoryApiError::new(
-                StatusCode::UNAUTHORIZED.as_u16(),
-                "Unauthorized",
-                "request requires a browser session or Bearer API token",
-                Vec::new(),
-            )
-        })?;
         let api = self.auth_api();
         api.store
             .db_executor()
-            .run(move || approve_device_login(&api, actor, request))
+            .run(move || {
+                let Some(actor) = live_transport_actor(&api, &context, true)? else {
+                    return Ok(None);
+                };
+                approve_device_login(&api, actor, request).map(Some)
+            })
             .await
-            .map_err(ApiError::into_repository_api_error)
+            .map_err(ApiError::into_repository_api_error)?
+            .ok_or_else(|| {
+                server_api::RepositoryApiError::new(
+                    StatusCode::UNAUTHORIZED.as_u16(),
+                    "Unauthorized",
+                    "request requires a browser session or Bearer API token",
+                    Vec::new(),
+                )
+            })
     }
 
     async fn auth_device_login_poll(
@@ -9488,27 +9684,25 @@ impl server_api::ServerApi for ServerApiContractService {
     ) -> std::result::Result<WhoamiResponse, server_api::RepositoryApiError> {
         let headers = contract_request_headers(&context)?;
         let api = self.auth_api();
-        crate::auth::resolve_whoami(
-            api.store.clone(),
-            &headers,
-            &auth_public_config(&api.config).cookie_name,
-        )
-        .await
-        .map_err(|error| ApiError::from(error).into_repository_api_error())
+        crate::auth::resolve_whoami(api.store.clone(), &headers, auth_cookie_name(&api.config))
+            .await
+            .map_err(|error| ApiError::from(error).into_repository_api_error())
     }
 
     async fn auth_logout(
         &self,
+        context: server_api::ServerRequestContext,
         cookie: Option<String>,
     ) -> std::result::Result<
         server_api::server_api_responses::AuthLogout,
         server_api::RepositoryApiError,
     > {
+        let headers = contract_request_headers(&context)?;
         let api = self.auth_api();
         let (body, header_set_cookie) = api
             .store
             .db_executor()
-            .run(move || logout_browser_session(&api, cookie))
+            .run(move || logout_browser_session(&api, cookie, &headers))
             .await
             .map_err(ApiError::into_repository_api_error)?;
         Ok(server_api::server_api_responses::AuthLogout::Status200 {
@@ -34189,11 +34383,11 @@ fn passkey_owner_authority(
     headers: &HeaderMap,
     require_origin: bool,
 ) -> ApiResult<(UserRecord, PasskeyAuthenticationBinding)> {
-    let auth = auth_public_config(&api.config);
+    let cookie_name = auth_cookie_name(&api.config);
     let actor = crate::auth::resolve_request_actor_sync(
         api.store.as_ref(),
         crate::auth::parse_bearer(headers),
-        parse_cookie(headers, &auth.cookie_name),
+        parse_cookie(headers, cookie_name),
     )?
     .ok_or_else(|| {
         auth_error(
@@ -34203,7 +34397,9 @@ fn passkey_owner_authority(
     })?;
     let binding = match actor.auth_method {
         ActorAuthMethod::BrowserSession => {
-            if require_origin && request_origin(headers).as_deref() != Some(auth.origin.as_str()) {
+            if (require_origin || headers.contains_key(ORIGIN))
+                && !allowed_request_origin(&api.config, headers)
+            {
                 return Err(Error::WorkspacePermissionDenied(
                     "cookie-authenticated passkey addition requires the configured Browser origin"
                         .into(),
@@ -34211,7 +34407,7 @@ fn passkey_owner_authority(
                 .into());
             }
             PasskeyAuthenticationBinding::BrowserSession(token_hash(
-                &parse_cookie(headers, &auth.cookie_name)
+                &parse_cookie(headers, cookie_name)
                     .ok_or_else(|| auth_error("auth_required", "missing browser credential"))?,
             ))
         }
@@ -34233,6 +34429,44 @@ fn passkey_owner_authority(
         .into());
     }
     Ok((user, binding))
+}
+
+// This authority is deliberately browser-only even if a bearer is also supplied.
+fn addition_code_owner(
+    api: &ServerAuthApi,
+    headers: &HeaderMap,
+    mutation: bool,
+) -> ApiResult<(UserRecord, PasskeyAuthenticationBinding)> {
+    let mut cookie_headers = headers.clone();
+    cookie_headers.remove(axum::http::header::AUTHORIZATION);
+    passkey_owner_authority(api, &cookie_headers, mutation)
+}
+
+fn require_addition_code_cookie_owner(
+    api: &ServerAuthApi,
+    headers: &HeaderMap,
+    user: &UserRecord,
+) -> ApiResult<()> {
+    if let Some(actor) = crate::auth::resolve_request_actor_sync(
+        api.store.as_ref(),
+        None,
+        parse_cookie(headers, auth_cookie_name(&api.config)),
+    )? {
+        if !allowed_request_origin(&api.config, headers) {
+            return Err(Error::WorkspacePermissionDenied(
+                "cookie-authenticated addition requires actual Origin".into(),
+            )
+            .into());
+        }
+        if actor.user_id != user.user_id || actor.account_id != user.account_id {
+            return Err(auth_error(
+                "passkey_authentication_changed",
+                "sign out of the other account before using this addition code",
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn require_expected_passkey_owner(
@@ -34264,7 +34498,8 @@ fn start_passkey_registration(
     let (user, exclude_credentials) = match &target {
         PasskeyRegistrationTarget::NewAccount { user }
         | PasskeyRegistrationTarget::Activation { user, .. } => (user, Vec::new()),
-        PasskeyRegistrationTarget::Addition { user, .. } => (
+        PasskeyRegistrationTarget::Addition { user, .. }
+        | PasskeyRegistrationTarget::AdditionCode { user, .. } => (
             user,
             passkeys_for_user(api, &user.user_id)?
                 .into_iter()
@@ -34272,8 +34507,7 @@ fn start_passkey_registration(
                 .collect(),
         ),
     };
-    let header_origin = request_origin(headers);
-    let auth = auth_config_for_origin(&api.config, browser_origin.or(header_origin.as_deref()))?;
+    let auth = auth_config_for_request(&api.config, headers, browser_origin)?;
     let webauthn = webauthn_for_auth(&auth)?;
     let (mut public_key, verifier) = webauthn
         .start_passkey_registration(
@@ -34304,6 +34538,7 @@ fn start_passkey_registration(
     let user_id = match &target {
         PasskeyRegistrationTarget::NewAccount { .. } => None,
         PasskeyRegistrationTarget::Addition { user, .. }
+        | PasskeyRegistrationTarget::AdditionCode { user, .. }
         | PasskeyRegistrationTarget::Activation { user, .. } => Some(user.user_id.clone()),
     };
     api.store.put_auth_challenge(&AuthChallengeRecord {
@@ -34347,8 +34582,9 @@ fn start_passkey_registration(
 fn complete_passkey_registration(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
+    headers: &HeaderMap,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
-    complete_passkey_enrollment(api, request, EnrollmentCompletion::NewAccount)
+    complete_passkey_enrollment(api, request, EnrollmentCompletion::NewAccount, headers)
 }
 
 /// Completion endpoints select a purpose, not a caller-controlled body field.
@@ -34356,6 +34592,7 @@ fn complete_passkey_registration(
 enum EnrollmentCompletion<'a> {
     NewAccount,
     Addition(&'a HeaderMap),
+    AdditionCode,
     Activation,
 }
 
@@ -34363,6 +34600,7 @@ fn complete_passkey_enrollment(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
     completion: EnrollmentCompletion<'_>,
+    headers: &HeaderMap,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
     let is_addition = matches!(&completion, EnrollmentCompletion::Addition(_));
     let authority = match completion {
@@ -34382,6 +34620,7 @@ fn complete_passkey_enrollment(
                 "passkey registration challenge is invalid or already consumed",
             )
         })?;
+    validate_challenge_request_origin(&api.config, &challenge, headers)?;
     if is_expired(&challenge.expires_at) {
         return Err(auth_error(
             "expired_passkey_challenge",
@@ -34434,6 +34673,22 @@ fn complete_passkey_enrollment(
             // issuance, code expiry and attempts before atomically activating it.
             user.clone()
         }
+        (
+            PasskeyRegistrationTarget::AdditionCode {
+                user,
+                target_origin,
+                rp_id,
+                ..
+            },
+            None,
+            EnrollmentCompletion::AdditionCode,
+        ) if challenge.user_id.as_deref() == Some(user.user_id.as_str())
+            && challenge.origin == *target_origin
+            && challenge.rp_id == *rp_id =>
+        {
+            require_addition_code_cookie_owner(api, headers, user)?;
+            user.clone()
+        }
         _ => {
             return Err(auth_error(
                 "passkey_registration_binding_mismatch",
@@ -34465,7 +34720,7 @@ fn complete_passkey_enrollment(
         },
         is_addition.then_some(request.challenge_id.as_str()),
     )?;
-    issue_browser_session(api, user)
+    issue_browser_session(api, user, &auth_for_challenge(&api.config, &challenge)?)
 }
 
 /// Normal login has no preselected identity. Explicit handle requests are the
@@ -34488,14 +34743,8 @@ async fn post_passkey_login_options(
     api.store
         .db_executor()
         .run(move || {
-            let header_origin = request_origin(&headers);
-            let auth = auth_config_for_origin(
-                &api.config,
-                request
-                    .browser_origin
-                    .as_deref()
-                    .or(header_origin.as_deref()),
-            )?;
+            let auth =
+                auth_config_for_request(&api.config, &headers, request.browser_origin.as_deref())?;
             let webauthn = webauthn_for_auth(&auth)?;
             let (public_key, state, user_id) =
                 if let Some(handle) = request.handle.as_deref() {
@@ -34568,6 +34817,7 @@ async fn post_passkey_login_options(
 fn complete_passkey_login(
     api: &ServerAuthApi,
     request: PasskeyLoginCompleteRequest,
+    headers: &HeaderMap,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
     let challenge = api
         .store
@@ -34582,6 +34832,7 @@ fn complete_passkey_login(
                 "passkey login challenge is invalid or already consumed",
             )
         })?;
+    validate_challenge_request_origin(&api.config, &challenge, headers)?;
     if is_expired(&challenge.expires_at) {
         return Err(auth_error(
             "expired_passkey_challenge",
@@ -34701,12 +34952,13 @@ fn complete_passkey_login(
         api.store
             .mark_passkey_normal_login_verified(&credential_id, &crate::auth::now_rfc3339())?;
     }
-    issue_browser_session(api, user)
+    issue_browser_session(api, user, &auth_for_challenge(&api.config, &challenge)?)
 }
 
 fn issue_browser_session(
     api: &ServerAuthApi,
     user: UserRecord,
+    auth: &AuthPublicConfig,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
     let session_token = mint_secret("yoi_sess");
     api.store.create_browser_session(&BrowserSessionRecord {
@@ -34717,7 +34969,6 @@ fn issue_browser_session(
         expires_at: rfc3339_after(Duration::seconds(crate::auth::BROWSER_SESSION_SECONDS)),
         revoked_at: None,
     })?;
-    let auth = auth_public_config(&api.config);
     let cookie = session_set_cookie(
         session_cookie_policy(&auth),
         &session_token,
@@ -34743,7 +34994,7 @@ async fn post_device_login_start(
         .run(move || {
             const MAX_CODE_ALLOCATION_ATTEMPTS: usize = 8;
 
-            let auth = auth_public_config(&api.config);
+            let auth = auth_public_config(&api.config)?;
             let verification_uri = format!(
                 "{}/login/device",
                 auth.public_base_url.trim_end_matches('/')
@@ -34903,8 +35154,9 @@ async fn post_device_login_poll(
 fn logout_browser_session(
     api: &ServerAuthApi,
     cookie: Option<String>,
+    request_headers: &HeaderMap,
 ) -> ApiResult<(LogoutResponse, server_api::SetCookieHeader)> {
-    let auth = auth_public_config(&api.config);
+    let auth = auth_config_for_request(&api.config, request_headers, None)?;
     let mut headers = HeaderMap::new();
     if let Some(cookie) = cookie {
         let value = cookie.parse::<HeaderValue>().map_err(|_| {
@@ -34914,6 +35166,14 @@ fn logout_browser_session(
             )
         })?;
         headers.insert(axum::http::header::COOKIE, value);
+    }
+    if parse_cookie(&headers, &auth.cookie_name).is_some()
+        && !allowed_request_origin(&api.config, request_headers)
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "cookie logout requires an allowed Browser origin".into(),
+        )
+        .into());
     }
     if let Some(session_token) = parse_cookie(&headers, &auth.cookie_name) {
         let _ = api
@@ -34947,44 +35207,155 @@ fn request_origin(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Browser configuration is an explicit origin allowlist, never a host allowlist.
+/// Reject URL components that cannot be represented in an Origin header.
+fn normalized_browser_origin(value: &str) -> ApiResult<Url> {
+    let url = Url::parse(value)
+        .map_err(|error| auth_error("invalid_webauthn_origin", &error.to_string()))?;
+    let local = match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
+        Some(url::Host::Ipv4(host)) => host.is_loopback(),
+        Some(url::Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    };
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !(url.scheme() == "https" || (url.scheme() == "http" && local))
+    {
+        return Err(auth_error(
+            "invalid_webauthn_origin",
+            "browser origin must be HTTPS (or HTTP loopback), without credentials, path, query or fragment",
+        ).into());
+    }
+    Ok(url)
+}
+
+fn auth_cookie_name(config: &ServerConfig) -> &str {
+    let AuthConfig::Passkey { cookie_name, .. } = &config.auth;
+    cookie_name
+}
+
 fn auth_config_for_origin(
     config: &ServerConfig,
     request_origin: Option<&str>,
 ) -> ApiResult<AuthPublicConfig> {
-    let mut auth = auth_public_config(config);
-    let Some(request_origin) = request_origin else {
-        return Ok(auth);
-    };
-    let origin = Url::parse(request_origin)
-        .map_err(|error| auth_error("invalid_webauthn_request_origin", &error.to_string()))?;
-    let host = origin.host_str().ok_or_else(|| {
+    let AuthConfig::Passkey {
+        public_urls,
+        cookie_name,
+    } = &config.auth;
+    let allowed = public_urls
+        .iter()
+        .map(|value| normalized_browser_origin(value))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let selected = match request_origin {
+        Some(value) => {
+            let requested = normalized_browser_origin(value)?;
+            allowed
+                .iter()
+                .find(|url| url.origin() == requested.origin())
+        }
+        None => allowed.first(),
+    }
+    .ok_or_else(|| {
         auth_error(
-            "invalid_webauthn_request_origin",
-            "request Origin header does not contain a host",
+            "webauthn_origin_not_allowed",
+            "browser origin is not explicitly configured",
         )
     })?;
-    if host != auth.rp_id {
+    let origin = selected.origin().ascii_serialization();
+    Ok(AuthPublicConfig {
+        rp_id: selected.host_str().expect("validated host").to_owned(),
+        public_base_url: origin.clone(),
+        origin,
+        cookie_name: cookie_name.clone(),
+    })
+}
+
+fn allowed_request_origin(config: &ServerConfig, headers: &HeaderMap) -> bool {
+    // Missing, malformed and duplicate transport headers must not select a default.
+    headers.get_all(ORIGIN).iter().count() == 1
+        && headers
+            .get(ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|origin| auth_config_for_origin(config, Some(origin)).is_ok())
+}
+
+fn auth_config_for_request(
+    config: &ServerConfig,
+    headers: &HeaderMap,
+    browser_origin: Option<&str>,
+) -> ApiResult<AuthPublicConfig> {
+    let transport = if headers.contains_key(ORIGIN) {
+        if !allowed_request_origin(config, headers) {
+            return Err(auth_error(
+                "webauthn_origin_not_allowed",
+                "request Origin is not allowed",
+            )
+            .into());
+        }
+        Some(auth_config_for_origin(
+            config,
+            request_origin(headers).as_deref(),
+        )?)
+    } else {
+        None
+    };
+    let selected = auth_config_for_origin(
+        config,
+        browser_origin.or(transport.as_ref().map(|auth| auth.origin.as_str())),
+    )?;
+    if transport.is_some_and(|auth| auth.origin != selected.origin) {
         return Err(auth_error(
-            "webauthn_origin_rp_id_mismatch",
-            &format!(
-                "browser origin host {host} does not match configured RP ID {}",
-                auth.rp_id
-            ),
+            "webauthn_origin_mismatch",
+            "browser origin differs from request Origin",
         )
         .into());
     }
-    auth.origin = request_origin.to_string();
+    Ok(selected)
+}
+
+fn auth_for_challenge(
+    config: &ServerConfig,
+    challenge: &AuthChallengeRecord,
+) -> ApiResult<AuthPublicConfig> {
+    let auth = auth_config_for_origin(config, Some(&challenge.origin))?;
+    if auth.rp_id != challenge.rp_id {
+        return Err(auth_error(
+            "webauthn_origin_rp_id_mismatch",
+            "challenge RP no longer matches allowed origin",
+        )
+        .into());
+    }
     Ok(auth)
+}
+
+fn validate_challenge_request_origin(
+    config: &ServerConfig,
+    challenge: &AuthChallengeRecord,
+    headers: &HeaderMap,
+) -> ApiResult<()> {
+    let auth = auth_for_challenge(config, challenge)?;
+    if headers.contains_key(ORIGIN)
+        && auth_config_for_request(config, headers, None)?.origin != auth.origin
+    {
+        return Err(auth_error(
+            "webauthn_origin_mismatch",
+            "completion Origin differs from challenge",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn webauthn_for_challenge(
     config: &ServerConfig,
     challenge: &AuthChallengeRecord,
 ) -> ApiResult<Webauthn> {
-    let mut auth = auth_public_config(config);
-    auth.rp_id = challenge.rp_id.clone();
-    auth.origin = challenge.origin.clone();
-    webauthn_for_auth(&auth)
+    webauthn_for_auth(&auth_for_challenge(config, challenge)?)
 }
 
 fn webauthn_for_auth(auth: &AuthPublicConfig) -> ApiResult<Webauthn> {
@@ -35035,20 +35406,8 @@ fn session_cookie_policy(auth: &AuthPublicConfig) -> SessionCookiePolicy<'_> {
     }
 }
 
-fn auth_public_config(config: &ServerConfig) -> AuthPublicConfig {
-    match &config.auth {
-        AuthConfig::Passkey {
-            rp_id,
-            origin,
-            public_base_url,
-            cookie_name,
-        } => AuthPublicConfig {
-            rp_id: rp_id.clone(),
-            origin: origin.clone(),
-            public_base_url: public_base_url.clone(),
-            cookie_name: cookie_name.clone(),
-        },
-    }
+fn auth_public_config(config: &ServerConfig) -> ApiResult<AuthPublicConfig> {
+    auth_config_for_origin(config, None)
 }
 
 fn allocate_new_user(
@@ -35091,8 +35450,8 @@ async fn resolve_actor(
     api: &ServerAuthApi,
     headers: &HeaderMap,
 ) -> ApiResult<Option<RequestActor>> {
-    let cookie_name = auth_public_config(&api.config).cookie_name;
-    Ok(resolve_request_actor(api.store.clone(), headers, &cookie_name).await?)
+    let cookie_name = auth_cookie_name(&api.config);
+    Ok(resolve_request_actor(api.store.clone(), headers, cookie_name).await?)
 }
 
 // Hosting endpoints re-resolve actual transport credentials, not actor-like headers,
@@ -35104,19 +35463,32 @@ fn live_hosting_actor(
     context: &server_api::ServerRequestContext,
     mutating: bool,
 ) -> ApiResult<RequestActor> {
+    live_transport_actor(api, context, mutating)?
+        .ok_or_else(|| auth_error("auth_required", "current authentication required").into())
+}
+
+// Endpoints retain their own unauthenticated HTTP contract. Current credentials
+// and browser Origin are checked here before any protected mutation.
+fn live_transport_actor(
+    api: &ServerAuthApi,
+    context: &server_api::ServerRequestContext,
+    mutating: bool,
+) -> ApiResult<Option<RequestActor>> {
     let headers = contract_request_headers(context)
         .map_err(|error| Error::WorkspacePermissionDenied(error.message))?;
-    let auth = auth_public_config(&api.config);
-    let actor = crate::auth::resolve_request_actor_sync(
+    let cookie_name = auth_cookie_name(&api.config);
+    let Some(actor) = crate::auth::resolve_request_actor_sync(
         api.store.as_ref(),
         crate::auth::parse_bearer(&headers),
-        parse_cookie(&headers, &auth.cookie_name),
+        parse_cookie(&headers, cookie_name),
     )?
-    .ok_or_else(|| auth_error("auth_required", "current authentication required"))?;
+    else {
+        return Ok(None);
+    };
     let origin = request_origin(&headers);
     if mutating
         && (actor.auth_method == ActorAuthMethod::BrowserSession || origin.is_some())
-        && origin.as_deref() != Some(auth.origin.as_str())
+        && !allowed_request_origin(&api.config, &headers)
     {
         return Err(Error::WorkspacePermissionDenied(
             "hosting mutations require configured Browser origin when supplied, and for cookies"
@@ -35124,7 +35496,7 @@ fn live_hosting_actor(
         )
         .into());
     }
-    Ok(actor)
+    Ok(Some(actor))
 }
 
 fn require_hosting_admin(api: &ServerAuthApi, actor: &RequestActor) -> ApiResult<()> {
@@ -46788,10 +47160,10 @@ mod tests {
                 })
                 .unwrap();
             let AuthConfig::Passkey {
-                origin,
+                public_urls,
                 cookie_name,
-                ..
             } = &api.config.auth;
+            let origin = &public_urls[0];
             let cookie_context = |actual_origin: Option<&str>| {
                 let mut headers = HeaderMap::new();
                 headers.insert(
@@ -55039,6 +55411,10 @@ mod tests {
         let store_root = workspace_root.join(".test-embedded-runtime-store");
         let mut config = ServerConfig::local_dev(workspace_root.clone(), test_workspace())
             .with_embedded_runtime_store_root(store_root);
+        config.auth = AuthConfig::Passkey {
+            public_urls: vec!["http://localhost:5173".into()],
+            cookie_name: "yoi_workspace_session".into(),
+        };
         config.database_path = workspace_root.join(".test-yoi-server.db");
         config.data_root = workspace_root.join(".test-yoi-data");
         config.backend_base_url = Some("http://127.0.0.1:8787".to_string());
@@ -56747,11 +57123,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_server_config(temp.path());
         config.backend_base_url = Some("https://backend.example.test".to_string());
-        let AuthConfig::Passkey {
-            origin: expected_origin,
-            ..
-        } = &config.auth;
-        let expected_origin = expected_origin.clone();
+        let AuthConfig::Passkey { public_urls, .. } = &mut config.auth;
+        public_urls.push("https://workspace.test".into());
+        let expected_origin = public_urls[0].clone();
         let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
         store
             .upsert_account(&AccountRecord {
@@ -56963,31 +57337,63 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "{path} must reject a cookie-authenticated cross-site mutation"
             );
-            let same_origin = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri(path)
-                        .header(
-                            axum::http::header::COOKIE,
-                            "yoi_workspace_session=browser-session-auth",
-                        )
-                        .header(ORIGIN, expected_origin.as_str())
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from("{}"))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_ne!(
-                same_origin.status(),
-                StatusCode::FORBIDDEN,
-                "{path} must accept the configured Browser origin"
-            );
+            for allowed_origin in [expected_origin.as_str(), "https://workspace.test"] {
+                let same_origin = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(path)
+                            .header(
+                                axum::http::header::COOKIE,
+                                "yoi_workspace_session=browser-session-auth",
+                            )
+                            .header(ORIGIN, allowed_origin)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    same_origin.status(),
+                    StatusCode::FORBIDDEN,
+                    "{path} must accept the configured Browser origin"
+                );
+            }
         }
 
         let ws_uri = format!("/api/w/{}/protocol/ws", workspace.workspace.workspace_id);
+        for (origin, allowed) in [
+            (None, false),
+            (Some("https://workspace.test:444"), false),
+            (Some("http://localhost:5174"), false),
+            (Some(expected_origin.as_str()), true),
+            (Some("https://WORKSPACE.TEST:443"), true),
+        ] {
+            let mut request = Request::builder()
+                .uri(&ws_uri)
+                .header(
+                    axum::http::header::COOKIE,
+                    "yoi_workspace_session=browser-session-auth",
+                )
+                .header(axum::http::header::UPGRADE, "websocket");
+            if let Some(origin) = origin {
+                request = request.header(ORIGIN, origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            // A missing real HTTP upgrade extension may reject after admission;
+            // foreign/missing origins must be rejected before the WS handler.
+            assert_eq!(
+                response.status() == StatusCode::FORBIDDEN,
+                !allowed,
+                "{origin:?}"
+            );
+        }
         let anonymous_ws = app
             .clone()
             .oneshot(Request::builder().uri(&ws_uri).body(Body::empty()).unwrap())
@@ -57666,10 +58072,10 @@ mod tests {
             })
             .unwrap();
         let AuthConfig::Passkey {
-            origin,
+            public_urls,
             cookie_name,
-            ..
         } = &api.config.auth;
+        let origin = &public_urls[0];
         let origin = origin.clone();
         let cookie = format!("{cookie_name}=direct-browser-session");
         let app = build_router(api.clone());
@@ -57718,6 +58124,7 @@ mod tests {
         include!("server_activation_tests.rs");
         include!("server_discoverable_tests.rs");
         include!("server_passkey_results_tests.rs");
+        include!("server_passkey_addition_code_tests.rs");
 
         const ORIGIN_URL: &str = "https://workspace.test";
         type Authenticator = ResidentAuthenticator;
@@ -57733,15 +58140,8 @@ mod tests {
                 let root = tempfile::tempdir().unwrap();
                 let mut api = test_api(root.path()).await;
                 enable_test_self_registration(&api);
-                let AuthConfig::Passkey {
-                    rp_id,
-                    origin,
-                    public_base_url,
-                    ..
-                } = &mut api.config.auth;
-                *rp_id = "workspace.test".into();
-                *origin = ORIGIN_URL.into();
-                *public_base_url = ORIGIN_URL.into();
+                let AuthConfig::Passkey { public_urls, .. } = &mut api.config.auth;
+                *public_urls = vec![ORIGIN_URL.into()];
                 let app = generated_auth_contract_router(ServerApiContractService::Workspace(
                     api.clone(),
                 ));
@@ -59015,7 +59415,7 @@ mod tests {
                 updated_at: now.clone(),
             };
             api.store.upsert_user(&user).unwrap();
-            let webauthn = webauthn_for_auth(&auth_public_config(&api.config)).unwrap();
+            let webauthn = webauthn_for_auth(&auth_public_config(&api.config).unwrap()).unwrap();
             let (options, bare_state) = webauthn
                 .start_passkey_registration(
                     Uuid::now_v7(),
@@ -59174,7 +59574,8 @@ mod tests {
                 let user = allocate_new_user(&api, "legacy", None).unwrap();
                 let random_handle = Uuid::now_v7();
                 assert_ne!(random_handle, passkey_user_handle(&user.account_id));
-                let webauthn = webauthn_for_auth(&auth_public_config(&api.config)).unwrap();
+                let webauthn =
+                    webauthn_for_auth(&auth_public_config(&api.config).unwrap()).unwrap();
                 let (mut options, state) = webauthn
                     .start_passkey_registration(
                         random_handle,
@@ -59319,15 +59720,11 @@ mod tests {
         let mut api = test_api(workspace.path()).await;
         enable_test_self_registration(&api);
         let AuthConfig::Passkey {
-            rp_id,
-            origin,
-            public_base_url,
+            public_urls,
             cookie_name,
         } = &mut api.config.auth;
-        *rp_id = "workspace.test".to_string();
-        *origin = "https://workspace.test".to_string();
-        *public_base_url = origin.clone();
-        let origin = origin.clone();
+        *public_urls = vec!["https://workspace.test".into()];
+        let origin = public_urls[0].clone();
         let cookie_name = cookie_name.clone();
         let app = generated_auth_contract_router(ServerApiContractService::Workspace(api));
         let mut authenticator = ResidentAuthenticator::new(true);
@@ -59534,6 +59931,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/auth/logout")
                     .header(axum::http::header::COOKIE, &login_cookie_pair)
+                    .header(ORIGIN, &origin)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -59576,7 +59974,7 @@ mod tests {
         let api = test_api(workspace.path()).await;
         seed_test_api_token(api.store.as_ref(), "expiry-router");
         let user = api.store.get_user("user-expiry-router").unwrap().unwrap();
-        let auth = auth_public_config(&api.config);
+        let auth = auth_public_config(&api.config).unwrap();
         let cookie_name = auth.cookie_name;
         let hash = token_hash("expired-router-secret");
         api.store
@@ -59737,13 +60135,8 @@ mod tests {
         for (scheme, secure) in [("http", false), ("https", true)] {
             let workspace = tempfile::tempdir().unwrap();
             let mut api = test_api(workspace.path()).await;
-            let AuthConfig::Passkey {
-                origin,
-                public_base_url,
-                ..
-            } = &mut api.config.auth;
-            *origin = format!("{scheme}://workspace.test");
-            *public_base_url = format!("{scheme}://workspace.test");
+            let AuthConfig::Passkey { public_urls, .. } = &mut api.config.auth;
+            *public_urls = vec![format!("{scheme}://localhost")];
             seed_test_api_token(api.store.as_ref(), &format!("cookie-{scheme}"));
             let user = api
                 .store
@@ -59752,7 +60145,12 @@ mod tests {
                 .unwrap();
             let auth_api = ServerAuthApi::from(&api);
 
-            let (_, login) = issue_browser_session(&auth_api, user).unwrap();
+            let (_, login) = issue_browser_session(
+                &auth_api,
+                user,
+                &auth_public_config(&auth_api.config).unwrap(),
+            )
+            .unwrap();
             let login_cookie = login.expose();
             assert_eq!(login_cookie.contains("; Secure"), secure, "{scheme}");
             assert!(login_cookie.contains("; HttpOnly; SameSite=Lax"));
@@ -59764,6 +60162,7 @@ mod tests {
                         .method(Method::POST)
                         .uri("/api/auth/logout")
                         .header(axum::http::header::COOKIE, login_cookie)
+                        .header(ORIGIN, format!("{scheme}://localhost"))
                         .body(Body::empty())
                         .unwrap(),
                 )

@@ -1057,9 +1057,7 @@ impl ConnectedChat {
         config.static_assets_dir = assets.clone();
         if assets.is_some() {
             config.auth = AuthConfig::Passkey {
-                rp_id: "127.0.0.1".into(),
-                origin: url.clone(),
-                public_base_url: url.clone(),
+                public_urls: vec![url.clone()],
                 cookie_name: "yoi_workspace_session".into(),
             };
         }

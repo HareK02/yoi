@@ -79,7 +79,7 @@ fn real_backend_browser_cookies_preserve_identity_expiry_return_url_and_explicit
     let origin = format!("http://localhost:{port}");
     std::fs::write(
         &environment.server_config,
-        format!("[browser]\npublic_url = \"{origin}\"\n"),
+        format!("[browser]\npublic_urls = [\"{origin}\"]\n"),
     )?;
     environment.start_empty_backend()?;
     let admin =

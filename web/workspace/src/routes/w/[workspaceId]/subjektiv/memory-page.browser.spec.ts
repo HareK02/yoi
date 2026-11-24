@@ -21,9 +21,7 @@ function memoryWorkspace(workspaceId = "workspace-1"): WorkspaceResponse {
     schema_version: 1,
     auth: {
       Passkey: {
-        rp_id: "127.0.0.1",
-        origin: "http://127.0.0.1",
-        public_base_url: "http://127.0.0.1",
+        public_urls: ["http://127.0.0.1"],
         cookie_name: "fixture",
       },
     },

@@ -516,7 +516,7 @@ test("account displays the current identity without editable target fields and a
   });
   render(Account);
   await screen.findByRole("button", { name: "Add passkey to alice" });
-  expect(screen.getByText("alice")).toBeTruthy();
+  expect(screen.getByText("Account ID (handle)", { selector: "dt" }).nextElementSibling?.textContent).toBe("alice");
   expect(screen.getByText("Alice")).toBeTruthy();
   expect(screen.queryAllByRole("textbox")).toEqual([]);
   expect(screen.queryByRole("button", { name: "Log in with passkey" }))

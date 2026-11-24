@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -11,42 +13,29 @@ use crate::{Error, Result};
 
 pub const SERVER_HOST_CONFIG_FILE_NAME: &str = "server.toml";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
-const DEFAULT_BROWSER_PUBLIC_URL: &str = "http://localhost:5173";
 const DEFAULT_AUTH_COOKIE_NAME: &str = "yoi_workspace_session";
 const DEFAULT_MAX_RECORDS: usize = 200;
+
+// Examples remain comments: generating a file must not authorize a browser origin.
+const SERVER_HOST_CONFIG_TEMPLATE: &str = "\
+[browser]
+# Set the URLs people actually open in their browsers before starting the Server.
+# HTTPS is required except for local HTTP access. Include every allowed origin.
+# The first URL is used for device-login links when no browser origin is supplied.
+# Example:
+# public_urls = [\"https://example.com\", \"http://localhost:8787\"]
+";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerHostConfigFile {
-    #[serde(default)]
     pub browser: ServerBrowserConfig,
-}
-
-impl Default for ServerHostConfigFile {
-    fn default() -> Self {
-        Self {
-            browser: ServerBrowserConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerBrowserConfig {
-    #[serde(default = "default_browser_public_url")]
-    pub public_url: String,
-}
-
-impl Default for ServerBrowserConfig {
-    fn default() -> Self {
-        Self {
-            public_url: default_browser_public_url(),
-        }
-    }
-}
-
-fn default_browser_public_url() -> String {
-    DEFAULT_BROWSER_PUBLIC_URL.to_string()
+    pub public_urls: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -66,21 +55,17 @@ impl ServerHostConfigFile {
     }
 
     pub fn load_default() -> Result<Self> {
-        let Some(path) = Self::default_path() else {
-            return Ok(Self::default());
-        };
-        match fs::read_to_string(&path) {
-            Ok(raw) => Self::parse_str(&raw, &path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(Error::Io(error)),
-        }
+        let path = Self::default_path().ok_or_else(|| {
+            Error::Config("Server config directory is unavailable; specify --config <PATH> and create its template with `yoi-server init-config --config <PATH>`".into())
+        })?;
+        Self::load_from_path(path)
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let raw = fs::read_to_string(path).map_err(|error| {
             Error::Config(format!(
-                "failed to read Server host config `{}`: {error}",
+                "failed to read Server host config `{}`: {error}. Create a template with `yoi-server init-config --config <PATH>` using this path, then set browser.public_urls to your actual browser origins",
                 path.display()
             ))
         })?;
@@ -88,12 +73,39 @@ impl ServerHostConfigFile {
     }
 
     pub fn parse_str(raw: &str, path: impl AsRef<Path>) -> Result<Self> {
-        toml::from_str(raw).map_err(|error| {
+        let parse = || -> Result<Self> {
+            let mut config: Self =
+                toml::from_str(raw).map_err(|error| Error::Config(error.to_string()))?;
+            config.browser.public_urls = resolve_browser_public_urls(&config.browser.public_urls)?;
+            Ok(config)
+        };
+        parse().map_err(|error| {
             Error::Config(format!(
-                "failed to parse Server host config `{}`: {error}",
+                "invalid Server host config `{}`: {error}. Explicitly set [browser] public_urls to a nonempty list of actual browser origins (example: [\"https://example.com\"]); no default URL is used",
                 path.as_ref().display()
             ))
         })
+    }
+
+    pub fn create_template(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| Error::Config(format!(
+                "cannot create Server config template `{}`: {error}; existing files are never overwritten",
+                path.display()
+            )))?;
+        file.write_all(SERVER_HOST_CONFIG_TEMPLATE.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
     }
 }
 
@@ -104,31 +116,25 @@ impl ResolvedWorkspaceBackendConfig {
         host_config: &ServerHostConfigFile,
     ) -> Result<Self> {
         let workspace_root = workspace_root.as_ref();
-        let (browser_public_url, browser_rp_id) =
-            resolve_browser_public_url(&host_config.browser.public_url)?;
+        let public_urls = resolve_browser_public_urls(&host_config.browser.public_urls)?;
         let mut server = ServerConfig::local_dev(workspace_root.to_path_buf(), workspace);
         let database_path = server.database_path.clone();
         server.max_records = DEFAULT_MAX_RECORDS;
         server.remote_runtime_sources = Vec::new();
         server.auth = AuthConfig::Passkey {
-            rp_id: browser_rp_id,
-            origin: browser_public_url.clone(),
-            public_base_url: browser_public_url,
+            public_urls,
             cookie_name: DEFAULT_AUTH_COOKIE_NAME.to_string(),
         };
         let listen = DEFAULT_LISTEN.parse::<SocketAddr>().map_err(|error| {
             Error::Config(format!("invalid built-in Server listen address: {error}"))
         })?;
-
         Ok(Self {
             server,
             listen,
             database_path,
         })
     }
-}
 
-impl ResolvedWorkspaceBackendConfig {
     pub fn with_backend_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.server.backend_base_url = Some(base_url.into().trim_end_matches('/').to_string());
         self
@@ -140,42 +146,61 @@ impl ResolvedWorkspaceBackendConfig {
     }
 }
 
-fn normalize_required_string(field: &str, value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(Error::Config(format!("{field} must not be empty")));
+fn resolve_browser_public_urls(values: &[String]) -> Result<Vec<String>> {
+    if values.is_empty() {
+        return Err(Error::Config(
+            "browser.public_urls must not be empty".into(),
+        ));
     }
-    Ok(trimmed.to_string())
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let origin = resolve_browser_public_url(value)?;
+            if !seen.insert(origin.clone()) {
+                return Err(Error::Config(format!(
+                    "browser.public_urls contains duplicate origin `{origin}`"
+                )));
+            }
+            Ok(origin)
+        })
+        .collect()
 }
 
-fn resolve_browser_public_url(value: &str) -> Result<(String, String)> {
-    let value = normalize_required_string("browser.public_url", value)?;
-    let url = Url::parse(&value).map_err(|error| {
+fn resolve_browser_public_url(value: &str) -> Result<String> {
+    let url = Url::parse(value.trim()).map_err(|error| {
         Error::Config(format!(
-            "browser.public_url must be an absolute http(s) URL: {error}"
+            "browser.public_urls must contain absolute http(s) URLs: {error}"
         ))
     })?;
-    if !matches!(url.scheme(), "http" | "https") {
+    let local = match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
+        Some(url::Host::Ipv4(host)) => host.is_loopback(),
+        Some(url::Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    };
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
         return Err(Error::Config(
-            "browser.public_url must use the http or https scheme".to_string(),
+            "browser.public_urls requires HTTPS except for localhost or loopback HTTP".into(),
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::Config(
-            "browser.public_url must not contain user information".to_string(),
+            "browser.public_urls must not contain user information".into(),
         ));
     }
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         return Err(Error::Config(
-            "browser.public_url must contain only an origin without a path, query, or fragment"
-                .to_string(),
+            "browser.public_urls must contain only origins without paths, queries, or fragments"
+                .into(),
         ));
     }
-    let rp_id = url
-        .host_str()
-        .ok_or_else(|| Error::Config("browser.public_url must contain a host".to_string()))?
-        .to_string();
-    Ok((url.origin().ascii_serialization(), rp_id))
+    if url.host_str().is_none() {
+        return Err(Error::Config(
+            "browser.public_urls must contain a host".into(),
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 #[cfg(test)]
@@ -184,144 +209,147 @@ mod tests {
 
     fn workspace() -> WorkspaceRecord {
         WorkspaceRecord {
-            workspace_id: "018f6a2c-1111-7000-8000-000000000001".to_string(),
-            owner_account_id: "018f6a2c-1111-7000-8000-000000000002".to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            display_name: "Workspace".to_string(),
-            state: "active".to_string(),
+            workspace_id: "018f6a2c-1111-7000-8000-000000000001".into(),
+            owner_account_id: "018f6a2c-1111-7000-8000-000000000002".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            display_name: "Workspace".into(),
+            state: "active".into(),
         }
     }
 
     fn resolved() -> ResolvedWorkspaceBackendConfig {
-        let dir = tempfile::tempdir().unwrap();
+        let config = ServerHostConfigFile::parse_str(
+            "[browser]\npublic_urls = [\"https://deploy.example.test\", \"http://localhost:8787\"]",
+            "server.toml",
+        )
+        .unwrap();
         ResolvedWorkspaceBackendConfig::local_dev(
-            dir.path(),
+            tempfile::tempdir().unwrap().path(),
             workspace(),
-            &ServerHostConfigFile::default(),
+            &config,
         )
         .unwrap()
     }
 
     #[test]
-    fn default_settings_resolve_without_a_repository_file() {
-        let resolved = resolved();
-
-        assert_eq!(resolved.listen, "127.0.0.1:8787".parse().unwrap());
-        let AuthConfig::Passkey {
-            rp_id,
-            origin,
-            public_base_url,
-            ..
-        } = &resolved.server.auth;
-        assert_eq!(rp_id, "localhost");
-        assert_eq!(origin, DEFAULT_BROWSER_PUBLIC_URL);
-        assert_eq!(public_base_url, DEFAULT_BROWSER_PUBLIC_URL);
-        assert_eq!(resolved.server.max_records, DEFAULT_MAX_RECORDS);
-        assert!(resolved.database_path.ends_with("server.db"));
-        assert!(
-            resolved
-                .server
-                .embedded_runtime_store_root
-                .ends_with("embedded-runtime")
-        );
-    }
-
-    #[test]
-    fn backend_base_url_is_explicit_and_normalized() {
+    fn explicit_browser_origins_are_independent_of_listen_and_backend_url() {
         let listen = "127.0.0.1:48787".parse().unwrap();
         let resolved = resolved()
             .with_listen(listen)
             .with_backend_base_url("http://127.0.0.1:48787/");
-
         assert_eq!(resolved.listen, listen);
         assert_eq!(
             resolved.server.backend_base_url.as_deref(),
             Some("http://127.0.0.1:48787")
         );
+        let AuthConfig::Passkey { public_urls, .. } = &resolved.server.auth;
+        assert_eq!(
+            public_urls,
+            &["https://deploy.example.test", "http://localhost:8787"]
+        );
+        assert!(resolved.server.remote_runtime_sources.is_empty());
+        assert!(resolved.database_path.ends_with("server.db"));
     }
 
     #[test]
-    fn browser_public_url_from_host_config_drives_all_browser_auth_settings() {
-        let host_config = ServerHostConfigFile::parse_str(
-            "[browser]\npublic_url = \"https://Yoi.Example:443/\"\n",
-            "server.toml",
-        )
-        .unwrap();
-        let resolved = ResolvedWorkspaceBackendConfig::local_dev(
-            tempfile::tempdir().unwrap().path(),
-            workspace(),
-            &host_config,
-        )
-        .unwrap();
-
-        let AuthConfig::Passkey {
-            rp_id,
-            origin,
-            public_base_url,
-            ..
-        } = &resolved.server.auth;
-        assert_eq!(rp_id, "yoi.example");
-        assert_eq!(origin, "https://yoi.example");
-        assert_eq!(public_base_url, "https://yoi.example");
-    }
-
-    #[test]
-    fn browser_public_url_rejects_non_origin_urls() {
-        for value in [
-            "https://example.test/path",
-            "https://example.test?query=true",
-            "file:///tmp/web",
+    fn missing_empty_and_old_single_url_settings_fail_with_path_and_guidance() {
+        for raw in [
+            "",
+            "[browser]",
+            "[browser]\npublic_urls = []",
+            "[browser]\npublic_url = \"https://example.test\"",
         ] {
-            let host_config = ServerHostConfigFile {
-                browser: ServerBrowserConfig {
-                    public_url: value.to_string(),
-                },
-            };
-            let result = ResolvedWorkspaceBackendConfig::local_dev(
-                tempfile::tempdir().unwrap().path(),
-                workspace(),
-                &host_config,
-            );
-            let error = match result {
-                Ok(_) => panic!("expected {value} to be rejected"),
-                Err(error) => error,
-            };
+            let error = ServerHostConfigFile::parse_str(raw, "custom/server.toml")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("custom/server.toml"), "{error}");
             assert!(
-                error.to_string().contains("browser.public_url"),
-                "unexpected error for {value}: {error}"
+                error.contains("browser") && error.contains("public_urls"),
+                "{error}"
             );
         }
     }
 
     #[test]
-    fn server_host_config_loads_only_from_the_explicit_host_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = ServerHostConfigFile::path_for_config_dir(dir.path());
-        fs::write(
-            &path,
-            "[browser]\npublic_url = \"https://deploy.example.test\"\n",
+    fn browser_origins_are_normalized_and_duplicates_rejected() {
+        let config = ServerHostConfigFile::parse_str(
+            "[browser]\npublic_urls = [\" https://Yoi.Example:443/ \", \"http://localhost:8787/\"]",
+            "server.toml",
         )
         .unwrap();
-
-        let loaded = ServerHostConfigFile::load_from_path(&path).unwrap();
-        assert_eq!(loaded.browser.public_url, "https://deploy.example.test");
-        assert_eq!(path, dir.path().join("server.toml"));
-    }
-
-    #[test]
-    fn explicit_missing_server_host_config_fails_closed() {
-        let error = ServerHostConfigFile::load_from_path("/missing/yoi/server.toml").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("failed to read Server host config")
+        assert_eq!(
+            config.browser.public_urls,
+            ["https://yoi.example", "http://localhost:8787"]
         );
+        let error = ServerHostConfigFile::parse_str(
+            "[browser]\npublic_urls = [\"https://Yoi.Example:443/\", \"https://yoi.example\"]",
+            "server.toml",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("duplicate origin"), "{error}");
     }
 
     #[test]
-    fn local_host_config_does_not_supply_runtime_authority() {
-        let resolved = resolved();
-        assert!(resolved.server.remote_runtime_sources.is_empty());
+    fn browser_origins_reject_insecure_remote_and_non_origin_urls() {
+        for value in [
+            "",
+            "https://example.test/path",
+            "https://example.test?query=true",
+            "https://example.test/#fragment",
+            "file:///tmp/web",
+            "https://user:secret@example.test",
+            "http://example.test",
+            "http://localhost.evil.test",
+            "http://192.168.1.1",
+        ] {
+            assert!(
+                resolve_browser_public_url(value).is_err(),
+                "accepted {value}"
+            );
+        }
+        for value in [
+            "https://example.test",
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+            "http://[::1]:8787",
+        ] {
+            assert!(
+                resolve_browser_public_url(value).is_ok(),
+                "rejected {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_config_fails_without_creating_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ServerHostConfigFile::path_for_config_dir(dir.path());
+        let error = ServerHostConfigFile::load_from_path(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(path.to_str().unwrap()));
+        assert!(error.contains("init-config"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn explicit_template_creation_requires_editing_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config/server.toml");
+        ServerHostConfigFile::create_template(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# public_urls = [\"https://example.com\""));
+        assert!(!raw.contains("5173"));
+        assert!(ServerHostConfigFile::load_from_path(&path).is_err());
+        fs::write(
+            &path,
+            "[browser]\npublic_urls = [\"https://deploy.example.test\"]",
+        )
+        .unwrap();
+        assert!(ServerHostConfigFile::create_template(&path).is_err());
+        let loaded = ServerHostConfigFile::load_from_path(&path).unwrap();
+        assert_eq!(loaded.browser.public_urls, ["https://deploy.example.test"]);
     }
 }

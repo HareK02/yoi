@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import type { PasskeyListResponse } from '#lib/generated/auth-api.ts';
-  import { addPasskey, logout, loadPasskeys, loadWhoami } from '#lib/workspace/auth/api.ts';
+  import { addPasskey, logout, loadPasskeys, loadWhoami, loginWithLegacyPasskey } from '#lib/workspace/auth/api.ts';
+  import AdditionCodeIssuer from '#lib/workspace/auth/AdditionCodeIssuer.svelte';
   import { BrowserAuth } from '#lib/workspace/auth/browser-session.svelte.ts';
   import { browserSession } from '#lib/workspace/auth/session-state.ts';
   import { loginUrl } from '#lib/workspace/auth/routes.ts';
@@ -50,6 +51,12 @@
   async function add() {
     if (!auth.actor || auth.additionAttempt && !auth.additionSaved) return;
     await auth.run('Waiting for passkey addition…', 'Passkey added to your account; the expected session was confirmed.', addPasskey);
+    await refreshKeys();
+  }
+  async function verifyIdentity() {
+    if (!auth.actor) return;
+    const handle = auth.actor.handle;
+    await auth.run('Waiting for identity verification…', 'Identity verified. You can now generate an addition code.', (signal) => loginWithLegacyPasskey(handle, signal));
     await refreshKeys();
   }
   async function checkAddition() { await auth.checkAddition(); await refreshKeys(); }
@@ -115,6 +122,9 @@
         <p>Removing the older-key entry for the service is not safe based on one account's success. The operator must first confirm migration and a working alternative for every affected account/device, keep a rollback path to the older-key entry, and verify normal login before retiring that entry. This page does not delete keys or disable compatibility login.</p>
       </details>
     </section>
+    {#key `${auth.actor.user_id}:${auth.actor.account_id}:${browserSession.authenticationGeneration}:${browserSession.authenticationStamp}`}
+      <AdditionCodeIssuer owner={auth.actor} disabled={auth.busy} verify={verifyIdentity} />
+    {/key}
     <div class="actions">
       <button type="button" disabled={auth.busy} onclick={signOut}>Log out</button>
       <button type="button" disabled={auth.busy} onclick={refresh}>Refresh session</button>

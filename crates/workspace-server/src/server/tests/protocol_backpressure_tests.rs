@@ -197,10 +197,10 @@ async fn backpressure_browser_context(api: &WorkspaceApi) -> (WorkerOperationCon
         })
         .unwrap();
     let AuthConfig::Passkey {
+        public_urls,
         cookie_name,
-        origin,
-        ..
     } = &api.config.auth;
+    let origin = &public_urls[0];
     let mut headers = HeaderMap::new();
     headers.insert(ORIGIN, origin.parse().unwrap());
     headers.insert(

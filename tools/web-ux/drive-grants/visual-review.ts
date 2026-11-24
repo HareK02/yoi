@@ -115,9 +115,7 @@ try {
                 schema_version: 1,
                 auth: {
                   Passkey: {
-                    rp_id: "127.0.0.1",
-                    origin: baseUrl,
-                    public_base_url: baseUrl,
+                    public_urls: [baseUrl],
                     cookie_name: "fixture",
                   },
                 },

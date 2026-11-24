@@ -35,6 +35,20 @@ export type AuthUserResponse = { user: AuthenticatedUser,
  */
 authentication_reference: string, };
 
+export type PasskeyAdditionCodeStatusResponse = { user: AuthenticatedUser, public_urls: Array<string>, active: PasskeyAdditionCodeStatus | null, };
+
+export type PasskeyAdditionCodeStatus = { issuance_id: string, target_origin: string, expires_at: string, };
+
+export type PasskeyAdditionCodeRequest = { expected_user_id: string, expected_account_id: string, expected_authentication_reference: string, target_origin: string, };
+
+export type PasskeyAdditionCodeResponse = { user: AuthenticatedUser, issuance_id: string, code: string, target_origin: string, expires_at: string, };
+
+export type PasskeyAdditionCodeRevokeRequest = { expected_user_id: string, expected_account_id: string, expected_authentication_reference: string, issuance_id: string, };
+
+export type PasskeyAdditionCodeRevokeResponse = { revoked: boolean, };
+
+export type PasskeyAdditionCodeOptionsRequest = { handle: string, code: string, browser_origin: string, };
+
 export type PasskeyAdditionOptionsRequest = { expected_user_id: string, expected_account_id: string, expected_authentication_reference: string, browser_origin?: string | null, };
 
 export type PasskeySummary = { key_reference: string, created_at: string, last_used_at: string | null, normal_login_verified_at: string | null, };

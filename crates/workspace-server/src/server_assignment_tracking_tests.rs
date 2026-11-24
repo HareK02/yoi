@@ -1761,10 +1761,10 @@ async fn catalog_assignment_routes_apply_cookie_workspace_auth_and_origin_to_bro
         })
         .unwrap();
     let AuthConfig::Passkey {
-        origin,
+        public_urls,
         cookie_name,
-        ..
     } = &api.config.auth;
+    let origin = &public_urls[0];
     let cookie = format!("{cookie_name}=assignment-browser-session");
     let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
     catalog
@@ -2514,7 +2514,8 @@ async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_
         app.clone(),
         assignment_request(&api, &identity, worker_id, &ticket, "generic-assign"),
         StatusCode::OK,
-    ).await;
+    )
+    .await;
     // Removing the actual launch authority must fence even saved receipts.
     set_test_subject_policy_as_owner(&api, &subject_id, Default::default(), Default::default());
     for request in [

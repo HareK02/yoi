@@ -146,10 +146,7 @@ impl WorkerOperationContext {
             if matches!(actor.auth_method, ActorAuthMethod::BrowserSession)
                 && (require_origin || headers.contains_key(ORIGIN))
             {
-                let AuthConfig::Passkey { origin, .. } = &api.config.auth;
-                if headers.get(ORIGIN).and_then(|value| value.to_str().ok())
-                    != Some(origin.as_str())
-                {
+                if !allowed_request_origin(&api.config, headers) {
                     return Err(Error::WorkspacePermissionDenied(
                         "cross-origin Worker mutation denied".into(),
                     )

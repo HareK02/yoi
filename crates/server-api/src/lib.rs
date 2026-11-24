@@ -474,6 +474,13 @@ impl_openapi_schema!(
     PasskeyLoginOptionsRequest,
     PasskeyLoginOptionsResponse,
     PasskeyLoginCompleteRequest,
+    PasskeyAdditionCodeStatusResponse,
+    PasskeyAdditionCodeStatus,
+    PasskeyAdditionCodeRequest,
+    PasskeyAdditionCodeResponse,
+    PasskeyAdditionCodeRevokeRequest,
+    PasskeyAdditionCodeRevokeResponse,
+    PasskeyAdditionCodeOptionsRequest,
     PasskeyAdditionOptionsRequest,
     PasskeySummary,
     PasskeyListResponse,
@@ -829,7 +836,10 @@ pub trait ServerApi {
     async fn health(&self) -> Result<HealthResponse, RepositoryApiError>;
 
     #[get("/api/auth/config", status = 200, error_status = 400)]
-    async fn auth_config(&self) -> Result<AuthPublicConfig, RepositoryApiError>;
+    async fn auth_config(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<AuthPublicConfig, RepositoryApiError>;
 
     #[get("/api/auth/registration-policy", status = 200, error_status = 400)]
     async fn auth_registration_policy(&self) -> Result<HostingSettings, RepositoryApiError>;
@@ -882,6 +892,7 @@ pub trait ServerApi {
     )]
     async fn auth_activation_complete(
         &self,
+        #[extension] context: ServerRequestContext,
         #[body] request: PasskeyRegistrationCompleteRequest,
     ) -> Result<server_api_responses::AuthActivationComplete, RepositoryApiError>;
 
@@ -918,8 +929,45 @@ pub trait ServerApi {
     )]
     async fn auth_passkey_registration_complete(
         &self,
+        #[extension] context: ServerRequestContext,
         #[body] request: PasskeyRegistrationCompleteRequest,
     ) -> Result<server_api_responses::AuthPasskeyRegistrationComplete, RepositoryApiError>;
+
+    #[get("/api/auth/passkeys/addition-code", status = 200, error_status = 400, additional_error_statuses = [403, 500], browser_auth = true)]
+    async fn auth_passkey_addition_code_status(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<PasskeyAdditionCodeStatusResponse, RepositoryApiError>;
+
+    #[post("/api/auth/passkeys/addition-code", status = 200, error_status = 400, additional_error_statuses = [403, 500], browser_auth = true)]
+    async fn auth_passkey_addition_code_issue(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyAdditionCodeRequest,
+    ) -> Result<PasskeyAdditionCodeResponse, RepositoryApiError>;
+
+    #[post("/api/auth/passkeys/addition-code/revoke", status = 200, error_status = 400, additional_error_statuses = [403, 500], browser_auth = true)]
+    async fn auth_passkey_addition_code_revoke(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyAdditionCodeRevokeRequest,
+    ) -> Result<PasskeyAdditionCodeRevokeResponse, RepositoryApiError>;
+
+    #[post("/api/auth/passkeys/addition-code/options", status = 200, error_status = 400, additional_error_statuses = [403, 500])]
+    async fn auth_passkey_addition_code_options(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyAdditionCodeOptionsRequest,
+    ) -> Result<PasskeyRegistrationOptionsResponse, RepositoryApiError>;
+
+    #[post("/api/auth/passkeys/addition-code/complete",
+        responses = [(status = 200, body = AuthUserResponse, headers = [("set-cookie", SetCookieHeader)])],
+        error_status = 400, additional_error_statuses = [403, 500])]
+    async fn auth_passkey_addition_code_complete(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyRegistrationCompleteRequest,
+    ) -> Result<server_api_responses::AuthPasskeyAdditionCodeComplete, RepositoryApiError>;
 
     #[get(
         "/api/auth/passkeys",
@@ -1000,6 +1048,7 @@ pub trait ServerApi {
     )]
     async fn auth_passkey_login_complete(
         &self,
+        #[extension] context: ServerRequestContext,
         #[body] request: PasskeyLoginCompleteRequest,
     ) -> Result<server_api_responses::AuthPasskeyLoginComplete, RepositoryApiError>;
 
@@ -1055,6 +1104,7 @@ pub trait ServerApi {
     )]
     async fn auth_logout(
         &self,
+        #[extension] context: ServerRequestContext,
         #[header("cookie")] cookie: Option<String>,
     ) -> Result<server_api_responses::AuthLogout, RepositoryApiError>;
 
@@ -4815,6 +4865,87 @@ pub struct PasskeyRegistrationOptionsRequest {
     pub browser_origin: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionCodeStatusResponse {
+    pub user: AuthenticatedUser,
+    pub public_urls: Vec<String>,
+    pub active: Option<PasskeyAdditionCodeStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionCodeStatus {
+    pub issuance_id: String,
+    pub target_origin: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionCodeRequest {
+    pub expected_user_id: String,
+    pub expected_account_id: String,
+    pub expected_authentication_reference: String,
+    pub target_origin: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionCodeResponse {
+    pub user: AuthenticatedUser,
+    pub issuance_id: String,
+    pub code: String,
+    pub target_origin: String,
+    pub expires_at: String,
+}
+
+impl std::fmt::Debug for PasskeyAdditionCodeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasskeyAdditionCodeResponse")
+            .field("code", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionCodeRevokeRequest {
+    pub expected_user_id: String,
+    pub expected_account_id: String,
+    pub expected_authentication_reference: String,
+    pub issuance_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionCodeRevokeResponse {
+    pub revoked: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionCodeOptionsRequest {
+    pub handle: String,
+    pub code: String,
+    pub browser_origin: String,
+}
+
+impl std::fmt::Debug for PasskeyAdditionCodeOptionsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasskeyAdditionCodeOptionsRequest")
+            .field("code", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Adds to the current actor. Expected identity/binding fields only fence stale UI;
 /// they never select an owner or authorize an addition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5556,9 +5687,7 @@ impl api_macros::HttpSuccess for WorkspaceCreateResponse {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum WorkspaceAuthConfig {
     Passkey {
-        rp_id: String,
-        origin: String,
-        public_base_url: String,
+        public_urls: Vec<String>,
         cookie_name: String,
     },
 }
@@ -12790,6 +12919,13 @@ pub fn auth_api_typescript() -> String {
         WhoamiResponse::decl(&config),
         AuthBootstrapUserRequest::decl(&config),
         AuthUserResponse::decl(&config),
+        PasskeyAdditionCodeStatusResponse::decl(&config),
+        PasskeyAdditionCodeStatus::decl(&config),
+        PasskeyAdditionCodeRequest::decl(&config),
+        PasskeyAdditionCodeResponse::decl(&config),
+        PasskeyAdditionCodeRevokeRequest::decl(&config),
+        PasskeyAdditionCodeRevokeResponse::decl(&config),
+        PasskeyAdditionCodeOptionsRequest::decl(&config),
         PasskeyAdditionOptionsRequest::decl(&config),
         PasskeySummary::decl(&config),
         PasskeyListResponse::decl(&config),
@@ -14753,9 +14889,7 @@ mod tests {
             "record_authority": "workspace-control-plane",
             "schema_version": 46,
             "auth": {"Passkey": {
-                "rp_id": "example.test",
-                "origin": "https://example.test",
-                "public_base_url": "https://example.test",
+                "public_urls": ["https://example.test", "http://localhost:8787"],
                 "cookie_name": "yoi_session"
             }},
             "permissions": {
@@ -16034,6 +16168,8 @@ mod openapi_artifact_tests {
             "auth_registration_policy",
             "auth_activation_options",
             "auth_activation_complete",
+            "auth_passkey_addition_code_options",
+            "auth_passkey_addition_code_complete",
             "auth_bootstrap_user",
             "auth_passkey_registration_options",
             "auth_passkey_registration_complete",
@@ -16094,7 +16230,12 @@ mod openapi_artifact_tests {
         // the Runtime/Worker-source signed operation inventory above.
         const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session", "worker_session_history"];
         const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config", "plugin_host"];
-        const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
+        const BROWSER_ONLY: &[&str] = &[
+            "merge_request_selector_repair",
+            "auth_passkey_addition_code_status",
+            "auth_passkey_addition_code_issue",
+            "auth_passkey_addition_code_revoke",
+        ];
 
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
         let value: serde_json::Value =
@@ -16551,4 +16692,30 @@ pub struct CompleteMergeRequestRequest {
     pub expected_owner_operation_id: String,
     pub approval_event_id: String,
     pub expected_source_ref: String,
+}
+
+#[cfg(test)]
+mod addition_code_contract_tests {
+    use super::*;
+    #[test]
+    fn addition_code_inputs_reject_authority_injection_and_redact_secrets() {
+        let input = serde_json::json!({"handle":"owner","code":"one-time-secret","browser_origin":"https://second.test"});
+        let decoded: PasskeyAdditionCodeOptionsRequest =
+            serde_json::from_value(input.clone()).unwrap();
+        assert!(!format!("{decoded:?}").contains("one-time-secret"));
+        for field in ["user_id", "account_id", "purpose", "issuance_id"] {
+            let mut injected = input.clone();
+            injected[field] = "forged".into();
+            assert!(serde_json::from_value::<PasskeyAdditionCodeOptionsRequest>(injected).is_err());
+        }
+        let issued: PasskeyAdditionCodeResponse = serde_json::from_value(serde_json::json!({
+            "user":{"user_id":"u","account_id":"a","handle":"owner","display_name":"Owner"},
+            "issuance_id":"i","code":"one-time-secret","target_origin":"https://second.test","expires_at":"expiry",
+        })).unwrap();
+        assert!(!format!("{issued:?}").contains("one-time-secret"));
+        let mut issue = serde_json::json!({"expected_user_id":"u","expected_account_id":"a","expected_authentication_reference":"r","target_origin":"https://second.test"});
+        assert!(serde_json::from_value::<PasskeyAdditionCodeRequest>(issue.clone()).is_ok());
+        issue["browser_origin"] = "https://first.test".into();
+        assert!(serde_json::from_value::<PasskeyAdditionCodeRequest>(issue).is_err());
+    }
 }

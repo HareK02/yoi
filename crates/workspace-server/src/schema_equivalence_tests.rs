@@ -73,6 +73,7 @@ fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
         "passkey_credentials",
         "passkey_metadata",
         "passkey_addition_receipts",
+        "passkey_addition_codes",
         "backend_jobs",
         "backend_job_attempts",
         "flow_sources",
