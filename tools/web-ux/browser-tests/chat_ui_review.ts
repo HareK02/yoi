@@ -197,6 +197,9 @@ try {
       if (mode === "after") {
         assertEquals(await page.locator(".chat-message.own").count(), 2);
         assertEquals(await page.locator(".chat-message:not(.own)").count(), 2);
+        assertEquals(await page.locator('.chat-message').getByText('You', { exact: true }).count(), 0);
+        assertEquals(await page.locator('.chat-author').count(), 0);
+        assertEquals(await page.getByRole('listitem', { name: 'You', exact: true }).count(), 2);
         assert(await page.locator(".chat-bubble strong").count() > 0);
         assert(await page.locator(".chat-bubble pre code").count() > 0);
         assertEquals(await page.getByRole("button", { name: /cancel/i }).count(), 0);
@@ -371,6 +374,25 @@ try {
           1,
         );
         assertEquals(await editor.textContent(), "editable next draft while outcome is unknown");
+      }
+      const editor = page.getByRole('textbox');
+      for (const text of ['Earlier unanswered input', 'Latest unanswered input']) {
+        await editor.fill(text);
+        await page.getByRole('button', { name: 'Send message', exact: true }).click();
+        await page.locator('.chat-message').filter({ hasText: text }).getByText('delivered', { exact: true }).waitFor();
+      }
+      if (mode === 'after') assertEquals(await page.getByText('delivered', { exact: true }).count(), 1);
+      for (const state of ['awaiting-reply', 'reply-received']) {
+        if (state === 'reply-received') {
+          add('Reply to the latest input');
+          publish();
+          await page.getByText('Reply to the latest input', { exact: true }).waitFor();
+          if (mode === 'after') assertEquals(await page.getByText('delivered', { exact: true }).count(), 0);
+        }
+        const path = join(output, `${width}-${colorScheme}-${state}.png`);
+        await page.screenshot({ path, fullPage: true });
+        captures.push({ width, colorScheme, state, path, sha256: await sha256File(path),
+          accessibility: await page.locator('.subject-conversation').ariaSnapshot() });
       }
       await context.close();
     }

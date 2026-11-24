@@ -59,5 +59,13 @@ export function conversationHistoryView(
       delivery: { operationId: request.operationId, state },
     });
   }
+  const latestOwn = rows.findLast(row => row.own);
+  const repliedTo = new Set(messages.filter(message => message.sender.kind === 'subject')
+    .flatMap(message => [message.last_user_message_id, message.reply_to]));
+  for (const row of rows) {
+    if (row.delivery?.state === 'delivered' && (row !== latestOwn || (!row.local && repliedTo.has(row.id)))) {
+      delete row.delivery;
+    }
+  }
   return rows;
 }

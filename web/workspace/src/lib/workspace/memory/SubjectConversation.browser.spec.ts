@@ -165,7 +165,7 @@ test("acceptance allows Busy follow-up without inventing a reply; multiple and d
   await compose("second input before any reply");
   await waitFor(() => expect(h.posts).toHaveLength(2));
   await waitFor(() => expect(readConversationAttempt(sessionStorage, props)).toBeNull());
-  await waitFor(() => expect(screen.getAllByText('delivered')).toHaveLength(2));
+  await waitFor(() => expect(screen.getAllByText('delivered')).toHaveLength(1));
   expect(screen.queryByText(/Runtime accepted|Processing and replies|Retained send input|Retry uses the same ID|Resolve the retained send/)).toBeNull();
   expect(screen.queryByText("Explicit first reply")).toBeNull();
   await waitFor(() =>
@@ -173,17 +173,37 @@ test("acceptance allows Busy follow-up without inventing a reply; multiple and d
       .toBe(false)
   );
   await refresh();
-  await waitFor(() => expect(screen.getAllByText("You", { exact: true })).toHaveLength(2));
+  await waitFor(() => expect(screen.getAllByRole('listitem', { name: 'You' })).toHaveLength(2));
   h.reply("Explicit first reply");
   h.reply("Explicit second reply");
   await refresh();
   await screen.findByText("Explicit second reply");
+  expect(screen.queryByText('delivered')).toBeNull();
   h.reply("Later evaluated background result");
   h.reconnect();
   await screen.findByText("Later evaluated background result");
   expect(screen.queryByText("internal assistant output")).toBeNull();
-  expect(screen.getAllByText("Research companion", { exact: true }))
+  expect(screen.getAllByRole('listitem', { name: 'Research companion' }))
     .toHaveLength(3);
+});
+
+test('a reply received before the delivery ACK keeps delivered hidden after the ACK and reconnect', async () => {
+  const h = harness();
+  const release = h.holdPost();
+  render(SubjectConversation, props);
+  await ready();
+  await compose('input awaiting ACK');
+  await screen.findByText('sending');
+  h.reply('Reply before ACK');
+  h.publish();
+  await screen.findByText('Reply before ACK');
+  release();
+  await waitFor(() => expect(readConversationAttempt(sessionStorage, props)).toBeNull());
+  expect(screen.queryByText('sending')).toBeNull();
+  expect(screen.queryByText('delivered')).toBeNull();
+  h.reconnect();
+  await screen.findByText('Conversation connection: connected');
+  expect(screen.queryByText('delivered')).toBeNull();
 });
 
 test("ACK loss keeps full input across reload while the next draft stays editable; exact retry does not duplicate public rows", async () => {
@@ -194,7 +214,7 @@ test("ACK loss keeps full input across reload while the next draft stays editabl
   const original = "  original input\n日本語  ";
   await compose(original);
   await screen.findByText('Delivery could not be confirmed.');
-  expect(screen.getAllByText('You', { exact: true })).toHaveLength(1);
+  expect(screen.getAllByRole('listitem', { name: 'You' })).toHaveLength(1);
   expect(screen.getByRole('button', { name: 'Retry message' }).closest('li')?.dataset.local).toBe('true');
   expect(screen.queryByText('delivered')).toBeNull();
   typeDraft("edited next draft");
@@ -203,7 +223,7 @@ test("ACK loss keeps full input across reload while the next draft stays editabl
   view.unmount();
   render(SubjectConversation, props);
   await screen.findByRole('button', { name: 'Retry message' });
-  await waitFor(() => expect(screen.getAllByText('You', { exact: true })).toHaveLength(1));
+  await waitFor(() => expect(screen.getAllByRole('listitem', { name: 'You' })).toHaveLength(1));
   expect(screen.getByRole('button', { name: 'Retry message' }).closest('li')?.dataset.messageId).toBe(h.messages[0].id);
   expect(screen.queryByText('delivered')).toBeNull();
   expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe('edited next draft');
@@ -224,7 +244,7 @@ test("ACK loss keeps full input across reload while the next draft stays editabl
   expect(h.posts).toHaveLength(2);
   expect(h.posts[0]).toEqual(h.posts[1]);
   expect(h.messages).toHaveLength(1);
-  await waitFor(() => expect(screen.getAllByText("You", { exact: true })).toHaveLength(1));
+  await waitFor(() => expect(screen.getAllByRole('listitem', { name: 'You' })).toHaveLength(1));
   expect(readConversationAttempt(sessionStorage, props)).toBeNull();
   expect(EditorView.findFromDOM(input())!.state.doc.toString()).toBe('edited next draft');
 });
@@ -343,7 +363,7 @@ test("more than one page follows saved sequence, reconnect adds only unseen mess
   await screen.findByText("Public reply 105");
   h.reconnect();
   await waitFor(() =>
-    expect(screen.getAllByText("Research companion", { exact: true }))
+    expect(screen.getAllByRole('listitem', { name: 'Research companion' }))
       .toHaveLength(105)
   );
   h.deny(403);
@@ -407,11 +427,11 @@ test('a second send does not replace an accepted bubble awaiting its saved page'
   await compose('first unpublished');
   await screen.findByText('delivered');
   await compose('second unpublished');
-  await waitFor(() => expect(screen.getAllByText('delivered')).toHaveLength(2));
+  await waitFor(() => expect(screen.getAllByText('delivered')).toHaveLength(1));
   expect(ui.container.querySelectorAll('[data-local]')).toHaveLength(2);
   h.publish();
   await waitFor(() => expect(ui.container.querySelectorAll('[data-local]')).toHaveLength(0));
-  expect(screen.getAllByText('delivered')).toHaveLength(2);
+  expect(screen.getAllByText('delivered')).toHaveLength(1);
   expect([...ui.container.querySelectorAll('[data-message-id]')].map(row => row.getAttribute('data-message-id'))).toEqual(h.messages.map(message => message.id));
 });
 

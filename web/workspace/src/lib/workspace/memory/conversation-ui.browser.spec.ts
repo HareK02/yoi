@@ -52,6 +52,11 @@ test("public messages use identity-based bubbles and safe shared Markdown, never
   });
   await waitFor(() => expect(ui.container.querySelector(".own strong")?.textContent).toBe("own"));
   expect(ui.container.querySelectorAll(".chat-message.own")).toHaveLength(1);
+  expect(ui.queryByText('You', { exact: true })).toBeNull();
+  expect(ui.queryByText('Companion', { exact: true })).toBeNull();
+  expect(ui.queryByText('Participant', { exact: true })).toBeNull();
+  expect(ui.getByRole('listitem', { name: 'You' }).textContent).toContain('own');
+  expect(ui.getByRole('listitem', { name: 'Companion' }).textContent).toContain('unsafe');
   expect(ui.container.querySelector(".own code")?.textContent).toBe("code");
   expect(ui.container.querySelector("script")).toBeNull();
   expect(ui.container.querySelector('a[href^="javascript:"]')).toBeNull();
@@ -89,6 +94,46 @@ test('delivery stays below its own bubble, retries its operation, and does not t
   expect(delivered.closest('li')?.dataset.messageId).toBe('m2');
   expect(delivered.closest('.chat-bubble')).toBeNull();
   expect(ui.queryByRole('button', { name: 'Retry message' })).toBeNull();
+});
+
+test('only the latest own input shows delivered, until a Subject reply observes it', async () => {
+  const first = message(1, 'first input', true);
+  const latest = message(2, 'latest input', true);
+  const outgoing: ConversationOutgoing[] = [first, latest].map(input => ({
+    request: { conversationId: 'c', operationId: input.operation_id, text: input.text, replyTo: null, workRef: null },
+    state: 'delivered',
+  }));
+  const ui = render(ConversationHistory, { ...props, messages: [first, latest], outgoing });
+  expect(ui.getAllByText('delivered')).toHaveLength(1);
+  expect(ui.getByText('delivered').closest('li')?.dataset.messageId).toBe(latest.id);
+  const olderReply = { ...message(3), last_user_message_id: first.id, reply_to: first.id };
+  await ui.rerender({ messages: [first, latest, olderReply] });
+  expect(ui.getByText('delivered').closest('li')?.dataset.messageId).toBe(latest.id);
+  const currentReply = { ...message(4), last_user_message_id: latest.id, reply_to: first.id };
+  await ui.rerender({ messages: [first, latest, olderReply, currentReply] });
+  expect(ui.queryByText('delivered')).toBeNull();
+  await ui.rerender({ messages: [first, latest, olderReply, currentReply, message(5, 'new input', true)] });
+  expect(ui.queryByText('delivered')).toBeNull();
+});
+
+test('a newer local send hides older delivered labels without hiding sending or retry', async () => {
+  const first = message(1, 'first input', true);
+  const delivered: ConversationOutgoing = {
+    request: { conversationId: 'c', operationId: first.operation_id, text: first.text, replyTo: null, workRef: null },
+    state: 'delivered',
+  };
+  const pending: ConversationOutgoing = {
+    request: { ...delivered.request, operationId: 'new-input', text: 'new input' }, state: 'sending',
+  };
+  const ui = render(ConversationHistory, { ...props, messages: [first], outgoing: [delivered, pending] });
+  expect(ui.queryByText('delivered')).toBeNull();
+  expect(ui.getByText('sending').closest('li')?.dataset.local).toBe('true');
+  await ui.rerender({ outgoing: [delivered, { ...pending, state: 'retry' }] });
+  expect(ui.queryByText('delivered')).toBeNull();
+  expect(ui.getByRole('button', { name: 'Retry message' })).toBeDefined();
+  await ui.rerender({ outgoing: [delivered, { ...pending, state: 'delivered' }] });
+  expect(ui.getAllByText('delivered')).toHaveLength(1);
+  expect(ui.getByText('delivered').closest('li')?.dataset.local).toBe('true');
 });
 
 test('delivery matching requires the same conversation and owning account, not operation alone', () => {

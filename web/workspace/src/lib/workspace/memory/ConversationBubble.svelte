@@ -8,9 +8,8 @@
   } = $props();
 </script>
 
-<li class="chat-message" class:own={message.own} data-message-id={message.id} data-local={message.local || undefined}>
+<li class="chat-message" class:own={message.own} aria-label={message.author} data-message-id={message.id} data-local={message.local || undefined}>
   <div class="chat-bubble">
-    <div class="chat-author">{message.author}</div>
     <RichMarkdown text={message.text} streamId={message.id} />
   </div>
   {#if message.own && message.delivery}
@@ -32,7 +31,6 @@
   .chat-message.own { align-items: flex-end; }
   .chat-bubble { min-width: 0; max-width: min(85%, 48rem); padding: var(--space-3) var(--space-4); background: var(--bg-subtle); border-radius: var(--space-3); overflow-wrap: anywhere; }
   .own .chat-bubble { background: var(--bg-raised); }
-  .chat-author { font-size: var(--font-size-compact); line-height: var(--line-height-compact); color: var(--text-muted); margin-bottom: var(--space-1); }
   .chat-delivery { margin-top: var(--space-1); color: var(--text-muted); font-size: var(--font-size-compact); line-height: var(--line-height-compact); }
   .retry-delivery { display: flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; padding: var(--space-1); border: 0; border-radius: var(--radius-soft); background: transparent; color: var(--danger); cursor: pointer; }
   .retry-delivery:hover:not(:disabled) { background: var(--interactive-hover); }
