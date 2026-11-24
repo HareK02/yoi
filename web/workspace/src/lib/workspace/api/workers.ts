@@ -838,7 +838,10 @@ function featureConnectionsRequest(
     throw new Error(`${label} exceeds its initialization limit`);
   }
   // Only the Backend's registered owner interprets the payload and authorizes it.
-  return connections.sort((left, right) => left.feature_id < right.feature_id ? -1 : left.feature_id > right.feature_id ? 1 : 0);
+  connections.sort((left, right) => left.feature_id < right.feature_id ? -1 : left.feature_id > right.feature_id ? 1 : 0);
+  // The checks above establish the generated ID-length, version-range and array-length
+  // brands. Narrow only at this validated boundary, as with policy authorization keys.
+  return connections as CreateWorkspaceWorkerRequest["feature_connections"];
 }
 
 function unsignedInteger(value: unknown, label: string): number {

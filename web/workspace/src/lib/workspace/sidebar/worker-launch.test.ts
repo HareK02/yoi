@@ -4,6 +4,7 @@ import {
   workerLaunchAttachmentError,
 } from "./worker-launch.ts";
 import type { WorkerLaunchOptionsResponse } from "./types.ts";
+import { parseCreateWorkspaceWorkerRequest } from "#lib/workspace/api/workers.ts";
 
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
@@ -218,7 +219,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits multiple aliased attachments"
         relative_cwd: null,
       },
     ],
-    feature_connections: [],
+    feature_connections: featureConnectionsFixture([]),
     authorization: { kind: "assignment", assignment: null },
     control_operation_id: request.control_operation_id,
   });
@@ -228,15 +229,15 @@ Deno.test("buildCreateWorkspaceWorkerRequest keeps subject attachment explicit a
   const unattached = buildCreateWorkspaceWorkerRequest(emptyForm({
     profile: "builtin:companion",
   }));
-  assertEquals(unattached.feature_connections, []);
+  assertEquals(unattached.feature_connections, featureConnectionsFixture([]));
 
   const attached = buildCreateWorkspaceWorkerRequest(emptyForm({
     profile: "builtin:companion",
     subjektiv_subject_id: " subject-42 ",
   }));
-  assertEquals(attached.feature_connections, [{
+  assertEquals(attached.feature_connections, featureConnectionsFixture([{
     feature_id: "builtin:subjektiv", version: 1, payload: { subject_id: "subject-42" },
-  }]);
+  }]));
   assertEquals(attached.profile, "builtin:companion");
 });
 
@@ -308,11 +309,23 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits an empty attachment list for 
     profile: "builtin:companion",
     initial_submit: [{ kind: "text", content: "chat" }],
     workdir_attachments: [],
-    feature_connections: [],
+    feature_connections: featureConnectionsFixture([]),
     authorization: { kind: "assignment", assignment: null },
     control_operation_id: request.control_operation_id,
   });
 });
+
+function featureConnectionsFixture(value: unknown) {
+  return parseCreateWorkspaceWorkerRequest({
+    runtime_id: "remote",
+    display_name: "Worker",
+    profile: null,
+    initial_submit: [],
+    workdir_attachments: [],
+    feature_connections: value,
+    control_operation_id: null,
+  }).feature_connections;
+}
 
 function emptyForm(
   overrides: Partial<Parameters<typeof buildCreateWorkspaceWorkerRequest>[0]> = {},
