@@ -179,7 +179,10 @@ mod feature_initialization;
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
 use protocol::feature_initialization::FeatureInitializations;
-const LATEST_SCHEMA_VERSION: i64 = 142;
+const LATEST_SCHEMA_VERSION: i64 = 143;
+#[path = "store/feature_worker_launch.rs"]
+mod feature_worker_launch;
+pub(crate) use feature_worker_launch::SavedFeatureWorkerLaunch;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -667,6 +670,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 142,
         name: feature_initialization::MIGRATION_NAME,
         apply: feature_initialization::migrate,
+    },
+    Migration {
+        version: 143,
+        name: feature_worker_launch::MIGRATION_NAME,
+        apply: feature_worker_launch::migrate,
     },
 ];
 
@@ -3916,6 +3924,37 @@ impl SqliteWorkspaceStore {
         prepare: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<Option<WorkerId>>,
         complete: impl FnOnce(&rusqlite::Transaction<'_>, &WorkerCreateReservation) -> Result<()>,
     ) -> Result<WorkerCreateReservation> {
+        self.reserve_worker_create_with_binding(
+            workspace_id,
+            runtime_id,
+            allocation_key,
+            request_fingerprint,
+            singleton_key,
+            current_memory_settings,
+            feature_initialization,
+            prepare,
+            complete,
+            |_, _| Ok(()),
+        )
+    }
+
+    // Unlike `complete` (new allocation only), `bind` runs for every successful
+    // outcome, including exact replay and manual singleton reuse. Its writes and
+    // the reservation are committed together, or neither is retained.
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_worker_create_with_binding(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        allocation_key: &str,
+        request_fingerprint: &str,
+        singleton_key: Option<&str>,
+        current_memory_settings: &WorkspaceMemorySettingsRecord,
+        feature_initialization: &FeatureInitializations,
+        prepare: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<Option<WorkerId>>,
+        complete: impl FnOnce(&rusqlite::Transaction<'_>, &WorkerCreateReservation) -> Result<()>,
+        bind: impl FnOnce(&rusqlite::Transaction<'_>, &WorkerCreateReservation) -> Result<()>,
+    ) -> Result<WorkerCreateReservation> {
         if allocation_key.trim().is_empty() || request_fingerprint.trim().is_empty() {
             return Err(Error::InvalidInput(
                 "Worker create allocation key and fingerprint must be non-empty".to_string(),
@@ -4008,13 +4047,16 @@ impl SqliteWorkspaceStore {
                 if let Some(lease) = singleton.as_ref() {
                     require_current_worker_singleton_lease(&tx, workspace_id, lease)?;
                 }
-                return Ok(WorkerCreateReservation {
+                let reservation = WorkerCreateReservation {
                     worker_id,
                     create_fingerprint,
                     memory_settings: snapshot,
                     feature_initialization: saved_initialization,
                     singleton,
-                });
+                };
+                bind(&tx, &reservation)?;
+                tx.commit()?;
+                return Ok(reservation);
             }
 
             let singleton_owner = singleton_key
@@ -4090,13 +4132,16 @@ impl SqliteWorkspaceStore {
                     saved_initialization.as_deref(), request_fingerprint, &snapshot, &create_fingerprint,
                     )?;
                     feature_initialization::require_same(&saved_initialization, feature_initialization)?;
-                    return Ok(WorkerCreateReservation {
+                    let reservation = WorkerCreateReservation {
                         worker_id,
                         create_fingerprint,
                         memory_settings: snapshot,
                         feature_initialization: saved_initialization,
                         singleton: Some(owner.clone()),
-                    });
+                    };
+                    bind(&tx, &reservation)?;
+                    tx.commit()?;
+                    return Ok(reservation);
                 }
                 return Err(Error::RepositoryConflict(format!(
                     "worker_singleton_owned: singleton key is already owned by Worker {}:{}",
@@ -4225,6 +4270,7 @@ impl SqliteWorkspaceStore {
                 singleton,
             };
             complete(&tx, &reservation)?;
+            bind(&tx, &reservation)?;
             tx.commit()?;
             Ok(reservation)
         })
@@ -17696,6 +17742,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::subject_policy::SCHEMA)?;
     conn.execute_batch(crate::launch_policy::CURRENT_SCHEMA)?;
     conn.execute_batch(include_str!("core_worker_launch.sql"))?;
+    conn.execute_batch(feature_worker_launch::SCHEMA)?;
     conn.execute_batch(backend_job_recovery_store::SCHEMA)?;
     conn.execute_batch(backend_job_reference_migration::SCHEMA)?;
     conn.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
@@ -20272,6 +20319,10 @@ mod tests {
                     WorkspaceSchemaMigrationStep {
                         version: 142,
                         name: feature_initialization::MIGRATION_NAME.into(),
+                    },
+                    WorkspaceSchemaMigrationStep {
+                        version: 143,
+                        name: feature_worker_launch::MIGRATION_NAME.into(),
                     }
                 ]
             );
@@ -23021,6 +23072,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 142,
                 name: feature_initialization::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 143,
+                name: feature_worker_launch::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -23175,6 +23230,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     (140, backend_job_recording_input::MIGRATION_NAME.into()),
                     (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
                     (142, feature_initialization::MIGRATION_NAME.into()),
+                    (143, feature_worker_launch::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);

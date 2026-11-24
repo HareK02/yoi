@@ -438,6 +438,7 @@ impl FailureTail {
         tail.push((140, super::backend_job_recording_input::MIGRATION_NAME));
         tail.push((141, super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME));
         tail.push((142, super::feature_initialization::MIGRATION_NAME));
+        tail.push((143, super::feature_worker_launch::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -631,6 +632,25 @@ fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> R
         return Err(invalid("Feature initialization receipt/shape mismatch"));
     }
 
+    if super::table_exists(conn, "worker_create_operation_bindings")? != (current >= 143) {
+        return Err(invalid(
+            "Worker create operation binding receipt/shape mismatch",
+        ));
+    }
+    if current >= 143 {
+        let reference = Connection::open_in_memory()?;
+        reference.execute_batch(super::feature_worker_launch::SCHEMA)?;
+        let expected = snapshot(&reference)?;
+        let actual: Shape = snapshot(conn)?
+            .into_iter()
+            .filter(|(_, object)| object.1 == "worker_create_operation_bindings")
+            .collect();
+        if actual != expected {
+            return Err(invalid(
+                "Worker create operation binding physical schema mismatch",
+            ));
+        }
+    }
     let startup = super::column_exists(conn, "worker_create_reservations", "startup_failure_json")?;
     if startup != tail.startup(current) {
         return Err(invalid("startup failure receipt/shape mismatch"));
@@ -1619,6 +1639,7 @@ mod failure_format_tests {
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
         124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
+        143,
     ];
 
     #[test]

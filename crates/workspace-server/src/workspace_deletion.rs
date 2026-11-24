@@ -46,6 +46,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "backend_jobs",
     "backend_job_reference_migration_jobs",
     "backend_job_reference_migration_targets",
+    "worker_create_operation_bindings",
     "core_worker_launch_bindings",
     "core_worker_grant_revocations",
     "core_worker_execution_grants",

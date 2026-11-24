@@ -6528,7 +6528,13 @@ impl WorkspaceApi {
         let allocation_key = request
             .resolved_control_operation
             .as_ref()
-            .map(|operation| operation.operation_id.clone())
+            .map(|operation| {
+                if connection_authority == feature_initialization::CreationAuthority::FeatureOwned {
+                    format!("manual:{}", operation.operation_id)
+                } else {
+                    operation.operation_id.clone()
+                }
+            })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
         // Delegated execution admission remains owned by the grant authority.
         // Feature-owned singleton/domain admission is supplied by its adapter.
@@ -6574,6 +6580,28 @@ impl WorkspaceApi {
                             bundle,
                             &request.resolved_feature_initialization,
                         )
+                } else if connection_authority
+                    == feature_initialization::CreationAuthority::FeatureOwned
+                    && let Some(operation) = request.resolved_control_operation.as_ref()
+                {
+                    let bundle = request.resolved_config_bundle.as_ref().ok_or_else(|| {
+                        Error::Config("Feature-owned Worker Profile bundle is missing".into())
+                    })?;
+                    let profile = match &request.profile {
+                        ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => name,
+                    };
+                    self.config_store.reserve_feature_worker_launch(
+                        &self.config.workspace_id,
+                        runtime_id,
+                        &operation.operation_id,
+                        &operation.input_fingerprint,
+                        &request_fingerprint,
+                        singleton_key.as_deref(),
+                        &current_memory_settings,
+                        profile,
+                        bundle,
+                        &request.resolved_feature_initialization,
+                    )
                 } else {
                     self.config_store.reserve_worker_create_with_initialization(
                         &self.config.workspace_id,
@@ -36191,12 +36219,10 @@ async fn create_workspace_worker_authenticated_on_host(
                 "Worker creation must use the authenticated worker-control reservation path".into(),
             )
         })?)
-    } else if connection_authority == feature_initialization::CreationAuthority::FeatureOwned {
-        resolved_control_operation
     } else {
         let account = account.as_deref().ok_or_else(|| {
             Error::WorkspacePermissionDenied(
-                "ordinary Worker creation requires authenticated owner context".into(),
+                "Worker creation requires authenticated owner context".into(),
             )
         })?;
         let key = control_operation_id
@@ -36204,8 +36230,7 @@ async fn create_workspace_worker_authenticated_on_host(
             .filter(|key| !key.trim().is_empty())
             .ok_or_else(|| {
                 Error::InvalidInput(
-                    "control_operation_id is required for replay-safe ordinary Worker creation"
-                        .into(),
+                    "control_operation_id is required for replay-safe Worker creation".into(),
                 )
             })?;
         let encoded = serde_json::to_vec(&(account, &caller_request))
@@ -36250,12 +36275,39 @@ async fn create_workspace_worker_authenticated_on_host(
             .ok_or_else(|| Error::Config("resolved Worker Profile bundle is missing".into()))?,
         &profile,
     )?;
-    let resolved_feature_initialization = initialization_registry.resolve(
+    let saved_initialization =
+        if connection_authority == feature_initialization::CreationAuthority::FeatureOwned {
+            resolved_control_operation
+                .as_ref()
+                .map(|operation| {
+                    api.config_store.saved_feature_worker_launch(
+                        api.workspace_id(),
+                        &operation.operation_id,
+                        &operation.input_fingerprint,
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .map(|saved| saved.initialization)
+        } else {
+            None
+        };
+    let current_initialization = initialization_registry.resolve(
         &api,
         &profile_manifest,
         &feature_connections,
         &mut singleton_key,
     )?;
+    let resolved_feature_initialization = match saved_initialization {
+        Some(saved) if saved != current_initialization => {
+            return Err(Error::RepositoryConflict(
+                "current Feature connection does not match the original creation resolution".into(),
+            )
+            .into());
+        }
+        Some(saved) => saved,
+        None => current_initialization,
+    };
     if connection_authority == feature_initialization::CreationAuthority::Ordinary {
         validate_caller_worker_singleton_key(singleton_key.as_deref())?;
     }
@@ -51276,6 +51328,134 @@ mod tests {
         .unwrap();
         assert_eq!(restored.worker_id, first.worker_id);
         assert_eq!(restored.worker.state, "idle");
+    }
+
+    #[tokio::test]
+    async fn public_subject_create_operation_rejects_changed_connection() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
+        let store = open_subjektiv_store(&api).unwrap();
+        let first_subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("first-operation-subject").unwrap())
+            .unwrap();
+        let other_subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("other-operation-subject").unwrap())
+            .unwrap();
+        let request = CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+            display_name: "Public connection operation".into(),
+            singleton_key: None,
+            profile: Some("builtin:companion".into()),
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: subjektiv_worker_initialization::subject_connection(
+                first_subject.id.clone(),
+            )
+            .unwrap(),
+            control_operation_id: Some("public-feature-replay".into()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                assignment: None,
+            },
+        };
+        let first = create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        // Discard the first response and replay through the same public owner
+        // entrypoint: a duplicate response is not evidence of a second creation.
+        let replay = create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(replay.worker_id, first.worker_id);
+        let mut alias_request = request.clone();
+        alias_request.control_operation_id = Some("public-feature-alias".into());
+        let alias = create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(alias_request.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(alias.worker_id, first.worker_id);
+
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &RuntimeWorkerRef::new(&first.runtime_id, &first.worker_id),
+                WorkerLifecycleRequest {
+                    stop_intent: None,
+                    reason: Some("public operation Server reopen".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        let configuration = api.config.clone();
+        let execution = Arc::new(execution.with_retained_stopped_executions());
+        drop(store);
+        drop(api);
+        execution.accept_restores();
+        let api = WorkspaceApi::new_api_fixture(configuration, execution.clone())
+            .await
+            .unwrap();
+        let reopened = create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(reopened.worker_id, first.worker_id);
+        let alias_reopened = create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(alias_request.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(alias_reopened.worker_id, first.worker_id);
+        let mut without_connection = request.clone();
+        without_connection.feature_connections = Default::default();
+        let error = create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(without_connection),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+        for mut changed in [request, alias_request] {
+            changed.feature_connections =
+                subjektiv_worker_initialization::subject_connection(other_subject.id.clone())
+                    .unwrap();
+            let error = match create_workspace_worker_as_owner(
+                State(api.clone()),
+                HeaderMap::new(),
+                Json(changed),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(response) => panic!(
+                    "same public operation key accepted changed Subject: first={}, other={}",
+                    first.worker_id, response.0.worker_id
+                ),
+            };
+            assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+        }
     }
 
     #[tokio::test]

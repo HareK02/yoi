@@ -410,7 +410,7 @@ mod reservation_initialization {
             "SELECT allocation_key,request_fingerprint,create_fingerprint FROM worker_create_reservations ORDER BY allocation_key",
         );
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
-        assert_eq!(plan.migrations.len(), 1);
+        assert_eq!(plan.migrations.len(), 2);
         assert!(
             !column_exists(
                 &conn,
@@ -476,6 +476,8 @@ mod reservation_initialization {
         conn.execute_batch("DROP TRIGGER reject_feature_migration")
             .unwrap();
         feature_initialization::migrate(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 142);
+        feature_worker_launch::migrate(&conn).unwrap();
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
@@ -558,4 +560,6 @@ mod reservation_initialization {
             "{error}"
         );
     }
+
+    include!("feature_worker_launch_tests.rs");
 }

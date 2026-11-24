@@ -126,6 +126,30 @@ pub(super) fn resolve_creation_profile(
             .into());
         }
     }
+    if let Some(operation) = resolved_control_operation
+        && let Some(saved) = api.config_store.saved_feature_worker_launch(
+            api.workspace_id(),
+            &operation.operation_id,
+            &operation.input_fingerprint,
+        )?
+    {
+        if connection_authority != feature_initialization::CreationAuthority::FeatureOwned {
+            return Err(Error::RepositoryConflict(
+                "creation operation is bound to a different Feature-owned authority".into(),
+            )
+            .into());
+        }
+        let selector = if saved.profile.starts_with("builtin:") {
+            ProfileSelector::Builtin(saved.profile.clone())
+        } else if saved.profile.starts_with("project:") {
+            ProfileSelector::Named(saved.profile.clone())
+        } else {
+            return Err(
+                Error::Config("saved Feature launch has noncanonical Profile".into()).into(),
+            );
+        };
+        return Ok((saved.profile, selector, Some(saved.bundle), None));
+    }
     let saved = resolved_control_operation
         .as_ref()
         .map(|operation| {
