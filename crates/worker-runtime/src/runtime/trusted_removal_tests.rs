@@ -234,11 +234,13 @@ mod trusted_removal_tests {
     }
 
     #[test]
-    fn cleanup_failure_blocks_removal_until_the_same_stop_operation_finishes() {
+    fn failed_stop_blocks_removal_until_a_fresh_request_confirms_termination() {
         let root = tempfile::tempdir().unwrap();
         let (runtime, backend) = stored_runtime(root.path());
         let worker = create(&runtime);
         let request = test_stop_request(&runtime, &worker.worker_ref, "cleanup-then-remove");
+        // This one-shot response contains no termination evidence. The next
+        // default response confirms termination only for a fresh Stop call.
         backend.set_stop_result(WorkerExecutionResult::errored(
             WorkerExecutionOperation::Stop,
             "cleanup pending",
@@ -247,28 +249,77 @@ mod trusted_removal_tests {
             runtime.stop_worker_request(&worker.worker_ref, request.clone()),
             Err(RuntimeError::WorkerExecutionRejected { .. })
         ));
-        let operation = runtime
-            .lock()
-            .unwrap()
-            .worker(&worker.worker_ref)
-            .unwrap()
-            .pending_stop()
-            .unwrap()
-            .operation_id;
-        assert!(runtime.delete_worker(&worker.worker_ref).is_err());
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Failed {
+                cause: RuntimeControlCause::ExecutionRejected,
+            }
+        );
         assert!(
             runtime
-                .execute_worker_retention(&plan(worker.worker_id))
-                .is_err()
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_stop()
+                .is_none()
         );
+        let failed_operation = backend.stop_operation_ids.lock().unwrap()[0];
+        let path = worker_root(root.path(), worker.worker_id).join("worker.json");
+        let before = std::fs::read(&path).unwrap();
+        let failed = runtime_store(&runtime)
+            .read_worker_record(&worker.worker_ref)
+            .unwrap();
+        assert!(!matches!(
+            failed.execution_state,
+            PersistedWorkerExecutionState::Stopped(_)
+        ));
+        assert!(failed.restore_guard.execution_termination.is_none());
+        let failed_result = &failed.restore_guard.stop_results["cleanup-then-remove"];
+        assert_eq!(
+            failed_result.failure,
+            Some(RuntimeControlCause::ExecutionRejected)
+        );
+        assert!(failed_result.receipt.is_none());
+        assert!(matches!(
+            runtime.delete_worker(&worker.worker_ref),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            runtime.execute_worker_retention(&plan(worker.worker_id)),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            runtime.stop_worker_request(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::StopRequestFailed {
+                cause: RuntimeControlCause::ExecutionRejected,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        let fresh_request =
+            test_stop_request(&runtime, &worker.worker_ref, "fresh-stop-then-remove");
         let ack = runtime
-            .stop_worker_request(&worker.worker_ref, request)
+            .stop_worker_request(&worker.worker_ref, fresh_request)
             .unwrap();
         assert_eq!(ack.status, WorkerStatus::Stopped);
+        assert!(!ack.replayed);
+        {
+            let operations = backend.stop_operation_ids.lock().unwrap();
+            assert_eq!(operations.len(), 2);
+            assert_eq!(operations[0], failed_operation);
+            assert_ne!(operations[0], operations[1]);
+        }
         assert_eq!(
-            backend.stop_operation_ids.lock().unwrap().as_slice(),
-            &[operation, operation]
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Failed {
+                cause: RuntimeControlCause::ExecutionRejected,
+            }
         );
         let canonical = runtime_store(&runtime)
             .read_worker_record(&worker.worker_ref)
@@ -277,6 +328,7 @@ mod trusted_removal_tests {
             canonical.execution_state,
             PersistedWorkerExecutionState::Stopped(_)
         ));
+        assert!(canonical.restore_guard.execution_termination.is_some());
         assert!(runtime.delete_worker(&worker.worker_ref).unwrap().deleted);
         assert_eq!(
             *backend.stop_count.lock().unwrap(),
@@ -306,20 +358,44 @@ mod trusted_removal_tests {
             .pending_stop()
             .unwrap()
             .operation_id;
-        // Admission is already durable; the next Worker write is terminal Stop.
+        // Admission is already saved; dispatch reuses its in-memory Stop, so
+        // AfterRename faults the terminal write after the stopped row is visible.
         runtime_store(&runtime)
             .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
-        assert!(matches!(
-            runtime.stop_worker_request(&worker.worker_ref, request),
-            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
-        ));
-        assert!(
-            runtime
-                .lock()
-                .unwrap()
-                .unreconciled_worker_writes
-                .contains(&worker.worker_id)
+        let error = runtime
+            .stop_worker_request(&worker.worker_ref, request)
+            .unwrap_err();
+        assert_eq!(
+            error.control_cause(),
+            RuntimeControlCause::StopTerminatedPersistenceOutcomeUnknown
         );
+        let RuntimeError::WorkerStopPersistenceFailed {
+            worker_id,
+            result,
+            source,
+        } = &error
+        else {
+            panic!("expected confirmed termination with a persistence error: {error:?}");
+        };
+        assert_eq!(*worker_id, worker.worker_id);
+        assert!(matches!(
+            source.as_ref(),
+            RuntimeError::StoreCommitOutcomeUnknown { .. }
+        ));
+        let termination = result.termination.as_ref().unwrap();
+        assert!(termination.confirms_scope_shutdown(&worker.worker_ref, operation));
+        assert_eq!(result.execution_id, Some(termination.execution_id));
+        {
+            let state = runtime.lock().unwrap();
+            let record = state.worker(&worker.worker_ref).unwrap();
+            assert_eq!(record.status(), WorkerStatus::Stopped);
+            assert!(record.pending_stop().is_none());
+            assert_eq!(
+                record.restore_guard.execution_termination.as_ref(),
+                Some(termination)
+            );
+            assert!(state.unreconciled_worker_writes.contains(&worker.worker_id));
+        }
         assert!(matches!(
             runtime_store(&runtime)
                 .read_worker_record(&worker.worker_ref)
@@ -328,6 +404,14 @@ mod trusted_removal_tests {
             PersistedWorkerExecutionState::Stopped(_)
         ));
         assert!(runtime.delete_worker(&worker.worker_ref).unwrap().deleted);
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .unreconciled_worker_writes
+                .contains(&worker.worker_id)
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
         assert_eq!(
             backend.stop_operation_ids.lock().unwrap().as_slice(),
             &[operation]

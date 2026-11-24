@@ -274,6 +274,12 @@ pub(super) async fn stop_outcome(
     let outcome = match result {
         runtime_api::WorkerStopOutcome::NotFound => server_api::SubjectBodyStopOutcome::NotFound,
         runtime_api::WorkerStopOutcome::Pending => server_api::SubjectBodyStopOutcome::Pending,
+        runtime_api::WorkerStopOutcome::Interrupted => {
+            server_api::SubjectBodyStopOutcome::Interrupted
+        }
+        runtime_api::WorkerStopOutcome::Failed { cause } => {
+            server_api::SubjectBodyStopOutcome::Failed { cause }
+        }
         runtime_api::WorkerStopOutcome::Stopped { .. } => {
             server_api::SubjectBodyStopOutcome::Stopped
         }

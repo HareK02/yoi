@@ -488,7 +488,13 @@ impl WorkerLifecycleAck {
 pub enum WorkerStopOutcome {
     NotFound,
     Pending,
-    Stopped { ack: WorkerLifecycleAck },
+    Interrupted,
+    Failed {
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
+    Stopped {
+        ack: WorkerLifecycleAck,
+    },
 }
 
 #[cfg(test)]

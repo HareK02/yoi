@@ -785,7 +785,7 @@ pub struct WorkerExecutionRestoreRequest {
     pub config_bundle: Option<ConfigBundle>,
 }
 
-/// Request to execute or reconcile one durably journaled Worker stop.
+/// Identity for a Stop invocation owned only by the current Runtime lifetime.
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionStopRequest {
     pub operation_id: WorkerLifecycleOperationId,
@@ -1329,8 +1329,18 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// Internal pending-Stop recovery. Saved scope termination does not prove
-    /// factory cleanup; backends must reconcile both under their Worker lock.
+    /// Cleanup of resources owned after a confirmed stop. This never sends
+    /// Shutdown or waits for an execution to join, and must reject replacements.
+    fn cleanup_stopped_worker(
+        &self,
+        _worker_ref: &WorkerRef,
+        _saved: Option<&WorkerExecutionTermination>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Internal resource reconciliation for consumers holding actual termination
+    /// evidence. This is not authority to reconstruct a pending Stop after restart.
     fn reconcile_stop_worker_operation(
         &self,
         request: WorkerExecutionStopRequest,
@@ -1692,6 +1702,14 @@ impl WorkerExecutionBackendRef {
     ) -> Vec<protocol::CompletionEntry> {
         self.backend
             .worker_completions(worker_ref, kind, prefix, context)
+    }
+
+    pub(crate) fn cleanup_stopped_worker(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: Option<&WorkerExecutionTermination>,
+    ) -> Result<(), String> {
+        self.backend.cleanup_stopped_worker(worker_ref, saved)
     }
 
     pub(crate) fn reconcile_stop_worker_operation(

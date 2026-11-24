@@ -8472,6 +8472,13 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             HostDiagnosticSeverity::Warning,
             "Stop observation changed; reload before a new intent",
         ),
+        EmbeddedRuntimeError::StopRequestInterrupted { .. }
+        | EmbeddedRuntimeError::StopRequestFailed { .. }
+        | EmbeddedRuntimeError::WorkerStopPersistenceFailed { .. } => diagnostic(
+            error.control_cause().reason(),
+            HostDiagnosticSeverity::Warning,
+            error.control_cause().explanation(),
+        ),
         EmbeddedRuntimeError::StopRequestConflict { .. } => diagnostic(
             "stop_request_conflict",
             HostDiagnosticSeverity::Warning,

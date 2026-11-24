@@ -22,16 +22,20 @@ impl ApiBoundary<RuntimeControlCause> for ControlBoundary {
             | C::StopObservationConflict
             | C::StopRequestConflict
             | C::StopAdmissionBusy
+            | C::StopRequestInterrupted
             | C::ExecutionRejected => S::Conflict,
             C::RuntimeStopped | C::ExecutionUnavailable | C::ConfigurationUnavailable => {
                 S::Unavailable
             }
             C::ExecutionFailed
             | C::PersistenceFailed
+            | C::StopTerminatedPersistenceFailed
             | C::StoreUnavailable
             | C::StateUnavailable
             | C::ClientSetupFailed => S::Internal,
             C::PersistenceOutcomeUnknown
+            | C::StopTerminatedPersistenceOutcomeUnknown
+            | C::StopTerminatedCleanupFailed
             | C::TransportFailed
             | C::ResultUnavailable
             | C::RecordingSourceUnavailable

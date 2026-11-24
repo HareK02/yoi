@@ -487,8 +487,8 @@ mod publication {
         assert!(
             remove_error
                 .to_string()
-                .contains("pending stop reconciliation"),
-            "Remove must be fenced by the unresolved Stop"
+                .contains("pending restore reconciliation"),
+            "Remove must be fenced by the independent Restore resource owner"
         );
         assert!(Arc::ptr_eq(
             &pending,
@@ -525,6 +525,9 @@ mod publication {
         );
         release.release();
         drop(pause);
+        // The failed call is terminal; late factory progress does not resume
+        // Stop. A fresh explicit call joins the still-owned activation task.
+        runtime.stop_worker_scoped(scope, &worker_ref, None).unwrap();
         runtime.test_wait_restore_continuation(
             &worker_ref,
             started.operation_id,
@@ -1086,11 +1089,18 @@ mod publication {
                 let retry = restarted
                     .restore_worker_operation(&worker_ref, request.clone())
                     .unwrap();
-                assert_eq!(retry.worker, receipt.worker);
-                assert_eq!(
-                    retry.state,
-                    server_api::WorkerRestoreState::ReconciliationRequired
-                );
+                if commit == F::LegacyUnknown {
+                    assert_eq!(retry.worker, receipt.worker);
+                    assert_eq!(retry.state, server_api::WorkerRestoreState::ReconciliationRequired);
+                    assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 0);
+                } else {
+                    // A failed Stop is not a permanent gate on the independent
+                    // repairable Restore. This explicit request may complete it;
+                    // startup above still must not replay uncommitted execution.
+                    assert_eq!(retry.state, server_api::WorkerRestoreState::Accepted);
+                    assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
+                    restarted.stop_worker_scoped(scope, &worker_ref, None).unwrap();
+                }
             }
             fixture.assert_released();
             fixture.assert_quiet();
@@ -1129,6 +1139,9 @@ mod publication {
         assert!(fixture.backend.workers.lock().unwrap().is_empty());
         release.notify_one();
         drop(pause);
+        // Resume only the resource owner's cleanup through a new call, never
+        // a persisted Stop continuation or a fabricated cold join receipt.
+        runtime.stop_worker_scoped(scope, &worker_ref, None).unwrap();
         runtime.test_wait_restore_continuation(&worker_ref, operation.operation_id, WAIT);
         assert_eq!(
             runtime.worker_detail(&worker_ref).unwrap().status,

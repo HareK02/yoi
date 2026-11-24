@@ -6027,7 +6027,18 @@ where
             return result;
         };
 
-        if let Err(message) = self.cleanup_execution_resources(&execution) {
+        let cleanup = if operation_id
+            .is_some_and(|id| execution.tasks.termination(worker_ref, id).is_some())
+        {
+            execution
+                .handle
+                .delete_uncommitted_uploaded_files()
+                .map(|_| ())
+                .map_err(|error| format!("uploaded_file_cleanup_failed: {error}"))
+        } else {
+            self.cleanup_execution_resources(&execution)
+        };
+        if let Err(message) = cleanup {
             let mut result = startup_stop_result.clone().unwrap_or_else(|| {
                 WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message.clone())
             });
@@ -7191,7 +7202,7 @@ where
         if let Some(existing) = workers.get(&request.worker_ref) {
             let result = WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Restore,
-                "Worker is already connected to execution backend",
+                "Worker execution resources are still owned; if shutdown was requested, issue a fresh Stop to reclaim that owner before Restore",
             );
             if existing.shutdown_requested.load(Ordering::Acquire)
                 || existing.tasks.has_cleanup_candidates().map_err(|message| {
@@ -8512,6 +8523,55 @@ where
         self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method)
     }
 
+    fn cleanup_stopped_worker(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> Result<(), String> {
+        let lock = self.worker_lock(worker_ref)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| "worker operation lock is poisoned")?;
+        if self.pending_spawn_exists(worker_ref)? || self.pending_restore(worker_ref)?.is_some() {
+            return Err("Worker startup resources still have a current owner; stop that owner before retrying cleanup".into());
+        }
+        let execution = self
+            .workers
+            .lock()
+            .map_err(|_| "worker registry poisoned")?
+            .get(worker_ref)
+            .cloned();
+        if let Some(execution) = execution {
+            let saved = saved
+                .ok_or("a current execution still owns resources; explicit Stop is required")?;
+            if execution
+                .tasks
+                .termination(worker_ref, saved.stop_operation_id)
+                .as_ref()
+                != Some(saved)
+            {
+                return Err("current execution differs from the terminated resource owner".into());
+            }
+            // Actual join is already confirmed by this original scope. Only the
+            // remaining resource effects are retried, never Shutdown or join.
+            execution
+                .handle
+                .delete_uncommitted_uploaded_files()
+                .map_err(|error| format!("uploaded_file_cleanup_failed: {error}"))?;
+            self.factory
+                .deactivate_stopped_controller(worker_ref, &execution.handle)?;
+            self.workers
+                .lock()
+                .map_err(|_| "worker registry poisoned")?
+                .remove(worker_ref);
+        }
+        let factory = self.factory.clone();
+        let stopped = worker_ref.clone();
+        self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
+            factory.reconcile_stopped_worker(&stopped).await
+        })
+    }
+
     fn reconcile_stop_worker_operation(
         &self,
         request: WorkerExecutionStopRequest,
@@ -8574,7 +8634,9 @@ where
                 );
             }
         };
-        self.stop_worker_operation_under_lock(request)
+        let worker = request.worker_ref.clone();
+        let result = self.stop_worker_operation_under_lock(request);
+        self.reconcile_stop_cleanup_under_lock(&worker, result)
     }
 
     fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
@@ -13148,6 +13210,91 @@ mod tests {
         }
     }
 
+    struct FailLiveStopCleanupFactory {
+        inner: MockFactory,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeWorkerFactory for FailLiveStopCleanupFactory {
+        async fn spawn_controller(
+            &self,
+            request: WorkerExecutionSpawnRequest,
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+            self.inner.spawn_controller(request).await
+        }
+        async fn prepare_restore(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
+            self.inner.prepare_restore(request).await
+        }
+        async fn reconcile_stopped_worker(&self, _: &WorkerRef) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("factory cleanup failed after live join".into())
+        }
+    }
+
+    #[test]
+    fn public_runtime_live_stop_reports_factory_cleanup_failure_after_real_join() {
+        require_restore_test_environment();
+        let root = tempfile::tempdir_in(".").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(FailLiveStopCleanupFactory {
+                inner: MockFactory {
+                    client: MockClient::new(vec![]),
+                    runtime_base: PathBuf::from(root.path().file_name().unwrap())
+                        .join("controllers"),
+                    cwd: fs::canonicalize(root.path()).unwrap(),
+                    store_dir: root.path().join("sessions"),
+                    worker_metadata_dir: root.path().join("metadata"),
+                    observed_cwds: Arc::default(),
+                    observed_workspace_clients: Arc::default(),
+                },
+                calls: calls.clone(),
+            })
+            .unwrap(),
+        );
+        let runtime = EmbeddedRuntime::with_execution_backend(
+            crate::RuntimeOptions::default(),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(create_request("live cleanup failure"))
+            .unwrap();
+        let execution = backend.workers.lock().unwrap()[&worker.worker_ref].clone();
+        let error = runtime.stop_worker(&worker.worker_ref, None).unwrap_err();
+        assert_eq!(
+            error.control_cause(),
+            protocol::control_failure::RuntimeControlCause::StopTerminatedCleanupFailed
+        );
+        let termination = error
+            .execution_result()
+            .unwrap()
+            .termination
+            .as_ref()
+            .unwrap();
+        assert_eq!(termination.execution_id, execution.tasks.execution_id);
+        assert!(
+            termination.confirms_scope_shutdown(&worker.worker_ref, termination.stop_operation_id)
+        );
+        assert!(execution.handle.protocol_is_closed());
+        assert!(execution.tasks.tasks.lock().unwrap().is_empty());
+        assert!(backend.workers.lock().unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().lifecycle,
+            crate::catalog::WorkerLifecycleState::Stopped
+        );
+        assert_eq!(
+            runtime.execution_termination(&worker.worker_ref).unwrap(),
+            Some(termination.clone())
+        );
+    }
+
     fn core_filesystem_tool_names() -> BTreeSet<&'static str> {
         ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
             .into_iter()
@@ -13535,10 +13682,17 @@ mod tests {
         let journal_path = aggregate.join("worker.json");
         let journal_before = fs::read(&journal_path).unwrap();
         let journal: serde_json::Value = serde_json::from_slice(&journal_before).unwrap();
-        assert_eq!(journal["execution_state"]["execution"]["operation"], "stop");
         assert_eq!(
-            journal["execution_state"]["execution"]["intent"]["pending_restore"]["operation_id"],
+            journal["execution_state"]["execution"]["operation"],
+            "restore"
+        );
+        assert_eq!(
+            journal["execution_state"]["execution"]["intent"]["operation_id"],
             prior_restore_id.to_string()
+        );
+        assert_eq!(
+            journal["restore_guard"]["automatic_restore_suppressed"],
+            true
         );
         let artifact = aggregate
             .join("runs")
@@ -13592,12 +13746,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // A fresh Stop rotates only the observation fence. It must retain the
+        // independent Restore identity and all other canonical material.
+        let assert_retained_restore = || {
+            let mut observed: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+            observed["restore_guard"]["observation_token"] =
+                journal["restore_guard"]["observation_token"].clone();
+            assert_eq!(observed, journal);
+        };
         let failed = restarted.stop_worker(&worker.worker_ref, None).unwrap_err();
         assert!(
             failed.to_string().contains("unsafe restore artifact"),
             "{failed}"
         );
-        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_retained_restore();
         assert!(artifact.is_file());
         assert!(!profile_base.exists());
 
@@ -13611,7 +13774,7 @@ mod tests {
                 .contains("map absence is not shutdown proof")
         );
         assert!(!artifact.exists());
-        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_retained_restore();
         assert_eq!(
             fs::read_to_string(aggregate.join("session").join("keep-authority")).unwrap(),
             "saved Session authority"

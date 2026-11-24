@@ -13986,6 +13986,10 @@
               "stop_observation_conflict",
               "stop_request_conflict",
               "stop_admission_busy",
+              "stop_request_interrupted",
+              "stop_terminated_persistence_failed",
+              "stop_terminated_persistence_outcome_unknown",
+              "stop_terminated_cleanup_failed",
               "create_request_conflict",
               "invalid_request",
               "workspace_binding_mismatch",
@@ -14956,6 +14960,10 @@
           "stop_observation_conflict",
           "stop_request_conflict",
           "stop_admission_busy",
+          "stop_request_interrupted",
+          "stop_terminated_persistence_failed",
+          "stop_terminated_persistence_outcome_unknown",
+          "stop_terminated_cleanup_failed",
           "create_request_conflict",
           "invalid_request",
           "workspace_binding_mismatch",
@@ -18040,12 +18048,37 @@
         "type": "object"
       },
       "SubjectBodyStopOutcome": {
-        "enum": [
-          "not_found",
-          "pending",
-          "stopped"
-        ],
-        "type": "string"
+        "oneOf": [
+          {
+            "enum": [
+              "not_found",
+              "pending",
+              "interrupted",
+              "stopped"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "failed": {
+                "properties": {
+                  "cause": {
+                    "$ref": "#/components/schemas/RuntimeControlCause"
+                  }
+                },
+                "required": [
+                  "cause"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "failed"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "SubjectBodyStopOutcomeResponse": {
         "additionalProperties": false,
@@ -23561,6 +23594,10 @@
               "stop_observation_conflict",
               "stop_request_conflict",
               "stop_admission_busy",
+              "stop_request_interrupted",
+              "stop_terminated_persistence_failed",
+              "stop_terminated_persistence_outcome_unknown",
+              "stop_terminated_cleanup_failed",
               "create_request_conflict",
               "invalid_request",
               "workspace_binding_mismatch",
@@ -27159,7 +27196,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:e2c06c114c3ea871ce1f2d00e949d3e841eb3a9e028314f99f90760e27e60661"
+    "x-yoi-source-digest": "sha256:35952ac1f506ab5deb94e854a652ff922a0017b64a45efb7eca8b0345e917640"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -829,7 +829,13 @@ pub struct WorkerStopIntent {
 pub enum WorkerStopOutcome {
     NotFound,
     Pending,
-    Stopped { ack: WorkerLifecycleAck },
+    Interrupted,
+    Failed {
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
+    Stopped {
+        ack: WorkerLifecycleAck,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
