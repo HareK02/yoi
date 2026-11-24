@@ -1533,9 +1533,21 @@ export function applyProtocolEvent(
       // These are protocol/status/control events. TUI Console does not append
       // them to the conversation surface; browser Console should not either.
       break;
-    case "rewind_applied":
+    case "rewind_applied": {
+      const retained = snapshotProjectionFromSession(
+        envelope.eventId,
+        event.data.session,
+        next.cwd,
+      );
+      next.lines = retained.lines;
+      next.tasks = retained.tasks;
+      next.taskNextId = retained.taskNextId;
+      next.appliedTaskCallIds = retained.appliedTaskCallIds;
+      next.usage = null;
+      next.runActivity = emptyRunActivityStats();
       next.workerMetadata = metadataWithoutContext(next.workerMetadata);
       break;
+    }
     case "compaction_progress":
       return applyInFlightCompaction(next, event.data.compaction ?? null);
     case "compact_start":

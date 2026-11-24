@@ -103,7 +103,7 @@ const session = {
   pending_submissions: { notification_count: 0, head_id: null, submissions: [] },
   entries,
 };
-const state = { last_command_id: 0, state: { kind: "idle" } };
+const state = { state_sequence: 0, last_command_id: 0, state: { kind: "idle" } };
 const worker = {
   worker_id: workerId,
   runtime_id: runtimeId,
@@ -483,6 +483,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
               event: "worker_state",
               data: {
                 snapshot: {
+                  state_sequence: ++state.state_sequence,
                   last_command_id: 0,
                   state: submitMode === "hold"
                     ? { kind: "busy", state: { kind: "run", state: "running" } }

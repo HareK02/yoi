@@ -2994,6 +2994,46 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
   );
 });
 
+Deno.test("rewind replaces the live tail and task projection with the retained snapshot, even without greeting metadata", () => {
+  const retainedTask = taskCallEntry('retained-task', 'TaskCreate', { subject: 'Keep task', description: 'retained' });
+  const discardedTask = taskCallEntry('discarded-task', 'TaskCreate', { subject: 'Discard task', description: 'discarded' });
+  const prefix: SessionSnapshotEntry[] = [{
+    kind: 'user_input', entry_id: 'kept-input', timestamp: 1, provenance: 'human_input', derived_from: [],
+    segments: [{ kind: 'text', content: 'kept input' }],
+  }];
+  for (const withGreeting of [true, false]) {
+    const projector = createConsoleProjector();
+    if (withGreeting) projector.append([{ eventId: 'snapshot', event: snapshotEvent('/repo') }]);
+    projector.append([
+      ...[...prefix, retainedTask, discardedTask].map(entry => ({ eventId: entry.entry_id, event: taskCommitEvent(entry) })),
+      { eventId: 'old-input', event: { event: 'user_message', data: { entry_id: 'selected-input', segments: [{ kind: 'text', content: 'discarded input' }] } } },
+      { eventId: 'old-output', event: { event: 'text_delta', data: { text: 'discarded streaming output' } } },
+    ]);
+    assertEquals(projector.snapshot().tasks.length, 2);
+    const retained = [...prefix, retainedTask];
+    const rewound = projector.append([{ eventId: 'rewind', event: { event: 'rewind_applied', data: {
+      session: { entries: retained, pending_submissions: { submissions: [], head_id: null, notification_count: 0 } },
+      input: [{ kind: 'text', content: 'discarded input' }],
+      summary: { truncated_to_entries: retained.length, discarded_entries: 3, tool_side_effect_warning: true },
+    } } }]);
+    assertEquals(rewound.lines.map(line => line.entryId), retained.map(entry => entry.entry_id));
+    assertEquals(rewound.tasks.map(task => task.subject), ['Keep task']);
+    assertEquals(rewound.taskNextId, 2);
+    assertEquals([...rewound.appliedTaskCallIds], ['retained-task']);
+    assertEquals(rewound.workerMetadata?.model ?? null, withGreeting ? 'model' : null);
+    assertEquals(rewound.status, withGreeting ? 'idle' : null);
+    const after = projector.append([{ eventId: 'new-output', event: { event: 'text_delta', data: { text: 'new output' } } }]);
+    assertEquals(after.lines.at(-1)?.body, 'new output');
+    const empty = projector.append([{ eventId: 'rewind-empty', event: { event: 'rewind_applied', data: {
+      session: { entries: [], pending_submissions: { submissions: [], head_id: null, notification_count: 0 } },
+      input: [], summary: { truncated_to_entries: 0, discarded_entries: 2, tool_side_effect_warning: false },
+    } } }]);
+    assertEquals(empty.lines, []);
+    assertEquals(empty.tasks, []);
+    assertEquals(empty.taskNextId, 1);
+  }
+});
+
 Deno.test("projectConsole mirrors live TaskCreate and TaskUpdate calls", () => {
   const projection = projectConsole([
     {

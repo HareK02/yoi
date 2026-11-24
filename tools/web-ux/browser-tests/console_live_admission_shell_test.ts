@@ -541,12 +541,31 @@ Deno.test("production rewind selects transcript rows locally and sends only entr
       { method: "rewind_to", params: { entry_id: "user-1" } },
       { method: "rewind_to", params: { entry_id: "user-1" } },
     ]);
+    assertEquals(await page.locator('.console-line.user').count(), 2);
+    assertEquals(await page.locator('.console-line.assistant').count(), 2);
     await control(base, { apply_rewind: true });
     await page.waitForFunction(() => document.querySelector(".cm-content")?.textContent === "Review the release notes before sending.");
     assertEquals(await selected.count(), 0);
+    await page.waitForFunction(() => document.querySelectorAll('.console-line.user').length === 1);
+    assert((await page.locator('.console-line.user').innerText()).includes('Earlier rewind input'));
+    assertEquals(await page.locator('.console-line.assistant').count(), 1);
+    assertEquals(await page.locator('.console-body').getByText('Ready. Choose a Feature', { exact: false }).count(), 0);
+    assertEquals(await page.getByRole('button', { name: /^Turn \d+:/ }).count(), 1);
     assertEquals(await page.locator(".cm-content").getAttribute("contenteditable"), "true");
     await page.keyboard.type(" edited");
     assertEquals(await page.locator(".cm-content").textContent(), "Review the release notes before sending. edited");
     assertEquals(errors, []);
     await page.screenshot({ path: join(caseOutput, "rewind-applied.png") });
+    await Deno.writeTextFile(join(caseOutput, 'review-context.json'), JSON.stringify({
+      status: 'pass', source: 'production Web with synthetic HTTP/WebSocket fixture',
+      viewport: page.viewportSize(), errors,
+      overflow: await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),
+      accessibility: await page.locator('main').ariaSnapshot(),
+    }, null, 2));
+    await page.reload();
+    await page.locator('.console-line.user').waitFor();
+    assertEquals(await page.locator('.console-line.user').count(), 1);
+    assertEquals(await page.locator('.console-line.assistant').count(), 1);
+    assertEquals(await page.getByRole('button', { name: /^Turn \d+:/ }).count(), 1);
+    assertEquals(errors, []);
   }, true));

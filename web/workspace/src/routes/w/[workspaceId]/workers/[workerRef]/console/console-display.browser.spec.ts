@@ -1971,10 +1971,48 @@ test("rewind selects existing history by ID, follows arrows, tolerates appended 
   await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
   expect(multiplexer.sendWorkerMethod).toHaveBeenCalledExactlyOnceWith({ method: "rewind_to", params: { entry_id: "second" } });
   expect(cm.state.readOnly).toBe(false);
+  expect(rows()).toHaveLength(3);
+  expect(screen.getByText("newly appended")).not.toBeNull();
   protocolEvent({ event: "rewind_applied", data: { session: { ...rewindSession(), entries: rewindSession().entries.slice(0, 1) }, input: [{ kind: "text", content: "identical input" }], summary: { truncated_to_entries: 1, discarded_entries: 2, tool_side_effect_warning: true } } });
+  await waitFor(() => expect(rows()).toHaveLength(1));
+  expect(screen.queryByText("newly appended")).toBeNull();
+  expect(screen.getAllByRole('button', { name: /^Turn \d+:/ })).toHaveLength(1);
   await waitFor(() => expect(cm.state.doc.toString()).toBe("identical input"));
   expect(view.container.querySelector(".rewind-selected")).toBeNull();
   expect(cm.hasFocus).toBe(true);
+});
+
+test("rewind clears paged history immediately and rejects a pre-rewind response even if refresh fails", async () => {
+  const stale = deferred<Response>();
+  let historyRequests = 0;
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    if (!String(input).includes('/session/history')) return Response.json({ availability: 'live_protocol' });
+    historyRequests += 1;
+    if (historyRequests === 1) return Response.json(historyPage([1, 2], null));
+    if (historyRequests === 2) return stale.promise;
+    return new Response(null, { status: 503 });
+  }));
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame(rewindSession()));
+  await screen.findByText('question 2');
+  protocolEvent({ event: 'run_end', data: { result: 'finished' } });
+  await waitFor(() => expect(historyRequests).toBe(2));
+  const retained = { ...rewindSession(), entries: rewindSession().entries.slice(0, 1) };
+  protocolEvent({ event: 'rewind_applied', data: {
+    session: retained, input: [],
+    summary: { truncated_to_entries: 1, discarded_entries: 1, tool_side_effect_warning: false },
+  } });
+  await waitFor(() => expect(view.container.querySelectorAll('.console-line.user')).toHaveLength(1));
+  expect(screen.queryByText('question 2')).toBeNull();
+  stale.resolve(Response.json(historyPage([1, 2], null)));
+  await screen.findByRole('button', { name: 'Earlier conversation unavailable · retry' });
+  expect(view.container.querySelectorAll('.console-line.user')).toHaveLength(1);
+  expect(screen.queryByText('question 1')).toBeNull();
+  expect(screen.queryByText('question 2')).toBeNull();
+  latestListener().onFrame(subscribedFrame(retained));
+  await waitFor(() => expect(historyRequests).toBe(4));
+  expect(view.container.querySelectorAll('.console-line.user')).toHaveLength(1);
 });
 
 test("rewind Escape and draft editing leave selection without sending; rejection keeps it available", async () => {
@@ -1991,6 +2029,7 @@ test("rewind Escape and draft editing leave selection without sending; rejection
   protocolEvent({ event: "error", data: { code: "invalid_request", message: "Target is outside current segment" } });
   await waitFor(() => expect(alert).toHaveBeenCalledWith("error", "Target is outside current segment", expect.any(Object)));
   expect(view.container.querySelector(".rewind-selected")).not.toBeNull();
+  expect(view.container.querySelectorAll('.console-line.user')).toHaveLength(2);
   expect((screen.getByRole("button", { name: "Rewind to selected input" }) as HTMLButtonElement).disabled).toBe(false);
   await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => "new draft" } });
   expect(cm.state.doc.toString()).toBe("new draft");
