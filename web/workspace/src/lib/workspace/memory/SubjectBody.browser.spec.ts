@@ -1663,3 +1663,99 @@ test("Worker and operation diagnostics never become user-facing prose", async ()
   expect(ui.container.textContent).not.toMatch(/runtime_id|worker_id|Request ID|Request diagnostics|frozen|retained|observation token|Worker lifecycle|Live execution/);
   expect(ui.container.textContent).not.toContain(saved.request.request_id);
 });
+
+test("start diagnostics are escaped, survive refresh, and clear on a different Subject", async () => {
+  const message =
+    'Profile "builtin:async-chat" cannot import ./base.dcdl <img src=x onerror=alert(1)>';
+  const posts: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string, init?: RequestInit) => {
+      if (init?.method !== "POST") {
+        return Response.json(
+          absent(path.includes("/other/") ? "other" : props.subjectId),
+        );
+      }
+      posts.push(init.body as string);
+      return Response.json({
+        request_id: JSON.parse(init.body as string).request_id,
+        disposition: posts.length === 1 ? "unknown" : "rejected",
+        diagnostics: [{
+          code: "subject_body_start_outcome_unknown",
+          severity: "warning",
+          message,
+        }],
+        body: absent(),
+      });
+    }),
+  );
+  const view = render(SubjectBody, props);
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Start Subject" }),
+  );
+  await screen.findByText("Could not confirm the operation.");
+  await ready();
+  await fireEvent.click(screen.getByText("Operation details"));
+  expect(screen.getByText(message, { exact: false }).textContent).toContain(
+    message,
+  );
+  expect(view.container.querySelector("img")).toBeNull();
+  await emitUpdate();
+  await ready();
+  expect(screen.getByText(message, { exact: false })).toBeTruthy();
+  expect(posts).toHaveLength(1);
+  await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  await screen.findByText("Could not complete the operation.");
+  await ready();
+  expect(posts[1]).toBe(posts[0]);
+  expect(screen.getByText(message, { exact: false })).toBeTruthy();
+  expect(
+    readSubjectBodyAttempt(
+      sessionStorage,
+      props.accountId,
+      props.workspaceId,
+      props.subjectId,
+    ),
+  ).toBeNull();
+  await view.rerender({ ...props, subjectId: "other" });
+  await ready();
+  expect(screen.queryByText(message, { exact: false })).toBeNull();
+  expect(screen.queryByText("Operation details")).toBeNull();
+});
+
+test("HTTP failure details stay visible without settling an unknown request", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_path: string, init?: RequestInit) => {
+      if (init?.method !== "POST") return Response.json(absent());
+      return Response.json({
+        error: "Config",
+        message: "Profile evaluation failed",
+        diagnostics: [
+          {
+            code: "profile_invalid",
+            severity: "error",
+            message: "Import map is incomplete",
+          },
+        ],
+        request: null,
+      }, { status: 500 });
+    }),
+  );
+  render(SubjectBody, props);
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Start Subject" }),
+  );
+  await screen.findByText("Could not confirm the operation.");
+  await ready();
+  expect(screen.getByText(/HTTP 500: Import map is incomplete/)).toBeTruthy();
+  expect(
+    readSubjectBodyAttempt(
+      sessionStorage,
+      props.accountId,
+      props.workspaceId,
+      props.subjectId,
+    ),
+  ).not.toBeNull();
+  expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+});

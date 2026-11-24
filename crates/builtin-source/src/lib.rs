@@ -113,7 +113,7 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         path: "profiles/async-chat.dcdl",
         source: include_str!("../../../resources/profiles/async-chat.dcdl"),
         description: "Explicitly connected Subject chat with bounded references and asynchronous Worker delegation.",
-        imports: NO_IMPORTS,
+        imports: BASE_IMPORT,
     },
     BuiltinProfileResource {
         selector: Some("builtin:companion"),

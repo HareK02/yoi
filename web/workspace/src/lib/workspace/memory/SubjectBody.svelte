@@ -30,6 +30,9 @@
   let controls = $derived(snapshot ? subjectBodyControls(snapshot) : { start: false, stop: false, recover: false });
   let retryAuthorized = $derived(snapshot && attempt && (attempt.action === 'stop' ? snapshot.can_stop : snapshot.can_start));
   let updatesUnavailable = $state(false);
+  let operationDetails = $derived([storageError, operationError, outcomeError].filter(
+    (message): message is string => !!message && message !== 'The Subject changed. Try again.',
+  ));
 
   function current(generation: number, account: string, workspace: string, subject: string): boolean {
     return routeGeneration === generation && accountId === account && workspaceId === workspace && subjectId === subject;
@@ -251,6 +254,20 @@
     {:else if snapshot && !snapshot.can_start && !snapshot.can_stop}
       <p role="status">Subject controls are unavailable.</p>
     {/if}
+    {#if !sending && !checkingOutcome && (operationDetails.length || receipt?.diagnostics.length)}
+      <details class="operation-details">
+        <summary>Operation details</summary>
+        {#each operationDetails as message}<p>{message}</p>{/each}
+        {#if receipt}
+          {#each receipt.diagnostics as diagnostic}
+            <p><code>{diagnostic.code}</code>: {diagnostic.message}</p>
+          {/each}
+        {/if}
+        {#if attempt && !operationError}
+          <p>The request may already have taken effect. Retry uses the same saved request; it does not create a new operation.</p>
+        {/if}
+      </details>
+    {/if}
     <div class="actions">
       {#if attempt}
         {#if attempt.action === "stop" && snapshot?.can_stop}
@@ -276,6 +293,11 @@
 
 <style>
   .subject-body { min-width: 0; overflow-wrap: anywhere; }
+  .operation-details { margin-bottom: var(--space-2); }
+  .operation-details summary { cursor: pointer; }
+  .operation-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .operation-details p { margin-top: var(--space-2); white-space: pre-wrap; }
+  .operation-details code { font-family: var(--font-mono); }
   .actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
   p { margin: 0 0 var(--space-2); }
   [role="alert"] { color: var(--danger); }

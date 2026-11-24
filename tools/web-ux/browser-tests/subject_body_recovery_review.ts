@@ -8,12 +8,14 @@ import { startOwnedProcesses, stopOwnedProcesses } from "../src/processes.ts";
 import { assertNoPageWideOverflow, freePort } from "./memory_document_harness.ts";
 
 const root = resolve(dirname(fromFileUrl(import.meta.url)), "../../..");
-const [buildArg, runId, mode] = Deno.args;
+const [buildArg, runId, mode, scenario] = Deno.args;
+const diagnosticScenario = scenario === "diagnostics";
 if (
-  !buildArg || !runId || !/^[a-zA-Z0-9._-]+$/.test(runId) || !["before", "after"].includes(mode)
+  !buildArg || !runId || !/^[a-zA-Z0-9._-]+$/.test(runId) || !["before", "after"].includes(mode) ||
+  (scenario !== undefined && scenario !== "diagnostics")
 ) {
   throw new Error(
-    "usage: subject_body_recovery_review.ts <actual-build-path> <unique-run-id> <before|after>",
+    "usage: subject_body_recovery_review.ts <actual-build-path> <unique-run-id> <before|after> [diagnostics]",
   );
 }
 const buildRoot = resolve(buildArg);
@@ -74,10 +76,17 @@ const owned = await startOwnedProcesses(
 let browser: Browser | undefined;
 try {
   browser = await chromium.launch({ headless: true });
-  for (const width of [1440, 768, 390]) {
+  for (
+    const { width, theme } of [1440, 768, 390].flatMap((width) =>
+      (diagnosticScenario ? ["light", "dark"] as const : ["light"] as const).map((theme) => ({
+        width,
+        theme,
+      }))
+    )
+  ) {
     const context = await browser.newContext({
       viewport: { width, height: 1000 },
-      colorScheme: "light",
+      colorScheme: theme,
       reducedMotion: "reduce",
     });
     // Worker notifications only invalidate the observation; the body GET supplies authority.
@@ -125,11 +134,11 @@ try {
       }
     });
     const current = { runtime_id: "runtime", worker_id: "failed-worker", generation: "2" };
-    let recovered = false;
+    let recovered = diagnosticScenario;
     let authority = true;
     const requests: unknown[] = [];
     const observations: unknown[] = [];
-    manifest.scenarios.push({ width, requests, observations });
+    manifest.scenarios.push({ width, theme, requests, observations });
     const body = () => ({
       workspace_id: "memory-review",
       subject_id: "empty-subject",
@@ -156,6 +165,24 @@ try {
           observations.push(observation);
           return await route.fulfill({ json: observation });
         }
+        if (diagnosticScenario) {
+          assert(request.url().endsWith("/start"));
+          const input = request.postDataJSON();
+          requests.push(input);
+          return await route.fulfill({
+            json: {
+              request_id: input.request_id,
+              disposition: requests.length === 1 ? "unknown" : "rejected",
+              diagnostics: [{
+                code: "subject_body_start_outcome_unknown",
+                severity: "warning",
+                message:
+                  'workspace backend config error: failed to resolve Profile "builtin:async-chat": profile source archive import is not declared in manifest import map: ./base.dcdl',
+              }],
+              body: body(),
+            },
+          });
+        }
         assert(request.url().endsWith("/recover"), "recovery must never dispatch start or stop");
         const input = request.postDataJSON();
         requests.push(input);
@@ -173,7 +200,7 @@ try {
       },
     );
     // Historical capture mode used HTTP; keep that bridge isolated from current WS assertions.
-    if (mode === "before") {
+    if (mode === "before" && !diagnosticScenario) {
       const conversation = {
         id: "conversation",
         subject_id: "empty-subject",
@@ -195,7 +222,7 @@ try {
         await page.locator('section.subject-body[aria-busy="false"]').waitFor();
       }
       await assertNoPageWideOverflow(page);
-      const image = join(output, `${width}-${state}.png`);
+      const image = join(output, `${width}-${theme}-${state}.png`);
       await page.screenshot({ path: image });
       captures.push({
         state,
@@ -211,6 +238,24 @@ try {
       const document = await page.goto(`${base}/w/memory-review/subjektiv/empty-subject/chat`);
       assertEquals(document?.status(), 200);
       await page.getByText("No public messages yet.").waitFor();
+      if (diagnosticScenario) {
+        await page.getByText("Subject controls", { exact: true }).click();
+        await page.getByRole("button", { name: "Start Subject", exact: true }).click();
+        await page.getByText("Could not confirm the operation.", { exact: true }).waitFor();
+        await capture("diagnostic-collapsed");
+        if (mode === "after") {
+          await page.getByText("Operation details", { exact: true }).click();
+          await page.getByText(/workspace backend config error: failed to resolve Profile/)
+            .waitFor();
+          await capture("diagnostic-expanded");
+        }
+        await page.getByRole("button", { name: "Retry", exact: true }).click();
+        await page.getByText("Could not complete the operation.", { exact: true }).waitFor();
+        assertEquals(requests.length, 2);
+        assertEquals(requests[0], requests[1]);
+        await capture("diagnostic-rejected");
+        continue;
+      }
       if (mode === "before") {
         await page.getByText("Body owner present; observation unavailable.", { exact: true })
           .waitFor();

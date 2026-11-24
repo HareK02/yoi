@@ -64,6 +64,15 @@ worker.workspace = true
 server-api = { path = "../server-api" }
 workdir.workspace = true
 
+[build-dependencies]
+decodal.workspace = true
+manifest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+
 [dev-dependencies]
 worker = { workspace = true, features = ["test-support"] }
 tools.workspace = true

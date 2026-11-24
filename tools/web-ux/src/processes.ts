@@ -224,7 +224,7 @@ export async function stopOwnedProcesses(processes: RunningProcess[]): Promise<C
       const descendants = await descendantPids(process.pid);
       tryKill(process.pid, "SIGTERM");
       for (const pid of descendants) tryKill(pid, "SIGTERM");
-      let timer: number | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const [parentExited, liveDescendants] = await Promise.all([
         Promise.race([
           process.status.then(() => true),
