@@ -3,7 +3,7 @@
   import WorkerRemovalStatus from '#lib/workspace/workers/WorkerRemovalStatus.svelte';
   import { workerDeletionOutcome, deletionNotice } from '#lib/workspace/workers/worker-removal.ts';
   import WorkerDriveGrants from '#lib/workspace/drive-grants/WorkerDriveGrants.svelte';
-  import { canRestoreWorker, createRestoreRequest, restoreWorkspaceWorker, restoreNotice, restoreErrorNotice, type RestoreRequest } from '#lib/workspace/sidebar/worker-actions.ts';
+  import { canDeleteSidebarWorker as canDeleteWorker, canRestoreWorker, createRestoreRequest, restoreWorkspaceWorker, restoreNotice, restoreErrorNotice, type RestoreRequest } from '#lib/workspace/sidebar/worker-actions.ts';
   import { workspaceWorkersStore, refreshWorkspaceWorkers } from '#lib/workspace/sidebar/worker-subscription.ts';
   import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
   import { workspaceApiPath } from '#lib/workspace/api/http.ts';
@@ -202,7 +202,7 @@
 
   async function deleteWorker(worker: Worker, candidate: CleanupWorkerCandidate): Promise<void> {
     const plan = cleanupPlans?.[worker.runtime_id];
-    if (!plan || busyAction || candidate.blocking_reason || cleanupCandidate(worker) !== candidate) return;
+    if (!plan || busyAction || !canDeleteWorker(worker) || candidate.blocking_reason || cleanupCandidate(worker) !== candidate) return;
     const scope = actionScope();
     busyAction = { workerKey: workerKey(worker), kind: 'delete' };
     cleanupPlans = {};
@@ -308,7 +308,7 @@
         <tbody>
           {#each workers as worker}
             {@const cleanup = cleanupCandidate(worker)}
-            {@const canDelete = cleanup && !cleanup.blocking_reason}
+            {@const canDelete = canDeleteWorker(worker) && cleanup && !cleanup.blocking_reason}
             {@const anyActionDisabled = actionsDisabled()}
             {@const workerDisplayName = worker.display_name || worker.label}
             <tr>

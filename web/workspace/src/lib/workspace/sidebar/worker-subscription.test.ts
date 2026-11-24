@@ -40,6 +40,7 @@ function worker(
     runtime_id: runtimeId,
     availability,
     state: 'idle',
+    lifecycle: 'active',
     has_running_internal_workers: hasRunningInternalWorkers,
     workspace_id: 'workspace-test',
     display_name: null,
@@ -105,13 +106,44 @@ Deno.test('Worker list state uses the authoritative live snapshot separately fro
       availability: 'observed',
       worker_state: null,
       state: 'missing',
+      lifecycle: undefined,
     }),
-    'missing',
+    'unknown',
   );
   unavailable.availability = 'observed';
   unavailable.worker_state = null;
   unavailable.state = 'stopped';
+  assertEquals(liveWorkerState(unavailable), 'unknown');
+  unavailable.lifecycle = 'stopped';
   assertEquals(liveWorkerState(unavailable), 'stopped');
+});
+
+Deno.test('Worker display preserves nonactive lifecycle instead of obsolete snapshots or catalog stopped status', () => {
+  const staleSnapshot = {
+    state_sequence: 1,
+    state: { kind: 'idle' as const },
+    last_command_id: 1,
+  };
+  for (const lifecycle of [
+    'not_started', 'stopped', 'awaiting_restore', 'creating',
+    'restoring', 'stopping', 'recovery_required',
+  ] as const) {
+    for (const worker_state of [null, staleSnapshot]) {
+      const target = { ...worker('runtime-a', 'worker-1'), state: 'stopped' as const, lifecycle, worker_state };
+      assertEquals(liveWorkerState(target), lifecycle);
+      assertEquals(liveWorkerState({ ...target, availability: 'unavailable' }), 'unknown');
+    }
+  }
+  for (const availability of [undefined, null, 'unknown', 'stale']) {
+    const target = { ...worker('runtime-a', 'worker-1'), availability, lifecycle: 'stopped' } as SubscriptionWorker;
+    assertEquals(liveWorkerState(target), 'unknown');
+  }
+  for (const lifecycle of [undefined, null, 'inactive', 'unknown', 'stale', 'future_lifecycle']) {
+    const target = {
+      ...worker('runtime-a', 'worker-1'), state: 'stopped', lifecycle, worker_state: staleSnapshot,
+    } as SubscriptionWorker;
+    assertEquals(liveWorkerState(target), 'unknown');
+  }
 });
 
 Deno.test('workspace Worker projection preserves Runtime lifecycle separately from last catalog status', () => {
@@ -130,7 +162,7 @@ Deno.test('workspace Worker projection preserves Runtime lifecycle separately fr
 Deno.test('registry-only Worker snapshots and updates do not infer stopped lifecycle', () => {
   const projection = createWorkspaceWorkersProjection();
   const registryOnly: SubscriptionWorker = {
-    ...worker('runtime-a', 'worker-1', false, 'unavailable'), state: 'stopped',
+    ...worker('runtime-a', 'worker-1', false, 'unavailable'), state: 'stopped', lifecycle: undefined,
   };
   applyWorkspaceWorkersFrame(projection, snapshot('subscription-1', [registryOnly]));
   const current = projection.workers.get(key('runtime-a', 'worker-1'));

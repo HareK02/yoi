@@ -73,14 +73,19 @@ fn stopped_worker(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId) 
             "request": request, "binding": {}, "restore_intent": "explicit"
         }}
     });
+    if schema >= 16 {
+        worker_document["workdir_attachments_guard"] =
+            serde_json::to_value(crate::runtime::WorkdirAttachmentsGuard::default()).unwrap();
+    }
+    if schema >= 17 {
+        worker_document["logical_workdir_attachments"] = json!([]);
+    }
     if schema == SCHEMA_VERSION {
         worker_document["execution_state"]["state"] = json!("stopped");
         worker_document["execution_state"]["execution"]
             .as_object_mut()
             .unwrap()
             .remove("restore_intent");
-        worker_document["workdir_attachments_guard"] =
-            serde_json::to_value(crate::runtime::WorkdirAttachmentsGuard::default()).unwrap();
     }
     write_json(&aggregate.join("worker.json"), &worker_document);
     let (session, segment) = write_v4_session(&aggregate);
@@ -95,7 +100,7 @@ fn stopped_worker(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId) 
     (worker, session, segment)
 }
 
-fn runtime_fixture(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId) {
+pub(super) fn runtime_fixture(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId) {
     fs::create_dir_all(root.join("workers")).unwrap();
     let fenced_worker = WorkerId::now_v7();
     write_json(
@@ -226,6 +231,7 @@ fn completed_v4_archive(
             request: request.clone(),
             result: completed.clone(),
             shutdown: None,
+            create_fingerprint: None,
         },
     );
     fs::remove_dir_all(provider.worker_dir(worker)).unwrap();

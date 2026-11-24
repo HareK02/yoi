@@ -959,6 +959,12 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Err("execution backend cannot confirm Subject create execution absence".into())
     }
 
+    /// Reject current execution resource conflicts without re-proving a settled
+    /// Stop. Runtime holds its Worker lease before entering the backend lock.
+    fn preflight_worker_removal(&self, _worker_ref: &WorkerRef) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Read-only exact execution identity check before Runtime persists exclusion.
     fn preflight_subject_delete_worker(
         &self,
@@ -1410,6 +1416,10 @@ impl WorkerExecutionBackendRef {
         request: &runtime_api::SubjectCreateRecoveryRequest,
     ) -> Result<(), String> {
         self.backend.recover_subject_create(request)
+    }
+
+    pub(crate) fn preflight_worker_removal(&self, worker_ref: &WorkerRef) -> Result<(), String> {
+        self.backend.preflight_worker_removal(worker_ref)
     }
 
     pub(crate) fn preflight_subject_delete_worker(

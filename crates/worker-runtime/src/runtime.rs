@@ -5126,66 +5126,41 @@ impl Runtime {
         if let Some(scope) = scope {
             self.ensure_worker_in_workspace(scope, worker_ref)?;
         }
-        let (backend, has_termination) = {
-            let state = self.lock()?;
-            state.ensure_running()?;
-            state.ensure_worker_ref(worker_ref)?;
-            state.ensure_subject_not_reserved(worker_ref, true)?;
-            let worker = state.worker(worker_ref)?;
-            if let Some(operation) = worker.pending_lifecycle_operation_name() {
-                return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} has pending {operation} reconciliation and cannot be deleted",
-                    worker_ref.worker_id
-                )));
-            }
-            if !worker.is_settled_inactive() {
-                return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} is active or requires reconciliation and must be stopped before deletion",
-                    worker_ref.worker_id
-                )));
-            }
-            (
-                state.execution_backend.clone(),
-                worker.restore_guard.execution_termination.is_some(),
-            )
-        };
-        if has_termination {
-            // Consume the canonical Stop's exact receipt. A new Stop could
-            // target a replacement Controller or discard a later candidate;
-            // neither is authorized by the original scope's termination.
-            if self.execution_termination_under_lock(worker_ref)?.is_none() {
-                return Err(RuntimeError::WorkerExecutionUnavailable {
-                    worker_id: worker_ref.worker_id,
-                    message: "canonical Stop receipt no longer matches the execution owner; deletion remains pending".into(),
-                });
-            }
-        } else if let Some(backend) = backend {
-            let result = backend.stop_worker(worker_ref);
-            if !result.is_accepted() {
-                return Err(RuntimeError::WorkerExecutionRejected {
-                    worker_id: worker_ref.worker_id,
-                    operation: result.operation,
-                    outcome: result.outcome,
-                    message: result.message_or_default(),
-                    result,
-                });
-            }
-        }
         let mut state = self.lock()?;
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
+        state.ensure_subject_not_reserved(worker_ref, true)?;
+        state.refresh_uncertain_worker_write(worker_ref)?;
         let worker = state.worker(worker_ref)?;
         if let Some(operation) = worker.pending_lifecycle_operation_name() {
             return Err(RuntimeError::InvalidRequest(format!(
-                "worker {} still has pending {operation} reconciliation",
+                "worker {} has pending {operation} reconciliation and cannot be deleted",
                 worker_ref.worker_id
             )));
         }
         if !worker.is_settled_inactive() {
             return Err(RuntimeError::InvalidRequest(format!(
-                "worker {} became active or reconciliation-required before deletion",
+                "worker {} is active or requires reconciliation and must be stopped before deletion",
                 worker_ref.worker_id
             )));
+        }
+        // The canonical lifecycle already owns termination and cleanup. Keep the
+        // lifecycle lease through deletion; current resource conflicts are not
+        // historical Stop evidence and never cause a replacement to be stopped.
+        let backend = state.execution_backend.clone();
+        drop(state);
+        if let Some(backend) = backend {
+            backend
+                .preflight_worker_removal(worker_ref)
+                .map_err(RuntimeError::InvalidRequest)?;
+        }
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        let worker = state.worker(worker_ref)?;
+        if !worker.is_settled_inactive() {
+            return Err(RuntimeError::InvalidRequest(
+                "Worker lifecycle changed before deletion".into(),
+            ));
         }
         #[cfg(feature = "fs-store")]
         let deletion = match state.fs_store() {
@@ -6869,6 +6844,15 @@ impl Runtime {
                 "Worker retention Runtime identity mismatch".to_string(),
             ));
         }
+        let backend = state.execution_backend.clone();
+        drop(state);
+        if let Some(backend) = backend {
+            backend
+                .preflight_worker_removal(&WorkerRef::new(request.worker_id))
+                .map_err(RuntimeError::InvalidRequest)?;
+        }
+        let mut state = self.lock()?;
+        state.ensure_running()?;
         let store = state.fs_store().ok_or_else(|| {
             RuntimeError::InvalidRequest(
                 "Worker retention execution requires an fs-backed Runtime".to_string(),
@@ -6907,81 +6891,42 @@ impl Runtime {
                 worker_id: request.worker_id,
             });
         }
-        if worker.status() != WorkerStatus::Stopped {
+        if !worker.is_settled_inactive() {
             return Err(RuntimeError::InvalidRequest(
-                "Worker retention requires a stopped Worker".to_string(),
+                "Worker retention requires a settled NotStarted or Stopped Worker".to_string(),
             ));
         }
-        if let Some(operation) = worker.pending_lifecycle_operation_name() {
-            return Err(RuntimeError::InvalidRequest(format!(
-                "Worker retention cannot remove pending {operation} reconciliation"
-            )));
-        }
-        // Preserve only the original canonical Stop, not stopped status, map
-        // absence or a backend receipt for a different execution. The aggregate
-        // is about to disappear; the existing retention operation owns the
-        // historical copy. Missing legacy evidence does not block removal.
+        // Keep accepted submissions and diagnostics as history, not as a second
+        // eligibility check. Cold settled Workers need no execution owner.
         let shutdown = worker.request.as_ref().and_then(|create| {
             worker
                 .restore_guard
                 .execution_termination
                 .as_ref()
-                .and_then(|termination| {
-                    termination
-                        .confirms_scope_shutdown(&worker.worker_ref, termination.stop_operation_id)
-                        .then(|| crate::retention::RetainedWorkerShutdown {
-                            create_fingerprint: create.create_fingerprint.clone(),
-                            stop_operation_id: termination.stop_operation_id,
-                            termination: termination.clone(),
-                        })
+                .map(|termination| crate::retention::RetainedWorkerShutdown {
+                    create_fingerprint: create.create_fingerprint.clone(),
+                    stop_operation_id: termination.stop_operation_id,
+                    termination: termination.clone(),
                 })
         });
         let expected = worker.persisted_record();
-        let backend = state.execution_backend.clone();
-        drop(state);
-        if let Some(saved) = shutdown.as_ref() {
-            let current = backend
-                .ok_or_else(|| {
-                    RuntimeError::InvalidRequest(
-                        "Canonical removal shutdown has no execution owner".into(),
-                    )
-                })?
-                .reconcile_termination_receipt(&expected.worker_ref, &saved.termination)
-                .map_err(RuntimeError::InvalidRequest)?;
-            if current.as_ref() != Some(&saved.termination) {
-                return Err(RuntimeError::InvalidRequest(
-                    "Canonical removal shutdown no longer matches execution owner".into(),
-                ));
+        let (_, matches) = match store.reconcile_worker_record(&expected) {
+            Ok(observation) => observation,
+            Err(error) => {
+                // Only the exact retention receipt may finish the source-removed
+                // window while this catalog still holds the original record.
+                let Ok(result) = provider.recover_after_source_removal(request) else {
+                    return Err(error);
+                };
+                state.workers.remove(&request.worker_id);
+                state.persist_runtime_snapshot()?;
+                return Ok(result);
             }
-        }
-        let mut state = self.lock()?;
-        state.ensure_running()?;
-        if shutdown.is_some() {
-            let store = state.fs_store().ok_or_else(|| {
-                RuntimeError::InvalidRequest(
-                    "Canonical removal shutdown requires filesystem storage".into(),
-                )
-            })?;
-            let (_, matches) = match store.reconcile_worker_record(&expected) {
-                Ok(observation) => observation,
-                Err(error) => {
-                    // The exact operation may have removed its source before
-                    // saving the final receipt while this catalog stayed live.
-                    // Only that provider-owned receipt can finish this window;
-                    // never upgrade its original shutdown or create a new one.
-                    let Ok(result) = provider.recover_after_source_removal(request) else {
-                        return Err(error);
-                    };
-                    state.workers.remove(&request.worker_id);
-                    state.persist_runtime_snapshot()?;
-                    return Ok(result);
-                }
-            };
-            if !matches {
-                return Err(RuntimeError::InvalidRequest(
-                    "Canonical removal shutdown source changed".into(),
-                ));
-            }
+        };
+        if !matches {
+            return Err(RuntimeError::InvalidRequest(
+                "Worker retention canonical source changed".into(),
+            ));
         }
         let result = provider.execute_with_shutdown(request, shutdown)?;
         state.workers.remove(&request.worker_id);
@@ -7749,8 +7694,11 @@ impl RuntimeState {
             worker_id,
             runtime_id: None,
             resource_key: None,
-            availability: if worker.worker_state().is_some() && worker.active_execution().is_some()
-            {
+            availability: if worker.is_settled_inactive()
+                || matches!(
+                    worker.observation_state(),
+                    crate::catalog::WorkerObservationState::Current { .. }
+                ) {
                 protocol::subscription::SubscriptionWorkerAvailability::Observed
             } else {
                 protocol::subscription::SubscriptionWorkerAvailability::Unavailable
@@ -12679,6 +12627,15 @@ mod tests {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
                 assert_eq!(worker.state, SubscriptionWorkerState::Stopped);
+                assert_eq!(
+                    worker.lifecycle,
+                    Some(protocol::WorkerLifecycleState::Stopped)
+                );
+                assert_eq!(
+                    worker.availability,
+                    protocol::subscription::SubscriptionWorkerAvailability::Observed
+                );
+                assert!(worker.worker_state.is_none());
                 assert!(!worker.has_running_internal_workers);
             }
             payload => panic!("unexpected subscription payload: {payload:?}"),
@@ -14522,6 +14479,8 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     include!("runtime/execution_termination_tests.rs");
+
+    include!("runtime/trusted_removal_tests.rs");
 
     #[cfg(feature = "fs-store")]
     #[test]

@@ -401,15 +401,17 @@ impl InternalWorkerSummary {
 }
 
 fn observation_availability(
+    lifecycle: protocol::WorkerLifecycleState,
     observation: &runtime_api::WorkerObservationState,
 ) -> protocol::subscription::SubscriptionWorkerAvailability {
-    match observation {
-        runtime_api::WorkerObservationState::Current { .. } => {
+    use protocol::WorkerLifecycleState::{Active, NotStarted, Stopped};
+    match (lifecycle, observation) {
+        // A successfully read settled lifecycle has no live Controller snapshot.
+        (NotStarted | Stopped, _)
+        | (Active, runtime_api::WorkerObservationState::Current { .. }) => {
             protocol::subscription::SubscriptionWorkerAvailability::Observed
         }
-        runtime_api::WorkerObservationState::Unavailable => {
-            protocol::subscription::SubscriptionWorkerAvailability::Unavailable
-        }
+        _ => protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
     }
 }
 
@@ -3507,7 +3509,7 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability: observation_availability(&summary.observation),
+            availability: observation_availability(summary.lifecycle, &summary.observation),
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -3555,7 +3557,7 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability: observation_availability(&detail.observation),
+            availability: observation_availability(detail.lifecycle, &detail.observation),
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             execution_reconstructed: detail.execution_reconstructed,
@@ -6330,7 +6332,7 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability: observation_availability(&summary.observation),
+            availability: observation_availability(summary.lifecycle, &summary.observation),
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -6376,7 +6378,7 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability: observation_availability(&detail.observation),
+            availability: observation_availability(detail.lifecycle, &detail.observation),
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             execution_reconstructed: detail.execution_reconstructed,
@@ -11922,6 +11924,8 @@ mod tests {
         };
         let response = runtime_api::SubjectDeleteWorkerResponse {
             originals_absent: true,
+            completed_removal: None,
+            pending_removal: None,
             workspace_id: request.workspace_id.clone(),
             worker_id: request.worker_id,
             create_fingerprint: request.create_fingerprint.clone(),
@@ -12342,6 +12346,15 @@ mod tests {
                 .is_none()
         );
         assert_eq!(stopped_detail.state, "stopped");
+        assert_eq!(
+            workers.items[0].availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert_eq!(
+            stopped_detail.availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert!(stopped_detail.worker_state.is_none());
         assert_eq!(
             stopped_detail.lifecycle,
             Some(protocol::WorkerLifecycleState::Stopped)

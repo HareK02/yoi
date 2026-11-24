@@ -4211,6 +4211,43 @@ where
             .clone())
     }
 
+    // Caller holds the backend Worker lock, acquired after the Runtime Worker
+    // lease. Only current owners matter here; Stop owns termination and cleanup.
+    fn confirm_worker_resources_absent_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<(), String> {
+        if self
+            .workers
+            .lock()
+            .map_err(|_| "worker registry poisoned")?
+            .contains_key(worker_ref)
+            || self.pending_spawn_exists(worker_ref)?
+            || self
+                .pending_restores
+                .lock()
+                .map_err(|_| "restore registry poisoned")?
+                .contains_key(worker_ref)
+            || self
+                .subject_reservations
+                .lock()
+                .map_err(|_| "Subject reservations poisoned")?
+                .iter()
+                .any(|((saved, _), reservation)| {
+                    saved == worker_ref
+                        && (reservation.guard.is_some()
+                            || !matches!(
+                                reservation.state,
+                                runtime_api::SubjectReleaseState::Cancelled
+                                    | runtime_api::SubjectReleaseState::Disconnected
+                            ))
+                })
+        {
+            return Err("Worker still has an execution resource owner".into());
+        }
+        Ok(())
+    }
+
     fn wait_for_runtime_task<T>(receiver: mpsc::Receiver<Result<T, String>>) -> Result<T, String> {
         receiver
             .recv_timeout(RUNTIME_TASK_TIMEOUT)
@@ -6368,6 +6405,12 @@ where
         Ok(())
     }
 
+    fn preflight_worker_removal(&self, worker_ref: &WorkerRef) -> Result<(), String> {
+        let lock = self.worker_lock(worker_ref)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        self.confirm_worker_resources_absent_under_lock(worker_ref)
+    }
+
     fn confirm_subject_delete_worker_absent(
         &self,
         request: &runtime_api::SubjectDeleteWorkerRequest,
@@ -6394,40 +6437,7 @@ where
         {
             return Err("exact Subject admission fence required".into());
         }
-        if self.pending_spawn_exists(&worker)?
-            || self
-                .pending_restores
-                .lock()
-                .map_err(|_| "restore registry poisoned")?
-                .contains_key(&worker)
-            || self
-                .workers
-                .lock()
-                .map_err(|_| "worker registry poisoned")?
-                .contains_key(&worker)
-            || self
-                .subject_reservations
-                .lock()
-                .map_err(|_| "Subject reservations poisoned")?
-                .iter()
-                .any(|((saved, _), reservation)| {
-                    *saved == worker
-                        && (reservation.guard.is_some()
-                            || !matches!(
-                                reservation.state,
-                                runtime_api::SubjectReleaseState::Cancelled
-                                    | runtime_api::SubjectReleaseState::Disconnected
-                            ))
-                })
-        {
-            return Err("Subject Worker still has an execution resource owner".into());
-        }
-        // The caller's confirmed fence proves prior shutdown. Factory artifacts
-        // are checked separately; neither an empty map nor cleanup mints proof.
-        let factory = self.factory.clone();
-        self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
-            factory.reconcile_stopped_worker(&worker).await
-        })
+        self.confirm_worker_resources_absent_under_lock(&worker)
     }
 
     fn subject_delete_worker_stop(

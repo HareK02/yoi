@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "request": {
+    "operation_id": "legacy-removal-1",
+    "input_fingerprint": "legacy-retention-fingerprint-1",
+    "archive_id": "legacy-archive-1",
+    "workspace_id": "workspace-a",
+    "source_runtime_id": "runtime-a",
+    "worker_id": "00000000-0000-7000-8000-000000000001",
+    "source_created_at": "2026-10-01T00:00:00Z",
+    "removed_at": "2026-10-06T00:00:00Z",
+    "effective_profile": "builtin:coder",
+    "retention_class": null,
+    "policy_id": "legacy-policy",
+    "session_disposition": "archive",
+    "diagnostics_disposition": "purge"
+  },
+  "result": {
+    "operation_id": "legacy-removal-1",
+    "input_fingerprint": "legacy-retention-fingerprint-1",
+    "worker_id": "00000000-0000-7000-8000-000000000001",
+    "session_disposition": "archive",
+    "diagnostics_disposition": "purge",
+    "archive": {
+      "schema_version": 1,
+      "archive_id": "legacy-archive-1",
+      "workspace_id": "workspace-a",
+      "source_runtime_id": "runtime-a",
+      "source_worker_id": "00000000-0000-7000-8000-000000000001",
+      "source_session_id": "10000000-0000-4000-8000-000000000001",
+      "segment_ids": [],
+      "source_created_at": "2026-10-01T00:00:00Z",
+      "removed_at": "2026-10-06T00:00:00Z",
+      "archived_at_unix_seconds": 1791244800,
+      "effective_profile": "builtin:coder",
+      "retention_class": null,
+      "content_checksum_sha256": "synthetic-archive-identity-only",
+      "content_bytes": 26,
+      "content_file_count": 1,
+      "policy_id": "legacy-policy",
+      "operation_id": "legacy-removal-1",
+      "input_fingerprint": "legacy-retention-fingerprint-1"
+    },
+    "source_removed": true,
+    "diagnostics_retained": false
+  }
+}

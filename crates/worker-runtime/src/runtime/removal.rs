@@ -10,7 +10,7 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 struct SavedRemovalFreeze {
     request: WorkerRetentionExecutionRequest,
-    create_fingerprint: String,
+    create_fingerprint: Option<String>,
     freeze: WorkerRemovalFreeze,
 }
 
@@ -40,7 +40,10 @@ fn read_saved(path: &Path) -> Result<Option<SavedRemovalFreeze>, RuntimeError> {
                 .map_err(|_| ownership_unknown("Worker removal freeze is corrupt"))?;
             let freeze = &saved.freeze;
             let mut sessions = std::collections::HashSet::new();
-            if saved.create_fingerprint.is_empty()
+            if saved
+                .create_fingerprint
+                .as_deref()
+                .is_some_and(str::is_empty)
                 || freeze.operation_id != saved.request.operation_id
                 || freeze.input_fingerprint != saved.request.input_fingerprint
                 || freeze.workspace_id != saved.request.workspace_id
@@ -129,7 +132,8 @@ fn source_error(error: session_store::StoreError) -> RuntimeError {
 
 // Both Remove and explicit Release enumerate the same producer-owned Session union.
 // The caller owns the exclusive publication lock and, for live Release, an actual
-// Controller reservation. Only Remove additionally requires canonical Stop receipts.
+// Controller reservation. Remove uses the settled lifecycle; optional termination
+// history below reconciles accepted input, not whether execution has stopped.
 fn recording_scope_members(
     root: &Path,
     owner: &WorkerSessionSources,
@@ -602,8 +606,8 @@ impl Runtime {
         Ok(())
     }
 
-    /// Persist original ingress exclusion only after reconciling the canonical
-    /// Stop owner. Metadata fixes every retained source without restoring it.
+    /// Freeze a canonically settled producer under its lifecycle lease. Optional
+    /// Stop history preserves accepted-input checks, not a second shutdown gate.
     pub fn freeze_worker_removal_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,
@@ -616,7 +620,7 @@ impl Runtime {
         let lease = self.worker_operation_lock(request.worker_id)?;
         let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
         let worker_ref = WorkerRef::new(request.worker_id);
-        let (root, create_fingerprint) = {
+        let (root, create_fingerprint, termination, backend) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
             state.ensure_workspace_owner(scope, false)?;
@@ -636,22 +640,24 @@ impl Runtime {
             let fingerprint = worker
                 .request
                 .as_ref()
-                .ok_or_else(|| ownership_unknown("Worker removal create identity unavailable"))?
-                .create_fingerprint
-                .clone();
+                .map(|request| request.create_fingerprint.clone());
             let root = state
                 .fs_store()
                 .ok_or_else(|| source_unavailable("Worker removal requires filesystem storage"))?
                 .runtime_dir()
                 .to_path_buf();
-            (root, fingerprint)
+            (
+                root,
+                fingerprint,
+                worker.restore_guard.execution_termination.clone(),
+                state.execution_backend.clone(),
+            )
         };
-        let termination = self
-            .execution_termination_under_lock(&worker_ref)
-            .map_err(|error| execution_unconfirmed(error.to_string()))?
-            .ok_or_else(|| {
-                execution_unconfirmed("Worker removal requires canonical Stop termination proof")
-            })?;
+        if let Some(backend) = backend {
+            backend
+                .preflight_worker_removal(&worker_ref)
+                .map_err(execution_unconfirmed)?;
+        }
         let owner = sources(&root, &scope.workspace_id, request.worker_id)?;
         let _publication = owner.lock_exclusive().map_err(source_error)?;
         let path = owner.freeze_path();
@@ -671,7 +677,7 @@ impl Runtime {
             &owner,
             &scope.workspace_id,
             request.worker_id,
-            Some(&termination),
+            termination.as_ref(),
         )?;
         let freeze = WorkerRemovalFreeze {
             operation_id: request.operation_id.clone(),
@@ -726,9 +732,7 @@ impl Runtime {
                     worker
                         .request
                         .as_ref()
-                        .ok_or_else(|| ownership_unknown("Frozen archive create identity missing"))?
-                        .create_fingerprint
-                        .clone(),
+                        .map(|request| request.create_fingerprint.clone()),
                 )
             } else {
                 None
@@ -747,8 +751,8 @@ impl Runtime {
         })?;
         if saved.request != *request
             || fingerprint
-                .as_deref()
-                .is_some_and(|value| value != saved.create_fingerprint)
+                .as_ref()
+                .is_some_and(|value| value != &saved.create_fingerprint)
         {
             return Err(ownership_unknown(
                 "Frozen archive operation or producer identity mismatch",
@@ -1118,11 +1122,7 @@ impl Runtime {
                         worker
                             .request
                             .as_ref()
-                            .ok_or_else(|| {
-                                ownership_unknown("Worker removal create identity missing")
-                            })?
-                            .create_fingerprint
-                            .clone(),
+                            .map(|request| request.create_fingerprint.clone()),
                     )
                 }
                 None => None,
@@ -1145,8 +1145,8 @@ impl Runtime {
             || saved.request.workspace_id != scope.workspace_id
             || runtime_id.as_deref() != Some(saved.request.source_runtime_id.as_str())
             || fingerprint
-                .as_deref()
-                .is_some_and(|value| value != saved.create_fingerprint)
+                .as_ref()
+                .is_some_and(|value| value != &saved.create_fingerprint)
         {
             return Err(ownership_unknown(
                 "Worker removal capture identity mismatch",
@@ -1289,7 +1289,9 @@ pub(super) fn check_retention_freeze(
 ) -> Result<(), RuntimeError> {
     let owner = sources(root, &request.workspace_id, request.worker_id)?;
     if let Some(saved) = read_saved(&owner.freeze_path())? {
-        if create_fingerprint.is_some_and(|fingerprint| fingerprint != saved.create_fingerprint) {
+        if create_fingerprint
+            .is_some_and(|fingerprint| Some(fingerprint) != saved.create_fingerprint.as_deref())
+        {
             return Err(ownership_unknown("Worker retention creation owner changed"));
         }
         if saved.request != *request {

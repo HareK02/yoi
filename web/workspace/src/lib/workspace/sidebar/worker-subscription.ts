@@ -26,7 +26,7 @@ export type SidebarWorker = Omit<Worker, "workdir_attachments"> & {
   workdir_attachments: SidebarWorkdirAttachment[];
   has_running_internal_workers: boolean;
   /** Catalog lifecycle, independent of the possibly unknown foreground display state. */
-  lifecycleState: SubscriptionWorker["state"];
+  lifecycleState: SubscriptionWorker["lifecycle"];
 };
 
 export type WorkspaceWorkersState = {
@@ -403,7 +403,7 @@ function projectWorker(
     availability: worker.availability,
     state: liveWorkerState(worker),
     lifecycle: worker.lifecycle,
-    lifecycleState: worker.state,
+    lifecycleState: worker.lifecycle,
     restore_observation_token: worker.restore_observation_token,
     worker_state: worker.worker_state,
     pinned: false,
