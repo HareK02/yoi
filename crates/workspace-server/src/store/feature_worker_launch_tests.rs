@@ -246,6 +246,11 @@ mod public_feature_operation {
             first
         );
         let reopened = SqliteWorkspaceStore::open_for_test(&fixture.path).unwrap();
+        for identity in ["human-worker:first", "human-worker:second", "manual:human-worker:first"] {
+            assert_eq!(reopened.reserved_worker_create_runtime("workspace-a", identity).unwrap(), Some("runtime-a".into()));
+            assert!(!reopened.worker_create_allocation_removed("workspace-a", identity).unwrap());
+        }
+        assert_eq!(reopened.reserved_worker_create_runtime("workspace-a", "missing").unwrap(), None);
         assert_eq!(
             saved(&reopened, "human-worker:second", "caller-second")
                 .unwrap()
@@ -334,6 +339,10 @@ mod public_feature_operation {
             )
             .unwrap();
         assert_ne!(next.worker_id, first.worker_id);
+        for identity in ["first", "alias", "manual:first"] {
+            assert!(fixture.store.worker_create_allocation_removed("workspace-a", identity).unwrap());
+        }
+        assert!(!fixture.store.worker_create_allocation_removed("workspace-a", "replacement").unwrap());
         assert!(matches!(
             saved(&fixture.store, "alias", "caller-alias"),
             Err(Error::RepositoryConflict(_))

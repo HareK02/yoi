@@ -172,6 +172,18 @@ impl SqliteWorkspaceStore {
     }
 }
 
+pub(super) fn allocation_for_operation(
+    conn: &Connection,
+    workspace: &str,
+    operation_or_allocation: &str,
+) -> Result<String> {
+    let bound: Option<String> = conn.query_row(
+        "SELECT allocation_key FROM worker_create_operation_bindings WHERE workspace_id=?1 AND operation_id=?2",
+        params![workspace, operation_or_allocation], |row| row.get(0),
+    ).optional()?;
+    Ok(bound.unwrap_or_else(|| operation_or_allocation.to_owned()))
+}
+
 fn valid_profile_bundle(workspace: &str, profile: &str, bundle: &ConfigBundle) -> bool {
     !profile.is_empty()
         && profile.trim() == profile

@@ -4525,10 +4525,13 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         allocation_key: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2 AND state='removed')",
-            params![workspace_id, allocation_key], |row| row.get(0),
-        )?))
+        self.with_conn(|conn| {
+            let allocation_key = feature_worker_launch::allocation_for_operation(conn, workspace_id, allocation_key)?;
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2 AND state='removed')",
+                params![workspace_id, allocation_key], |row| row.get(0),
+            )?)
+        })
     }
 
     /// Read only: recover the original create reservation, never create/restore a
@@ -4589,6 +4592,7 @@ impl SqliteWorkspaceStore {
         allocation_key: &str,
     ) -> Result<Option<String>> {
         self.with_conn(|conn| {
+            let allocation_key = feature_worker_launch::allocation_for_operation(conn, workspace_id, allocation_key)?;
             Ok(conn.query_row(
                 "SELECT runtime_id FROM worker_create_reservations WHERE workspace_id = ?1 AND allocation_key = ?2",
                 params![workspace_id, allocation_key],

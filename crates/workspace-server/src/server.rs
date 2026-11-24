@@ -36219,6 +36219,8 @@ async fn create_workspace_worker_authenticated_on_host(
                 "Worker creation must use the authenticated worker-control reservation path".into(),
             )
         })?)
+    } else if let Some(operation) = resolved_control_operation {
+        Some(operation)
     } else {
         let account = account.as_deref().ok_or_else(|| {
             Error::WorkspacePermissionDenied(
