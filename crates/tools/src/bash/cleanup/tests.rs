@@ -136,6 +136,8 @@ fn terminal() -> CommandTerminal {
         status: CommandStatus::Completed,
         exit_code: Some(0),
         process_failure: None,
+        signal: None,
+        resource_outcome: None,
         output_collection: CommandOutputCollection::Complete,
         stdout_bytes: 7,
         stderr_bytes: 0,

@@ -778,6 +778,7 @@ async fn spawn_fault_retains_safe_reason_without_claiming_output_collection() {
         "spawn-fault",
         &CommandTelemetry::new(),
         BTreeMap::new(),
+        Arc::new(crate::CommandHost::default()),
         cancel_rx,
         &sender,
     )
@@ -884,4 +885,185 @@ async fn drain_failure_and_byte_budget_keep_independent_loss_diagnostics() {
         );
         assert!(terminal.metadata_valid());
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a user systemd manager, cgroup v2 memory controller and user@.service OOMPolicy=continue"]
+async fn systemd_scope_oom_is_attributed_without_stopping_sibling_or_provider() {
+    let root = TempDir::new().unwrap();
+    let host = crate::CommandHost::systemd(32 * 1024 * 1024, 2).unwrap();
+    let session = LocalWorkdirSession::new(
+        Scope::writable(root.path()).unwrap(),
+        root.path().to_path_buf(),
+    )
+    .with_command_host(host)
+    .unwrap();
+    let harness = Harness {
+        session,
+        _root: root,
+    };
+    let sibling = harness
+        .start("printf sibling-ready; exec sleep 100", 30)
+        .await;
+    let page = harness.page(&sibling, 0, 13).await;
+    assert_eq!(
+        stream_bytes(&page.chunks, CommandStream::Stdout),
+        b"sibling-ready"
+    );
+    let oom = harness.start(
+        "printf before-oom; x=$(head -c 67108864 /dev/zero | tr '\\0' x); printf unexpected-success", 15,
+    ).await;
+    let (chunks, terminal) = harness.collect(&oom, 0).await;
+    assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"before-oom");
+    assert_eq!(terminal.status, CommandStatus::Failed);
+    assert_eq!(
+        terminal.resource_outcome,
+        Some(crate::CommandResourceOutcome::Systemd {
+            oom: crate::CommandOomObservation::SystemdOomKill,
+            cleanup_confirmed: true,
+        })
+    );
+    assert!(terminal.metadata_valid(), "{terminal:?}");
+    assert_eq!(
+        harness
+            .session
+            .command_status(sibling.clone())
+            .await
+            .unwrap(),
+        CommandStatus::Running
+    );
+    harness
+        .session
+        .cancel_command(sibling.clone())
+        .await
+        .unwrap();
+    let (_, cancelled) = harness.collect(&sibling, 0).await;
+    assert_eq!(cancelled.status, CommandStatus::Cancelled);
+    let next = harness.start("printf after-oom", 10).await;
+    let (chunks, terminal) = harness.collect(&next, 0).await;
+    assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"after-oom");
+    assert_eq!(terminal.status, CommandStatus::Completed);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a user systemd manager, cgroup v2 memory controller and user@.service OOMPolicy=continue"]
+async fn systemd_scope_collects_detached_grandchildren_and_distinguishes_kill_from_oom() {
+    let root = TempDir::new().unwrap();
+    let session = LocalWorkdirSession::new(
+        Scope::writable(root.path()).unwrap(),
+        root.path().to_path_buf(),
+    )
+    .with_command_host(crate::CommandHost::systemd(32 * 1024 * 1024, 1).unwrap())
+    .unwrap();
+    let harness = Harness {
+        session,
+        _root: root,
+    };
+    for (script, expected) in [
+        (
+            "setsid bash -c 'trap \"\" TERM; printf grandchild; exec sleep 100' & wait",
+            CommandStatus::TimedOut,
+        ),
+        (
+            "setsid bash -c 'printf grandchild; exec sleep 100' &",
+            CommandStatus::Completed,
+        ),
+        ("kill -KILL $$", CommandStatus::Failed),
+        ("exit 137", CommandStatus::Failed),
+    ] {
+        let command = format!("cat /proc/self/cgroup; {script}");
+        let handle = harness.start(&command, 1).await;
+        let (chunks, terminal) = harness.collect(&handle, 0).await;
+        let stdout = stream_bytes(&chunks, CommandStream::Stdout);
+        let text = std::str::from_utf8(&stdout).unwrap();
+        let cgroup = text.lines().next().unwrap().strip_prefix("0::/").unwrap();
+        assert!(
+            !Path::new("/sys/fs/cgroup").join(cgroup).exists(),
+            "scope cgroup survived cleanup"
+        );
+        assert_eq!(terminal.status, expected, "{terminal:?}");
+        assert!(
+            matches!(
+                terminal.resource_outcome,
+                Some(crate::CommandResourceOutcome::Systemd {
+                    oom: crate::CommandOomObservation::NotObserved
+                        | crate::CommandOomObservation::Unknown,
+                    cleanup_confirmed: true,
+                })
+            ),
+            "{terminal:?}"
+        );
+        assert!(terminal.metadata_valid(), "{terminal:?}");
+        if script.starts_with("kill") {
+            // systemd-run may report its child's signal as exit 137. Only the
+            // launcher's actual wait signal is retained, never reconstructed.
+            assert!(terminal.signal == Some(libc::SIGKILL) || terminal.exit_code == Some(137));
+        }
+        if script.starts_with("exit") {
+            assert_eq!(terminal.exit_code, Some(137));
+            assert_eq!(terminal.signal, None);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_host_budget_refuses_commands_before_launch_across_workdirs() {
+    let host = crate::CommandHost::systemd(32 * 1024 * 1024, 1).unwrap();
+    let reservation = host.admit().unwrap();
+    for _ in 0..2 {
+        let root = TempDir::new().unwrap();
+        let session =
+            LocalWorkdirSession::new(Scope::writable(root.path()).unwrap(), root.path().into())
+                .with_command_host(host.clone())
+                .unwrap();
+        let error = session
+            .start_command(Harness::request("touch must-not-start", 1, 10))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::Unavailable(_)));
+        assert!(!root.path().join("must-not-start").exists());
+    }
+    drop(reservation);
+    assert!(host.admit().is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a user systemd manager, cgroup v2 memory controller and user@.service OOMPolicy=continue"]
+async fn systemd_scope_missing_launcher_never_falls_back_to_unconfined_execution() {
+    let root = TempDir::new().unwrap();
+    let session = LocalWorkdirSession::materialized_bound_with_environment(
+        Workdir::new("missing-launcher"),
+        root.path().into(),
+        root.path().into(),
+        SharedScope::new(Scope::writable(root.path()).unwrap()),
+        WorkdirSessionCapabilities::ALL,
+        BTreeMap::from([("PATH".into(), "/nonexistent-yoi-command-path".into())]),
+        vec![],
+    )
+    .with_command_host(crate::CommandHost::systemd(32 * 1024 * 1024, 1).unwrap())
+    .unwrap();
+    let harness = Harness {
+        session,
+        _root: root,
+    };
+    let handle = harness.start("touch must-not-start", 5).await;
+    let (_, terminal) = harness.collect(&handle, 0).await;
+    assert_eq!(terminal.status, CommandStatus::Failed);
+    assert_eq!(
+        terminal.output_collection,
+        CommandOutputCollection::NotStarted
+    );
+    assert_eq!(
+        terminal.resource_outcome,
+        Some(crate::CommandResourceOutcome::SetupUnconfirmed {
+            oom: crate::CommandOomObservation::Unknown,
+            cleanup_confirmed: true
+        })
+    );
+    assert!(terminal.metadata_valid());
+    assert!(!harness._root.path().join("must-not-start").exists());
 }

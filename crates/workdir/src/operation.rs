@@ -235,6 +235,7 @@ pub enum CommandFailureStage {
     StderrRead,
     StdoutDrain,
     StderrDrain,
+    OutputDrain,
     OutputDelivery,
 }
 
@@ -267,6 +268,29 @@ pub enum CommandOutputCollection {
     Incomplete { failure: CommandFailure },
 }
 
+/// OOM attribution requires execution-unit evidence, never SIGKILL or exit 137.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOomObservation {
+    SystemdOomKill,
+    NotObserved,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CommandResourceOutcome {
+    Unconfined,
+    SetupUnconfirmed {
+        oom: CommandOomObservation,
+        cleanup_confirmed: bool,
+    },
+    Systemd {
+        oom: CommandOomObservation,
+        cleanup_confirmed: bool,
+    },
+}
+
 /// Raw totals include discarded *observed* pipe bytes, not an unknown failed tail.
 /// Delivered totals count only prefixes admitted to the transport queue, not page
 /// reads or retries. Neither terminal arrival nor exit zero implies EOF collection.
@@ -276,6 +300,10 @@ pub struct CommandTerminal {
     pub status: CommandStatus,
     pub exit_code: Option<i32>,
     pub process_failure: Option<CommandFailure>,
+    /// Unix signal observed from wait, independently of resource attribution.
+    pub signal: Option<i32>,
+    /// None means no resource evidence, including retained results from older providers.
+    pub resource_outcome: Option<CommandResourceOutcome>,
     pub output_collection: CommandOutputCollection,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
@@ -296,6 +324,25 @@ impl CommandTerminal {
         {
             return false;
         }
+        if self.signal.is_some_and(|signal| signal <= 0)
+            || (self.signal.is_some() && self.exit_code.is_some())
+            || (self.status == CommandStatus::Completed
+                && (self.signal.is_some()
+                    || matches!(
+                        self.resource_outcome,
+                        Some(CommandResourceOutcome::SetupUnconfirmed { .. })
+                            | Some(CommandResourceOutcome::Systemd {
+                                oom: CommandOomObservation::SystemdOomKill,
+                                ..
+                            })
+                            | Some(CommandResourceOutcome::Systemd {
+                                cleanup_confirmed: false,
+                                ..
+                            })
+                    )))
+        {
+            return false;
+        }
         match self.process_failure {
             Some(CommandFailure {
                 stage: CommandFailureStage::Spawn,
@@ -303,6 +350,7 @@ impl CommandTerminal {
             }) => {
                 self.status == CommandStatus::Failed
                     && self.exit_code.is_none()
+                    && self.signal.is_none()
                     && self.output_collection == CommandOutputCollection::NotStarted
                     && self.stdout_bytes == 0
                     && self.stderr_bytes == 0
@@ -313,9 +361,19 @@ impl CommandTerminal {
             }) => {
                 self.status != CommandStatus::Completed
                     && self.exit_code.is_none()
+                    && self.signal.is_none()
                     && self.collection_started()
             }
             Some(_) => false,
+            None if self.output_collection == CommandOutputCollection::NotStarted => {
+                matches!(
+                    self.status,
+                    CommandStatus::Cancelled | CommandStatus::TimedOut
+                ) && self.exit_code.is_none()
+                    && self.signal.is_none()
+                    && self.stdout_bytes == 0
+                    && self.stderr_bytes == 0
+            }
             None => self.collection_started(),
         }
     }
@@ -488,6 +546,19 @@ mod tests {
             (
                 "process_failure",
                 serde_json::json!({"stage":"spawn","reason":"not_found"}),
+            ),
+            ("signal", serde_json::json!(9)),
+            (
+                "resource_outcome",
+                serde_json::json!({"kind":"setup_unconfirmed","oom":"unknown","cleanup_confirmed":true}),
+            ),
+            (
+                "resource_outcome",
+                serde_json::json!({"kind":"systemd", "oom":"systemd_oom_kill", "cleanup_confirmed":true}),
+            ),
+            (
+                "resource_outcome",
+                serde_json::json!({"kind":"systemd", "oom":"unknown", "cleanup_confirmed":false}),
             ),
             ("truncation_reason", serde_json::json!("byte_budget")),
         ] {

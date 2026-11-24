@@ -27,6 +27,8 @@ workdir = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+axum.workspace = true
+workdir = { workspace = true, features = ["http-client"] }
 jsonschema = { version = "0.33.0", default-features = false }
 error-contract = { workspace = true, features = ["test-support"] }
 filetime = "0.2.27"
