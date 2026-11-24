@@ -4452,12 +4452,12 @@ async fn subject_removal_prior_purge_receipt_recovers_without_inventing_erasure(
 }
 
 #[tokio::test]
-async fn subject_removal_pending_purge_receipt_recovers_with_current_canonical_shutdown() {
+async fn subject_removal_pending_purge_receipt_recovers_from_settled_lifecycle() {
     assert_prior_purge_receipt(true, false).await;
 }
 
 #[tokio::test]
-async fn subject_removal_missing_canonical_shutdown_never_adopts_stale_catalog_purge() {
+async fn subject_removal_pending_purge_receipt_needs_no_historical_shutdown_reproof() {
     assert_prior_purge_receipt(true, true).await;
 }
 
@@ -4523,19 +4523,9 @@ async fn assert_prior_purge_receipt(stale_catalog: bool, missing_shutdown: bool)
         .prepare_worker_removal_execution(TEST_WORKSPACE_ID, &plan.plan_id, &plan.input_fingerprint)
         .unwrap();
     if stale_catalog {
-        let worker = worker_runtime::identity::WorkerRef::new(f.target.worker_id.parse().unwrap());
-        let shutdown = f
-            .execution
-            .terminations
-            .lock()
-            .unwrap()
-            .get(&worker)
-            .cloned()
-            .expect("fixture must retain its genuine Stop receipt");
-        assert!(shutdown.confirms_scope_shutdown(&worker, shutdown.stop_operation_id));
-        // The original v1 pending result has no embedded shutdown proof.
-        // Current canonical Stop must be reconciled independently; a stopped
-        // catalog and this historical receipt cannot replace missing proof.
+        // Model the committed disposition checkpoint before final receipt/catalog
+        // publication. Runtime already owns a settled lifecycle; the old optional
+        // shutdown payload is not a second completion gate for this operation.
         let request = &prepared.runtime_request;
         let pending = worker_runtime::retention::WorkerRetentionExecutionResult {
             operation_id: request.operation_id.clone(),
@@ -4562,7 +4552,11 @@ async fn assert_prior_purge_receipt(stale_catalog: bool, missing_shutdown: bool)
         )
         .unwrap();
         std::fs::remove_dir_all(session_root(f.dir.path(), &f.target).parent().unwrap()).unwrap();
-        assert_eq!(f.api.runtime.worker(&f.target).unwrap().state, "stopped");
+        let observed = f.api.runtime.worker(&f.target).unwrap();
+        assert_eq!(
+            observed.lifecycle,
+            Some(protocol::WorkerLifecycleState::Stopped)
+        );
     } else {
         let result = f
             .api
@@ -4581,8 +4575,9 @@ async fn assert_prior_purge_receipt(stale_catalog: bool, missing_shutdown: bool)
         )
         .unwrap();
     if missing_shutdown {
-        // Fault only the substituted execution owner's reconciliation evidence.
-        // Do not change the Runtime catalog, original operation or provider receipt.
+        // Remove only the substituted owner's optional historical receipt. The
+        // canonical stopped aggregate and original disposition checkpoint stay
+        // intact; no new Stop or synthetic termination is authorized here.
         let worker = worker_runtime::identity::WorkerRef::new(f.target.worker_id.parse().unwrap());
         assert!(
             f.execution
@@ -4606,37 +4601,18 @@ async fn assert_prior_purge_receipt(stale_catalog: bool, missing_shutdown: bool)
             receipt.get("shutdown").is_none_or(Value::is_null),
             "historical receipt must not be upgraded into shutdown evidence"
         );
-        assert_eq!(receipt["result"]["source_removed"], !missing_shutdown);
+        assert_eq!(receipt["result"]["source_removed"], true);
     }
     if missing_shutdown {
-        assert_eq!(
-            response.status,
-            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            "{}",
-            response.body
-        );
-        assert!(response.body.contains("runtime_retention_failed"));
+        let worker = worker_runtime::identity::WorkerRef::new(f.target.worker_id.parse().unwrap());
         assert!(
-            f.api
-                .store
-                .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            !f.execution
+                .terminations
+                .lock()
                 .unwrap()
-                .is_some()
+                .contains_key(&worker),
+            "settled lifecycle recovery must not manufacture a new Stop receipt"
         );
-        let retained = f
-            .api
-            .config_store
-            .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
-            .unwrap()
-            .unwrap();
-        assert_eq!(retained.plan.operation_id, plan.operation_id);
-        assert_eq!(retained.plan.input_fingerprint, plan.input_fingerprint);
-        assert_ne!(
-            retained.plan.state,
-            crate::retention::WorkerRemovalPlanState::Succeeded
-        );
-        assert!(!f.store.journal_session_erased(&f.host).unwrap());
-        return;
     }
     assert_eq!(
         response.status,
@@ -5182,13 +5158,12 @@ impl SubjectRemovalFixture {
             store,
         } = self;
         let config = api.config.clone();
-        // Reopen the Server's stores/catalog while the external substituted
-        // execution owner retains its joined Stop receipts. A provider-process
-        // cold receipt reader is exercised by the production Runtime suites.
+        // Reopen stores/catalog while preserving the substituted execution owner's
+        // independent Job receipts. These are not a second producer-stop gate.
         let retained_execution = Arc::new(execution.with_retained_stopped_executions());
         drop(api);
-        // Reconstruct Server/Runtime over the same execution owner. Its real
-        // Stop receipts survive; a new empty fake cannot certify a cold shutdown.
+        // Keep Job execution/Host cleanup evidence distinct from the source
+        // Worker's canonical settled lifecycle and completed removal receipts.
         drop(dispatcher);
         drop(store);
         let control = Arc::new(test_control_store(&config));

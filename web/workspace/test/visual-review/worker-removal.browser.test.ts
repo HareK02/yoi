@@ -6,8 +6,10 @@ import { startOwnedProcesses, stopOwnedProcesses } from "../../../../tools/web-u
 // prove rendering and browser interaction, not Backend persistence or authority.
 Deno.test("Worker removal receipts retain Workers and expose saved progress after reload", async () => {
   const before = Deno.args.includes("--before");
+  const lifecycleOnly = Deno.args.includes("--lifecycle-only");
+  const lifecycleBefore = Deno.args.includes("--lifecycle-before");
   const root = new URL("../../../../", import.meta.url).pathname;
-  const output = `${root}web/workspace/.svelte-kit/removal-review/${before ? "before" : "after"}/`;
+  const output = `${root}web/workspace/.svelte-kit/removal-review/${lifecycleOnly ? "lifecycle-" : ""}${before || lifecycleBefore ? "before" : "after"}/`;
   await Deno.mkdir(output, { recursive: true });
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (listener.addr as Deno.NetAddr).port;
@@ -113,6 +115,8 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
                 workspace_id: workspace,
               },
               availability: "observed",
+              lifecycle: "stopped" as string | undefined,
+              restore_observation_token: "lifecycle-visual-observation",
               state: "stopped",
               last_seen_at: null,
               pinned: false,
@@ -178,6 +182,7 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
                   },
                 }),
             );
+            await page.route("**/api/w/*/workers/W-842", (route) => route.fulfill({ json: worker }));
             await page.route(
               "**/api/w/*/runtimes/runtime-a/cleanup-plan",
               (route) => route.fulfill({ json: plan() }),
@@ -214,6 +219,8 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
               resource_key: worker.resource_key,
               workspace_id: workspace,
               availability: "observed",
+              lifecycle: "stopped" as string | undefined,
+              restore_observation_token: "lifecycle-visual-observation",
               state: "stopped",
               display_name: worker.display_name,
               profile: worker.profile,
@@ -306,6 +313,50 @@ Deno.test("Worker removal receipts retain Workers and expose saved progress afte
               throw error;
             });
             await capture("normal", documentStatus);
+            if (lifecycleOnly) {
+              // Keep the old catalog status deliberately stopped. These frames
+              // exercise the real page and sidebar's canonical lifecycle gates.
+              for (const [lifecycle, availability] of [
+                ["not_started", "observed"],
+                ["stopped", "observed"],
+                ["awaiting_restore", "observed"],
+                ["creating", "observed"],
+                ["restoring", "observed"],
+                ["stopping", "observed"],
+                ["recovery_required", "observed"],
+                [undefined, "observed"],
+                ["stopped", "unavailable"],
+              ] as const) {
+                worker.lifecycle = streamWorker.lifecycle = lifecycle;
+                worker.availability = streamWorker.availability = availability;
+                documentStatus = (await page.reload())?.status() ?? null;
+                const name = `${lifecycle ?? "unknown"}-${availability}`;
+                const deletion = page.getByRole("button", { name: `Delete ${worker.display_name}`, exact: true });
+                await deletion.waitFor();
+                const settled = availability === "observed" && (lifecycle === "not_started" || lifecycle === "stopped");
+                if (!lifecycleBefore) {
+                  assertEquals(await deletion.isDisabled(), !settled, name);
+                  assertEquals(await page.getByRole("button", { name: `Restore ${worker.display_name}`, exact: true }).isDisabled(), !settled, name);
+                }
+                await capture(`${name}-page`, documentStatus);
+                const showSidebar = page.getByRole("button", { name: "Show sidebar", exact: true });
+                if (await showSidebar.isVisible()) await showSidebar.click();
+                await page.locator(".worker-nav-item").first().hover();
+                await page.getByRole("button", { name: "Actions for Journal source — long retained history", exact: true }).click();
+                const menu = page.getByRole("menu", { name: "Actions for Journal source — long retained history", exact: true });
+                await menu.waitFor();
+                if (!lifecycleBefore) {
+                  assertEquals(await menu.getByRole("menuitem", { name: "Restore", exact: true }).isDisabled(), !settled, name);
+                  assertEquals(await menu.getByRole("menuitem", { name: "Delete", exact: true }).isDisabled(), !settled, name);
+                  assertEquals(await menu.getByRole("menuitem", { name: "Stop", exact: true }).isDisabled(), true, name);
+                }
+                await capture(`${name}-menu`, documentStatus);
+                await page.keyboard.press("Escape");
+              }
+              assertEquals(mutations, 0);
+              assertEquals(errors, []);
+              continue;
+            }
             await page.getByRole("button", {
               name: `Delete ${worker.display_name}`,
               exact: true,

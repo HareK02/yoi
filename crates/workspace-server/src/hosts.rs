@@ -404,20 +404,14 @@ fn observation_availability(
     lifecycle: protocol::WorkerLifecycleState,
     observation: &runtime_api::WorkerObservationState,
 ) -> protocol::subscription::SubscriptionWorkerAvailability {
-    // A successful Runtime read can confirm an inactive lifecycle without a Controller snapshot.
-    if matches!(
-        lifecycle,
-        protocol::WorkerLifecycleState::Stopped | protocol::WorkerLifecycleState::NotStarted
-    ) {
-        return protocol::subscription::SubscriptionWorkerAvailability::Observed;
-    }
-    match observation {
-        runtime_api::WorkerObservationState::Current { .. } => {
+    use protocol::WorkerLifecycleState::{Active, NotStarted, Stopped};
+    match (lifecycle, observation) {
+        // A successfully read settled lifecycle has no live Controller snapshot.
+        (NotStarted | Stopped, _)
+        | (Active, runtime_api::WorkerObservationState::Current { .. }) => {
             protocol::subscription::SubscriptionWorkerAvailability::Observed
         }
-        runtime_api::WorkerObservationState::Unavailable => {
-            protocol::subscription::SubscriptionWorkerAvailability::Unavailable
-        }
+        _ => protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
     }
 }
 
@@ -11930,6 +11924,8 @@ mod tests {
         };
         let response = runtime_api::SubjectDeleteWorkerResponse {
             originals_absent: true,
+            completed_removal: None,
+            pending_removal: None,
             workspace_id: request.workspace_id.clone(),
             worker_id: request.worker_id,
             create_fingerprint: request.create_fingerprint.clone(),
@@ -12366,6 +12362,15 @@ mod tests {
             workers.items[4].availability,
             protocol::subscription::SubscriptionWorkerAvailability::Unavailable
         );
+        assert_eq!(
+            workers.items[0].availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert_eq!(
+            stopped_detail.availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert!(stopped_detail.worker_state.is_none());
         assert_eq!(
             stopped_detail.lifecycle,
             Some(protocol::WorkerLifecycleState::Stopped)

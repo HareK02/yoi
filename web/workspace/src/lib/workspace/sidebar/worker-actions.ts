@@ -30,14 +30,19 @@ function workerPath(workspaceId: string, worker: WorkerActionTarget): string {
   );
 }
 
-export function canRestoreWorker(worker: {
-  availability: Worker["availability"];
+type WorkerLifecycleObservation = Pick<Worker, "availability" | "lifecycle"> & {
   state?: string;
-  lifecycleState?: string;
-  restore_observation_token?: string | null;
-}): boolean {
+};
+
+function isSettledInactiveWorker(worker: WorkerLifecycleObservation): boolean {
   return worker.availability === "observed" &&
-    (worker.lifecycleState ?? worker.state) === "stopped" &&
+    (worker.lifecycle === "not_started" || worker.lifecycle === "stopped");
+}
+
+export function canRestoreWorker(
+  worker: WorkerLifecycleObservation & { restore_observation_token?: string | null },
+): boolean {
+  return isSettledInactiveWorker(worker) &&
     Boolean(worker.restore_observation_token);
 }
 
@@ -148,16 +153,12 @@ export function restoreErrorNotice(cause: unknown): RestoreNotice {
   };
 }
 
-export function canStopSidebarWorker(worker: {
-  availability: Worker["availability"];
-  lifecycleState: string;
-}): boolean {
-  return worker.availability === "observed" &&
-    ["idle", "running", "paused"].includes(worker.lifecycleState);
+export function canStopSidebarWorker(worker: WorkerLifecycleObservation): boolean {
+  return worker.availability === "observed" && worker.lifecycle === "active";
 }
 
-export function canDeleteSidebarWorker(worker: WorkerActionTarget): boolean {
-  return worker.state === "stopped";
+export function canDeleteSidebarWorker(worker: WorkerLifecycleObservation): boolean {
+  return isSettledInactiveWorker(worker);
 }
 
 export async function stopSidebarWorker(

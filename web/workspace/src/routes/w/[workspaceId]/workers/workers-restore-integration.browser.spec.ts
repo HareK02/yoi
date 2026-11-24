@@ -49,6 +49,7 @@ function worker(state = "stopped", token = "generation-1") {
     display_name: "Team Worker",
     label: "Team Worker",
     availability: "observed" as const,
+    lifecycle: state === "stopped" ? "stopped" as const : "active" as const,
     state,
     restore_observation_token: token,
     tags: [],

@@ -681,7 +681,11 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
                     serde_json::to_value(&loaded.restore_guard).unwrap(),
                 )
             });
-        assert!(cleanup_calls.load(Ordering::SeqCst) > cleanup_before);
+        if startup_recovers {
+            assert_eq!(cleanup_calls.load(Ordering::SeqCst), cleanup_before);
+        } else {
+            assert!(cleanup_calls.load(Ordering::SeqCst) > cleanup_before);
+        }
         let settled = reopened
             .test_runtime_store()
             .read_worker_record(&worker.worker_ref)
@@ -701,7 +705,11 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
         );
         assert_eq!(
             cold.admissions.lock().unwrap()[&worker.worker_ref].deletion_stop_operation_id,
-            Some(original.stop_operation_id)
+            if startup_recovers {
+                None
+            } else {
+                Some(original.stop_operation_id)
+            }
         );
         assert!(cold.completed_stops.lock().unwrap().is_empty());
         assert!(cold.workers.lock().unwrap().is_empty());
@@ -746,6 +754,15 @@ impl WorkerExecutionBackend for SubjectStopSaveFaultBackend {
         request: &runtime_api::SubjectDeleteWorkerRequest,
     ) -> Result<(), String> {
         self.inner.fence_subject_delete_worker(request)
+    }
+    fn preflight_worker_removal(&self, worker: &WorkerRef) -> Result<(), String> {
+        self.inner.preflight_worker_removal(worker)
+    }
+    fn confirm_subject_delete_worker_absent(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        self.inner.confirm_subject_delete_worker_absent(request)
     }
     fn subject_delete_worker_stop(
         &self,
@@ -829,6 +846,11 @@ fn subject_delete_first_stop_saves_original_child_and_reconciles_interrupted_com
             .create_worker_scoped(&scope, create.clone())
             .unwrap();
         let execution = inner.workers.lock().unwrap()[&worker.worker_ref].clone();
+        assert!(
+            backend
+                .preflight_worker_removal(&worker.worker_ref)
+                .is_err()
+        );
         let request = runtime_api::SubjectDeleteWorkerRequest {
             workspace_id: scope.workspace_id.clone(),
             worker_id: create.worker_id,
@@ -892,7 +914,7 @@ fn subject_delete_first_stop_saves_original_child_and_reconciles_interrupted_com
         );
         assert_eq!(
             cold.admissions.lock().unwrap()[&worker.worker_ref].deletion_stop_operation_id,
-            Some(original.stop_operation_id)
+            None
         );
         assert!(cold.workers.lock().unwrap().is_empty());
         assert!(cold.factory.observed_cwds.lock().unwrap().is_empty());
@@ -902,7 +924,7 @@ fn subject_delete_first_stop_saves_original_child_and_reconciles_interrupted_com
 
 #[test]
 #[cfg(feature = "fs-store")]
-fn subject_delete_cold_prior_stop_rejects_replacement_and_mismatched_originals() {
+fn subject_delete_cold_settled_state_rejects_replacement_without_rechecking_stop_history() {
     let temp = tempfile::tempdir_in(".").unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let new_backend = || {
@@ -961,18 +983,41 @@ fn subject_delete_cold_prior_stop_rejects_replacement_and_mismatched_originals()
         "feature",
         "whole-receipt",
         "candidate",
+        "live",
+        "fingerprint",
+        "foreign",
         "child",
         "valid",
     ] {
         let backend = new_backend();
-        if invalid == "candidate" {
+        let current_owner = matches!(invalid, "candidate" | "live" | "fingerprint" | "foreign");
+        if current_owner {
             let mut request = direct_restore_request(worker.worker_ref.clone());
             request.workspace_scope = Some(scope.clone());
             request.request = create.clone();
+            if invalid == "fingerprint" {
+                request.request.create_fingerprint.push_str("-replacement");
+            } else if invalid == "foreign" {
+                request.workspace_scope.as_mut().unwrap().workspace_id = "foreign-workspace".into();
+                request.request.workspace_api.as_mut().unwrap().workspace_id =
+                    "foreign-workspace".into();
+                request
+                    .request
+                    .memory_settings
+                    .as_mut()
+                    .unwrap()
+                    .workspace_id = "foreign-workspace".into();
+            }
+            let operation_id = request.operation_id;
             assert!(matches!(
                 backend.restore_worker(request),
                 WorkerExecutionSpawnResult::Connected { .. }
             ));
+            if invalid == "live" {
+                backend
+                    .activate_restored_worker(operation_id, &worker.worker_ref)
+                    .unwrap();
+            }
         } else if invalid == "child" {
             backend.admissions.lock().unwrap().insert(
                 worker.worker_ref.clone(),
@@ -1016,19 +1061,57 @@ fn subject_delete_cold_prior_stop_rejects_replacement_and_mismatched_originals()
                 .unwrap()
                 .insert(worker.worker_ref.clone(), wrong);
         }
+        let retained_stops = backend.completed_stops.lock().unwrap().clone();
+        let retained_child = backend
+            .admissions
+            .lock()
+            .unwrap()
+            .get(&worker.worker_ref)
+            .and_then(|admission| admission.deletion_stop_operation_id);
         let runtime =
             EmbeddedRuntime::with_fs_store_and_execution_backend(options.clone(), backend.clone())
                 .unwrap();
         let result = runtime.subject_delete_worker_scoped(&scope, deletion.clone());
-        if invalid == "valid" {
-            result.unwrap();
-            assert_eq!(
-                runtime.execution_termination(&worker.worker_ref).unwrap(),
-                Some(original.clone())
+        if current_owner {
+            assert!(
+                result.is_err(),
+                "current replacement must remain owned: {invalid}"
             );
-            assert!(backend.completed_stops.lock().unwrap().is_empty());
+            assert!(
+                backend
+                    .confirm_subject_delete_worker_absent(&deletion)
+                    .is_err()
+            );
         } else {
-            assert!(result.is_err(), "{invalid}");
+            assert!(!result.unwrap().originals_absent);
+        }
+        let canonical = runtime.test_runtime_store().read_worker_record(&worker.worker_ref).unwrap();
+        assert_eq!(
+            serde_json::to_value(&canonical.restore_guard).unwrap()["execution_termination"],
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(*backend.completed_stops.lock().unwrap(), retained_stops);
+        assert_eq!(
+            backend.admissions.lock().unwrap()[&worker.worker_ref].deletion_stop_operation_id,
+            retained_child,
+            "settled Subject deletion must not start or retag a Stop"
+        );
+        if invalid != "valid" {
+            // Explicit Stop receipt replay still requires its exact original;
+            // settled deletion above does not consume or reconcile that history.
+            assert!(
+                backend
+                    .subject_delete_worker_stop(
+                        &deletion,
+                        WorkerExecutionStopRequest {
+                            worker_ref: worker.worker_ref.clone(),
+                            operation_id: original.stop_operation_id,
+                        },
+                        Some(&original),
+                    )
+                    .is_err(),
+                "{invalid}"
+            );
             let record = runtime
                 .test_runtime_store()
                 .read_worker_record(&worker.worker_ref)
@@ -1037,13 +1120,20 @@ fn subject_delete_cold_prior_stop_rejects_replacement_and_mismatched_originals()
                 serde_json::to_value(&record.restore_guard).unwrap()["execution_termination"],
                 serde_json::to_value(&original).unwrap()
             );
-            if invalid == "candidate" {
-                assert!(
-                    backend
-                        .pending_restore(&worker.worker_ref)
-                        .unwrap()
-                        .is_some()
-                );
+            if current_owner {
+                if invalid == "live" {
+                    let current = backend.workers.lock().unwrap()[&worker.worker_ref].clone();
+                    assert_ne!(current.tasks.execution_id, original.execution_id);
+                    assert!(!current.handle.protocol_is_closed());
+                } else {
+                    assert!(
+                        backend
+                            .pending_restore(&worker.worker_ref)
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                assert!(backend.completed_stops.lock().unwrap().is_empty());
                 let stopped = backend.stop_worker_operation(WorkerExecutionStopRequest {
                     worker_ref: worker.worker_ref.clone(),
                     operation_id: crate::execution::WorkerLifecycleOperationId::new(),
@@ -1056,7 +1146,7 @@ fn subject_delete_cold_prior_stop_rejects_replacement_and_mismatched_originals()
 
 #[test]
 #[cfg(feature = "fs-store")]
-fn subject_delete_stopped_catalog_without_original_never_certifies_empty_backend() {
+fn subject_delete_stopped_catalog_without_stop_history_never_restarts_execution() {
     let root = tempfile::tempdir().unwrap();
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(MockFactory {
@@ -1116,15 +1206,19 @@ fn subject_delete_stopped_catalog_without_original_never_certifies_empty_backend
         create_fingerprint: create.create_fingerprint,
         operation_id: "missing-original".into(),
     };
-    assert!(
-        runtime
-            .subject_delete_worker_scoped(&scope, deletion.clone())
-            .is_err()
-    );
-    assert!(
+    let confirmed = runtime
+        .subject_delete_worker_scoped(&scope, deletion.clone())
+        .unwrap();
+    assert!(!confirmed.originals_absent);
+    assert_eq!(
         runtime
             .subject_delete_worker_scoped(&scope, deletion)
-            .is_err()
+            .unwrap(),
+        confirmed
+    );
+    assert_eq!(
+        backend.admissions.lock().unwrap()[&worker_ref].deletion_stop_operation_id,
+        None
     );
     assert!(
         runtime
@@ -1219,13 +1313,14 @@ fn subject_delete_confirmed_removal_retries_warm_and_cold_without_new_stop() {
     let reopened =
         EmbeddedRuntime::with_fs_store_and_execution_backend(options.clone(), cold.clone())
             .unwrap();
+    let completed_cleanup_calls = cleanup_calls.load(Ordering::SeqCst);
     cleanup_allowed.store(false, Ordering::SeqCst);
-    assert!(
-        reopened
-            .subject_delete_worker_scoped(&scope, deletion.clone())
-            .is_err(),
-        "saved response cannot bypass current factory cleanup"
+    assert_eq!(
+        reopened.subject_delete_worker_scoped(&scope, deletion.clone()).unwrap(),
+        expected,
+        "completed removal must not repeat Stop-owned factory cleanup"
     );
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), completed_cleanup_calls);
     cleanup_allowed.store(true, Ordering::SeqCst);
     let material = options
         .root
@@ -1261,7 +1356,7 @@ fn subject_delete_confirmed_removal_retries_warm_and_cold_without_new_stop() {
 #[test]
 #[cfg(feature = "fs-store")]
 #[serial_test::serial(worker_allocation)]
-fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history() {
+fn subject_delete_removal_first_accepts_missing_shutdown_and_rechecks_cold_removal_identity() {
     let temp = tempfile::tempdir_in(".").unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let spawns = Arc::new(AtomicUsize::new(0));
@@ -1355,11 +1450,12 @@ fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history(
         create_fingerprint: create.create_fingerprint.clone(),
         operation_id: "first-Subject".into(),
     };
-    // Every failure happens after a real ordinary removal, before any successful
-    // Subject response; an empty adapter/catalog cannot provide the missing fact.
-    let mut bad = receipt.clone();
-    bad.as_object_mut().unwrap().remove("shutdown");
-    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    // Completed removal remains authoritative without optional Stop history.
+    // Contradictory identities below must still fail before Subject confirmation.
+    let mut without_shutdown = receipt.clone();
+    without_shutdown.as_object_mut().unwrap().remove("shutdown");
+    let receipt_bytes = serde_json::to_vec(&without_shutdown).unwrap();
+    fs::write(&receipt_path, &receipt_bytes).unwrap();
     assert!(
         runtime
             .execute_worker_retention(&removal)
@@ -1372,11 +1468,6 @@ fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history(
             .get("shutdown")
             .is_none(),
         "legacy replay must not synthesize shutdown"
-    );
-    assert!(
-        runtime
-            .subject_delete_worker_scoped(&scope, deletion.clone())
-            .is_err()
     );
     let mut bad = receipt.clone();
     bad["shutdown"]["stop_operation_id"] =
@@ -1438,12 +1529,14 @@ fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history(
             .is_err()
     );
     fs::write(&receipt_path, &receipt_bytes).unwrap();
+    let completed_cleanup_calls = cleanup_calls.load(Ordering::SeqCst);
     cleanup_allowed.store(false, Ordering::SeqCst);
     assert!(
         runtime
             .subject_delete_worker_scoped(&scope, deletion.clone())
-            .is_err()
+            .unwrap().originals_absent
     );
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), completed_cleanup_calls);
     cleanup_allowed.store(true, Ordering::SeqCst);
     let confirmed = runtime
         .subject_delete_worker_scoped(&scope, deletion.clone())
@@ -1491,17 +1584,23 @@ fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history(
         "cold retry must reread the original whole child receipt, not just request fields"
     );
     fs::write(&receipt_path, &receipt_bytes).unwrap();
-    // A later completed Controller is successor evidence even with empty maps.
+    // Later Stop history is not a current resource owner and must not replace
+    // the exact completed removal or be adopted as another shutdown proof.
     let mut successor = original.clone();
     successor.execution_id = uuid::Uuid::now_v7();
     cold.completed_stops
         .lock()
         .unwrap()
-        .insert(worker.worker_ref.clone(), successor);
-    assert!(
+        .insert(worker.worker_ref.clone(), successor.clone());
+    assert_eq!(
         reopened
             .subject_delete_worker_scoped(&scope, deletion.clone())
-            .is_err()
+            .unwrap(),
+        confirmed
+    );
+    assert_eq!(
+        cold.completed_stops.lock().unwrap()[&worker.worker_ref],
+        successor
     );
     cold.completed_stops.lock().unwrap().clear();
     let mut duplicate = receipt.clone();
@@ -1515,12 +1614,16 @@ fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history(
             .is_err()
     );
     fs::remove_file(duplicate_path).unwrap();
+    let completed_cleanup_calls = cleanup_calls.load(Ordering::SeqCst);
     cleanup_allowed.store(false, Ordering::SeqCst);
-    assert!(
+    assert_eq!(
         reopened
             .subject_delete_worker_scoped(&scope, deletion.clone())
-            .is_err()
+            .unwrap(),
+        confirmed,
+        "completed original removal must not repeat Stop-owned cleanup"
     );
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), completed_cleanup_calls);
     cleanup_allowed.store(true, Ordering::SeqCst);
     let material = options
         .root
@@ -1541,7 +1644,7 @@ fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history(
         confirmed
     );
     assert_eq!(spawns.load(Ordering::SeqCst), 1);
-    assert!(cleanup_calls.load(Ordering::SeqCst) > 0);
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
     assert!(cold.completed_stops.lock().unwrap().is_empty());
     assert!(cold.workers.lock().unwrap().is_empty());
     assert!(cold.pending_spawns.lock().unwrap().is_empty());

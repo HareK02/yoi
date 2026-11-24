@@ -260,7 +260,13 @@ fn confirm_restore_recovery(detail: &str) -> io::Result<bool> {
 
 fn is_resume_candidate(worker: &BackendWorkerSummary) -> bool {
     worker.availability == protocol::subscription::SubscriptionWorkerAvailability::Observed
-        && worker.state == "stopped"
+        && matches!(
+            worker.lifecycle,
+            Some(
+                protocol::WorkerLifecycleState::NotStarted
+                    | protocol::WorkerLifecycleState::Stopped
+            )
+        )
         && worker.worker_state.is_none()
         && worker.restore_observation_token.is_some()
 }
@@ -565,14 +571,29 @@ fn worker_name(worker: &BackendWorkerSummary) -> &str {
 }
 
 fn worker_state_label(worker: &BackendWorkerSummary) -> &str {
-    match worker.worker_state.as_ref().map(|state| &state.state) {
-        Some(protocol::WorkerState::Idle) => "idle",
-        Some(protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-            protocol::WorkerRunState::Paused,
-        ))) => "paused",
-        Some(protocol::WorkerState::Busy(_)) => "running",
-        None if worker.state == "stopped" => "stopped",
+    use protocol::WorkerLifecycleState;
+    if worker.availability != protocol::subscription::SubscriptionWorkerAvailability::Observed {
+        return "unknown";
+    }
+    match worker.lifecycle {
+        Some(WorkerLifecycleState::NotStarted) => "not started",
+        Some(WorkerLifecycleState::Stopped) => "stopped",
+        Some(WorkerLifecycleState::AwaitingRestore) => "awaiting restore",
+        Some(WorkerLifecycleState::Creating) => "creating",
+        Some(WorkerLifecycleState::Restoring) => "restoring",
+        Some(WorkerLifecycleState::Stopping) => "stopping",
+        Some(WorkerLifecycleState::RecoveryRequired) => "recovery required",
         None => "unknown",
+        Some(WorkerLifecycleState::Active) => {
+            match worker.worker_state.as_ref().map(|state| &state.state) {
+                Some(protocol::WorkerState::Idle) => "idle",
+                Some(protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                    protocol::WorkerRunState::Paused,
+                ))) => "paused",
+                Some(protocol::WorkerState::Busy(_)) => "running",
+                None => "unknown",
+            }
+        }
     }
 }
 
@@ -1210,6 +1231,7 @@ mod tests {
         let live = worker("runtime-a", "worker-live", None);
         let mut stopped = worker("runtime-a", "worker-stopped", None);
         stopped.state = "stopped".to_string();
+        stopped.lifecycle = Some(protocol::WorkerLifecycleState::Stopped);
         stopped.worker_state = None;
         let mut unknown = worker("runtime-a", "worker-unknown", None);
         unknown.worker_state = None;
@@ -1217,6 +1239,45 @@ mod tests {
         assert!(!is_resume_candidate(&live));
         assert!(is_resume_candidate(&stopped));
         assert!(!is_resume_candidate(&unknown));
+    }
+
+    #[test]
+    fn picker_uses_canonical_lifecycle_not_last_status_or_operation_snapshot() {
+        use protocol::WorkerLifecycleState;
+        for (lifecycle, label, resumable) in [
+            (WorkerLifecycleState::NotStarted, "not started", true),
+            (WorkerLifecycleState::Stopped, "stopped", true),
+            (
+                WorkerLifecycleState::AwaitingRestore,
+                "awaiting restore",
+                false,
+            ),
+            (WorkerLifecycleState::Creating, "creating", false),
+            (WorkerLifecycleState::Restoring, "restoring", false),
+            (WorkerLifecycleState::Stopping, "stopping", false),
+            (
+                WorkerLifecycleState::RecoveryRequired,
+                "recovery required",
+                false,
+            ),
+        ] {
+            let mut item = worker("runtime-a", "worker-a", None);
+            item.state = "stopped".into();
+            item.lifecycle = Some(lifecycle);
+            // Operation-owned snapshots are not current Active observations.
+            assert_eq!(worker_state_label(&item), label);
+            item.worker_state = None;
+            assert_eq!(is_resume_candidate(&item), resumable);
+            item.availability = protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+            assert_eq!(worker_state_label(&item), "unknown");
+            assert!(!is_resume_candidate(&item));
+        }
+        let mut missing = worker("runtime-a", "worker-a", None);
+        missing.state = "stopped".into();
+        missing.lifecycle = None;
+        missing.worker_state = None;
+        assert_eq!(worker_state_label(&missing), "unknown");
+        assert!(!is_resume_candidate(&missing));
     }
 
     #[test]
@@ -1326,6 +1387,7 @@ mod tests {
         worker.display_name = "Coder".to_string();
         worker.label = "Coder · T-585".to_string();
         worker.state = "stopped".to_string();
+        worker.lifecycle = Some(protocol::WorkerLifecycleState::Stopped);
         worker.worker_state = None;
         worker.workdir_attachments = vec![
             serde_json::from_value(serde_json::json!({
@@ -1403,6 +1465,7 @@ mod tests {
         long.label = "Longer worker · T-9".to_string();
         long.display_name = long.label.clone();
         long.state = "stopped".to_string();
+        long.lifecycle = Some(protocol::WorkerLifecycleState::Stopped);
         long.worker_state = None;
 
         for worker in [&mut short, &mut long] {

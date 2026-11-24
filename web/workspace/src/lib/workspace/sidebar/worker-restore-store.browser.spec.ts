@@ -36,6 +36,7 @@ function summary(state = "stopped", token = "generation-1") {
     label: "test",
     availability: "observed",
     state,
+    lifecycle: state === "stopped" ? "stopped" : "active",
     restore_observation_token: token,
     workspace: {
       visibility: "workspace",
@@ -70,6 +71,7 @@ function snapshot(
     resource_key: "W-1",
     availability: "observed",
     state,
+    lifecycle: state === "stopped" ? "stopped" : "active",
     restore_observation_token: token,
     has_running_internal_workers: false,
     workspace_id: "team",
@@ -176,6 +178,29 @@ describe("shared catalog observation refresh", () => {
       expect(canStopSidebarWorker(latest.workers[0])).toBe(false);
     }
   });
+  it("projects canonical recovery lifecycle from subscription and catalog without stopped fallback", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) =>
+      url.endsWith("/workers")
+        ? Response.json({
+          workspace_id: "team", limit: 100, source: "catalog", diagnostics: [],
+          items: [{ ...summary(), lifecycle: "recovery_required" }],
+        })
+        : Response.json({ items: [] })
+    ));
+    let latest!: WorkspaceWorkersState;
+    unsubscribe = workspaceWorkersStore("team").subscribe((state) => latest = state);
+    const frame = snapshot();
+    if (frame.frame !== "response" || frame.message.result !== "subscribed" ||
+      frame.message.payload.snapshot.topic !== "workers") throw new Error("invalid fixture");
+    frame.message.payload.snapshot.data.workers[0].lifecycle = "stopping";
+    mock.handlers.onFrame(frame);
+    expect(latest.workers[0].lifecycleState).toBe("stopping");
+    expect(latest.workers[0].state).toBe("stopping");
+    await settle();
+    expect(latest.workers[0].lifecycleState).toBe("recovery_required");
+    expect(latest.workers[0].state).toBe("recovery_required");
+    expect(latest.catalogWorkers?.[0].state).toBe("stopped");
+  });
   it("invalidates dependent plans before refresh and discards a GET superseded by a newer catalog event", async () => {
     const pending: Array<(response: Response) => void> = [];
     vi.stubGlobal(
@@ -196,7 +221,7 @@ describe("shared catalog observation refresh", () => {
     mock.handlers.onFrame(snapshot("idle", "generation-2"));
     expect(latest.catalogRequest).not.toBe(before);
     expect(before?.aborted).toBe(true);
-    expect(latest.workers[0].lifecycleState).toBe("idle");
+    expect(latest.workers[0].lifecycleState).toBe("active");
     pending.at(-1)!(response("idle", "generation-2"));
     await settle();
     old(response("stopped", "generation-1"));

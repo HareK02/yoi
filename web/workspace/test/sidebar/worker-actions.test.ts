@@ -68,29 +68,55 @@ function jsonResponse(payload: unknown, status = 200): Response {
   });
 }
 
-Deno.test("sidebar Stop follows observed catalog lifecycle, not foreground display state", () => {
-  for (const lifecycleState of ["idle", "running", "paused"]) {
-    const target = {
-      availability: "observed" as const,
-      lifecycleState,
-      state: "unknown",
-    };
-    assert(canStopSidebarWorker(target));
-    assert(!canStopSidebarWorker({ ...target, availability: "unavailable" }));
+Deno.test("sidebar actions use canonical lifecycle and observed availability, never legacy status", () => {
+  const cases = [
+    ["not_started", true, false],
+    ["stopped", true, false],
+    ["active", false, true],
+    ["awaiting_restore", false, false],
+    ["creating", false, false],
+    ["restoring", false, false],
+    ["stopping", false, false],
+    ["recovery_required", false, false],
+    [null, false, false],
+    [undefined, false, false],
+  ] as const;
+  for (const [lifecycle, settled, active] of cases) {
+    for (const state of ["stopped", "idle", "running", "unknown"]) {
+      for (const availability of ["observed", "unavailable"] as const) {
+        const target = {
+          availability,
+          lifecycle,
+          state,
+          restore_observation_token: "generation",
+        };
+        assertEquals(canRestoreWorker(target), availability === "observed" && settled);
+        assertEquals(canDeleteSidebarWorker(target), availability === "observed" && settled);
+        assertEquals(canStopSidebarWorker(target), availability === "observed" && active);
+        assert(!canRestoreWorker({ ...target, restore_observation_token: null }));
+      }
+    }
   }
-  for (
-    const lifecycleState of [
-      "stopped",
-      "missing",
-      "execution_unavailable",
-      "unknown",
-    ]
-  ) {
+  for (const availability of [undefined, null, "unknown", "stale"]) {
     const target = {
-      availability: "observed" as const,
-      lifecycleState,
-      state: "running",
-    };
+      availability,
+      lifecycle: "stopped",
+      state: "stopped",
+      restore_observation_token: "generation",
+    } as Worker;
+    assert(!canRestoreWorker(target));
+    assert(!canDeleteSidebarWorker(target));
+    assert(!canStopSidebarWorker({ ...target, lifecycle: "active" }));
+  }
+  for (const lifecycle of ["inactive", "unknown", "stale", "future_lifecycle"]) {
+    const target = {
+      availability: "observed",
+      lifecycle,
+      state: "stopped",
+      restore_observation_token: "generation",
+    } as Worker;
+    assert(!canRestoreWorker(target));
+    assert(!canDeleteSidebarWorker(target));
     assert(!canStopSidebarWorker(target));
   }
 });
@@ -366,11 +392,6 @@ Deno.test("sidebar Delete reports cleanup-plan blocking reasons", async () => {
   );
 });
 
-Deno.test("sidebar Delete is enabled only for stopped Workers", () => {
-  assert(!canDeleteSidebarWorker(worker));
-  assert(canDeleteSidebarWorker({ ...worker, state: "stopped" }));
-});
-
 Deno.test("Worker navigation exposes an accessible hover action menu", async () => {
   const source = await Deno.readTextFile(
     new URL(
@@ -389,27 +410,6 @@ Deno.test("Worker navigation exposes an accessible hover action menu", async () 
   assert(styles.includes(".worker-nav-item:hover .worker-actions-trigger"));
 });
 
-Deno.test("Restore eligibility uses observed catalog state and backend token, not foreground state", () => {
-  const stopped = {
-    availability: "observed" as const,
-    state: "unknown",
-    lifecycleState: "stopped",
-    restore_observation_token: "generation",
-  };
-  assert(canRestoreWorker(stopped));
-  assert(!canRestoreWorker({ ...stopped, availability: "unavailable" }));
-  assert(
-    !canRestoreWorker({ ...stopped, lifecycleState: "idle", state: "stopped" }),
-  );
-  assert(!canRestoreWorker({ ...stopped, restore_observation_token: null }));
-  assert(
-    canRestoreWorker({
-      availability: "observed",
-      state: "stopped",
-      restore_observation_token: "generation",
-    }),
-  );
-});
 Deno.test("Restore scoped POST encodes identities and sends immutable intent without assignment query", async () => {
   const request = createRestoreRequest({
     restore_observation_token: "generation",

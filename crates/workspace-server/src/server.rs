@@ -42561,7 +42561,8 @@ mod tests {
         );
         assert!(!stopped.is_current_idle());
         let observation = observed_stopped.observation.as_mut().unwrap();
-        observation.availability = protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+        observation.availability =
+            protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
         let disconnected = worker_summary_from_projection(&observed_stopped).unwrap();
         assert_eq!(disconnected.state, "unavailable");
         assert!(disconnected.restore_observation_token.is_none());

@@ -48,6 +48,7 @@ function snapshot(
   state: SubscriptionWorker["state"],
   availability: SubscriptionWorker["availability"],
   workspaceId = "stop-test",
+  lifecycle: SubscriptionWorker["lifecycle"] = state === "stopped" ? "stopped" : "active",
 ): SubscriptionFrame {
   return {
     protocol_version: 2,
@@ -67,6 +68,7 @@ function snapshot(
               resource_key: "W-1",
               availability,
               state,
+              lifecycle,
               // An absent foreground snapshot must not prevent stopping an active catalog Worker.
               worker_state: null,
               has_running_internal_workers: false,
@@ -83,7 +85,7 @@ function snapshot(
 }
 
 test.each(["idle", "running", "paused", "stopped"] as const)(
-  "Stop uses observed catalog state without capabilities (%s)",
+  "Stop uses observed canonical lifecycle without capabilities (%s)",
   async (state) => {
     const request = vi.fn(async (input: RequestInfo | URL) =>
       String(input).endsWith("/stop")
@@ -129,6 +131,41 @@ test.each(["idle", "running", "paused", "stopped"] as const)(
           .disabled,
       ).toBe(true)
     );
+  },
+);
+
+test.each([
+  ["not_started", true, false],
+  ["stopped", true, false],
+  ["active", false, true],
+  ["awaiting_restore", false, false],
+  ["creating", false, false],
+  ["restoring", false, false],
+  ["stopping", false, false],
+  ["recovery_required", false, false],
+  [null, false, false],
+] as const)(
+  "Worker menu uses canonical lifecycle rather than legacy stopped status (%s)",
+  async (lifecycle, settled, active) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404 })));
+    render(WorkersNavSection, { workspaceId: "stop-test" });
+    await waitFor(() => expect(transport.listener).not.toBeNull());
+    transport.listener!.onFrame(snapshot("stopped", "observed", "stop-test", lifecycle));
+    await fireEvent.click(
+      await screen.findByRole("button", { name: "Actions for Test worker" }),
+    );
+    const restore = screen.getByRole("menuitem", { name: "Restore" }) as HTMLButtonElement;
+    const stop = screen.getByRole("menuitem", { name: "Stop" }) as HTMLButtonElement;
+    const remove = screen.getByRole("menuitem", { name: "Delete" }) as HTMLButtonElement;
+    expect(restore.disabled).toBe(!settled);
+    expect(remove.disabled).toBe(!settled);
+    expect(stop.disabled).toBe(!active);
+    transport.listener!.onFrame(snapshot("stopped", "unavailable", "stop-test", lifecycle));
+    await waitFor(() => {
+      expect(restore.disabled).toBe(true);
+      expect(stop.disabled).toBe(true);
+      expect(remove.disabled).toBe(true);
+    });
   },
 );
 
