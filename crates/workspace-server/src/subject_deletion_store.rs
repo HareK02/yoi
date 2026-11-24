@@ -433,7 +433,36 @@ impl SqliteWorkspaceStore {
         workspace: &str,
         worker: &RuntimeWorkerRef,
     ) -> Result<Option<super::SubjectDeletionRemoval>> {
-        self.with_conn(|conn| saved_removal(conn, workspace, None, worker))
+        self.with_conn(|conn| {
+            let saved = saved_removal(conn, workspace, None, worker)?;
+            if let Some(saved) = &saved {
+                if !removal_reconciliation_matches(
+                    conn, workspace, worker, &saved.request.operation_id,
+                    &saved.request.input_fingerprint,
+                )? || conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM subject_deletion_workers WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND prior_removal_operation_id IS NOT NULL)",
+                    params![workspace, worker.runtime_id, worker.worker_id], |row| row.get::<_, bool>(0),
+                )? {
+                    return Err(Error::RepositoryConflict(
+                        "Subject deletion child is not an exact pending-at-fence removal".into(),
+                    ));
+                }
+                if saved.completed {
+                    let subjects = conn.prepare(
+                        "SELECT subject_id FROM subject_deletion_removals WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+                    )?.query_map(params![workspace, worker.runtime_id, worker.worker_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for subject in subjects {
+                        if !completed_removal_matches(conn, workspace, &subject, worker)? {
+                            return Err(Error::RepositoryConflict(
+                                "Completed Subject child lacks canonical success or Job purge receipt".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(saved)
+        })
     }
 
     /// A canonical success alone is not proof of additional Job erasure. Keep the
@@ -1547,6 +1576,8 @@ mod tests {
                 .unwrap()
                 .operation_id,
             originals_absent: false,
+            completed_removal: None,
+            pending_removal: None,
         };
         assert!(
             s.confirm_subject_deletion_absence("w", "subject", "delete", &body, &fence)
@@ -1895,6 +1926,8 @@ mod tests {
             create_fingerprint: fence_request.create_fingerprint,
             operation_id: fence_request.operation_id,
             originals_absent: true,
+            completed_removal: None,
+            pending_removal: None,
         };
         assert!(
             s.confirm_subject_deletion_absence("w", "subject", "delete", &w, &fence)
@@ -1987,6 +2020,52 @@ mod tests {
             s.finish_subject_deletion_record("w", "subject", "delete")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn completed_subject_child_read_rechecks_canonical_success() {
+        for is_job in [false, true] {
+            let s = setup();
+            let w = worker(83);
+            in_flight(&s, &w, "executing", is_job);
+            s.prepare_subject_deletion("w", "subject", "delete", &[])
+                .unwrap();
+            let request = s
+                .subject_deletion_removal("w", &w)
+                .unwrap()
+                .unwrap()
+                .request;
+            let result = execution_result(&request);
+            let purge = is_job.then(|| runtime_api::SubjectJobRemovalPurgeResponse {
+                workspace_id: request.workspace_id.clone(),
+                worker_id: request.worker_id,
+                operation_id: request.operation_id.clone(),
+                input_fingerprint: request.input_fingerprint.clone(),
+            });
+            succeed(&s, &request);
+            s.confirm_subject_deletion_removal("w", &w, &request, &result, purge.as_ref())
+                .unwrap();
+            assert!(
+                s.subject_deletion_removal("w", &w)
+                    .unwrap()
+                    .unwrap()
+                    .completed
+            );
+            s.with_conn(|c| {
+                c.execute(
+                    "UPDATE worker_removal_operations SET state='failed' WHERE operation_id=?1",
+                    [&request.operation_id],
+                )?;
+                assert!(c.query_row(
+                    "SELECT completed FROM subject_deletion_removals WHERE operation_id=?1",
+                    [&request.operation_id],
+                    |row| row.get::<_, bool>(0)
+                )?);
+                Ok(())
+            })
+            .unwrap();
+            assert!(s.subject_deletion_removal("w", &w).is_err());
+        }
     }
 
     #[test]

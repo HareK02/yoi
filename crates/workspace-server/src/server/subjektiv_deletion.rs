@@ -197,23 +197,49 @@ async fn remove_worker(
         .config_store
         .subject_deletion_removal(api.workspace_id(), worker)?
     {
+        // Runtime-only success (including a lost response) is observed from the
+        // original child, never inferred from Backend state or originals_absent.
+        // An exact Job child may erase authorized partial copies before generic
+        // retention replay, whose preservation check must remain strict.
+        let decode = |request: &runtime_api::WorkerRetentionExecutionRequest| {
+            serde_json::from_value::<worker_runtime::retention::WorkerRetentionExecutionRequest>(
+                serde_json::to_value(request).map_err(|error| Error::Store(error.to_string()))?,
+            )
+            .map_err(|error| Error::Store(error.to_string()))
+        };
+        let completed = fence.completed_removal.as_ref().map(decode).transpose()?;
+        let pending = fence.pending_removal.as_ref().map(decode).transpose()?;
+        if (completed.is_some() && pending.is_some())
+            || pending
+                .as_ref()
+                .is_some_and(|pending| pending != &reconciliation.request)
+            || completed
+                .as_ref()
+                .is_some_and(|completed| completed != &reconciliation.request)
+        {
+            return Err(Error::RepositoryConflict(
+                "Subject canonical child observation mismatch".into(),
+            )
+            .into());
+        }
         if reconciliation.completed {
+            // The store rechecks canonical success and any required Job purge
+            // receipt; the current Runtime observation must name that same child.
+            // Do not replay preservation after a later legitimate Session erasure.
+            if completed.is_none() {
+                return Err(Error::RepositoryConflict(
+                    "Completed Subject reconciliation lacks current child success".into(),
+                )
+                .into());
+            }
             return Ok(());
         }
-        // First reconcile the original canonical result, without changing any old
-        // disposition, fingerprint or success snapshot. A lost Runtime response or
-        // Backend commit remains unknown until that same child succeeds.
-        execute_removal(api, operation, worker).await?;
-        let result = api
-            .runtime
-            .execute_worker_retention(worker, reconciliation.request.clone())
-            .map_err(RuntimeRegistryError::into_error)?;
-        let purge = if reconciliation.is_job {
+        let mut purge = if reconciliation.is_job && completed.is_some() {
             Some(
                 api.runtime
                     .purge_subject_job_removal(
                         &worker.runtime_id,
-                        request,
+                        request.clone(),
                         reconciliation.request.clone(),
                     )
                     .map_err(RuntimeRegistryError::into_error)?,
@@ -221,6 +247,24 @@ async fn remove_worker(
         } else {
             None
         };
+        // Pending children still finish their original operation normally. After
+        // an early purge, canonical result/catalog replay keeps the old disposition.
+        execute_removal(api, operation, worker).await?;
+        let result = api
+            .runtime
+            .execute_worker_retention(worker, reconciliation.request.clone())
+            .map_err(RuntimeRegistryError::into_error)?;
+        if reconciliation.is_job && purge.is_none() {
+            purge = Some(
+                api.runtime
+                    .purge_subject_job_removal(
+                        &worker.runtime_id,
+                        request,
+                        reconciliation.request.clone(),
+                    )
+                    .map_err(RuntimeRegistryError::into_error)?,
+            );
+        }
         // The extra physical Job erasure is a distinct receipt. An old Archive
         // success is never counted as a Purge, nor pinned as an older success later.
         api.config_store.confirm_subject_deletion_removal(
@@ -231,6 +275,12 @@ async fn remove_worker(
             purge.as_ref(),
         )?;
         return Ok(());
+    }
+    if fence.pending_removal.is_some() {
+        return Err(Error::RepositoryConflict(
+            "Pending Runtime child requires an exact Backend-pinned reconciliation".into(),
+        )
+        .into());
     }
     // A completed canonical receipt can finish the Backend catalog midpoint
     // without reconstructing purged source metadata or replaying Runtime work.

@@ -7694,8 +7694,11 @@ impl RuntimeState {
             worker_id,
             runtime_id: None,
             resource_key: None,
-            availability: if worker.worker_state().is_some() && worker.active_execution().is_some()
-            {
+            availability: if worker.is_settled_inactive()
+                || matches!(
+                    worker.observation_state(),
+                    crate::catalog::WorkerObservationState::Current { .. }
+                ) {
                 protocol::subscription::SubscriptionWorkerAvailability::Observed
             } else {
                 protocol::subscription::SubscriptionWorkerAvailability::Unavailable
@@ -12624,6 +12627,15 @@ mod tests {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
                 assert_eq!(worker.state, SubscriptionWorkerState::Stopped);
+                assert_eq!(
+                    worker.lifecycle,
+                    Some(protocol::WorkerLifecycleState::Stopped)
+                );
+                assert_eq!(
+                    worker.availability,
+                    protocol::subscription::SubscriptionWorkerAvailability::Observed
+                );
+                assert!(worker.worker_state.is_none());
                 assert!(!worker.has_running_internal_workers);
             }
             payload => panic!("unexpected subscription payload: {payload:?}"),

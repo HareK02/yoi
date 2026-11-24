@@ -205,7 +205,7 @@ fn subject_delete_existing_stopped_or_active_worker_preserves_record_and_allows_
         assert_eq!(record.worker_id, worker.worker_ref.worker_id);
         drop(runtime);
         let runtime =
-            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
         assert!(
             runtime
                 .restore_worker(
@@ -226,10 +226,13 @@ fn subject_delete_existing_stopped_or_active_worker_preserves_record_and_allows_
         // Canonical removal deletes the aggregate, not the permanent Subject
         // fence. Its exact retry must finish from the confirmed owner history,
         // without manufacturing another Stop from a missing catalog entry.
+        assert!(runtime.lock().unwrap().runtime_identity.is_none());
         let removed = runtime
-            .subject_delete_worker_scoped(&scoped, request)
+            .subject_delete_worker_scoped(&scoped, request.clone())
             .unwrap();
         assert!(removed.originals_absent);
+        assert!(removed.completed_removal.is_none());
+        assert!(removed.pending_removal.is_none());
         assert_eq!(removed.workspace_id, receipt.workspace_id);
         assert_eq!(removed.worker_id, receipt.worker_id);
         assert_eq!(removed.create_fingerprint, receipt.create_fingerprint);
@@ -240,6 +243,16 @@ fn subject_delete_existing_stopped_or_active_worker_preserves_record_and_allows_
                 .lock()
                 .unwrap()
                 .forget_workspace_owner_if_unused("workspace-a")
+        );
+        drop(runtime);
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+        assert!(runtime.lock().unwrap().runtime_identity.is_none());
+        assert_eq!(
+            runtime
+                .subject_delete_worker_scoped(&scoped, request)
+                .unwrap(),
+            removed
         );
     }
 }

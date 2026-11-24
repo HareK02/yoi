@@ -605,6 +605,21 @@ pub(crate) fn delete_worker_aggregate(
     delete_sessions(&retention, &sessions, intent, remove).map_err(retention_error)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SubjectRemovalReceipt {
+    Pending(WorkerRetentionExecutionRequest),
+    Completed {
+        request: WorkerRetentionExecutionRequest,
+        receipt_sha256: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SubjectRemovalArchiveValidation {
+    RetainedMaterial,
+    ExplicitPurgeIdentity,
+}
+
 /// Filesystem provider for the canonical Runtime Worker aggregate.
 #[derive(Clone, Debug)]
 pub(crate) struct FsWorkerRetentionProvider {
@@ -714,6 +729,27 @@ impl FsWorkerRetentionProvider {
         &self,
         archive: &WorkerSessionArchiveManifest,
     ) -> Result<(), RuntimeError> {
+        let sessions = self.validate_removal_archive_identity(archive)?;
+        let archive_dir = self.archive_dir(&archive.archive_id)?;
+        let retention = runtime_session_retention(&self.runtime_root);
+        let mut all_erased = true;
+        for session in sessions {
+            match retention.ensure_live(session) {
+                Ok(()) => all_erased = false,
+                Err(session_store::StoreError::SessionErased(id)) if id == session => (),
+                Err(error) => return Err(retention_error(error)),
+            }
+        }
+        if !all_erased {
+            validate_existing_archive(&archive_dir, archive, false)?;
+        }
+        Ok(())
+    }
+
+    fn validate_removal_archive_identity(
+        &self,
+        archive: &WorkerSessionArchiveManifest,
+    ) -> Result<Vec<session_store::SessionId>, RuntimeError> {
         let (saved, _) = self.session_archive_identity(&archive.archive_id)?;
         if saved != *archive {
             return Err(RuntimeError::InvalidRequest(
@@ -738,17 +774,66 @@ impl FsWorkerRetentionProvider {
             }
             sessions.push(binding.session_id);
         }
+        Ok(sessions)
+    }
+
+    // Subject erasure needs historical success, not a promise that the whole
+    // ingestion payload survives an authorized partial erasure. Still reject
+    // missing live members: erasing one Session never excuses losing a sibling.
+    // This check is deliberately not used by completed_for or execute.
+    fn validate_subject_removal_archive(
+        &self,
+        archive: &WorkerSessionArchiveManifest,
+    ) -> Result<(), RuntimeError> {
+        use session_store::Store;
+
+        let sessions = self.validate_removal_archive_identity(archive)?;
         let retention = runtime_session_retention(&self.runtime_root);
-        let mut all_erased = true;
-        for session in sessions {
-            match retention.ensure_live(session) {
-                Ok(()) => all_erased = false,
-                Err(session_store::StoreError::SessionErased(id)) if id == session => (),
+        let mut live = Vec::new();
+        for session in &sessions {
+            match retention.ensure_live(*session) {
+                Ok(()) => live.push(*session),
+                Err(session_store::StoreError::SessionErased(id)) if id == *session => (),
                 Err(error) => return Err(retention_error(error)),
             }
         }
-        if !all_erased {
+        let archive_dir = self.archive_dir(&archive.archive_id)?;
+        if live.len() == sessions.len() {
             validate_existing_archive(&archive_dir, archive, false)?;
+            return Ok(());
+        }
+        for session in live {
+            let binding = archive
+                .retained_sessions
+                .iter()
+                .find(|b| b.session_id == session);
+            let root = match binding {
+                Some(_) => archive_dir
+                    .join("session/retained-sessions")
+                    .join(session.to_string()),
+                None => archive_dir.join("session"),
+            };
+            let identity: CanonicalSessionManifest =
+                read_json(&root.join("session.json"), "inspect live removal Session")?;
+            if identity.session_id != session.to_string() {
+                return Err(RuntimeError::InvalidRequest(
+                    "Removal Session identity mismatch".into(),
+                ));
+            }
+            let store = session_store::WorkerSessionStore::open_read_only(&root)
+                .map_err(retention_error)?;
+            let segments = store.list_segments(session).map_err(retention_error)?;
+            let active = binding
+                .map(|b| b.active_segment_id)
+                .or(archive.source_active_segment_id);
+            if segments.is_empty() || active.is_some_and(|id| !segments.contains(&id)) {
+                return Err(retention_error(
+                    session_store::StoreError::SessionSourceMissing(session),
+                ));
+            }
+            for segment in segments {
+                store.read_all(session, segment).map_err(retention_error)?;
+            }
         }
         Ok(())
     }
@@ -801,41 +886,7 @@ impl FsWorkerRetentionProvider {
         }
         self.ensure_removal_source_absent(request.worker_id)?;
         let mut sessions = if let Some(manifest) = &result.archive {
-            if request.archive_id.as_ref() != Some(&manifest.archive_id)
-                || manifest.workspace_id != request.workspace_id
-                || manifest.source_runtime_id != request.source_runtime_id
-                || manifest.source_worker_id != request.worker_id
-                || manifest.operation_id != request.operation_id
-                || manifest.input_fingerprint != request.input_fingerprint
-            {
-                return Err(RuntimeError::InvalidRequest(
-                    "Removal archive identity mismatch".into(),
-                ));
-            }
-            let (saved, _) = self.session_archive_identity(&manifest.archive_id)?;
-            if saved != *manifest {
-                return Err(RuntimeError::InvalidRequest(
-                    "Removal archive receipt mismatch".into(),
-                ));
-            }
-            let session = manifest
-                .source_session_id
-                .parse::<session_store::SessionId>()
-                .map_err(|_| {
-                    RuntimeError::InvalidRequest("Invalid removal Session identity".into())
-                })?;
-            let mut sessions = vec![session];
-            for binding in &manifest.retained_sessions {
-                if binding.owner.workspace_id != request.workspace_id
-                    || binding.owner.worker_id != request.worker_id.to_string()
-                {
-                    return Err(RuntimeError::InvalidRequest(
-                        "Removal retained Session owner mismatch".into(),
-                    ));
-                }
-                sessions.push(binding.session_id);
-            }
-            sessions
+            self.validate_removal_archive_identity(manifest)?
         } else {
             Vec::new()
         };
@@ -990,22 +1041,55 @@ impl FsWorkerRetentionProvider {
     /// Read an exact completed removal, normalizing legacy success once under
     /// its original operation. Shutdown is retained history, not a completion gate.
     /// The caller holds the Worker lock and permanent Subject deletion fence.
+    #[cfg(test)]
     pub(crate) fn subject_completed_removal(
         &self,
         deletion: &runtime_api::SubjectDeleteWorkerRequest,
         runtime_id: &str,
         expected: Option<(&WorkerRetentionExecutionRequest, &str)>,
     ) -> Result<(WorkerRetentionExecutionRequest, String), RuntimeError> {
+        match self.subject_removal_if_present(
+            deletion,
+            Some(runtime_id),
+            expected,
+            None,
+            SubjectRemovalArchiveValidation::RetainedMaterial,
+        )? {
+            Some(SubjectRemovalReceipt::Completed {
+                request,
+                receipt_sha256,
+            }) => Ok((request, receipt_sha256)),
+            _ => Err(RuntimeError::InvalidRequest(
+                "Missing or mismatched completed canonical removal receipt".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn subject_removal_if_present(
+        &self,
+        deletion: &runtime_api::SubjectDeleteWorkerRequest,
+        runtime_id: Option<&str>,
+        expected: Option<(&WorkerRetentionExecutionRequest, &str)>,
+        expected_pending: Option<&WorkerRetentionExecutionRequest>,
+        archive_validation: SubjectRemovalArchiveValidation,
+    ) -> Result<Option<SubjectRemovalReceipt>, RuntimeError> {
         let invalid = || {
             RuntimeError::InvalidRequest(
                 "Missing or mismatched completed canonical removal receipt".into(),
             )
         };
+        let missing = || {
+            if expected.is_some() || expected_pending.is_some() {
+                Err(invalid())
+            } else {
+                Ok(None)
+            }
+        };
         let _lock = self.lock_operations()?;
         let operations = self.runtime_root.join("retention/operations");
         let entries = match fs::read_dir(&operations) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(invalid()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing(),
             Err(source) => {
                 return Err(RuntimeError::StoreIo {
                     operation: "read Subject removal history",
@@ -1039,8 +1123,11 @@ impl FsWorkerRetentionProvider {
             let digest = receipt.identity_sha256()?;
             if path != self.operation_path(&request.operation_id)?
                 || request.workspace_id != deletion.workspace_id
-                || request.source_runtime_id != runtime_id
-                || expected.is_some_and(|(saved, hash)| saved != request || hash != digest)
+                || Some(request.source_runtime_id.as_str()) != runtime_id
+                || expected.is_some_and(|(saved, hash)| {
+                    saved != request || hash != digest || !receipt.result.source_removed
+                })
+                || expected_pending.is_some_and(|saved| saved != request)
                 || receipt
                     .create_fingerprint
                     .as_deref()
@@ -1049,19 +1136,44 @@ impl FsWorkerRetentionProvider {
                     .shutdown
                     .as_ref()
                     .is_some_and(|saved| saved.create_fingerprint != deletion.create_fingerprint)
-                || !receipt.result.source_removed
             {
                 return Err(invalid());
             }
             found = Some((path, receipt.request, digest));
         }
-        let (path, request, digest) = found.ok_or_else(invalid)?;
+        let Some((path, request, digest)) = found else {
+            return missing();
+        };
         // Legacy receipts predate create fingerprint retention. Their immutable
         // Workspace/Runtime/Worker identity and unique removal operation bind the
         // Backend-selected allocation; the Subject fence keeps exact fingerprint
         // retries exclusive. Do not claim a missing historical fingerprint was observed.
-        self.normalized_receipt(&path)?.ok_or_else(invalid)?;
-        Ok((request, digest))
+        let mut receipt = read_operation_receipt(&path)?.ok_or_else(invalid)?;
+        self.ensure_removal_source_absent(request.worker_id)?;
+        if let Some(archive) = &receipt.result.archive {
+            self.validate_removal_archive_identity(archive)?;
+        }
+        if !receipt.result.source_removed {
+            // A pending child can resume its original operation, but is neither
+            // a completed removal nor authority for additional physical erasure.
+            return Ok(Some(SubjectRemovalReceipt::Pending(request)));
+        }
+        if matches!(
+            archive_validation,
+            SubjectRemovalArchiveValidation::RetainedMaterial
+        ) {
+            if let Some(archive) = &receipt.result.archive {
+                self.validate_subject_removal_archive(archive)?;
+            }
+        }
+        if receipt.schema_version != OPERATION_SCHEMA_VERSION {
+            receipt.schema_version = OPERATION_SCHEMA_VERSION;
+            atomic_write_json(&path, &receipt, "normalize Subject removal receipt")?;
+        }
+        Ok(Some(SubjectRemovalReceipt::Completed {
+            request,
+            receipt_sha256: digest,
+        }))
     }
 
     pub(crate) fn recover_after_source_removal(

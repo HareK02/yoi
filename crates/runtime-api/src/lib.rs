@@ -1553,8 +1553,18 @@ pub struct SubjectDeleteWorkerResponse {
     pub create_fingerprint: String,
     pub operation_id: String,
     /// The canonical live Worker/Session/diagnostic aggregate is physically absent
-    /// under the permanent creation fence. False is not a deletion receipt.
+    /// under the permanent creation fence. False is not a deletion receipt; an
+    /// unfinished retention child remains false until its normal recovery succeeds.
     pub originals_absent: bool,
+    /// Freshly verified successful canonical child, not proof that archived material
+    /// is preserved. Only a Backend-pinned Job reconciliation may erase its copies.
+    /// Absence of this observation never proves that an unfinished child succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_removal: Option<WorkerRetentionExecutionRequest>,
+    /// Exact unfinished child observed after previously confirmed shutdown. This
+    /// permits only normal recovery of that operation, never success or extra purge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_removal: Option<WorkerRetentionExecutionRequest>,
 }
 
 /// Additional erasure of a Subject Job's newly reconciled removal copies.
@@ -2416,6 +2426,8 @@ mod tests {
         ) -> Result<SubjectDeleteWorkerResponse, RuntimeApiError> {
             Ok(SubjectDeleteWorkerResponse {
                 originals_absent: true,
+                completed_removal: None,
+                pending_removal: None,
                 workspace_id: request.workspace_id,
                 worker_id: request.worker_id,
                 create_fingerprint: request.create_fingerprint,

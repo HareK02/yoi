@@ -800,15 +800,86 @@ async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pendi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_retry_and_restart() {
-    use worker_runtime::retention::{DiagnosticsDisposition, SessionDisposition};
-    for phase in [
+    job_removal_subject_deletion(&[
         "planned",
         "executing",
         "failed",
         "response_lost",
         "catalog_failure",
         "purge_ack_commit_failure",
-    ] {
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partially_erased_job_child_reconciles_runtime_and_backend_success_across_retry() {
+    job_removal_subject_deletion(&[
+        "partial_response_lost",
+        "partial_catalog_failure",
+        "partial_backend_success",
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirmed_subject_fence_recovers_pending_job_receipt_with_absent_originals() {
+    job_removal_subject_deletion(&["pending_receipt"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prior_successful_job_archive_is_not_subject_purge_target() {
+    job_removal_subject_deletion(&["prior_success"]).await;
+}
+
+fn seed_subject_retained_sibling(
+    root: &Path,
+    worker: &RuntimeWorkerRef,
+) -> (session_store::SessionId, session_store::SegmentId) {
+    use session_store::Store;
+    let session = session_store::new_session_id();
+    let segment = session_store::new_segment_id();
+    let root = root
+        .join(".test-embedded-runtime-store/workers")
+        .join(&worker.worker_id);
+    session_store::WorkerSessionStore::new(
+        root.join("retained-sessions").join(session.to_string()),
+    )
+    .unwrap()
+    .create_segment(
+        session,
+        segment,
+        &[session_store::LogEntry::AnnotatedSegmentStart {
+            ts: 1,
+            session_id: session,
+            system_prompt: Some("retained sibling".into()),
+            config: Default::default(),
+            history: vec![],
+            forked_from: None,
+            compacted_from: None,
+        }],
+    )
+    .unwrap();
+    let bindings = root.join("retained-session-bindings");
+    std::fs::create_dir_all(&bindings).unwrap();
+    std::fs::write(
+        bindings.join(format!("{session}.json")),
+        serde_json::to_vec(&session_store::worker_sources::RetainedSessionBinding {
+            owner: session_store::worker_sources::WorkerSessionOwner {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker_id: worker.worker_id.clone(),
+            },
+            session_id: session,
+            active_segment_id: segment,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    (session, segment)
+}
+
+async fn job_removal_subject_deletion(phases: &[&str]) {
+    use worker_runtime::retention::{DiagnosticsDisposition, SessionDisposition};
+    for &phase in phases {
         let dir = tempfile::tempdir().unwrap();
         let (api, execution) = test_api_with_recording_backend(dir.path()).await;
         let store = open_subjektiv_store(&api).unwrap();
@@ -867,6 +938,11 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
             .unwrap();
         let worker = attempt.worker.clone().unwrap();
         seed_worker_session_for_cleanup(dir.path(), &worker);
+        let retained = if phase.starts_with("partial_") || phase == "prior_success" {
+            Some(seed_subject_retained_sibling(dir.path(), &worker))
+        } else {
+            None
+        };
         api.runtime
             .stop_worker(
                 &worker,
@@ -944,15 +1020,22 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
                 )
                 .unwrap();
         }
-        if phase == "catalog_failure" {
+        if matches!(phase, "catalog_failure" | "partial_catalog_failure") {
             api.config_store.with_conn(|c| { c.execute_batch("CREATE TRIGGER injected_old_catalog_failure BEFORE DELETE ON worker_registry BEGIN SELECT RAISE(ABORT,'catalog failure'); END;")?; Ok(()) }).unwrap();
         }
-        let old_result = if matches!(phase, "response_lost" | "catalog_failure") {
+        let mut old_result = if matches!(
+            phase,
+            "response_lost"
+                | "catalog_failure"
+                | "partial_response_lost"
+                | "partial_catalog_failure"
+                | "prior_success"
+        ) {
             let result = api
                 .runtime
                 .execute_worker_retention(&worker, saved.runtime_request.clone())
                 .unwrap();
-            if phase == "catalog_failure" {
+            if matches!(phase, "catalog_failure" | "partial_catalog_failure") {
                 assert!(
                     api.config_store
                         .commit_worker_removal(
@@ -961,6 +1044,50 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
                             &old.input_fingerprint,
                             &result
                         )
+                        .is_err()
+                );
+            }
+            if phase == "prior_success" {
+                api.config_store
+                    .commit_worker_removal(
+                        TEST_WORKSPACE_ID,
+                        &old.operation_id,
+                        &old.input_fingerprint,
+                        &result,
+                    )
+                    .unwrap();
+            }
+            if phase.starts_with("partial_") {
+                let archive = result.archive.as_ref().unwrap();
+                api.runtime
+                    .session_material_erase(
+                        &worker.runtime_id,
+                        runtime_api::SessionMaterialEraseRequest {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            source: runtime_api::SessionPublicSource::Archived {
+                                archive_id: archive.archive_id.clone(),
+                            },
+                            expected_session_id: archive.source_session_id.clone(),
+                        },
+                    )
+                    .unwrap();
+                let (session, segment) = retained.unwrap();
+                let root = dir
+                    .path()
+                    .join(".test-embedded-runtime-store/archives/workers")
+                    .join(&archive.archive_id)
+                    .join("session/retained-sessions")
+                    .join(session.to_string());
+                use session_store::Store;
+                assert!(
+                    session_store::WorkerSessionStore::open_read_only(&root)
+                        .unwrap()
+                        .exists(session, segment)
+                        .unwrap()
+                );
+                assert!(
+                    api.runtime
+                        .execute_worker_retention(&worker, saved.runtime_request.clone())
                         .is_err()
                 );
             }
@@ -990,23 +1117,147 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
         let pinned = api
             .config_store
             .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
-            .unwrap()
             .unwrap();
-        assert_eq!(pinned.request, saved.runtime_request, "{phase}");
-        assert!(!pinned.completed);
-        assert!(pinned.is_job);
-        assert!(
-            api.config_store
-                .erase_subject_deleted_jobs(TEST_WORKSPACE_ID, &subject.id, "same-delete")
-                .is_err()
+        if phase == "prior_success" {
+            assert!(
+                pinned.is_none(),
+                "prior success must never become an additional purge child"
+            );
+        } else {
+            let pinned = pinned.unwrap();
+            assert_eq!(pinned.request, saved.runtime_request, "{phase}");
+            assert!(!pinned.completed);
+            assert!(pinned.is_job);
+        }
+        let job_erasure = api.config_store.erase_subject_deleted_jobs(
+            TEST_WORKSPACE_ID,
+            &subject.id,
+            "same-delete",
         );
+        if phase == "prior_success" {
+            // Exact pre-Subject success satisfies Job cleanup without a new
+            // physical purge. Job-row erasure is not whole-Subject completion.
+            job_erasure.unwrap();
+            assert!(
+                api.store
+                    .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !store
+                    .subject_deletion(&subject.id)
+                    .unwrap()
+                    .unwrap()
+                    .completed
+            );
+            // Ordinary replay still checks the preserved archive's full checksum.
+            let preserved = api
+                .runtime
+                .execute_worker_retention(&worker, saved.runtime_request.clone())
+                .unwrap();
+            assert_eq!(Some(&preserved), old_result.as_ref());
+        } else {
+            assert!(job_erasure.is_err(), "unfinished pinned child: {phase}");
+        }
+        if phase == "partial_backend_success" {
+            // The child was pinned unfinished, then succeeded before its Subject
+            // reconciliation. This is not a pre-Subject success archive.
+            let result = api
+                .runtime
+                .execute_worker_retention(&worker, saved.runtime_request.clone())
+                .unwrap();
+            api.config_store
+                .commit_worker_removal(
+                    TEST_WORKSPACE_ID,
+                    &old.operation_id,
+                    &old.input_fingerprint,
+                    &result,
+                )
+                .unwrap();
+            let archive = result.archive.as_ref().unwrap();
+            api.runtime
+                .session_material_erase(
+                    &worker.runtime_id,
+                    runtime_api::SessionMaterialEraseRequest {
+                        workspace_id: TEST_WORKSPACE_ID.into(),
+                        source: runtime_api::SessionPublicSource::Archived {
+                            archive_id: archive.archive_id.clone(),
+                        },
+                        expected_session_id: archive.source_session_id.clone(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                api.runtime
+                    .execute_worker_retention(&worker, saved.runtime_request.clone())
+                    .is_err()
+            );
+            old_result = Some(result);
+        }
+        if phase == "pending_receipt" {
+            *execution.subject_delete_failure.lock().unwrap() = None;
+            let deletion = api
+                .config_store
+                .subject_deletion_worker_request(
+                    TEST_WORKSPACE_ID,
+                    &subject.id,
+                    "same-delete",
+                    &worker,
+                )
+                .unwrap();
+            let fence = api
+                .runtime
+                .subject_delete_worker(&worker.runtime_id, deletion.clone())
+                .unwrap();
+            assert!(!fence.originals_absent);
+            let result = api
+                .runtime
+                .execute_worker_retention(&worker, saved.runtime_request.clone())
+                .unwrap();
+            // Fault fixture: physical removal completed, but the receipt still
+            // carries its pre-completion checkpoint. Keep the exact original child.
+            let path = dir
+                .path()
+                .join(".test-embedded-runtime-store/retention/operations")
+                .join(format!("{}.json", old.operation_id));
+            let mut pending: Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            pending["result"]["source_removed"] = json!(false);
+            let pending_bytes = serde_json::to_vec(&pending).unwrap();
+            std::fs::write(&path, &pending_bytes).unwrap();
+            let observed = api
+                .runtime
+                .subject_delete_worker(&worker.runtime_id, deletion.clone())
+                .unwrap();
+            assert!(!observed.originals_absent);
+            assert!(observed.completed_removal.is_none());
+            assert_eq!(
+                serde_json::to_value(observed.pending_removal.as_ref().unwrap()).unwrap(),
+                serde_json::to_value(&saved.runtime_request).unwrap()
+            );
+            assert!(
+                api.runtime
+                    .purge_subject_job_removal(
+                        &worker.runtime_id,
+                        deletion,
+                        saved.runtime_request.clone()
+                    )
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), pending_bytes);
+            old_result = Some(result);
+        }
         *execution.subject_delete_failure.lock().unwrap() = None;
         let mut reopened = api.clone();
         let reopened_store =
             Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
         reopened.config_store = reopened_store.clone();
         reopened.store = reopened_store;
-        if matches!(phase, "catalog_failure" | "purge_ack_commit_failure") {
+        if matches!(
+            phase,
+            "catalog_failure" | "partial_catalog_failure" | "purge_ack_commit_failure"
+        ) {
             let (status, pending) = delete_request(
                 &reopened,
                 &subject.id,
@@ -1034,11 +1285,13 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
             reopened
                 .config_store
                 .with_conn(|c| {
-                    c.execute_batch(if phase == "catalog_failure" {
-                        "DROP TRIGGER injected_old_catalog_failure;"
-                    } else {
-                        "DROP TRIGGER injected_purge_ack_commit_failure;"
-                    })?;
+                    c.execute_batch(
+                        if matches!(phase, "catalog_failure" | "partial_catalog_failure") {
+                            "DROP TRIGGER injected_old_catalog_failure;"
+                        } else {
+                            "DROP TRIGGER injected_purge_ack_commit_failure;"
+                        },
+                    )?;
                     Ok(())
                 })
                 .unwrap();
@@ -1067,10 +1320,14 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
         let reconciled = reopened
             .config_store
             .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
-            .unwrap()
             .unwrap();
-        assert!(reconciled.completed);
-        assert_eq!(reconciled.request, saved.runtime_request);
+        if phase == "prior_success" {
+            assert!(reconciled.is_none());
+        } else {
+            let reconciled = reconciled.unwrap();
+            assert!(reconciled.completed);
+            assert_eq!(reconciled.request, saved.runtime_request);
+        }
         let canonical = reopened
             .config_store
             .recover_worker_removal_execution(TEST_WORKSPACE_ID, &worker)
@@ -1097,21 +1354,40 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
         assert!(result.source_removed);
         let archive = result.archive.as_ref().unwrap();
         let root = dir.path().join(".test-embedded-runtime-store");
-        assert!(
-            !root
-                .join("archives/workers")
+        assert_eq!(
+            root.join("archives/workers")
                 .join(&archive.archive_id)
                 .join("session")
                 .exists(),
-            "new Job archive copy survives {phase}"
+            phase == "prior_success",
+            "only prior-success Job archives are preserved: {phase}",
         );
+        if let Some((session, segment)) = retained {
+            let retention = worker_runtime::retention::runtime_session_retention(&root);
+            if phase == "prior_success" {
+                use session_store::Store;
+                assert!(retention.ensure_live(session).is_ok());
+                let archived = session_store::WorkerSessionStore::open_read_only(
+                    root.join("archives/workers")
+                        .join(&archive.archive_id)
+                        .join("session/retained-sessions")
+                        .join(session.to_string()),
+                )
+                .unwrap();
+                assert!(archived.exists(session, segment).unwrap());
+            } else {
+                assert!(
+                    matches!(retention.ensure_live(session), Err(session_store::StoreError::SessionErased(id)) if id == session)
+                );
+            }
+        }
         if result.diagnostics_disposition == DiagnosticsDisposition::Retain {
-            assert!(
-                !root
-                    .join("archives/diagnostics")
+            assert_eq!(
+                root.join("archives/diagnostics")
                     .join(&old.operation_id)
                     .exists(),
-                "Job diagnostics survive {phase}"
+                phase == "prior_success",
+                "only prior-success Job diagnostics are preserved: {phase}",
             );
         }
         assert!(
@@ -1151,15 +1427,20 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subject_deletion() {
-    body_archive_subject_deletion(false).await;
+    body_archive_subject_deletion(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_metadata_purge_removal_allows_subject_deletion_without_tombstone() {
-    body_archive_subject_deletion(true).await;
+    body_archive_subject_deletion(true, false).await;
 }
 
-async fn body_archive_subject_deletion(completed_metadata_purge: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_non_job_child_survives_partial_session_erasure_before_subject_retry() {
+    body_archive_subject_deletion(false, true).await;
+}
+
+async fn body_archive_subject_deletion(completed_metadata_purge: bool, partial_reconciled: bool) {
     let dir = tempfile::tempdir().unwrap();
     init_clean_git_workspace(dir.path());
     let (api, execution) = test_api_with_recording_backend(dir.path()).await;
@@ -1192,6 +1473,7 @@ async fn body_archive_subject_deletion(completed_metadata_purge: bool) {
     .unwrap();
     let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
     seed_worker_session_for_cleanup(dir.path(), &worker);
+    let retained = partial_reconciled.then(|| seed_subject_retained_sibling(dir.path(), &worker));
     api.runtime
         .stop_worker(
             &worker,
@@ -1366,6 +1648,12 @@ async fn body_archive_subject_deletion(completed_metadata_purge: bool) {
         .unwrap();
     assert!(!snapshot.is_job && !snapshot.completed);
     assert_eq!(snapshot.request, saved.runtime_request);
+    if partial_reconciled {
+        api.config_store.with_conn(|c| {
+            c.execute_batch("CREATE TRIGGER injected_subject_finish_failure BEFORE UPDATE OF completed ON subject_deletions WHEN NEW.completed=1 BEGIN SELECT RAISE(ABORT,'subject finish failure'); END;")?;
+            Ok(())
+        }).unwrap();
+    }
     *execution.subject_delete_failure.lock().unwrap() = None;
     let (status, done) = delete_request(
         &api,
@@ -1375,6 +1663,98 @@ async fn body_archive_subject_deletion(completed_metadata_purge: bool) {
         TEST_WORKSPACE_ID,
     )
     .await;
+    if partial_reconciled {
+        assert_ne!(status, StatusCode::OK, "{done}");
+        let child = api
+            .config_store
+            .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .unwrap();
+        assert!(child.completed && !child.is_job);
+        assert!(
+            !store
+                .subject_deletion(&subject.id)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        let archive = result.archive.as_ref().unwrap();
+        api.runtime
+            .session_material_erase(
+                &worker.runtime_id,
+                runtime_api::SessionMaterialEraseRequest {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    source: runtime_api::SessionPublicSource::Archived {
+                        archive_id: archive.archive_id.clone(),
+                    },
+                    expected_session_id: archive.source_session_id.clone(),
+                },
+            )
+            .unwrap();
+        assert!(
+            api.runtime
+                .execute_worker_retention(&worker, saved.runtime_request.clone())
+                .is_err()
+        );
+        let (session, segment) = retained.unwrap();
+        let root = dir
+            .path()
+            .join(".test-embedded-runtime-store/archives/workers")
+            .join(&archive.archive_id)
+            .join("session/retained-sessions")
+            .join(session.to_string());
+        use session_store::Store;
+        let sibling = session_store::WorkerSessionStore::open_read_only(&root).unwrap();
+        let sibling_bytes =
+            serde_json::to_vec(&sibling.read_all(session, segment).unwrap()).unwrap();
+        api.config_store
+            .with_conn(|c| {
+                c.execute_batch("DROP TRIGGER injected_subject_finish_failure;")?;
+                Ok(())
+            })
+            .unwrap();
+        let mut reopened = api.clone();
+        let reopened_store =
+            Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
+        reopened.config_store = reopened_store.clone();
+        reopened.store = reopened_store;
+        for _ in 0..2 {
+            let (status, done) = delete_request(
+                &reopened,
+                &subject.id,
+                "same-body-delete",
+                Some(&owner),
+                TEST_WORKSPACE_ID,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{done}");
+            assert_eq!(done["completed"], true, "{done}");
+            assert_eq!(
+                reopened
+                    .config_store
+                    .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
+                    .unwrap(),
+                Some(child.clone())
+            );
+            assert!(
+                reopened
+                    .runtime
+                    .execute_worker_retention(&worker, saved.runtime_request.clone())
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_vec(&sibling.read_all(session, segment).unwrap()).unwrap(),
+                sibling_bytes
+            );
+            worker_runtime::retention::runtime_session_retention(
+                &dir.path().join(".test-embedded-runtime-store"),
+            )
+            .ensure_live(session)
+            .unwrap();
+        }
+        assert_eq!(*execution.stops.lock().unwrap(), stops_before);
+        return;
+    }
     assert_eq!(status, StatusCode::OK, "{done}");
     assert_eq!(done["completed"], true, "{done}");
     let completed = api

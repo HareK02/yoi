@@ -120,6 +120,7 @@ Deno.test('Worker list state uses the authoritative live snapshot separately fro
 
 Deno.test('Worker display preserves nonactive lifecycle instead of obsolete snapshots or catalog stopped status', () => {
   const staleSnapshot = {
+    state_sequence: 1,
     state: { kind: 'idle' as const },
     last_command_id: 1,
   };
