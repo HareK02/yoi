@@ -2737,7 +2737,8 @@ fn startup_transfer(
 
 fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
     match error {
-        RuntimeError::WorkerCreateFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        RuntimeError::WorkerCreateFailed { .. }
+        | RuntimeError::WorkerStopPersistenceFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
@@ -2799,6 +2800,8 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::RestoreAdmissionBusy { .. }
         | RuntimeError::StopObservationConflict { .. }
         | RuntimeError::StopRequestConflict { .. }
+        | RuntimeError::StopRequestInterrupted { .. }
+        | RuntimeError::StopRequestFailed { .. }
         | RuntimeError::StopAdmissionBusy { .. }
         | RuntimeError::WorkdirAttachmentsRequestConflict { .. }
         | RuntimeError::WorkdirAttachmentsGenerationStale { .. }
@@ -2840,6 +2843,9 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::StopObservationConflict { .. } => "stop_observation_conflict".to_string(),
         RuntimeError::StopRequestConflict { .. } => "stop_request_conflict".to_string(),
         RuntimeError::StopAdmissionBusy { .. } => "stop_admission_busy".to_string(),
+        RuntimeError::StopRequestInterrupted { .. } => "stop_request_interrupted".into(),
+        RuntimeError::StopRequestFailed { .. }
+        | RuntimeError::WorkerStopPersistenceFailed { .. } => error.control_cause().reason().into(),
         RuntimeError::WorkdirAttachmentsRequestConflict { .. } => {
             "workdir_attachments_request_conflict".to_string()
         }
@@ -5150,7 +5156,7 @@ mod tests {
         let stops = backend.stops.lock().unwrap();
         assert_eq!(stops.len(), 1);
         assert_eq!(stops[0].worker_ref, created.worker_ref);
-        let original_stop_id = stops[0].operation_id;
+
         drop(stops);
         assert!(
             backend
@@ -5176,7 +5182,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
-            "pending unproven Stop must forbid removal"
+            "unproven termination must forbid removal"
         );
         assert_eq!(
             read_control_cause(response).await,
@@ -5191,14 +5197,12 @@ mod tests {
             .test_runtime_store()
             .read_worker_record(&created.worker_ref)
             .unwrap();
-        let crate::fs_store::PersistedWorkerExecutionState::ReconciliationRequired(
-            crate::fs_store::PersistedWorkerLifecycleOperation::Stop(pending),
-        ) = record.execution_state
+        let crate::fs_store::PersistedWorkerExecutionState::Suspended(Some(spec)) =
+            record.execution_state
         else {
-            panic!("unproven Stop must retain its durable owner");
+            panic!("failed Stop must retain only its explicit stop intent");
         };
-        assert_eq!(pending.operation_id, original_stop_id);
-        assert_eq!(pending.request.as_ref().unwrap(), fixture.create_request());
+        assert_eq!(&spec.request, fixture.create_request());
         let document: serde_json::Value = serde_json::from_slice(
             &std::fs::read(
                 options

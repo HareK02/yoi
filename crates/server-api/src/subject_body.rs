@@ -162,6 +162,10 @@ pub struct SubjectBodyMutationResponse {
 pub enum SubjectBodyStopOutcome {
     NotFound,
     Pending,
+    Interrupted,
+    Failed {
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
     Stopped,
 }
 

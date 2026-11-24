@@ -36,6 +36,25 @@ pub enum RuntimeError {
     )]
     StopAdmissionBusy { worker_id: WorkerId },
 
+    #[error("worker {worker_id} Stop request was interrupted; it cannot be resumed")]
+    StopRequestInterrupted { worker_id: WorkerId },
+
+    #[error("worker {worker_id} Stop request already failed: {cause:?}")]
+    StopRequestFailed {
+        worker_id: WorkerId,
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
+
+    #[error(
+        "worker {worker_id} could not save its Stop result; execution and persistence results are separate"
+    )]
+    WorkerStopPersistenceFailed {
+        worker_id: WorkerId,
+        result: WorkerExecutionResult,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+
     #[error(
         "worker {worker_id} attachment operation request ID is bound to different input or pending authority"
     )]
@@ -201,7 +220,8 @@ impl RuntimeError {
     /// failures. Display is presentation only and must not be parsed to recover causes.
     pub fn execution_result(&self) -> Option<&WorkerExecutionResult> {
         match self {
-            Self::WorkerExecutionRejected { result, .. } => Some(result),
+            Self::WorkerExecutionRejected { result, .. }
+            | Self::WorkerStopPersistenceFailed { result, .. } => Some(result),
             Self::WorkerCreateFailed { source, .. } => source.execution_result(),
             _ => None,
         }
@@ -228,8 +248,25 @@ impl RuntimeError {
             E::StopObservationConflict { .. } => C::StopObservationConflict,
             E::StopRequestConflict { .. } => C::StopRequestConflict,
             E::StopAdmissionBusy { .. } => C::StopAdmissionBusy,
+            E::StopRequestInterrupted { .. } => C::StopRequestInterrupted,
+            E::StopRequestFailed { cause, .. } => *cause,
+            E::WorkerStopPersistenceFailed { result, source, .. } => {
+                if result.termination.is_none() {
+                    source.control_cause()
+                } else if source.control_cause() == C::PersistenceOutcomeUnknown {
+                    C::StopTerminatedPersistenceOutcomeUnknown
+                } else {
+                    C::StopTerminatedPersistenceFailed
+                }
+            }
             E::WorkerExecutionUnavailable { .. } | E::ExecutionBackendUnavailable { .. } => {
                 C::ExecutionUnavailable
+            }
+            E::WorkerExecutionRejected { result, .. }
+                if result.operation == crate::execution::WorkerExecutionOperation::Stop
+                    && result.termination.is_some() =>
+            {
+                C::StopTerminatedCleanupFailed
             }
             E::WorkerExecutionRejected { result, .. } => match result.command.as_ref() {
                 Some(protocol::WorkerCommandResult::Unconfirmed { .. }) => C::ResultUnavailable,

@@ -1,7 +1,7 @@
 // These catalog tests substitute the execution response. The real Controller
 // join and fs-store reopen connection is covered in worker_backend tests.
 #[test]
-fn stop_termination_unknown_save_reconciles_original_operation_before_and_after_reopen() {
+fn stop_termination_unknown_save_reconciles_result_without_resuming_stop_before_or_after_reopen() {
     for reconcile_in_process in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let options = crate::fs_store::FsRuntimeStoreOptions::new(dir.path())
@@ -26,7 +26,7 @@ fn stop_termination_unknown_save_reconciles_original_operation_before_and_after_
             .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
         assert!(matches!(
             runtime.commit_stopped_worker(&worker.worker_ref, operation_id, result),
-            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+            Err(RuntimeError::WorkerStopPersistenceFailed { .. })
         ));
         if reconcile_in_process {
             runtime_store(&runtime).fail_next_worker_reconcile_sync();
@@ -111,22 +111,21 @@ fn stop_termination_rejects_missing_wrong_operation_run_worker_and_feature_failu
                 .is_none(),
             "{invalid}"
         );
-        assert_eq!(
+        assert!(
             runtime
                 .lock()
                 .unwrap()
                 .worker(&worker.worker_ref)
                 .unwrap()
                 .pending_stop()
-                .unwrap()
-                .operation_id,
-            operation_id
+                .is_none(),
+            "{invalid}"
         );
     }
 }
 
 #[test]
-fn stop_termination_cleanup_error_retains_join_without_settling_stop_or_overwriting_receipt() {
+fn stop_termination_cleanup_error_settles_execution_without_resuming_stop_or_overwriting_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let options = crate::fs_store::FsRuntimeStoreOptions::new(dir.path())
         .with_runtime_id("termination-cleanup");
@@ -187,15 +186,124 @@ fn stop_termination_cleanup_error_retains_join_without_settling_stop_or_overwrit
         reopened.execution_termination(&worker.worker_ref).unwrap(),
         Some(original)
     );
-    assert_eq!(
+    assert!(
         reopened
             .lock()
             .unwrap()
             .worker(&worker.worker_ref)
             .unwrap()
             .pending_stop()
-            .unwrap()
-            .operation_id,
-        operation_id
+            .is_none()
     );
+    assert_eq!(
+        reopened.worker_detail(&worker.worker_ref).unwrap().status,
+        WorkerStatus::Stopped
+    );
+}
+
+#[test]
+fn stopped_execution_does_not_roll_back_after_failed_or_unknown_result_save() {
+    for fault in [
+        crate::fs_store::AtomicWriteFault::BeforeRename,
+        crate::fs_store::AtomicWriteFault::AfterRename,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(dir.path()).with_runtime_id("stopped-save-fault");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("joined before save fault"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "result-save-fault");
+        runtime
+            .coordinate_worker_stop(&worker.worker_ref, request.clone())
+            .unwrap();
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_stop()
+            .unwrap()
+            .operation_id;
+        let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            worker_ref: worker.worker_ref.clone(),
+            operation_id,
+        });
+        let termination = result.termination.clone().unwrap();
+        runtime_store(&runtime).fail_next_worker_write(fault);
+        let error = runtime
+            .commit_stopped_worker(&worker.worker_ref, operation_id, result)
+            .unwrap_err();
+        let RuntimeError::WorkerStopPersistenceFailed { result, source, .. } = &error else {
+            panic!("termination and persistence must both be returned")
+        };
+        assert_eq!(result.termination, Some(termination));
+        assert!(matches!(
+            source.as_ref(),
+            RuntimeError::StoreIo { .. } | RuntimeError::StoreCommitOutcomeUnknown { .. }
+        ));
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_stop()
+                .is_none()
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        let outcome = runtime
+            .worker_stop_outcome(&worker.worker_ref, request.clone())
+            .unwrap();
+        if matches!(fault, crate::fs_store::AtomicWriteFault::BeforeRename) {
+            assert!(matches!(
+                outcome,
+                crate::catalog::WorkerStopOutcome::Failed {
+                    cause: RuntimeControlCause::StopTerminatedPersistenceFailed
+                }
+            ));
+            assert!(matches!(
+                runtime.stop_worker_request(&worker.worker_ref, request),
+                Err(RuntimeError::StopRequestFailed {
+                    cause: RuntimeControlCause::StopTerminatedPersistenceFailed,
+                    ..
+                })
+            ));
+        } else {
+            assert!(matches!(
+                outcome,
+                crate::catalog::WorkerStopOutcome::Stopped { .. }
+            ));
+            assert!(
+                runtime
+                    .stop_worker_request(&worker.worker_ref, request)
+                    .unwrap()
+                    .replayed
+            );
+        }
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        drop(runtime);
+        let restarted_backend = Arc::new(TestExecutionBackend::default());
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options, restarted_backend.clone())
+                .unwrap();
+        assert!(
+            reopened
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_stop()
+                .is_none()
+        );
+        assert_eq!(*restarted_backend.stop_count.lock().unwrap(), 0);
+        assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
+    }
 }

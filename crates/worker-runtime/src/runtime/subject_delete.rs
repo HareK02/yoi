@@ -457,19 +457,36 @@ impl Runtime {
             }
         };
         if let Some((stop, termination)) = stop {
-            // Only an unfinished operation resumes its owned cleanup. Historical
-            // termination is retained as progress, never a gate on settled state.
+            // This invocation owns the in-memory Stop. A later deletion retry
+            // rechecks resources without resurrecting a saved Stop operation.
             let result = backend
                 .subject_delete_worker_stop(&request, stop.clone(), termination.as_ref())
-                .map_err(RuntimeError::InvalidRequest)?;
+                .unwrap_or_else(|message| {
+                    WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message)
+                });
             self.commit_stopped_worker(&worker_ref, stop.operation_id, result)?;
         } else {
             // A settled lifecycle authorizes removal without Stop. Admission is
             // already fenced; reject a conflicting current candidate/resource
             // owner without interpreting an older Stop as its termination.
+            let saved = self
+                .lock()?
+                .worker(&worker_ref)?
+                .restore_guard
+                .execution_termination
+                .clone();
+            backend
+                .cleanup_stopped_worker(&worker_ref, saved.as_ref())
+                .map_err(RuntimeError::InvalidRequest)?;
             backend
                 .preflight_worker_removal(&worker_ref)
                 .map_err(RuntimeError::InvalidRequest)?;
+            // A prior Stop may have terminated execution but failed to save it.
+            // Retry only the settled facts before confirming durable deletion;
+            // never reconstruct a Stop or obtain another join receipt.
+            let mut state = self.lock()?;
+            let settled = state.worker(&worker_ref)?.clone();
+            state.persist_worker_record_with_fence(&settled)?;
         }
         let mut state = self.lock()?;
         // This is storage-owner evidence under the same lock that permanently

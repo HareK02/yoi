@@ -86,6 +86,7 @@ enum StopProgress {
 #[derive(Debug, Clone)]
 struct StopOperation {
     pending: PendingWorkerStop,
+    request: Option<runtime_api::WorkerLifecycleRequest>,
     progress: StopProgress,
     restore: Option<RestoreOperation>,
     #[cfg(feature = "fs-store")]
@@ -326,6 +327,7 @@ impl WorkerRecord {
         };
         self.execution = WorkerExecutionState::Stopping(StopOperation {
             pending,
+            request: None,
             progress: StopProgress::AwaitingTermination,
             restore,
             #[cfg(feature = "fs-store")]
@@ -334,6 +336,46 @@ impl WorkerRecord {
             execution,
         });
     }
+    fn record_stop_failure(&mut self, cause: RuntimeControlCause) {
+        let id = self
+            .stop_operation()
+            .and_then(|stop| stop.request.as_ref())
+            .and_then(|request| request.stop_intent.as_ref())
+            .map(|intent| intent.request_id.clone());
+        if let Some(id) = id
+            && let Some(result) = self.restore_guard.stop_results.get_mut(&id)
+        {
+            result.failure = Some(cause);
+        }
+    }
+
+    fn finish_failed_stop(&mut self, operation_id: WorkerLifecycleOperationId) {
+        let Some(stop) = self
+            .stop_operation()
+            .filter(|stop| stop.pending.operation_id == operation_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.execution = if let Some(mut active) = stop.execution {
+            active.observation_valid = false;
+            WorkerExecutionState::Active(active)
+        } else if let Some(restore) = stop.restore {
+            WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Restore(restore))
+        } else if let Some(create) = stop.create {
+            WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Create(create))
+        } else {
+            #[cfg(feature = "fs-store")]
+            if let Some(finalization) = stop.restore_finalization {
+                self.execution = WorkerExecutionState::RecoveryRequired(
+                    WorkerLifecycleOperation::RestoreFinalization(finalization),
+                );
+                return;
+            }
+            WorkerExecutionState::AwaitingRestore(stop.pending.last_settled_status)
+        };
+    }
+
     /// Only operation owners call this after their execution/cleanup has finished.
     fn settle_stopped(&mut self) {
         self.execution = WorkerExecutionState::Stopped;
@@ -355,6 +397,7 @@ impl WorkerRecord {
         let Some(restore) = self.restore_operation().cloned() else {
             return;
         };
+        self.restore_guard.automatic_restore_suppressed = false;
         self.execution = match restore.candidate {
             RestoreCandidate::Existing(active) => WorkerExecutionState::Active(active),
             RestoreCandidate::Publishing(active)

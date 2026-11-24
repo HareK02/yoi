@@ -15,6 +15,10 @@ fn schema17_document(worker: &PersistedWorkerRecord) -> serde_json::Value {
         serde_json::to_value(WorkerAggregateRecord::from_persisted(worker)).unwrap(),
     );
     document["schema_version"] = serde_json::json!(ATTACHMENT_AUTHORITY_SCHEMA_VERSION);
+    document["restore_guard"]
+        .as_object_mut()
+        .unwrap()
+        .remove("automatic_restore_suppressed");
     document
 }
 
@@ -66,7 +70,8 @@ fn schema17_lifecycle_roundtrip_preserves_empty_authority_history_and_unresolved
                 }
             });
             let guard = document["workdir_attachments_guard"].clone();
-            let restore_guard = document["restore_guard"].clone();
+            let mut restore_guard = document["restore_guard"].clone();
+            restore_guard["automatic_restore_suppressed"] = serde_json::json!(false);
             install_schema17_document(&store, &path, &document);
             let before = fs::read(&path).unwrap();
             drop(store);
@@ -121,7 +126,7 @@ fn schema17_lifecycle_roundtrip_preserves_empty_authority_history_and_unresolved
 }
 
 #[test]
-fn schema17_pending_restore_and_stop_preserve_phase_owner_and_nonempty_authority() {
+fn schema17_interrupted_stop_preserves_independent_restore_authority_without_stop_owner() {
     for under_stop in [false, true] {
         for commit in ["not_committed", "committed", "legacy_unknown"] {
             let (_temp, store, worker, path) = canonical_worker_store();
@@ -152,7 +157,8 @@ fn schema17_pending_restore_and_stop_preserve_phase_owner_and_nonempty_authority
                 serde_json::json!({"state": "reconciliation_required", "execution": operation});
             let operation_id =
                 document["execution_state"]["execution"]["intent"]["operation_id"].clone();
-            let before_guard = document["restore_guard"].clone();
+            let mut before_guard = document["restore_guard"].clone();
+            before_guard["automatic_restore_suppressed"] = serde_json::json!(under_stop);
             install_schema17_document(&store, &path, &document);
             // Workspace ownership is a separate Runtime fact, not inferred from a
             // retained logical attachment or a lifecycle operation.
@@ -166,19 +172,18 @@ fn schema17_pending_restore_and_stop_preserve_phase_owner_and_nonempty_authority
             let disk: serde_json::Value = read_json(&path, "read lifecycle").unwrap();
             assert_eq!(disk["logical_workdir_attachments"], authority);
             assert_eq!(disk["restore_guard"], before_guard);
+            assert_eq!(disk["execution_state"]["execution"]["operation"], "restore");
             let intent = &disk["execution_state"]["execution"]["intent"];
-            assert_eq!(intent["operation_id"], operation_id);
-            assert_eq!(
-                if under_stop {
-                    &intent["pending_restore"]["commit"]
-                } else {
-                    &intent["commit"]
-                },
-                commit
-            );
-            if under_stop {
-                assert_eq!(intent["progress"]["phase"], "awaiting_termination");
-            }
+            let restore_id = if under_stop {
+                &document["execution_state"]["execution"]["intent"]["pending_restore"]["operation_id"]
+            } else {
+                &operation_id
+            };
+            assert_eq!(&intent["operation_id"], restore_id);
+            assert_eq!(intent["commit"], commit);
+            assert!(intent.get("progress").is_none());
+            assert!(intent.get("pending_restore").is_none());
+            assert!(disk["restore_guard"].get("stop_owners").is_none());
             assert!(
                 !serde_json::to_string(&disk)
                     .unwrap()
@@ -220,7 +225,8 @@ fn schema17_guard_only_restore_admission_is_not_migrated_to_stable_stopped_or_ru
             "request": {"request_id": "admitted", "expected_observation_token": document["restore_guard"]["observation_token"]},
             "preparation_applied": false, "execution_started": false, "receipt": null
         });
-        let guard = document["restore_guard"].clone();
+        let mut guard = document["restore_guard"].clone();
+        guard["automatic_restore_suppressed"] = serde_json::json!(false);
         install_schema17_document(&store, &path, &document);
         drop(store);
         let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -299,7 +305,7 @@ fn schema17_invalid_old_combinations_fail_without_replacing_original_tree() {
 }
 
 #[test]
-fn schema18_decoder_rejects_old_intent_and_unbound_runnable_stop() {
+fn current_decoder_rejects_legacy_intent_persisted_stop_and_bound_not_started() {
     for fault in ["intent", "unbound-stop", "not-started-bound"] {
         let (_temp, store, worker, path) = canonical_worker_store();
         let mut document =
@@ -333,7 +339,7 @@ fn schema18_decoder_rejects_old_intent_and_unbound_runnable_stop() {
 }
 
 #[test]
-fn schema17_joined_stop_keeps_original_operation_and_shutdown_receipt_on_reopen() {
+fn schema17_joined_stop_retains_termination_history_without_resumable_operation() {
     let (_temp, store, worker, path) = canonical_worker_store();
     let root = store.root.clone();
     let mut document = schema17_document(&worker);
@@ -354,12 +360,18 @@ fn schema17_joined_stop_keeps_original_operation_and_shutdown_receipt_on_reopen(
     let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
     let saved = opened.store.read_worker_record(&worker.worker_ref).unwrap();
     let disk: serde_json::Value = read_json(&path, "read joined Stop").unwrap();
+    assert_eq!(disk["execution_state"]["state"], "suspended");
+    assert_eq!(disk["restore_guard"]["automatic_restore_suppressed"], true);
     assert_eq!(
-        disk["execution_state"]["execution"]["intent"]["progress"],
-        serde_json::json!({
-            "phase": "scope_terminated", "termination": termination
-        })
+        disk["restore_guard"]["execution_termination"],
+        serde_json::to_value(&termination).unwrap()
     );
+    assert!(
+        disk["execution_state"]["execution"]
+            .get("operation_id")
+            .is_none()
+    );
+    assert!(disk["restore_guard"].get("stop_owners").is_none());
     opened.store.write_worker_record(&saved).unwrap();
     let bytes = fs::read(&path).unwrap();
     drop(opened);
@@ -369,11 +381,12 @@ fn schema17_joined_stop_keeps_original_operation_and_shutdown_receipt_on_reopen(
         .read_worker_record(&worker.worker_ref)
         .unwrap();
     assert_eq!(fs::read(&path).unwrap(), bytes);
-    // Malformed current JSON cannot swap the joined execution while keeping the
-    // older guard's evidence, even though both receipts address this Worker.
+    // History is not a current Stop checkpoint, but still requires complete evidence.
     let mut invalid = disk;
-    invalid["execution_state"]["execution"]["intent"]["progress"]["termination"]["execution_id"] =
-        serde_json::json!(uuid::Uuid::now_v7());
+    invalid["restore_guard"]["execution_termination"]
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_id");
     fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
     assert!(
         reopened
@@ -456,8 +469,11 @@ fn schema17_historical_receipts_survive_without_becoming_current_execution() {
     );
     let mut expected_snapshot = restore_receipt["worker"]["worker_state"].clone();
     expected_snapshot["state_sequence"] = serde_json::json!(0);
-    assert_eq!(restored_receipt["worker"]["worker_state"], expected_snapshot);
-    let mut restored_stop = disk["restore_guard"]["stop_owners"]["old-stop"]["receipt"].clone();
+    assert_eq!(
+        restored_receipt["worker"]["worker_state"],
+        expected_snapshot
+    );
+    let mut restored_stop = disk["restore_guard"]["stop_results"]["old-stop"]["receipt"].clone();
     assert_eq!(restored_stop["lifecycle"], "stopped");
     restored_stop.as_object_mut().unwrap().remove("lifecycle");
     // Optional null snapshot is omitted by the canonical current writer.
@@ -467,9 +483,15 @@ fn schema17_historical_receipts_survive_without_becoming_current_execution() {
         disk["restore_guard"]["owners"]["old-restore"]["operation_id"],
         restore_id.to_string()
     );
+    assert!(disk["restore_guard"].get("stop_owners").is_none());
+    assert!(
+        disk["restore_guard"]["stop_results"]["old-stop"]
+            .get("operation_id")
+            .is_none()
+    );
     assert_eq!(
-        disk["restore_guard"]["stop_owners"]["old-stop"]["operation_id"],
-        stop_id.to_string()
+        disk["restore_guard"]["stop_results"]["old-stop"]["request"],
+        document["restore_guard"]["stop_owners"]["old-stop"]["request"]
     );
     opened.store.write_worker_record(&saved).unwrap();
     let bytes = fs::read(&path).unwrap();

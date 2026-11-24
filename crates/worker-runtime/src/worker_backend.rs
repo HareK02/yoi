@@ -6074,7 +6074,18 @@ where
             return result;
         };
 
-        if let Err(message) = self.cleanup_execution_resources(&execution) {
+        let cleanup = if operation_id
+            .is_some_and(|id| execution.tasks.termination(worker_ref, id).is_some())
+        {
+            execution
+                .handle
+                .delete_uncommitted_uploaded_files()
+                .map(|_| ())
+                .map_err(|error| format!("uploaded_file_cleanup_failed: {error}"))
+        } else {
+            self.cleanup_execution_resources(&execution)
+        };
+        if let Err(message) = cleanup {
             let mut result = startup_stop_result.clone().unwrap_or_else(|| {
                 WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message.clone())
             });
@@ -7237,7 +7248,7 @@ where
         if let Some(existing) = workers.get(&request.worker_ref) {
             let result = WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Restore,
-                "Worker is already connected to execution backend",
+                "Worker execution resources are still owned; if shutdown was requested, issue a fresh Stop to reclaim that owner before Restore",
             );
             if existing.shutdown_requested.load(Ordering::Acquire)
                 || existing.tasks.has_cleanup_candidates().map_err(|message| {
@@ -8556,6 +8567,55 @@ where
         };
 
         self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method)
+    }
+
+    fn cleanup_stopped_worker(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> Result<(), String> {
+        let lock = self.worker_lock(worker_ref)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| "worker operation lock is poisoned")?;
+        if self.pending_spawn_exists(worker_ref)? || self.pending_restore(worker_ref)?.is_some() {
+            return Err("Worker startup resources still have a current owner; stop that owner before retrying cleanup".into());
+        }
+        let execution = self
+            .workers
+            .lock()
+            .map_err(|_| "worker registry poisoned")?
+            .get(worker_ref)
+            .cloned();
+        if let Some(execution) = execution {
+            let saved = saved
+                .ok_or("a current execution still owns resources; explicit Stop is required")?;
+            if execution
+                .tasks
+                .termination(worker_ref, saved.stop_operation_id)
+                .as_ref()
+                != Some(saved)
+            {
+                return Err("current execution differs from the terminated resource owner".into());
+            }
+            // Actual join is already confirmed by this original scope. Only the
+            // remaining resource effects are retried, never Shutdown or join.
+            execution
+                .handle
+                .delete_uncommitted_uploaded_files()
+                .map_err(|error| format!("uploaded_file_cleanup_failed: {error}"))?;
+            self.factory
+                .deactivate_stopped_controller(worker_ref, &execution.handle)?;
+            self.workers
+                .lock()
+                .map_err(|_| "worker registry poisoned")?
+                .remove(worker_ref);
+        }
+        let factory = self.factory.clone();
+        let stopped = worker_ref.clone();
+        self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
+            factory.reconcile_stopped_worker(&stopped).await
+        })
     }
 
     fn reconcile_stop_worker_operation(
@@ -13614,10 +13674,17 @@ mod tests {
         let journal_path = aggregate.join("worker.json");
         let journal_before = fs::read(&journal_path).unwrap();
         let journal: serde_json::Value = serde_json::from_slice(&journal_before).unwrap();
-        assert_eq!(journal["execution_state"]["execution"]["operation"], "stop");
         assert_eq!(
-            journal["execution_state"]["execution"]["intent"]["pending_restore"]["operation_id"],
+            journal["execution_state"]["execution"]["operation"],
+            "restore"
+        );
+        assert_eq!(
+            journal["execution_state"]["execution"]["intent"]["operation_id"],
             prior_restore_id.to_string()
+        );
+        assert_eq!(
+            journal["restore_guard"]["automatic_restore_suppressed"],
+            true
         );
         let artifact = aggregate
             .join("runs")
@@ -13671,12 +13738,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // A fresh Stop rotates only the observation fence. It must retain the
+        // independent Restore identity and all other canonical material.
+        let assert_retained_restore = || {
+            let mut observed: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+            observed["restore_guard"]["observation_token"] =
+                journal["restore_guard"]["observation_token"].clone();
+            assert_eq!(observed, journal);
+        };
         let failed = restarted.stop_worker(&worker.worker_ref, None).unwrap_err();
         assert!(
             failed.to_string().contains("unsafe restore artifact"),
             "{failed}"
         );
-        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_retained_restore();
         assert!(artifact.is_file());
         assert!(!profile_base.exists());
 
@@ -13690,7 +13766,7 @@ mod tests {
                 .contains("map absence is not shutdown proof")
         );
         assert!(!artifact.exists());
-        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_retained_restore();
         assert_eq!(
             fs::read_to_string(aggregate.join("session").join("keep-authority")).unwrap(),
             "saved Session authority"
