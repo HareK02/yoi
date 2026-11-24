@@ -778,6 +778,7 @@ async fn spawn_fault_retains_safe_reason_without_claiming_output_collection() {
         "spawn-fault",
         &CommandTelemetry::new(),
         BTreeMap::new(),
+        Arc::new(crate::CommandHost::default()),
         cancel_rx,
         &sender,
     )
@@ -883,5 +884,841 @@ async fn drain_failure_and_byte_budget_keep_independent_loss_diagnostics() {
             }
         );
         assert!(terminal.metadata_valid());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a user systemd manager, cgroup v2 memory controller and user@.service OOMPolicy=continue"]
+async fn systemd_scope_oom_is_attributed_without_stopping_sibling_or_provider() {
+    let root = TempDir::new().unwrap();
+    let host = crate::CommandHost::systemd(32 * 1024 * 1024, 2).unwrap();
+    let session = LocalWorkdirSession::new(
+        Scope::writable(root.path()).unwrap(),
+        root.path().to_path_buf(),
+    )
+    .with_command_host(host)
+    .unwrap();
+    let harness = Harness {
+        session,
+        _root: root,
+    };
+    let sibling = harness
+        .start("printf sibling-ready; exec sleep 100", 30)
+        .await;
+    let page = harness.page(&sibling, 0, 13).await;
+    assert_eq!(
+        stream_bytes(&page.chunks, CommandStream::Stdout),
+        b"sibling-ready"
+    );
+    let oom = harness.start(
+        "printf before-oom; x=$(head -c 67108864 /dev/zero | tr '\\0' x); printf unexpected-success", 15,
+    ).await;
+    let (chunks, terminal) = harness.collect(&oom, 0).await;
+    assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"before-oom");
+    assert_eq!(terminal.status, CommandStatus::Failed);
+    assert_eq!(
+        terminal.resource_outcome,
+        Some(crate::CommandResourceOutcome::Systemd {
+            oom: crate::CommandOomObservation::SystemdOomKill,
+            cleanup_confirmed: true,
+        })
+    );
+    assert!(terminal.metadata_valid(), "{terminal:?}");
+    assert_eq!(
+        harness
+            .session
+            .command_status(sibling.clone())
+            .await
+            .unwrap(),
+        CommandStatus::Running
+    );
+    harness
+        .session
+        .cancel_command(sibling.clone())
+        .await
+        .unwrap();
+    let (_, cancelled) = harness.collect(&sibling, 0).await;
+    assert_eq!(cancelled.status, CommandStatus::Cancelled);
+    let next = harness.start("printf after-oom", 10).await;
+    let (chunks, terminal) = harness.collect(&next, 0).await;
+    assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"after-oom");
+    assert_eq!(terminal.status, CommandStatus::Completed);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a user systemd manager, cgroup v2 memory controller and user@.service OOMPolicy=continue"]
+async fn systemd_scope_collects_detached_grandchildren_and_distinguishes_kill_from_oom() {
+    let root = TempDir::new().unwrap();
+    let session = LocalWorkdirSession::new(
+        Scope::writable(root.path()).unwrap(),
+        root.path().to_path_buf(),
+    )
+    .with_command_host(crate::CommandHost::systemd(32 * 1024 * 1024, 1).unwrap())
+    .unwrap();
+    let harness = Harness {
+        session,
+        _root: root,
+    };
+    for (script, expected) in [
+        (
+            "setsid bash -c 'trap \"\" TERM; printf grandchild; exec sleep 100' & wait",
+            CommandStatus::TimedOut,
+        ),
+        (
+            "setsid bash -c 'printf grandchild; exec sleep 100' &",
+            CommandStatus::Completed,
+        ),
+        ("kill -KILL $$", CommandStatus::Failed),
+        ("exit 137", CommandStatus::Failed),
+    ] {
+        let command = format!("cat /proc/self/cgroup; {script}");
+        let handle = harness.start(&command, 1).await;
+        let (chunks, terminal) = harness.collect(&handle, 0).await;
+        let stdout = stream_bytes(&chunks, CommandStream::Stdout);
+        let text = std::str::from_utf8(&stdout).unwrap();
+        let cgroup = text.lines().next().unwrap().strip_prefix("0::/").unwrap();
+        assert!(
+            !Path::new("/sys/fs/cgroup").join(cgroup).exists(),
+            "scope cgroup survived cleanup"
+        );
+        assert_eq!(terminal.status, expected, "{terminal:?}");
+        assert!(
+            matches!(
+                terminal.resource_outcome,
+                Some(crate::CommandResourceOutcome::Systemd {
+                    oom: crate::CommandOomObservation::NotObserved
+                        | crate::CommandOomObservation::Unknown,
+                    cleanup_confirmed: true,
+                })
+            ),
+            "{terminal:?}"
+        );
+        assert!(terminal.metadata_valid(), "{terminal:?}");
+        if script.starts_with("kill") {
+            // systemd-run may report its child's signal as exit 137. Only the
+            // launcher's actual wait signal is retained, never reconstructed.
+            assert!(terminal.signal == Some(libc::SIGKILL) || terminal.exit_code == Some(137));
+        }
+        if script.starts_with("exit") {
+            assert_eq!(terminal.exit_code, Some(137));
+            assert_eq!(terminal.signal, None);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_host_budget_refuses_commands_before_launch_across_workdirs() {
+    let host = crate::CommandHost::systemd(32 * 1024 * 1024, 1).unwrap();
+    let reservation = host.admit().unwrap();
+    for _ in 0..2 {
+        let root = TempDir::new().unwrap();
+        let session =
+            LocalWorkdirSession::new(Scope::writable(root.path()).unwrap(), root.path().into())
+                .with_command_host(host.clone())
+                .unwrap();
+        let error = session
+            .start_command(Harness::request("touch must-not-start", 1, 10))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::Unavailable(_)));
+        assert!(!root.path().join("must-not-start").exists());
+    }
+    drop(reservation);
+    assert!(host.admit().is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a user systemd manager, cgroup v2 memory controller and user@.service OOMPolicy=continue"]
+async fn systemd_scope_missing_launcher_never_falls_back_to_unconfined_execution() {
+    let root = TempDir::new().unwrap();
+    let session = LocalWorkdirSession::materialized_bound_with_environment(
+        Workdir::new("missing-launcher"),
+        root.path().into(),
+        root.path().into(),
+        SharedScope::new(Scope::writable(root.path()).unwrap()),
+        WorkdirSessionCapabilities::ALL,
+        BTreeMap::from([("PATH".into(), "/nonexistent-yoi-command-path".into())]),
+        vec![],
+    )
+    .with_command_host(crate::CommandHost::systemd(32 * 1024 * 1024, 1).unwrap())
+    .unwrap();
+    let harness = Harness {
+        session,
+        _root: root,
+    };
+    let handle = harness.start("touch must-not-start", 5).await;
+    let (_, terminal) = harness.collect(&handle, 0).await;
+    assert_eq!(terminal.status, CommandStatus::Failed);
+    assert_eq!(
+        terminal.output_collection,
+        CommandOutputCollection::NotStarted
+    );
+    assert_eq!(
+        terminal.resource_outcome,
+        Some(crate::CommandResourceOutcome::SetupUnconfirmed {
+            oom: crate::CommandOomObservation::Unknown,
+            cleanup_confirmed: true
+        })
+    );
+    assert!(terminal.metadata_valid());
+    assert!(!harness._root.path().join("must-not-start").exists());
+}
+
+// Re-exec only the exact current test: PATH injection is confined to that child,
+// including systemd::control(), which intentionally uses the process environment.
+// No application boundary, wrapper verification, or outcome classifier is mocked.
+#[cfg(target_os = "linux")]
+mod systemd_r2 {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const MEMORY: u64 = 32 * 1024 * 1024;
+
+    fn executable(name: &str) -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .map(|path| path.join(name))
+            .find(|path| {
+                path.is_absolute()
+                    && std::fs::metadata(path)
+                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+            // Preserve argv[0] applet selection (Nix sleep may link to coreutils).
+            .unwrap_or_else(|| panic!("real {name} required"))
+    }
+
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    // The parent owns the unit ledger and cleanup even when the child panics or
+    // its overall deadline expires. Never run a wildcard stop/reset operation.
+    struct Fixture {
+        root: TempDir,
+        systemctl: PathBuf,
+    }
+
+    impl Fixture {
+        fn unit(&self) -> Option<String> {
+            let unit = std::fs::read_to_string(self.root.path().join("unit")).ok()?;
+            let id = unit.strip_prefix("yoi-command-")?.strip_suffix(".scope")?;
+            (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(unit)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let Some(unit) = self.unit() else { return };
+            for args in [
+                vec!["kill", "--signal=KILL", "--kill-whom=all", unit.as_str()],
+                vec!["stop", unit.as_str()],
+                vec!["reset-failed", unit.as_str()],
+            ] {
+                let Ok(mut child) = std::process::Command::new(&self.systemctl)
+                    .args(["--user", "--no-pager", "--no-ask-password"])
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                else {
+                    continue;
+                };
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        _ => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn isolated(test: &str, mode: &str) -> bool {
+        if std::env::var("YOI_R2_CHILD").as_deref() == Ok(mode) {
+            return false;
+        }
+        // module_path! includes the crate name; libtest's names do not.
+        let test = test.split_once("::").expect("qualified test name").1;
+        // Resolve every executable used by the fixture before changing child PATH.
+        let bash = executable("bash");
+        let run = executable("systemd-run");
+        let systemctl = executable("systemctl");
+        let setsid = executable("setsid");
+        let sleep = executable("sleep");
+        let fixture = Fixture {
+            root: TempDir::new().unwrap(),
+            systemctl,
+        };
+        let bin = fixture.root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let launcher = format!(
+            "#!{}\n{}",
+            bash.display(),
+            r#"set -eu
+args=("$@")
+for i in "${!args[@]}"; do
+    case "${args[$i]}" in
+        --unit=yoi-command-*.scope) printf '%s' "${args[$i]#--unit=}" >"$YOI_R2_DIR/unit" ;;
+    esac
+    if [ "$YOI_R2_CHILD" = reject ] && [ "${args[$i]}" = yoi-command ]; then
+        # Change only the expected memory value passed to the REAL wrapper.
+        # The manager still creates the REAL scope with MemoryMax=32MiB/swap=0.
+        args[$((i+2))]=33554433
+    fi
+done
+exec "$YOI_R2_REAL_RUN" "${args[@]}"
+"#
+        );
+        let controller = format!(
+            "#!{}\n{}",
+            bash.display(),
+            r#"set -eu
+if [ "$YOI_R2_CHILD" = uncertain ] && [ -f "$YOI_R2_DIR/unit" ]; then
+    unit=$(<"$YOI_R2_DIR/unit")
+    owned=false
+    action=
+    for arg in "$@"; do
+        [ "$arg" != "$unit" ] || owned=true
+        case "$arg" in show|kill|stop) action=$arg ;; esac
+    done
+    if $owned && [ -n "$action" ]; then
+        printf '%s\n' "$action" >>"$YOI_R2_DIR/rejected-controls"
+        exit 1
+    fi
+fi
+# In particular, user@UID.service preflight is never replaced or rejected.
+exec "$YOI_R2_REAL_CTL" "$@"
+"#
+        );
+        for (name, body) in [("systemd-run", launcher), ("systemctl", controller)] {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PATH", path)
+            .env("YOI_R2_CHILD", mode)
+            .env("YOI_R2_DIR", fixture.root.path())
+            .env("YOI_R2_REAL_RUN", run)
+            .env("YOI_R2_REAL_CTL", &fixture.systemctl)
+            .env("YOI_R2_REAL_BASH", bash)
+            .env("YOI_R2_REAL_SETSID", setsid)
+            .env("YOI_R2_REAL_SLEEP", sleep)
+            .kill_on_drop(true);
+        let result = tokio::time::timeout(Duration::from_secs(45), child.output()).await;
+        // Cleanup bypasses shims, after (not before) the child's uncertainty and
+        // permit assertions. It also runs if any assertion in the child failed.
+        let cleanup_unit = fixture.unit();
+        let real_systemctl = fixture.systemctl.clone();
+        drop(fixture);
+        if let Some(unit) = cleanup_unit {
+            let output = tokio::time::timeout(
+                Duration::from_secs(3),
+                Command::new(real_systemctl)
+                    .args([
+                        "--user",
+                        "show",
+                        &unit,
+                        "-p",
+                        "LoadState",
+                        "-p",
+                        "ActiveState",
+                    ])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let state = String::from_utf8(output.stdout).unwrap();
+            eprintln!("R2 real cleanup {unit}: {state}");
+            assert!(
+                state.lines().any(|line| line == "LoadState=not-found"),
+                "{state}"
+            );
+        }
+        let output = result.expect("R2 subprocess deadline").unwrap();
+        eprintln!(
+            "R2 {test}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "{test}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // An incorrectly filtered subprocess must not silently pass with 0 tests.
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        true
+    }
+
+    fn unit() -> String {
+        std::fs::read_to_string(Path::new(&std::env::var_os("YOI_R2_DIR").unwrap()).join("unit"))
+            .expect("launcher captured the exact unit")
+    }
+
+    async fn properties(unit: &str) -> String {
+        let mut command = Command::new(std::env::var_os("YOI_R2_REAL_CTL").unwrap());
+        command
+            .args([
+                "--user",
+                "--no-pager",
+                "--no-ask-password",
+                "show",
+                unit,
+                "-p",
+                "LoadState",
+                "-p",
+                "ActiveState",
+                "-p",
+                "ControlGroup",
+                "-p",
+                "MemoryMax",
+                "-p",
+                "MemorySwapMax",
+            ])
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(3), command.output())
+            .await
+            .expect("bounded real manager observation")
+            .unwrap();
+        // systemctl may return nonzero with LoadState=not-found after collection.
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.lines().any(|line| line.starts_with("LoadState=")),
+            "{text}"
+        );
+        text
+    }
+
+    async fn active_scope() -> PathBuf {
+        let unit = unit();
+        let text = properties(&unit).await;
+        for property in [
+            "LoadState=loaded",
+            "ActiveState=active",
+            "MemoryMax=33554432",
+            "MemorySwapMax=0",
+        ] {
+            assert!(text.lines().any(|line| line == property), "{text}");
+        }
+        let group = text
+            .lines()
+            .find_map(|line| line.strip_prefix("ControlGroup="))
+            .unwrap();
+        assert!(group.ends_with(&format!("/app.slice/{unit}")), "{group}");
+        let path = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+        assert!(path.exists(), "real scope cgroup must exist");
+        path
+    }
+
+    async fn gone(unit: &str, cgroup: Option<&Path>) {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let text = properties(unit).await;
+                let inactive = text.lines().any(|line| {
+                    matches!(
+                        line,
+                        "LoadState=not-found" | "ActiveState=inactive" | "ActiveState=failed"
+                    )
+                });
+                let empty = cgroup.is_none_or(|path| {
+                    !path.exists()
+                        || std::fs::read_to_string(path.join("cgroup.events"))
+                            .is_ok_and(|text| text.lines().any(|line| line == "populated 0"))
+                });
+                if inactive && empty {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("exact unit and detached processes must be gone");
+    }
+
+    fn harness(host: Arc<crate::CommandHost>) -> Harness {
+        let root = TempDir::new().unwrap();
+        let session =
+            LocalWorkdirSession::new(Scope::writable(root.path()).unwrap(), root.path().into())
+                .with_command_host(host)
+                .unwrap();
+        Harness {
+            session,
+            _root: root,
+        }
+    }
+
+    fn detached_script() -> String {
+        let real = |name| quote(&std::env::var(name).unwrap());
+        let inner = format!("printf ready; exec {} 15", real("YOI_R2_REAL_SLEEP"));
+        format!(
+            "{} {} -c {} & wait",
+            real("YOI_R2_REAL_SETSID"),
+            real("YOI_R2_REAL_BASH"),
+            quote(&inner)
+        )
+    }
+
+    async fn retained_output(
+        transport: &Arc<Mutex<Transport>>,
+        handle: &CommandHandle,
+    ) -> (Vec<crate::CommandByteChunk>, crate::CommandTerminal) {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let mut chunks = Vec::new();
+            let mut cursor = 0;
+            loop {
+                let page = transport
+                    .lock()
+                    .await
+                    .read(&CommandOutputRequest {
+                        handle: handle.clone(),
+                        cursor,
+                        limit: 4096,
+                        wait: true,
+                    })
+                    .await
+                    .unwrap();
+                cursor = page.next_cursor;
+                chunks.extend(page.chunks);
+                if let Some(terminal) = page.terminal {
+                    return (chunks, terminal);
+                }
+            }
+        })
+        .await
+        .expect("bounded retained output")
+    }
+
+    #[tokio::test]
+    #[ignore = "real user manager/cgroup v2; reexecs exact test with child-only PATH shims"]
+    async fn rejected_preflight_after_real_scope_creation_has_no_script_side_effect() {
+        if isolated(
+            concat!(
+                module_path!(),
+                "::rejected_preflight_after_real_scope_creation_has_no_script_side_effect"
+            ),
+            "reject",
+        )
+        .await
+        {
+            return;
+        }
+        let host = crate::CommandHost::systemd(MEMORY, 1).unwrap();
+        let harness = harness(host.clone());
+        let handle = harness.start(": > must-not-start", 15).await;
+        let (chunks, terminal) = harness.collect(&handle, 0).await;
+        assert_eq!(terminal.status, CommandStatus::Failed);
+        assert_eq!(terminal.exit_code, Some(125));
+        assert_eq!(terminal.stdout_bytes, 0);
+        assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"");
+        let stderr = stream_bytes(&chunks, CommandStream::Stderr);
+        // This diagnostic follows real membership and controller-file reads in
+        // WRAPPER; a missing launcher or a pre-creation refusal cannot satisfy it.
+        assert!(
+            String::from_utf8_lossy(&stderr)
+                .contains("Workdir isolation: memory limits or OOM group policy do not match")
+        );
+        assert_eq!(terminal.stderr_bytes, stderr.len() as u64);
+        assert_eq!(terminal.stderr_delivered_bytes, stderr.len() as u64);
+        assert_eq!(
+            terminal.output_collection,
+            CommandOutputCollection::Complete
+        );
+        assert!(
+            matches!(
+                terminal.resource_outcome,
+                Some(crate::CommandResourceOutcome::SetupUnconfirmed {
+                    cleanup_confirmed: true,
+                    ..
+                })
+            ),
+            "{terminal:?}"
+        );
+        assert!(terminal.metadata_valid());
+        assert!(!harness._root.path().join("must-not-start").exists());
+        gone(&unit(), None).await;
+        assert!(
+            host.admit().is_ok(),
+            "confirmed cleanup releases the permit"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "real user manager/cgroup v2; reexecs exact test with child-only PATH shims"]
+    async fn manager_failures_retain_cleanup_uncertainty_and_host_reservation() {
+        if isolated(
+            concat!(
+                module_path!(),
+                "::manager_failures_retain_cleanup_uncertainty_and_host_reservation"
+            ),
+            "uncertain",
+        )
+        .await
+        {
+            return;
+        }
+        let host = crate::CommandHost::systemd(MEMORY, 1).unwrap();
+        let harness = harness(host.clone());
+        let handle = harness.start(&detached_script(), 15).await;
+        let first = harness.page(&handle, 0, 5).await;
+        assert_eq!(stream_bytes(&first.chunks, CommandStream::Stdout), b"ready");
+        let cgroup = active_scope().await;
+        harness
+            .session
+            .cancel_command(handle.clone())
+            .await
+            .unwrap();
+        let (chunks, terminal) = harness.collect(&handle, 0).await;
+        assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"ready");
+        assert_eq!(terminal.status, CommandStatus::Cancelled);
+        assert_eq!(
+            terminal.resource_outcome,
+            Some(crate::CommandResourceOutcome::Systemd {
+                oom: crate::CommandOomObservation::Unknown,
+                cleanup_confirmed: false,
+            })
+        );
+        assert!(
+            matches!(
+                terminal.output_collection,
+                CommandOutputCollection::Incomplete {
+                    failure: CommandFailure {
+                        stage: CommandFailureStage::OutputDrain,
+                        reason: CommandIoErrorKind::TimedOut,
+                        ..
+                    }
+                }
+            ),
+            "{terminal:?}"
+        );
+        assert_eq!(terminal.stdout_bytes, 5);
+        assert_eq!(terminal.stdout_delivered_bytes, 5);
+        assert!(terminal.metadata_valid());
+        let log = std::fs::read_to_string(
+            Path::new(&std::env::var_os("YOI_R2_DIR").unwrap()).join("rejected-controls"),
+        )
+        .unwrap();
+        for action in ["show", "kill", "stop"] {
+            assert!(log.lines().any(|line| line == action), "{log}");
+        }
+        // Bypass the shim to prove this is a live unit, not just fake metadata.
+        assert_eq!(active_scope().await, cgroup);
+        assert!(
+            host.admit().is_err(),
+            "uncertain cleanup must retain the host permit"
+        );
+        let error = harness
+            .session
+            .start_command(Harness::request(": > refused", 15, 100))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::Unavailable(_)));
+        assert!(!harness._root.path().join("refused").exists());
+        harness.session.close().await.unwrap();
+        assert!(
+            host.admit().is_err(),
+            "closing a session cannot forgive uncertainty"
+        );
+        // Only now bypass the failures for fixture cleanup. Parent RAII remains
+        // the panic/deadline fallback, so a failed assertion cannot leak the unit.
+        let unit = unit();
+        for args in [
+            vec!["kill", "--signal=KILL", "--kill-whom=all", unit.as_str()],
+            vec!["stop", unit.as_str()],
+        ] {
+            let mut command = Command::new(std::env::var_os("YOI_R2_REAL_CTL").unwrap());
+            command
+                .args(["--user", "--no-pager", "--no-ask-password"])
+                .args(args)
+                .kill_on_drop(true);
+            // Successful kill may unload the scope before stop reaches the
+            // manager. The real postcondition below, not both exit codes,
+            // establishes cleanup of the exact observed live cgroup.
+            let status = tokio::time::timeout(Duration::from_secs(3), command.status())
+                .await
+                .expect("bounded real fixture cleanup")
+                .unwrap();
+            eprintln!("R2 real cleanup request: {status}");
+        }
+        gone(&unit, Some(&cgroup)).await;
+        assert!(
+            host.admit().is_err(),
+            "external cleanup is not provider confirmation"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "real user manager/cgroup v2; reexecs exact test with child-only PATH shims"]
+    async fn scoped_sender_receiver_and_session_loss_kill_unit_without_inventing_terminal() {
+        if isolated(
+            concat!(
+                module_path!(),
+                "::scoped_sender_receiver_and_session_loss_kill_unit_without_inventing_terminal"
+            ),
+            "loss",
+        )
+        .await
+        {
+            return;
+        }
+        for loss in ["sender", "receiver", "session"] {
+            let host = crate::CommandHost::systemd(MEMORY, 1).unwrap();
+            let harness = harness(host.clone());
+            let handle = harness.start(&detached_script(), 15).await;
+            let first = harness.page(&handle, 0, 5).await;
+            assert_eq!(stream_bytes(&first.chunks, CommandStream::Stdout), b"ready");
+            let cgroup = active_scope().await;
+            let unit = unit();
+            let (transport, mut status) = {
+                let commands = harness.session.inner.commands.lock().await;
+                let command = &commands[&handle.0];
+                (command.transport.clone(), command.status.clone())
+            };
+            if loss == "session" {
+                // Inner Drop aborts (it does not gracefully cancel) its tasks.
+                // Retain existing bytes, but do NOT invent a terminal fence.
+                drop(harness);
+                tokio::time::timeout(Duration::from_secs(5), status.changed())
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert!(status.borrow().is_none());
+                assert!(
+                    host.admit().is_err(),
+                    "aborted cleanup has no confirmation to release its permit"
+                );
+                let mut transport = transport.lock().await;
+                let replay = transport
+                    .read(&CommandOutputRequest {
+                        handle: handle.clone(),
+                        cursor: 0,
+                        limit: 5,
+                        wait: true,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(replay, first);
+                let error = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    transport.read(&CommandOutputRequest {
+                        handle: handle.clone(),
+                        cursor: 5,
+                        limit: 4096,
+                        wait: true,
+                    }),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert_eq!(
+                    error.failure_reason(),
+                    Some(crate::WorkdirFailureReason::CommandTerminalMissing)
+                );
+            } else {
+                let task = if loss == "sender" {
+                    // Dropping LocalCommand alone does not abort its JoinHandle.
+                    // Remove it from the session so the last cancel sender drops.
+                    let command = harness
+                        .session
+                        .inner
+                        .commands
+                        .lock()
+                        .await
+                        .remove(&handle.0)
+                        .unwrap();
+                    let LocalCommand { task, cancel, .. } = command;
+                    drop(cancel);
+                    Some(task)
+                } else {
+                    transport.lock().await.close();
+                    None
+                };
+                let (chunks, terminal) = retained_output(&transport, &handle).await;
+                assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"ready");
+                assert!(
+                    matches!(
+                        terminal.status,
+                        CommandStatus::Cancelled | CommandStatus::Failed
+                    ),
+                    "{terminal:?}"
+                );
+                if loss == "sender" {
+                    assert_eq!(terminal.status, CommandStatus::Cancelled);
+                    assert_eq!(
+                        terminal.output_collection,
+                        CommandOutputCollection::Complete
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            terminal.output_collection,
+                            CommandOutputCollection::Complete
+                                | CommandOutputCollection::Incomplete {
+                                    failure: CommandFailure {
+                                        stage: CommandFailureStage::OutputDelivery,
+                                        reason: CommandIoErrorKind::Unknown,
+                                        os_code: None,
+                                    },
+                                }
+                        ),
+                        "{terminal:?}"
+                    );
+                    if terminal.status == CommandStatus::Failed {
+                        assert!(matches!(
+                            terminal.output_collection,
+                            CommandOutputCollection::Incomplete { .. }
+                        ));
+                    }
+                }
+                assert!(
+                    matches!(
+                        terminal.resource_outcome,
+                        Some(crate::CommandResourceOutcome::Systemd {
+                            oom: crate::CommandOomObservation::NotObserved
+                                | crate::CommandOomObservation::Unknown,
+                            cleanup_confirmed: true,
+                        })
+                    ),
+                    "{terminal:?}"
+                );
+                assert_eq!(terminal.stdout_bytes, 5);
+                assert_eq!(terminal.stdout_delivered_bytes, 5);
+                assert_eq!(terminal.truncation_reason, None);
+                assert!(terminal.metadata_valid());
+                if let Some(task) = task {
+                    task.await.unwrap();
+                }
+                harness.session.close().await.unwrap();
+                assert!(host.admit().is_ok());
+            }
+            gone(&unit, Some(&cgroup)).await;
+        }
     }
 }

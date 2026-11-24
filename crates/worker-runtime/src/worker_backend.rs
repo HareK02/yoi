@@ -1783,18 +1783,23 @@ fn runtime_local_workdir_session(
     cwd: &Path,
     scope: manifest::SharedScope,
     capabilities: WorkdirSessionCapabilities,
+    command_host: Arc<workdir::CommandHost>,
     command_environment: std::collections::BTreeMap<String, String>,
     resources: Vec<Arc<dyn workdir::WorkdirSessionResource>>,
 ) -> WorkdirSessionHandle {
-    Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
-        Workdir::new(workdir_id),
-        root.to_path_buf(),
-        cwd.to_path_buf(),
-        scope,
-        capabilities,
-        command_environment,
-        resources,
-    ))
+    Arc::new(
+        LocalWorkdirSession::materialized_bound_with_environment(
+            Workdir::new(workdir_id),
+            root.to_path_buf(),
+            cwd.to_path_buf(),
+            scope,
+            capabilities,
+            command_environment,
+            resources,
+        )
+        .with_command_host(command_host)
+        .expect("new provider session is not shared"),
+    )
 }
 
 fn runtime_local_workdir_router(
@@ -1815,6 +1820,7 @@ fn runtime_local_workdir_router(
             binding.cwd(),
             scope,
             capabilities,
+            binding.command_host(),
             binding.command_environment(),
             binding
                 .session_resources()
@@ -2007,6 +2013,7 @@ fn deferred_restore_workdir_sessions(
                         binding.cwd(),
                         scope,
                         capabilities,
+                        binding.command_host(),
                         binding.command_environment(),
                         binding
                             .session_resources()
@@ -6878,6 +6885,7 @@ where
             binding.cwd(),
             scope,
             WorkdirSessionCapabilities::ALL,
+            binding.command_host(),
             binding.command_environment(),
             binding.session_resources()?,
         ))
@@ -14775,6 +14783,7 @@ mod tests {
             root.path(),
             spawned_scope,
             WorkdirSessionCapabilities::READ_ONLY,
+            Arc::new(workdir::CommandHost::default()),
             Default::default(),
             Vec::new(),
         );
@@ -14785,6 +14794,7 @@ mod tests {
             root.path(),
             restored_scope,
             WorkdirSessionCapabilities::READ_ONLY,
+            Arc::new(workdir::CommandHost::default()),
             Default::default(),
             Vec::new(),
         );

@@ -23,7 +23,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 tracing.workspace = true
-tokio = { workspace = true, features = ["io-util", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "process", "rt", "sync", "time", "fs", "net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

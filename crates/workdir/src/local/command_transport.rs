@@ -7,6 +7,25 @@ use crate::{CommandFailure, CommandFailureStage, CommandIoErrorKind, CommandOutp
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 
+#[cfg(target_os = "linux")]
+mod systemd;
+#[cfg(not(target_os = "linux"))]
+mod systemd {
+    use super::*;
+    pub(super) struct Scope;
+    pub(super) async fn prepare(_: u64, _: &str, _: u64) -> std::io::Result<(Command, Scope)> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    impl Scope {
+        pub(super) async fn finish(&mut self) -> crate::CommandResourceOutcome {
+            crate::CommandResourceOutcome::SetupUnconfirmed {
+                oom: crate::CommandOomObservation::Unknown,
+                cleanup_confirmed: true,
+            }
+        }
+    }
+}
+
 const QUEUE_CHUNKS: usize = 8;
 pub(super) const MAX_COMMANDS: usize = 64;
 
@@ -140,6 +159,16 @@ impl Transport {
     }
 }
 
+struct MemoryReservation(Option<tokio::sync::OwnedSemaphorePermit>);
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        if let Some(permit) = self.0.take() {
+            permit.forget();
+        }
+    }
+}
+
 pub(super) fn start(
     cwd: PathBuf,
     request: CommandRequest,
@@ -147,6 +176,8 @@ pub(super) fn start(
     telemetry: CommandTelemetry,
     environment: BTreeMap<String, String>,
     resources: Vec<Arc<dyn WorkdirSessionResource>>,
+    host: Arc<crate::CommandHost>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> LocalCommand {
     let execution_id = command_id.clone();
     let execution_telemetry = telemetry.clone();
@@ -155,16 +186,36 @@ pub(super) fn start(
         telemetry,
         resources,
         move |cancel, sender| async move {
-            execute(
+            let mut reservation = MemoryReservation(Some(permit));
+            let terminal = execute(
                 cwd,
                 request,
                 &execution_id,
                 &execution_telemetry,
                 environment,
+                host,
                 cancel,
                 &sender,
             )
-            .await
+            .await;
+            // Unknown cleanup must not release memory reservations for a unit
+            // that may still execute. Fail closed until the operator intervenes.
+            let uncertain = matches!(
+                terminal.resource_outcome,
+                Some(
+                    crate::CommandResourceOutcome::Systemd {
+                        cleanup_confirmed: false,
+                        ..
+                    } | crate::CommandResourceOutcome::SetupUnconfirmed {
+                        cleanup_confirmed: false,
+                        ..
+                    }
+                )
+            );
+            if !uncertain {
+                drop(reservation.0.take());
+            }
+            terminal
         },
     )
 }
@@ -222,6 +273,8 @@ impl ByteAccounting {
             status,
             exit_code,
             process_failure,
+            signal: None,
+            resource_outcome: Some(crate::CommandResourceOutcome::Unconfined),
             output_collection,
             stdout_bytes: self.stdout,
             stderr_bytes: self.stderr,
@@ -327,14 +380,48 @@ async fn execute(
     command_id: &str,
     telemetry: &CommandTelemetry,
     environment: BTreeMap<String, String>,
-    cancel: watch::Receiver<bool>,
+    host: Arc<crate::CommandHost>,
+    mut cancel: watch::Receiver<bool>,
     sender: &mpsc::Sender<Message>,
 ) -> crate::CommandTerminal {
     telemetry.started(command_id, request.tool_call_id);
-    let mut command = Command::new("bash");
+    let started = Instant::now();
+    let (mut command, scope) = if let Some(memory) = host.memory_max {
+        let prepared = tokio::select! {
+            result = systemd::prepare(memory, &request.command, request.timeout_secs) => result,
+            _ = tokio::time::sleep(Duration::from_secs(request.timeout_secs.max(1))) => {
+                let mut terminal = ByteAccounting::default().terminal(CommandStatus::TimedOut, None, None, CommandOutputCollection::NotStarted);
+                terminal.resource_outcome = Some(crate::CommandResourceOutcome::SetupUnconfirmed { oom: crate::CommandOomObservation::Unknown, cleanup_confirmed: true });
+                return terminal;
+            }
+            _ = cancel.changed() => {
+                let mut terminal = ByteAccounting::default().terminal(CommandStatus::Cancelled, None, None, CommandOutputCollection::NotStarted);
+                terminal.resource_outcome = Some(crate::CommandResourceOutcome::SetupUnconfirmed { oom: crate::CommandOomObservation::Unknown, cleanup_confirmed: true });
+                return terminal;
+            }
+        };
+        match prepared {
+            Ok((command, scope)) => (command, Some(scope)),
+            Err(error) => {
+                let mut terminal = ByteAccounting::default().terminal(
+                    CommandStatus::Failed,
+                    None,
+                    Some(CommandFailure::io(CommandFailureStage::Spawn, &error)),
+                    CommandOutputCollection::NotStarted,
+                );
+                terminal.resource_outcome = Some(crate::CommandResourceOutcome::SetupUnconfirmed {
+                    oom: crate::CommandOomObservation::Unknown,
+                    cleanup_confirmed: true,
+                });
+                return terminal;
+            }
+        }
+    } else {
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(&request.command);
+        (command, None)
+    };
     command
-        .arg("-c")
-        .arg(request.command)
         .current_dir(cwd)
         .envs(environment)
         .stdin(Stdio::null())
@@ -346,26 +433,38 @@ async fn execute(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return ByteAccounting::default().terminal(
+            let mut terminal = ByteAccounting::default().terminal(
                 CommandStatus::Failed,
                 None,
                 Some(CommandFailure::io(CommandFailureStage::Spawn, &error)),
                 CommandOutputCollection::NotStarted,
             );
+            if host.memory_max.is_some() {
+                terminal.resource_outcome = Some(crate::CommandResourceOutcome::SetupUnconfirmed {
+                    oom: crate::CommandOomObservation::Unknown,
+                    cleanup_confirmed: true,
+                });
+            }
+            return terminal;
         }
     };
+    drop(command);
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    supervise(
+    supervise_with_scope(
         child,
         stdout,
         stderr,
-        request.timeout_secs,
+        request
+            .timeout_secs
+            .saturating_sub(started.elapsed().as_secs())
+            .max(1),
         request.transport_byte_budget,
         command_id,
         telemetry,
         cancel,
         sender,
+        scope,
     )
     .await
 }
@@ -393,7 +492,12 @@ impl CommandProcess for tokio::process::Child {
 
 fn process_result(
     result: std::io::Result<std::process::ExitStatus>,
-) -> (CommandStatus, Option<i32>, Option<CommandFailure>) {
+) -> (
+    CommandStatus,
+    Option<i32>,
+    Option<CommandFailure>,
+    Option<i32>,
+) {
     match result {
         Ok(exit) => (
             if exit.success() {
@@ -403,17 +507,57 @@ fn process_result(
             },
             exit.code(),
             None,
+            {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    exit.signal()
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
         ),
         Err(error) => (
             CommandStatus::Failed,
             None,
             Some(CommandFailure::io(CommandFailureStage::Wait, &error)),
+            None,
         ),
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn supervise(
+    child: impl CommandProcess,
+    stdout: impl AsyncRead + Unpin,
+    stderr: impl AsyncRead + Unpin,
+    timeout_secs: u64,
+    byte_budget: u64,
+    command_id: &str,
+    telemetry: &CommandTelemetry,
+    cancel: watch::Receiver<bool>,
+    sender: &mpsc::Sender<Message>,
+) -> crate::CommandTerminal {
+    supervise_with_scope(
+        child,
+        stdout,
+        stderr,
+        timeout_secs,
+        byte_budget,
+        command_id,
+        telemetry,
+        cancel,
+        sender,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_with_scope(
     mut child: impl CommandProcess,
     stdout: impl AsyncRead + Unpin,
     stderr: impl AsyncRead + Unpin,
@@ -423,10 +567,11 @@ async fn supervise(
     telemetry: &CommandTelemetry,
     mut cancel: watch::Receiver<bool>,
     sender: &mpsc::Sender<Message>,
+    mut scope: Option<systemd::Scope>,
 ) -> crate::CommandTerminal {
     let mut process_group = CommandProcessGroupGuard::new(child.id());
     let mut accounting = ByteAccounting::default();
-    let (status, exit_code, process_failure, output_collection) = {
+    let (mut status, exit_code, process_failure, signal, output_collection, resource_outcome) = {
         let output = pump(
             stdout,
             stderr,
@@ -458,44 +603,91 @@ async fn supervise(
                 _ = &mut timeout => {
                     process_group.terminate();
                     child.start_kill();
-                    let (_, code, failure) = process_result(child.wait().await);
-                    break (CommandStatus::TimedOut, code, failure);
+                    let (_, code, failure, signal) = process_result(child.wait().await);
+                    break (CommandStatus::TimedOut, code, failure, signal);
                 }
                 _ = sender.closed() => {
                     process_group.terminate();
                     child.start_kill();
-                    let (_, code, failure) = process_result(child.wait().await);
-                    break (CommandStatus::Cancelled, code, failure);
+                    let (_, code, failure, signal) = process_result(child.wait().await);
+                    break (CommandStatus::Cancelled, code, failure, signal);
                 }
                 changed = cancel.changed() => {
                     if changed.is_err() || *cancel.borrow() {
                         process_group.terminate();
                         child.start_kill();
-                        let (_, code, failure) = process_result(child.wait().await);
-                        break (CommandStatus::Cancelled, code, failure);
+                        let (_, code, failure, signal) = process_result(child.wait().await);
+                        break (CommandStatus::Cancelled, code, failure, signal);
                     }
                 }
             }
         };
+        // Reap the launcher before stopping its exact unit: an in-flight scope
+        // start cannot race a premature stop and then launch a detached command.
+        let resources = match scope.as_mut() {
+            Some(scope) => scope.finish().await,
+            None => crate::CommandResourceOutcome::Unconfined,
+        };
         // Exit is not pipe EOF. Retain read failures first observed during drain.
         let result = match collected {
             Some(result) => result,
-            None => output.await.map_err(|mut failure| {
-                failure.stage = match failure.stage {
-                    CommandFailureStage::StdoutRead => CommandFailureStage::StdoutDrain,
-                    CommandFailureStage::StderrRead => CommandFailureStage::StderrDrain,
-                    stage => stage,
+            None => {
+                let result = if matches!(
+                    resources,
+                    crate::CommandResourceOutcome::SetupUnconfirmed { .. }
+                        | crate::CommandResourceOutcome::Systemd {
+                            cleanup_confirmed: false,
+                            ..
+                        }
+                ) {
+                    tokio::time::timeout(Duration::from_secs(3), &mut output)
+                        .await
+                        .unwrap_or(Err(CommandFailure {
+                            stage: CommandFailureStage::OutputDrain,
+                            reason: CommandIoErrorKind::TimedOut,
+                            os_code: None,
+                        }))
+                } else {
+                    output.await
                 };
-                failure
-            }),
+                result.map_err(|mut failure| {
+                    failure.stage = match failure.stage {
+                        CommandFailureStage::StdoutRead => CommandFailureStage::StdoutDrain,
+                        CommandFailureStage::StderrRead => CommandFailureStage::StderrDrain,
+                        stage => stage,
+                    };
+                    failure
+                })
+            }
         };
         let collection = match result {
             Ok(()) => CommandOutputCollection::Complete,
             Err(failure) => CommandOutputCollection::Incomplete { failure },
         };
-        (terminal.0, terminal.1, terminal.2, collection)
+        (
+            terminal.0, terminal.1, terminal.2, terminal.3, collection, resources,
+        )
     };
-    accounting.terminal(status, exit_code, process_failure, output_collection)
+    if status == CommandStatus::Completed
+        && matches!(
+            resource_outcome,
+            crate::CommandResourceOutcome::SetupUnconfirmed { .. }
+                | crate::CommandResourceOutcome::Systemd {
+                    oom: crate::CommandOomObservation::SystemdOomKill,
+                    ..
+                }
+                | crate::CommandResourceOutcome::Systemd {
+                    cleanup_confirmed: false,
+                    ..
+                }
+        )
+    {
+        status = CommandStatus::Failed;
+    }
+    let mut terminal = accounting.terminal(status, exit_code, process_failure, output_collection);
+    terminal.signal = signal;
+    terminal.resource_outcome = Some(resource_outcome);
+    terminal
 }
 
 #[cfg(test)]

@@ -5662,6 +5662,7 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "async-trait",
+ "axum",
  "error-contract",
  "filetime",
  "fs-operation",
@@ -7583,9 +7584,12 @@ dependencies = [
  "session-store",
  "sha2 0.11.0",
  "tempfile",
+ "toml",
  "tungstenite 0.29.0",
+ "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs-proto",
+ "workdir",
  "worker-runtime",
  "yoi-workspace-server",
 ]

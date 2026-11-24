@@ -315,6 +315,7 @@ mod tests {
                     &root,
                     scope,
                     WorkdirSessionCapabilities::READ_ONLY,
+                    Arc::new(workdir::CommandHost::default()),
                     Default::default(),
                     Vec::new(),
                 ))

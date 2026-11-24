@@ -70,6 +70,8 @@ pub struct OutputTerminal {
     pub status: Option<CommandStatus>,
     pub exit_code: Option<i32>,
     pub process_failure: Option<workdir::CommandFailure>,
+    pub signal: Option<i32>,
+    pub resource_outcome: Option<workdir::CommandResourceOutcome>,
     pub output_collection: Option<workdir::CommandOutputCollection>,
     /// True only for confirmed EOF collection (quota is reported separately). A terminal
     /// fence or exit zero alone does not confirm the unobserved process tail.
@@ -505,6 +507,8 @@ impl BashOutputWriter {
                 workdir::CommandOutputCollection::Complete
             ),
             process_failure: terminal.process_failure,
+            signal: terminal.signal,
+            resource_outcome: terminal.resource_outcome,
             output_collection: Some(terminal.output_collection),
         });
         Ok(r.metadata())
@@ -526,6 +530,8 @@ impl Drop for BashOutputWriter {
                 exit_code: None,
                 transport_complete: false,
                 process_failure: None,
+                signal: None,
+                resource_outcome: None,
                 output_collection: None,
             });
         }
@@ -545,6 +551,8 @@ mod tests {
                 exit_code: Some(0),
                 transport_complete: true,
                 process_failure: None,
+                signal: None,
+                resource_outcome: None,
                 output_collection: Some(workdir::CommandOutputCollection::Complete),
             })
             .id
@@ -605,6 +613,8 @@ mod tests {
             exit_code: Some(0),
             transport_complete: true,
             process_failure: None,
+            signal: None,
+            resource_outcome: None,
             output_collection: Some(workdir::CommandOutputCollection::Complete),
         });
         assert!(root.metadata(&metadata.id).is_some());

@@ -6,6 +6,8 @@ pub use checkout::{
     CheckoutObservation, CheckoutOperation, CheckoutOutput, CheckoutRequest, CheckoutResult,
     CheckoutSearchOperation, CheckoutSearchRequest, CheckoutSearchResult,
 };
+mod command_host;
+pub use command_host::CommandHost;
 mod environment;
 pub use environment::WorkdirSessionEnvironment;
 pub mod external;

@@ -966,6 +966,8 @@ mod tests {
                     next_cursor: 0,
                     terminal: Some(crate::CommandTerminal {
                         process_failure: None,
+                        signal: None,
+                        resource_outcome: None,
                         output_collection: crate::CommandOutputCollection::Complete,
                         status: crate::CommandStatus::Completed,
                         exit_code: Some(0),
@@ -1126,6 +1128,8 @@ mod tests {
                 next_cursor: 3,
                 terminal: Some(crate::CommandTerminal {
                     process_failure: None,
+                    signal: None,
+                    resource_outcome: None,
                     output_collection: crate::CommandOutputCollection::Complete,
                     status: crate::CommandStatus::Completed,
                     exit_code: Some(0),

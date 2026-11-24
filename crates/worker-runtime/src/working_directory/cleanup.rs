@@ -310,6 +310,7 @@ fn read_cleanup_binding(
         cwd: record.root,
         working_directory_root: materializer.working_directory_root(id),
         command_environment: BTreeMap::new(),
+        command_host: materializer.command_host.clone(),
         session_resources: Vec::new(),
         occupancy: materializer.occupancy.clone(),
         occupancy_id: id.to_string(),

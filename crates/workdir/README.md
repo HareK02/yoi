@@ -4,6 +4,7 @@ Provides contracts for persistent Workdir identity and Worker-bound operation se
 
 ## Reference index
 
+- [`CommandHost`] — host-owned memory reservations and optional systemd execution isolation.
 - [`WorkdirSession`] — provider operation and close boundaries.
 - [`WorkdirSessionRouter`] — aliases, connection generations, and detach coordination.
 - [`WorkdirToolBroker`] — scope delegation and write leases for child sessions.

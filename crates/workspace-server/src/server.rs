@@ -43076,6 +43076,8 @@ mod tests {
                     next_cursor: 0,
                     terminal: Some(workdir::CommandTerminal {
                         process_failure: None,
+                        signal: None,
+                        resource_outcome: None,
                         output_collection: workdir::CommandOutputCollection::Complete,
                         status: workdir::CommandStatus::Cancelled,
                         exit_code: None,
@@ -43181,6 +43183,8 @@ mod tests {
                     next_cursor: 0,
                     terminal: Some(workdir::CommandTerminal {
                         process_failure: None,
+                        signal: None,
+                        resource_outcome: None,
                         output_collection: workdir::CommandOutputCollection::Complete,
                         status: workdir::CommandStatus::Cancelled,
                         exit_code: None,
@@ -44325,6 +44329,8 @@ mod tests {
                         next_cursor: 0,
                         terminal: Some(workdir::CommandTerminal {
                             process_failure: None,
+                            signal: None,
+                            resource_outcome: None,
                             output_collection: workdir::CommandOutputCollection::Complete,
                             status: workdir::CommandStatus::Cancelled,
                             exit_code: None,

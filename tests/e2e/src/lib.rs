@@ -1277,8 +1277,8 @@ mod worker_session;
 pub use worker_session::{WorkerSessionSubscription, validate_full_snapshot};
 
 pub use worker_environment::{
-    WorkerBinaryProviderInfo, WorkerE2eEnvironment, WorkerEnvironmentCleanupReport,
-    worker_binary_provider_info,
+    ProductCliProcess, WorkerBinaryProviderInfo, WorkerE2eEnvironment,
+    WorkerEnvironmentCleanupReport, worker_binary_provider_info,
 };
 
 #[derive(Debug)]

@@ -27,6 +27,26 @@ Runtimeやmodelは起動しない。scripted transportやoffline fixtureの試�
 実TCP・製品processの試験である。binary hash、上限付きcommand結果、回収証拠は
 harnessの環境別artifactへ保存する。送信結果不明・結果照合の故障注入はこのtargetでは扱わない。
 
+## Workdir command隔離の製品経路
+
+`command_isolation` targetは、実Runtimeへの署名付きmaterialization/session admissionと、実`yoi workdir share`によるgrant作成・WebSocket登録・Backend command brokerを接続する。driverは隔離環境が新規発行した鍵で要求を署名し、Workerには初期入力を送らない。モデルによるTool選択は対象外である。両ホストのcommand OOM、他方の実行継続、後続command、typed結果、出力とcgroup回収を確認する。HTTP sessionをpre-seedするcomponent試験とは別の証拠とする。
+
+Linux/cgroup v2/user systemdと共通祖先の`OOMPolicy=continue`が必要である。環境不足では失敗し、親policyを変更しない。OOMは子commandの32 MiB unitに限り、制御用の製品processやhostを圧迫させない。tmux pane再生成と運用drop-in適用は別途確認する。このtargetに対応するCI jobは未配線である。
+
+製品binaryは通常featureで別invocationから用意し、buildと実行をそれぞれ有限のmemory/time scopeへ閉じる。次は明示binary選択の例であり、外側の予算設定を代替しない。全体のbuild上限と、command専用の小さなsibling unitの予算は別である。
+
+```sh
+cargo build --locked -p yoi --bin yoi -p yoi-workspace-server --bin yoi-server \
+  -p worker-runtime --bin yoi-runtime --target-dir target/e2e-products
+YOI_E2E_BIN="$PWD/target/e2e-products/debug/yoi" \
+YOI_E2E_SERVER_BIN="$PWD/target/e2e-products/debug/yoi-server" \
+YOI_E2E_RUNTIME_BIN="$PWD/target/e2e-products/debug/yoi-runtime" \
+  cargo test --locked -p yoi-e2e --features e2e --test command_isolation \
+    -- --ignored --test-threads=1
+```
+
+子commandは15秒、出力回収は25秒、HTTPは5秒（管理要求20秒）、CLI grantは120秒で制限する。起動とprocess回収は共有harnessの上限を使い、外側runnerにもkill猶予込みの有限timeoutを指定する。例外時のRAII回収と、成功時の明示session close・detach・revoke・process/root cleanupを分けて観測する。未実行や型検査成功を製品E2E成功と呼ばない。
+
 ## 固定Workerの段階起動
 
 1. 提供fixtureを所有crateの型で検証し、`FixtureSource`で原本hashを記録する。各環境の一時領域へcopyする。fixtureが未提供・不適合なら失敗とし、代替Workerを生成しない。
