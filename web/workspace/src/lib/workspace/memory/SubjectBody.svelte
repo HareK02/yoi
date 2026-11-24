@@ -249,6 +249,8 @@
       <p role="alert">The Subject changed. Try again.</p>
     {:else if attempt}
       <p role="status">Could not confirm the operation.</p>
+    {:else if operationError && !attempt}
+      <p role="alert">The operation ended without confirmed success. Check operation details and current observations.</p>
     {:else if receipt?.disposition === "rejected"}
       <p role="alert">Could not complete the operation.</p>
     {:else if !snapshot && loading}

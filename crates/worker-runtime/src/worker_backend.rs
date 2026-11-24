@@ -13253,10 +13253,16 @@ mod tests {
 
     #[async_trait]
     impl RuntimeWorkerFactory for FailLiveStopCleanupFactory {
-        async fn spawn_controller(&self, request: WorkerExecutionSpawnRequest) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+        async fn spawn_controller(
+            &self,
+            request: WorkerExecutionSpawnRequest,
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             self.inner.spawn_controller(request).await
         }
-        async fn prepare_restore(&self, request: WorkerExecutionRestoreRequest) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
+        async fn prepare_restore(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
             self.inner.prepare_restore(request).await
         }
         async fn reconcile_stopped_worker(&self, _: &WorkerRef) -> Result<(), String> {
@@ -13270,33 +13276,59 @@ mod tests {
         require_restore_test_environment();
         let root = tempfile::tempdir_in(".").unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let backend = Arc::new(WorkerRuntimeExecutionBackend::new(FailLiveStopCleanupFactory {
-            inner: MockFactory {
-                client: MockClient::new(vec![]),
-                runtime_base: PathBuf::from(root.path().file_name().unwrap()).join("controllers"),
-                cwd: fs::canonicalize(root.path()).unwrap(),
-                store_dir: root.path().join("sessions"),
-                worker_metadata_dir: root.path().join("metadata"),
-                observed_cwds: Arc::default(),
-                observed_workspace_clients: Arc::default(),
-            },
-            calls: calls.clone(),
-        }).unwrap());
-        let runtime = EmbeddedRuntime::with_execution_backend(crate::RuntimeOptions::default(), backend.clone()).unwrap();
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(FailLiveStopCleanupFactory {
+                inner: MockFactory {
+                    client: MockClient::new(vec![]),
+                    runtime_base: PathBuf::from(root.path().file_name().unwrap())
+                        .join("controllers"),
+                    cwd: fs::canonicalize(root.path()).unwrap(),
+                    store_dir: root.path().join("sessions"),
+                    worker_metadata_dir: root.path().join("metadata"),
+                    observed_cwds: Arc::default(),
+                    observed_workspace_clients: Arc::default(),
+                },
+                calls: calls.clone(),
+            })
+            .unwrap(),
+        );
+        let runtime = EmbeddedRuntime::with_execution_backend(
+            crate::RuntimeOptions::default(),
+            backend.clone(),
+        )
+        .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
-        let worker = runtime.create_worker(create_request("live cleanup failure")).unwrap();
+        let worker = runtime
+            .create_worker(create_request("live cleanup failure"))
+            .unwrap();
         let execution = backend.workers.lock().unwrap()[&worker.worker_ref].clone();
         let error = runtime.stop_worker(&worker.worker_ref, None).unwrap_err();
-        assert_eq!(error.control_cause(), protocol::control_failure::RuntimeControlCause::StopTerminatedCleanupFailed);
-        let termination = error.execution_result().unwrap().termination.as_ref().unwrap();
+        assert_eq!(
+            error.control_cause(),
+            protocol::control_failure::RuntimeControlCause::StopTerminatedCleanupFailed
+        );
+        let termination = error
+            .execution_result()
+            .unwrap()
+            .termination
+            .as_ref()
+            .unwrap();
         assert_eq!(termination.execution_id, execution.tasks.execution_id);
-        assert!(termination.confirms_scope_shutdown(&worker.worker_ref, termination.stop_operation_id));
+        assert!(
+            termination.confirms_scope_shutdown(&worker.worker_ref, termination.stop_operation_id)
+        );
         assert!(execution.handle.protocol_is_closed());
         assert!(execution.tasks.tasks.lock().unwrap().is_empty());
         assert!(backend.workers.lock().unwrap().is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(runtime.worker_detail(&worker.worker_ref).unwrap().lifecycle, crate::catalog::WorkerLifecycleState::Stopped);
-        assert_eq!(runtime.execution_termination(&worker.worker_ref).unwrap(), Some(termination.clone()));
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().lifecycle,
+            crate::catalog::WorkerLifecycleState::Stopped
+        );
+        assert_eq!(
+            runtime.execution_termination(&worker.worker_ref).unwrap(),
+            Some(termination.clone())
+        );
     }
 
     fn core_filesystem_tool_names() -> BTreeSet<&'static str> {
