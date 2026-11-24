@@ -955,6 +955,11 @@ async fn run_typed(
         eprintln!("External Workdir share cancelled; no grant was created.");
         return Ok(());
     };
+    let command_host = if options.permissions.command {
+        workdir::CommandHost::from_environment()?
+    } else {
+        Arc::new(workdir::CommandHost::default())
+    };
     // Pin before creating remote authority: the Backend grant can never outlive
     // a failed local approval/open race, and subsequent path replacement cannot
     // redirect the provider.
@@ -1038,6 +1043,7 @@ async fn run_typed(
             limits,
             capabilities,
         )
+        .and_then(|session| session.with_command_host(command_host.clone()))
         .map_err(|error| ShareError::workdir(WorkdirFailureOperation::SessionOpen, error))?;
         let outcome = serve_provider_connection(
             &backend_client,

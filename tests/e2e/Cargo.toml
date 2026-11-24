@@ -30,6 +30,9 @@ worker-runtime.workspace = true
 session-store.workspace = true
 config-source.workspace = true
 manifest.workspace = true
+workdir.workspace = true
+toml.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 webauthn-rs-proto = "0.5.5"
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }
 
@@ -51,6 +54,11 @@ required-features = ["e2e"]
 [[test]]
 name = "configuration_cli"
 path = "tests/configuration_cli.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "command_isolation"
+path = "tests/command_isolation.rs"
 required-features = ["e2e"]
 
 [[test]]

@@ -339,6 +339,35 @@ impl BashTool {
                     None => format!("$ {cmd_summary} (terminated)"),
                 }
             };
+        if let Some(signal) = terminal.signal {
+            summary.push_str(&format!(" (signal {signal})"));
+        }
+        if matches!(
+            terminal.resource_outcome,
+            Some(workdir::CommandResourceOutcome::SetupUnconfirmed { .. })
+        ) {
+            summary.push_str(" (command isolation unconfirmed)");
+        }
+        match terminal.resource_outcome {
+            Some(
+                workdir::CommandResourceOutcome::SetupUnconfirmed {
+                    oom,
+                    cleanup_confirmed,
+                }
+                | workdir::CommandResourceOutcome::Systemd {
+                    oom,
+                    cleanup_confirmed,
+                },
+            ) => {
+                if oom == workdir::CommandOomObservation::SystemdOomKill {
+                    summary.push_str(" (OOM killed: systemd unit evidence)");
+                }
+                if !cleanup_confirmed {
+                    summary.push_str(" (unit cleanup unconfirmed)");
+                }
+            }
+            _ => {}
+        }
         if matches!(
             terminal.output_collection,
             workdir::CommandOutputCollection::Incomplete { .. }
