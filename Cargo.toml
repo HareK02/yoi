@@ -101,7 +101,7 @@ default-members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.96"
 
 [profile.dev]
 debug = "line-tables-only"
