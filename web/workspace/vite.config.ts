@@ -28,7 +28,7 @@ export default defineConfig({
     host: "localhost",
     port: 5173,
     strictPort: true,
-    allowedHosts: ["develop.hareworks.net"],
+    allowedHosts: ["dev.yoi.dev"],
     watch: {
       ignored: [
         "**/.tmp*",
