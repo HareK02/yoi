@@ -236,11 +236,11 @@ async fn unconfirmed_worker_shutdown_is_not_completion_and_exact_retry_converges
             profile: Some("builtin:companion".into()),
             initial_submit: vec![],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.id.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(
+                    subject.id.clone(),
+                )
+                .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
@@ -1458,11 +1458,11 @@ async fn body_archive_subject_deletion(completed_metadata_purge: bool, partial_r
             profile: Some("builtin:companion".into()),
             initial_submit: vec![],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.id.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(
+                    subject.id.clone(),
+                )
+                .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,

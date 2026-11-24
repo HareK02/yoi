@@ -218,7 +218,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits multiple aliased attachments"
         relative_cwd: null,
       },
     ],
-    feature_connections: {},
+    feature_connections: [],
     authorization: { kind: "assignment", assignment: null },
     control_operation_id: request.control_operation_id,
   });
@@ -228,15 +228,15 @@ Deno.test("buildCreateWorkspaceWorkerRequest keeps subject attachment explicit a
   const unattached = buildCreateWorkspaceWorkerRequest(emptyForm({
     profile: "builtin:companion",
   }));
-  assertEquals(unattached.feature_connections, {});
+  assertEquals(unattached.feature_connections, []);
 
   const attached = buildCreateWorkspaceWorkerRequest(emptyForm({
     profile: "builtin:companion",
     subjektiv_subject_id: " subject-42 ",
   }));
-  assertEquals(attached.feature_connections, {
-    subjektiv: { subject_id: "subject-42" },
-  });
+  assertEquals(attached.feature_connections, [{
+    feature_id: "builtin:subjektiv", version: 1, payload: { subject_id: "subject-42" },
+  }]);
   assertEquals(attached.profile, "builtin:companion");
 });
 
@@ -308,7 +308,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits an empty attachment list for 
     profile: "builtin:companion",
     initial_submit: [{ kind: "text", content: "chat" }],
     workdir_attachments: [],
-    feature_connections: {},
+    feature_connections: [],
     authorization: { kind: "assignment", assignment: null },
     control_operation_id: request.control_operation_id,
   });

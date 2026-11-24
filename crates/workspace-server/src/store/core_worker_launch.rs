@@ -21,6 +21,8 @@ impl SqliteWorkspaceStore {
             ).optional()?;
             let Some((fingerprint, runtime, worker, bundle)) = row else { return Ok(None); };
             if fingerprint != caller_fingerprint { return Err(Error::RepositoryConflict("creation operation reused with different full input".into())); }
+            feature_initialization::read_saved(conn, workspace, operation)?
+                .ok_or_else(|| Error::Store("saved launch has no create reservation".into()))?;
             let grant = crate::launch_policy::core_grant(conn, workspace, &runtime, &worker)?.ok_or_else(|| Error::Store("saved launch has no execution grant".into()))?;
             let bundle: worker_runtime::config_bundle::ConfigBundle = serde_json::from_str(&bundle).map_err(|e| Error::Store(format!("saved launch Profile bundle: {e}")))?;
             if grant.creation_operation_id != operation || grant.profile_digest != bundle.computed_digest()
@@ -45,6 +47,34 @@ impl SqliteWorkspaceStore {
         draft: &CoreWorkerExecutionGrant,
         bundle: &worker_runtime::config_bundle::ConfigBundle,
     ) -> Result<WorkerCreateReservation> {
+        self.reserve_worker_create_with_core_initialization(
+            workspace,
+            runtime,
+            operation,
+            request_fingerprint,
+            caller_fingerprint,
+            singleton,
+            memory,
+            draft,
+            bundle,
+            &FeatureInitializations::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_worker_create_with_core_initialization(
+        &self,
+        workspace: &str,
+        runtime: &str,
+        operation: &str,
+        request_fingerprint: &str,
+        caller_fingerprint: &str,
+        singleton: Option<&str>,
+        memory: &WorkspaceMemorySettingsRecord,
+        draft: &CoreWorkerExecutionGrant,
+        bundle: &worker_runtime::config_bundle::ConfigBundle,
+        feature_initialization: &FeatureInitializations,
+    ) -> Result<WorkerCreateReservation> {
         if draft.workspace_id != workspace
             || draft.runtime_id != runtime
             || draft.creation_operation_id != operation
@@ -55,7 +85,7 @@ impl SqliteWorkspaceStore {
                 "resolved launch identity or Profile bundle mismatch".into(),
             ));
         }
-        self.reserve_worker_create_with(workspace, runtime, operation, request_fingerprint, singleton, memory,
+        self.reserve_worker_create_with(workspace, runtime, operation, request_fingerprint, singleton, memory, feature_initialization,
             |tx| {
                 let existing: Option<(Option<String>, Option<String>, String)> = tx.query_row(
                     "SELECT b.caller_fingerprint,b.config_bundle_json,r.worker_id FROM worker_create_reservations r LEFT JOIN core_worker_launch_bindings b ON b.workspace_id=r.workspace_id AND b.operation_id=r.allocation_key WHERE r.workspace_id=?1 AND r.allocation_key=?2",

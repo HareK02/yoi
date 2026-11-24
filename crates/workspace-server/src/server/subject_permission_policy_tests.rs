@@ -124,12 +124,13 @@ mod subject_permission_policy_tests {
                     }),
                     initial_submit: vec![],
                     workdir_attachments: vec![],
-                    feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                        subjektiv: connected.then(|| {
-                            server_api::SubjektivWorkerConnectionRequest {
-                                subject_id: self.subject.clone(),
-                            }
-                        }),
+                    feature_connections: if connected {
+                        crate::server::subjektiv_worker_initialization::subject_connection(
+                            self.subject.clone(),
+                        )
+                        .unwrap()
+                    } else {
+                        Default::default()
                     },
                     control_operation_id: Some("policy-test-worker".into()),
                     authorization:

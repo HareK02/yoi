@@ -1021,7 +1021,7 @@ mod tests {
                     workspace_id: "local".into(),
                     language: "English".into(),
                 }),
-                subjektiv_attached: false,
+                feature_initialization: Default::default(),
                 backend_job: None,
             })
             .unwrap();

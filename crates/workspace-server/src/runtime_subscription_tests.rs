@@ -73,7 +73,7 @@ fn create_request(name: &str) -> CreateWorkerRequest {
             workspace_id: "local".to_string(),
             language: "English".to_string(),
         }),
-        subjektiv_attached: false,
+        feature_initialization: Default::default(),
         backend_job: None,
     }
 }

@@ -227,11 +227,11 @@ impl SignedEmbeddedSession {
                 profile: Some("builtin:companion".into()),
                 initial_submit: vec![],
                 workdir_attachments: vec![],
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: subject.id.clone(),
-                    }),
-                },
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(
+                        subject.id.clone(),
+                    )
+                    .unwrap(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,

@@ -42,6 +42,14 @@ async fn worker_create_seals_plan_and_replay_retains_exact_snapshot_after_revoke
             &settings,
         )
         .unwrap();
+    assert_eq!(
+        f.api
+            .config_store
+            .saved_worker_feature_initialization(TEST_WORKSPACE_ID, &allocation,)
+            .unwrap(),
+        Some(reservation.feature_initialization.clone()),
+    );
+    let sealed_fingerprint = reservation.create_fingerprint.clone();
     assert!(
         f.api
             .config_store
@@ -74,6 +82,7 @@ async fn worker_create_seals_plan_and_replay_retains_exact_snapshot_after_revoke
         .api
         .plugin_launch_binding(&worker.runtime_id, &request, &reservation)
         .unwrap();
+    assert_eq!(binding.create_fingerprint, sealed_fingerprint);
     let replay = binding.plugin_execution.unwrap();
     assert_eq!(replay.plan_id, saved.plan_id);
     assert_eq!(replay.fingerprint, saved.fingerprint);

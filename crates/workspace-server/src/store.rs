@@ -174,9 +174,12 @@ pub(crate) use subject_release_input_handoff_store::{
     SubjectReleaseInputHandoff, SubjectReleaseInputHandoffProgress,
 };
 
+#[path = "store/feature_initialization.rs"]
+mod feature_initialization;
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
-const LATEST_SCHEMA_VERSION: i64 = 141;
+use protocol::feature_initialization::FeatureInitializations;
+const LATEST_SCHEMA_VERSION: i64 = 142;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -660,6 +663,11 @@ const MIGRATIONS: &[Migration] = &[
         name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME,
         apply: migrate_external_workdir_sessions_v140_to_v141,
     },
+    Migration {
+        version: 142,
+        name: feature_initialization::MIGRATION_NAME,
+        apply: feature_initialization::migrate,
+    },
 ];
 
 // Both schema-103 identities shipped. Keep the alternate implementation and accept
@@ -721,6 +729,7 @@ pub struct WorkerCreateReservation {
     pub worker_id: WorkerId,
     pub create_fingerprint: String,
     pub memory_settings: manifest::WorkspaceMemorySettingsSnapshot,
+    pub feature_initialization: FeatureInitializations,
     pub singleton: Option<WorkerSingletonLease>,
 }
 
@@ -3856,6 +3865,28 @@ impl SqliteWorkspaceStore {
         singleton_key: Option<&str>,
         current_memory_settings: &WorkspaceMemorySettingsRecord,
     ) -> Result<WorkerCreateReservation> {
+        self.reserve_worker_create_with_initialization(
+            workspace_id,
+            runtime_id,
+            allocation_key,
+            request_fingerprint,
+            singleton_key,
+            current_memory_settings,
+            &FeatureInitializations::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reserve_worker_create_with_initialization(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        allocation_key: &str,
+        request_fingerprint: &str,
+        singleton_key: Option<&str>,
+        current_memory_settings: &WorkspaceMemorySettingsRecord,
+        feature_initialization: &FeatureInitializations,
+    ) -> Result<WorkerCreateReservation> {
         self.reserve_worker_create_with(
             workspace_id,
             runtime_id,
@@ -3863,6 +3894,7 @@ impl SqliteWorkspaceStore {
             request_fingerprint,
             singleton_key,
             current_memory_settings,
+            feature_initialization,
             |_| Ok(None),
             |_, _| Ok(()),
         )
@@ -3880,6 +3912,7 @@ impl SqliteWorkspaceStore {
         request_fingerprint: &str,
         singleton_key: Option<&str>,
         current_memory_settings: &WorkspaceMemorySettingsRecord,
+        feature_initialization: &FeatureInitializations,
         prepare: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<Option<WorkerId>>,
         complete: impl FnOnce(&rusqlite::Transaction<'_>, &WorkerCreateReservation) -> Result<()>,
     ) -> Result<WorkerCreateReservation> {
@@ -3892,6 +3925,8 @@ impl SqliteWorkspaceStore {
             validate_worker_singleton_key(key)?;
         }
         validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
+        let initialization_json = serde_json::to_string(feature_initialization)
+            .map_err(|_| Error::Store("Feature initialization could not be encoded".into()))?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             subject_deletion_store::require_worker_admission(&tx, workspace_id, allocation_key, singleton_key)?;
@@ -3900,7 +3935,7 @@ impl SqliteWorkspaceStore {
                 .query_row(
                     "SELECT worker_id, runtime_id, request_fingerprint, create_fingerprint, \
                             memory_language, state, singleton_key, \
-                            singleton_generation \
+                            singleton_generation, feature_initialization_json \
                      FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND allocation_key = ?2",
                     params![workspace_id, allocation_key],
@@ -3914,11 +3949,12 @@ impl SqliteWorkspaceStore {
                             row.get::<_, String>(5)?,
                             row.get::<_, Option<String>>(6)?,
                             row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, language, state, stored_singleton_key, singleton_generation)) = existing {
+            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, language, state, stored_singleton_key, singleton_generation, saved_initialization)) = existing {
                 if state == "removed" {
                     return Err(Error::InvalidInput(format!(
                         "Worker create allocation {allocation_key} was terminally removed"
@@ -3947,6 +3983,11 @@ impl SqliteWorkspaceStore {
                     language,
                 };
                 validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
+                let saved_initialization = feature_initialization::read_bound(
+                    &tx, &RuntimeWorkerRef::new(runtime_id, worker_id.to_string()),
+                    saved_initialization.as_deref(), request_fingerprint, &snapshot, &create_fingerprint,
+                )?;
+                feature_initialization::require_same(&saved_initialization, feature_initialization)?;
                 let singleton = match (stored_singleton_key, singleton_generation) {
                     (Some(key), Some(generation)) => Some(WorkerSingletonLease {
                         key,
@@ -3971,6 +4012,7 @@ impl SqliteWorkspaceStore {
                     worker_id,
                     create_fingerprint,
                     memory_settings: snapshot,
+                    feature_initialization: saved_initialization,
                     singleton,
                 });
             }
@@ -3986,7 +4028,7 @@ impl SqliteWorkspaceStore {
                     .query_row(
                         "SELECT allocation_key, request_fingerprint, create_fingerprint, \
                                 memory_language, singleton_key, \
-                                singleton_generation, state \
+                                singleton_generation, state, feature_initialization_json \
                          FROM worker_create_reservations \
                          WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                         params![
@@ -4003,6 +4045,7 @@ impl SqliteWorkspaceStore {
                                 row.get::<_, Option<String>>(4)?,
                                 row.get::<_, Option<i64>>(5)?,
                                 row.get::<_, String>(6)?,
+                                row.get::<_, Option<String>>(7)?,
                             ))
                         },
                     )
@@ -4016,7 +4059,7 @@ impl SqliteWorkspaceStore {
                         owner.worker.runtime_id, owner.worker.worker_id
                     )));
                 }
-                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, language, stored_singleton_key, stored_generation, _)) = stored
+                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, language, stored_singleton_key, stored_generation, _, saved_initialization)) = stored
                     && allocation_key.starts_with("manual:")
                     && stored_allocation_key.starts_with("manual:")
                     && owner.worker.runtime_id == runtime_id
@@ -4042,10 +4085,16 @@ impl SqliteWorkspaceStore {
                             language,
                     };
                     validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
+                    let saved_initialization = feature_initialization::read_bound(
+                        &tx, &RuntimeWorkerRef::new(runtime_id, worker_id.to_string()),
+                    saved_initialization.as_deref(), request_fingerprint, &snapshot, &create_fingerprint,
+                    )?;
+                    feature_initialization::require_same(&saved_initialization, feature_initialization)?;
                     return Ok(WorkerCreateReservation {
                         worker_id,
                         create_fingerprint,
                         memory_settings: snapshot,
+                        feature_initialization: saved_initialization,
                         singleton: Some(owner.clone()),
                     });
                 }
@@ -4077,7 +4126,7 @@ impl SqliteWorkspaceStore {
             };
             validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
             let create_fingerprint =
-                bound_worker_create_fingerprint(request_fingerprint, &snapshot);
+                bound_worker_create_fingerprint(request_fingerprint, &snapshot, &initialization_json);
             let worker_id = fixed_worker_id.unwrap_or_else(WorkerId::now_v7);
             let worker_id_text = worker_id.to_string();
             let now = chrono::Utc::now().to_rfc3339();
@@ -4107,8 +4156,8 @@ impl SqliteWorkspaceStore {
                 "INSERT INTO worker_create_reservations(\
                     workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,\
                     state, created_at, updated_at, request_fingerprint,\
-                    memory_language, singleton_key, singleton_generation\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9, ?10)",
+                    memory_language, singleton_key, singleton_generation, feature_initialization_json\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     workspace_id,
                     allocation_key,
@@ -4120,6 +4169,7 @@ impl SqliteWorkspaceStore {
                     snapshot.language,
                     singleton_key,
                     singleton_generation.map(|generation| generation as i64),
+                    initialization_json,
                 ],
             )?;
             let singleton = singleton_key.zip(singleton_generation).map(|(key, generation)| {
@@ -4171,6 +4221,7 @@ impl SqliteWorkspaceStore {
                 worker_id,
                 create_fingerprint,
                 memory_settings: snapshot,
+                feature_initialization: feature_initialization.clone(),
                 singleton,
             };
             complete(&tx, &reservation)?;
@@ -4459,8 +4510,8 @@ impl SqliteWorkspaceStore {
         job.load_executable_request()?;
         let key = crate::backend_job::allocation_key(&attempt.attempt_id);
         self.with_conn(|conn| {
-            let saved = conn.query_row("SELECT worker_id,runtime_id,request_fingerprint,create_fingerprint,memory_language,state,singleton_key,singleton_generation FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2",params![workspace_id,key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?))).optional()?;
-            let Some((worker_id,runtime,request_fingerprint,create_fingerprint,language,state,singleton,generation))=saved else { return Ok(None); };
+            let saved = conn.query_row("SELECT worker_id,runtime_id,request_fingerprint,create_fingerprint,memory_language,state,singleton_key,singleton_generation,feature_initialization_json FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2",params![workspace_id,key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,Option<String>>(8)?))).optional()?;
+            let Some((worker_id,runtime,request_fingerprint,create_fingerprint,language,state,singleton,generation,saved_initialization))=saved else { return Ok(None); };
             if state == "removed" || singleton.is_some() || generation.is_some() {
                 return Err(Error::RepositoryConflict("original Job allocation is removed or has different create intent".into()));
             }
@@ -4474,14 +4525,15 @@ impl SqliteWorkspaceStore {
                 language: language.ok_or_else(||Error::Store("Job allocation Memory snapshot missing".into()))?,
             };
             validate_workspace_memory_settings_snapshot(&snapshot,workspace_id)?;
-            if create_fingerprint != bound_worker_create_fingerprint(&request_fingerprint,&snapshot) {
-                return Err(Error::RepositoryConflict("Job allocation create fingerprint mismatch".into()));
-            }
+            let feature_initialization = feature_initialization::read_bound(
+                conn, &RuntimeWorkerRef::new(&runtime, &worker_id),
+                saved_initialization.as_deref(), &request_fingerprint, &snapshot, &create_fingerprint,
+            )?;
             let worker_id = worker_id.parse::<WorkerId>().map_err(|_|Error::Store("invalid original Job Worker identity".into()))?;
             if attempt.worker.as_ref().is_some_and(|worker| worker.runtime_id != runtime || worker.worker_id != worker_id.to_string()) {
                 return Err(Error::RepositoryConflict("Job allocation differs from saved execution binding".into()));
             }
-            Ok(Some((WorkerCreateReservation{worker_id,create_fingerprint,memory_settings:snapshot,singleton:None},runtime)))
+            Ok(Some((WorkerCreateReservation{worker_id,create_fingerprint,memory_settings:snapshot,feature_initialization,singleton:None},runtime)))
         })
     }
 
@@ -18499,14 +18551,17 @@ fn require_current_worker_singleton_lease(
 fn bound_worker_create_fingerprint(
     request_fingerprint: &str,
     snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
+    initialization_json: &str,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"workspace-worker-create-v3\0");
+    digest.update(b"workspace-worker-create-v4\0");
     digest.update(request_fingerprint.as_bytes());
     digest.update(b"\0");
     digest.update(snapshot.workspace_id.as_bytes());
     digest.update(b"\0");
     digest.update(snapshot.language.as_bytes());
+    digest.update(b"\0");
+    digest.update(initialization_json.as_bytes());
     let encoded = digest
         .finalize()
         .iter()
@@ -20209,10 +20264,16 @@ mod tests {
             let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
             assert_eq!(
                 plan.migrations,
-                vec![WorkspaceSchemaMigrationStep {
-                    version: 141,
-                    name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
-                }]
+                vec![
+                    WorkspaceSchemaMigrationStep {
+                        version: 141,
+                        name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
+                    },
+                    WorkspaceSchemaMigrationStep {
+                        version: 142,
+                        name: feature_initialization::MIGRATION_NAME.into(),
+                    }
+                ]
             );
             assert!(
                 !column_exists(
@@ -20351,7 +20412,10 @@ mod tests {
             conn.execute_batch("DROP TRIGGER reject_session_cleanup_fence;")
                 .unwrap();
             apply_migrations(&conn).unwrap();
-            assert_eq!(current_schema_version(&conn).unwrap(), 141);
+            assert_eq!(
+                current_schema_version(&conn).unwrap(),
+                LATEST_SCHEMA_VERSION
+            );
             assert!(
                 crate::grant_cleanup_operation::read_intent(&conn, "legacy-ws", "legacy-online")
                     .unwrap()
@@ -22392,6 +22456,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("activation_tests.rs");
     include!("schema_equivalence_tests.rs");
     include!("schema_convergence_tests.rs");
+    include!("store/feature_initialization_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
     include!("ticket_plan_retirement_tests.rs");
@@ -22952,6 +23017,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 141,
                 name: EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 142,
+                name: feature_initialization::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -23105,6 +23174,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     (139, backend_job_result_application::MIGRATION_NAME.into()),
                     (140, backend_job_recording_input::MIGRATION_NAME.into()),
                     (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
+                    (142, feature_initialization::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -25130,7 +25200,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             resolved_core_execution_grant: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
         };
         let stable_fingerprint =
             crate::hosts::worker_spawn_create_fingerprint(&request(Some("src"))).unwrap();

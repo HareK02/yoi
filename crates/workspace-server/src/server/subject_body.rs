@@ -569,11 +569,10 @@ pub(super) async fn start(
                 profile: Some(server_api::authorization::SUBJECT_CONVERSATION_PROFILE.into()),
                 initial_submit: vec![],
                 workdir_attachments: vec![],
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: create_subject,
-                    }),
-                },
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(
+                        create_subject,
+                    )?,
                 control_operation_id: None,
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,

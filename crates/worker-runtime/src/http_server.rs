@@ -3752,7 +3752,7 @@ mod tests {
                 workspace_id: "local".to_string(),
                 language: "English".to_string(),
             }),
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
         }
     }
@@ -6239,7 +6239,7 @@ mod ws_tests {
                 workspace_id: "local".to_string(),
                 language: "English".to_string(),
             }),
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
         }
     }

@@ -180,6 +180,7 @@ mod schema_convergence {
                                 (139, backend_job_result_application::MIGRATION_NAME),
                                 (140, backend_job_recording_input::MIGRATION_NAME),
                                 (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME),
+                                (142, feature_initialization::MIGRATION_NAME),
                             ]
                             .into_iter()
                             .map(|(version, name)| {

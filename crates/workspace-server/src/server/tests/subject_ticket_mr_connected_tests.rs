@@ -2009,7 +2009,7 @@ async fn full_mr_run(
                 git(&new_root, &["fetch", "origin", FULL_SOURCE]);
                 git(&new_root, &["switch", "-c", FULL_SOURCE, "FETCH_HEAD"]);
                 let created = ok(&h, "POST", &format!("/api/w/{TEST_WORKSPACE_ID}/workers"), json!({
-                    "runtime_id":CONNECTED_RUNTIME,"display_name":"integration-continuation","feature_connections":{},"profile":"builtin:coder","control_operation_id":"continuation-worker","initial_submit":[],
+                    "runtime_id":CONNECTED_RUNTIME,"display_name":"integration-continuation","feature_connections":[],"profile":"builtin:coder","control_operation_id":"continuation-worker","initial_submit":[],
                     "workdir_attachments":[{"alias":"checkout","working_directory_id":new_wd}],"authorization":input["spawn"]["authorization"]
                 })).await;
                 let new_worker = json!({"runtime_id":created["runtime_id"],"worker_id":created["worker_id"]});

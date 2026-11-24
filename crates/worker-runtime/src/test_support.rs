@@ -773,7 +773,7 @@ fn check_request(request: &CreateWorkerRequest, install: bool) -> Result<(), Run
     if !request.workdir_attachment_requests.is_empty()
         || !request.workdir_attachments.is_empty()
         || request.backend_job.is_some()
-        || request.subjektiv_attached
+        || !request.feature_initialization.is_empty()
         || request.worker_observation_enabled
         || !request.worker_observation_grants.is_empty()
         || (install && request.initial_input.is_some())

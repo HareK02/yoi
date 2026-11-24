@@ -2,6 +2,7 @@
 //! Only the provider is replaced by an explicitly released async boundary; no live Host,
 //! Journal policy, socket or model continuation semantics are claimed.
 use super::*;
+use crate::feature::FeatureRegistryBuilder;
 use crate::{
     PreparedWorker, WorkerBootstrap, WorkerBootstrapLayout, WorkerFilesystemAuthority,
     WorkerManifest, WorkerWorkspaceContext,

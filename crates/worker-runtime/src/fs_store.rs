@@ -5053,6 +5053,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_attached_execution_metadata_is_rejected_without_dropping_its_connection_or_history() {
+        let (_temp, store, worker, path) = canonical_worker_store();
+        let history_path = path.parent().unwrap().join("session/history.json");
+        fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        let history = b"[{\"role\":\"user\",\"content\":\"retained history\"}]\n";
+        fs::write(&history_path, history).unwrap();
+        let mut document: serde_json::Value =
+            read_json(&path, "read initialization fixture").unwrap();
+        let request = document["execution_state"]["execution"]["request"]
+            .as_object_mut()
+            .unwrap();
+        request.remove("feature_initialization");
+        request.insert("subjektiv_attached".into(), serde_json::json!(true));
+        let bytes = serde_json::to_vec(&document).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        // This fixture owns an aggregate, not a complete Runtime snapshot. Read
+        // through the real aggregate decoder without an unrelated root preflight.
+        let error = store.read_worker_record(&worker.worker_ref).unwrap_err();
+        assert!(error.to_string().contains("subjektiv_attached"), "{error}");
+        assert_eq!(fs::read(&history_path).unwrap(), history);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "failed legacy decode must not rewrite saved connection metadata"
+        );
+    }
+
+    #[test]
     fn schema_v9_pending_restore_migrates_conservatively_and_survives_reopen() {
         assert_v9_pending_restore_migration(false);
     }

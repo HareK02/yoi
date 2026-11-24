@@ -348,9 +348,7 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
             singleton_key: None, profile: Some("builtin:companion".into()),
             initial_submit: vec![protocol::Segment::Text { content: "User chose B rather than A. Continue the partial work without assuming success.".into() }],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest { subject_id: subject.into() }),
-            }, control_operation_id: Some(uuid::Uuid::now_v7().to_string()), authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None },
+            feature_connections: crate::server::subjektiv_worker_initialization::subject_connection(subject.into()).unwrap(), control_operation_id: Some(uuid::Uuid::now_v7().to_string()), authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None },
         }),
     ).await.unwrap();
     RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
@@ -1537,15 +1535,21 @@ async fn seed_unstarted_pending_head(
     let singleton = crate::subjektiv::subject_worker_singleton_key(subject_id).unwrap();
     // Reserve only: this supplies the real Host's Worker/Subject binding, but is
     // deliberately not completed as an accepted create operation.
+    let initialization = subjektiv_worker_initialization::fixture_subject_initialization(
+        TEST_WORKSPACE_ID,
+        subject_id,
+    )
+    .unwrap();
     let reservation = api
         .config_store
-        .reserve_worker_create(
+        .reserve_worker_create_with_initialization(
             TEST_WORKSPACE_ID,
             EMBEDDED_WORKER_RUNTIME_ID,
             "pending-head-fixture-reservation",
             &"f".repeat(64),
             Some(&singleton),
             &settings,
+            &initialization,
         )
         .unwrap();
     let worker = RuntimeWorkerRef::new(
@@ -1589,7 +1593,7 @@ async fn seed_unstarted_pending_head(
         worker_observation_grants: Vec::new(),
         workspace_api: Some(api.workspace_api_ref(EMBEDDED_WORKER_RUNTIME_ID)),
         memory_settings: Some(reservation.memory_settings.clone()),
-        subjektiv_attached: true,
+        feature_initialization: initialization,
         backend_job: None,
     };
     let aggregate = root.join("workers").join(worker.worker_id.as_str());
@@ -1943,11 +1947,11 @@ async fn connected_restore_fixture_with_pending_head(
                 profile: Some("builtin:companion".into()),
                 initial_submit: vec![],
                 workdir_attachments: vec![],
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: subject.id.clone(),
-                    }),
-                },
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(
+                        subject.id.clone(),
+                    )
+                    .unwrap(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,

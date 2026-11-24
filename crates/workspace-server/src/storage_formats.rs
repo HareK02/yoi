@@ -437,6 +437,7 @@ impl FailureTail {
         tail.push((139, super::backend_job_result_application::MIGRATION_NAME));
         tail.push((140, super::backend_job_recording_input::MIGRATION_NAME));
         tail.push((141, super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME));
+        tail.push((142, super::feature_initialization::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -538,22 +539,33 @@ pub(super) fn verify_startup_shape(conn: &Connection) -> Result<()> {
 fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
     static WITH_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
     static WITHOUT_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static WITH_INITIALIZATION: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static INITIALIZATION_ONLY: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let initialized = super::column_exists(
+        conn,
+        "worker_create_reservations",
+        "feature_initialization_json",
+    )?;
     let select = |shape: Shape| -> Shape {
         shape
             .into_iter()
             .filter(|(_, object)| object.1 == "worker_create_reservations")
             .collect()
     };
-    let expected = if present {
-        &WITH_RESULT
-    } else {
-        &WITHOUT_RESULT
+    let expected = match (present, initialized) {
+        (true, false) => &WITH_RESULT,
+        (false, false) => &WITHOUT_RESULT,
+        (true, true) => &WITH_INITIALIZATION,
+        (false, true) => &INITIALIZATION_ONLY,
     }
     .get_or_init(|| {
         (|| -> Result<Shape> {
             let reference = reference_base()?;
             if present {
                 reference.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+            }
+            if initialized {
+                reference.execute_batch(super::feature_initialization::COLUMN_SCHEMA)?;
             }
             Ok(select(snapshot(&reference)?))
         })()
@@ -610,6 +622,15 @@ fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
 
 // Run only for the saved version, not recursively against historical prefixes.
 fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> Result<()> {
+    let initialized = super::column_exists(
+        conn,
+        "worker_create_reservations",
+        "feature_initialization_json",
+    )?;
+    if initialized != (current >= 142) {
+        return Err(invalid("Feature initialization receipt/shape mismatch"));
+    }
+
     let startup = super::column_exists(conn, "worker_create_reservations", "startup_failure_json")?;
     if startup != tail.startup(current) {
         return Err(invalid("startup failure receipt/shape mismatch"));
@@ -1597,7 +1618,7 @@ mod failure_format_tests {
 
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
-        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141,
+        124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
     ];
 
     #[test]

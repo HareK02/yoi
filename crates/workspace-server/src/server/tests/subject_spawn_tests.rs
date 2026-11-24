@@ -532,7 +532,14 @@ fn recovery_spawn_request(api: &WorkspaceApi, subject: &str) -> WorkerSpawnReque
     }))
     .unwrap();
     request.resolved_config_bundle = Some(bundle);
-    request.resolved_subjektiv_attached = true;
+    request.feature_connections =
+        subjektiv_worker_initialization::subject_connection(subject.into()).unwrap();
+    request.resolved_feature_initialization =
+        subjektiv_worker_initialization::fixture_subject_initialization(
+            api.workspace_id(),
+            subject,
+        )
+        .unwrap();
     request
 }
 

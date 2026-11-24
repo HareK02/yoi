@@ -2099,7 +2099,7 @@ async fn two_subjects_signed_assignment_isolates_current_subjects_and_stale_rece
             Some(
                 json!({"runtime_id":EMBEDDED_WORKER_RUNTIME_ID, "display_name":name,
                 "profile":"builtin:companion", "initial_submit":[],
-                "feature_connections":{"subjektiv":{"subject_id":subject.id}},
+                "feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject.id}}],
                 "workdir_attachments":[]}),
             ),
             &token,
@@ -2433,7 +2433,7 @@ async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_
     let child = tracking_response(app.clone(), runtime_source_request(&identity, Some(&body.worker_id), "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
         serde_json::to_vec(&json!({"runtime_id":body.runtime_id, "display_name":"Generic assignment author",
-            "profile":"builtin:intake", "initial_submit":[], "workdir_attachments":[], "feature_connections":{},
+            "profile":"builtin:intake", "initial_submit":[], "workdir_attachments":[], "feature_connections":[],
             "control_operation_id":"spawn-generic-author",
             "authorization":authorization})).unwrap()), StatusCode::OK).await;
     let worker_id = child["worker_id"].as_str().unwrap();
@@ -2514,7 +2514,8 @@ async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_
         app.clone(),
         assignment_request(&api, &identity, worker_id, &ticket, "generic-assign"),
         StatusCode::OK,
-    ).await;
+    )
+    .await;
     // Removing the actual launch authority must fence even saved receipts.
     set_test_subject_policy_as_owner(&api, &subject_id, Default::default(), Default::default());
     for request in [

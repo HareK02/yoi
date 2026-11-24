@@ -903,9 +903,12 @@ pub struct WorkerSpawnRequest {
     /// Backend-authored immutable Workspace Memory settings snapshot.
     #[serde(skip, default)]
     pub resolved_memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
-    /// Backend-attested subjektiv singleton attachment. Browser/model input cannot set it.
+    /// Caller intent is fingerprinted independently of Host-resolved connection data.
+    #[serde(default)]
+    pub feature_connections: protocol::feature_initialization::FeatureInitializations,
+    /// Only trusted Backend adapters can resolve initialization. Never accepted from JSON.
     #[serde(skip, default)]
-    pub resolved_subjektiv_attached: bool,
+    pub resolved_feature_initialization: protocol::feature_initialization::FeatureInitializations,
     /// Backend-owned feature enablement; client input cannot set it.
     #[serde(skip, default)]
     pub resolved_worker_observation_enabled: bool,
@@ -8074,7 +8077,7 @@ fn runtime_create_worker_request(
         workspace_api: Some(workspace_api),
         memory_settings: request.resolved_memory_settings.clone(),
         plugin_execution: binding.plugin_execution,
-        subjektiv_attached: request.resolved_subjektiv_attached,
+        feature_initialization: request.resolved_feature_initialization.clone(),
         backend_job: match &request.intent {
             WorkerSpawnIntent::BackendJob {
                 job_id,
@@ -11246,7 +11249,8 @@ mod tests {
             resolved_core_execution_grant: None,
             resolved_workspace_api: Some(test_workspace_api()),
             resolved_memory_settings: Some(test_memory_settings()),
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
         }
     }
 
@@ -11657,7 +11661,8 @@ mod tests {
                     resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
-                    resolved_subjektiv_attached: false,
+                    feature_connections: Default::default(),
+                    resolved_feature_initialization: Default::default(),
                 },
             )
             .unwrap();
@@ -11771,7 +11776,8 @@ mod tests {
                     resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
-                    resolved_subjektiv_attached: false,
+                    feature_connections: Default::default(),
+                    resolved_feature_initialization: Default::default(),
                 },
             )
             .unwrap();
@@ -11814,7 +11820,8 @@ mod tests {
                     resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
-                    resolved_subjektiv_attached: false,
+                    feature_connections: Default::default(),
+                    resolved_feature_initialization: Default::default(),
                 },
             )
             .unwrap();

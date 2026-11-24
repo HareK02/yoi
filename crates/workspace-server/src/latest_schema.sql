@@ -680,6 +680,9 @@ CREATE TABLE worker_create_reservations (
             singleton_generation INTEGER CHECK (singleton_generation IS NULL OR singleton_generation > 0),
             startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR
                 (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),
+            feature_initialization_json TEXT CHECK (feature_initialization_json IS NULL OR
+                (typeof(feature_initialization_json) = 'text' AND length(CAST(feature_initialization_json AS BLOB)) <= 131072
+                 AND json_valid(feature_initialization_json) AND json_type(feature_initialization_json) = 'array')),
             PRIMARY KEY (workspace_id, allocation_key),
             UNIQUE (workspace_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,

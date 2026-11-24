@@ -171,9 +171,9 @@ use worker::feature::contracts::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{WorkerProtocolSessionStreams, live_log_entry_event};
 use worker::{
-    PromptCatalogSource, SegmentLogSink, SubjektivSessionAttributionLifecycle, WorkerBootstrap,
-    WorkerBootstrapError, WorkerBootstrapLayout, WorkerError, WorkerFilesystemAuthority,
-    WorkerHandle, WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    PromptCatalogSource, SegmentLogSink, WorkerBootstrap, WorkerBootstrapError,
+    WorkerBootstrapLayout, WorkerError, WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState,
+    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 #[cfg(feature = "ws-server")]
@@ -1000,6 +1000,7 @@ type SpawnModelClientFactory =
 pub struct ProfileRuntimeWorkerFactory {
     spawn_model_client_factory: Option<SpawnModelClientFactory>,
     plugin_runtime: Option<Arc<dyn crate::plugin::PluginToolRuntime>>,
+    initialization_registry: Arc<ProfileFeatureInitializationRegistry>,
     observation_hub: Arc<RuntimeWorkerObservationHub>,
     profile_base_dir: PathBuf,
     worker_aggregate_root: Option<PathBuf>,
@@ -1171,6 +1172,7 @@ impl ProfileRuntimeWorkerFactory {
         Self {
             spawn_model_client_factory: None,
             plugin_runtime: None,
+            initialization_registry: Arc::new(feature_initializers()),
             observation_hub: Arc::new(RuntimeWorkerObservationHub::default()),
             profile_base_dir,
             worker_aggregate_root: None,
@@ -1197,6 +1199,15 @@ impl ProfileRuntimeWorkerFactory {
         factory: impl Fn() -> Box<dyn agen::llm_client::client::LlmClient> + Send + Sync + 'static,
     ) -> Self {
         self.spawn_model_client_factory = Some(Arc::new(factory));
+        self
+    }
+
+    /// Trusted Feature composition; durable requests carry envelopes, not adapters.
+    pub fn with_feature_initialization_registry(
+        mut self,
+        registry: Arc<ProfileFeatureInitializationRegistry>,
+    ) -> Self {
+        self.initialization_registry = registry;
         self
     }
 
@@ -1433,7 +1444,8 @@ impl ProfileRuntimeWorkerFactory {
             .map_err(|err| format!("failed to build restore fallback manifest: {err}"))?;
         Ok((manifest, PromptCatalogSource::builtins_only()))
     }
-    fn manifest_for_restore(
+    fn manifest_for_restore_using(
+        initializers: &ProfileFeatureInitializationRegistry,
         metadata: &session_store::WorkerMetadata,
         request: &CreateWorkerRequest,
     ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
@@ -1441,15 +1453,33 @@ impl ProfileRuntimeWorkerFactory {
         let manifest = match metadata.resolved_manifest_snapshot.clone() {
             Some(snapshot) => manifest::read_persisted_worker_manifest_snapshot(snapshot)
                 .map_err(|error| format!("failed to read saved Worker Manifest: {error}"))?,
-            None if request.workspace_api.is_some() || request.subjektiv_attached => {
+            None if request.workspace_api.is_some()
+                || !request.feature_initialization.is_empty() =>
+            {
                 return Err("Workspace Worker metadata has no saved Manifest; replacement Worker is required".to_string());
             }
             None => fallback,
         };
         // Saved policy is execution authority. Rebinding current settings here
         // would hide content and attachment mismatches.
-        validate_worker_memory_settings(&manifest, request)?;
+        initializers.validate_manifest(&manifest, &feature_initialization_context(request))?;
         Ok((manifest, loader))
+    }
+
+    fn restore_manifest(
+        &self,
+        metadata: &session_store::WorkerMetadata,
+        request: &CreateWorkerRequest,
+    ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
+        Self::manifest_for_restore_using(&self.initialization_registry, metadata, request)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn manifest_for_restore(
+        metadata: &session_store::WorkerMetadata,
+        request: &CreateWorkerRequest,
+    ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
+        Self::manifest_for_restore_using(&feature_initializers(), metadata, request)
     }
 
     fn observe_bundle_prompt_projection(
@@ -1989,74 +2019,44 @@ fn deferred_restore_workdir_sessions(
         .collect()
 }
 
-fn validate_backend_job_profile(
-    manifest: &manifest::WorkerManifest,
-    request: &CreateWorkerRequest,
-) -> Result<(), String> {
-    if let Some(binding) = &request.backend_job {
-        let policy = &manifest.feature.subjektiv.profile;
-        if policy.consolidation_tools != binding.subjektiv_consolidation
-            || ((binding.subjektiv_consolidation || binding.subjektiv_journal)
-                && policy.extraction.enabled)
-        {
-            return Err("Backend Job tools must match their independent trusted grants and extraction must be disabled".into());
-        }
-    }
-    Ok(())
+pub type ProfileFeatureInitializationRegistry =
+    worker::feature::initialization::FeatureInitializationRegistry<
+        Box<dyn agen::llm_client::LlmClient>,
+        CombinedStore<WorkerSessionStore, WorkerAggregateStore>,
+    >;
+
+fn feature_initializers() -> ProfileFeatureInitializationRegistry {
+    worker::feature::initialization::builtin_registry()
 }
 
-fn bind_workspace_memory_settings(
+pub(crate) fn feature_initialization_context(
+    request: &CreateWorkerRequest,
+) -> worker::feature::initialization::InitializationContext<'_> {
+    worker::feature::initialization::InitializationContext {
+        data: &request.feature_initialization,
+        workspace_id: request
+            .workspace_api
+            .as_ref()
+            .map(|api| api.workspace_id.as_str()),
+        memory_settings: request.memory_settings.as_ref(),
+        backend_job: request.backend_job.as_ref(),
+    }
+}
+
+#[cfg(test)]
+fn bind_worker_initialization(
     manifest: &mut manifest::WorkerManifest,
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
-    validate_backend_job_profile(manifest, request)?;
-    let Some(snapshot) = request.memory_settings.as_ref() else {
-        if request.workspace_api.is_some() || request.subjektiv_attached {
-            return Err(
-                "Workspace Worker request is missing its bound Memory settings snapshot"
-                    .to_string(),
-            );
-        }
-        return Ok(());
-    };
-    if let Some(workspace_api) = request.workspace_api.as_ref()
-        && snapshot.workspace_id != workspace_api.workspace_id
-    {
-        return Err(format!(
-            "Memory settings workspace {} does not match Workspace API scope {}",
-            snapshot.workspace_id, workspace_api.workspace_id
-        ));
-    }
-    if manifest.feature.memory.profile.enabled {
-        manifest
-            .feature
-            .memory
-            .bind_workspace_settings(snapshot.clone())
-            .map_err(str::to_string)?;
-    }
-    if request.subjektiv_attached {
-        if !manifest.feature.subjektiv.profile.enabled {
-            return Err(
-                "subject-attached Worker profile does not enable subjektiv policy".to_string(),
-            );
-        }
-        manifest
-            .feature
-            .subjektiv
-            .bind_workspace_settings(snapshot.clone())
-            .map_err(str::to_string)?;
-    }
-    manifest
-        .feature
-        .memory
-        .validate_execution()
-        .map_err(str::to_string)?;
-    manifest
-        .feature
-        .subjektiv
-        .validate_execution()
-        .map_err(str::to_string)?;
-    Ok(())
+    feature_initializers().bind_manifest(manifest, &feature_initialization_context(request))
+}
+
+#[cfg(test)]
+fn validate_worker_initialization(
+    manifest: &manifest::WorkerManifest,
+    request: &CreateWorkerRequest,
+) -> Result<(), String> {
+    feature_initializers().validate_manifest(manifest, &feature_initialization_context(request))
 }
 
 /// Read-only validation shared with the offline, feature-gated fixture installer.
@@ -2066,76 +2066,6 @@ pub(crate) fn validate_fixture_restore_metadata(
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
     ProfileRuntimeWorkerFactory::manifest_for_restore(metadata, request).map(|_| ())
-}
-
-fn validate_worker_memory_settings(
-    manifest: &manifest::WorkerManifest,
-    request: &CreateWorkerRequest,
-) -> Result<(), String> {
-    validate_backend_job_profile(manifest, request)?;
-    let Some(expected) = request.memory_settings.as_ref() else {
-        if request.subjektiv_attached || request.workspace_api.is_some() {
-            return Err(
-                "Workspace Worker restore is missing its trusted settings snapshot".to_string(),
-            );
-        }
-        return Ok(());
-    };
-    if let Some(workspace_api) = request.workspace_api.as_ref()
-        && expected.workspace_id != workspace_api.workspace_id
-    {
-        return Err("trusted Memory settings do not match Workspace API scope".to_string());
-    }
-    manifest
-        .feature
-        .memory
-        .validate_execution()
-        .map_err(str::to_string)?;
-    manifest
-        .feature
-        .subjektiv
-        .validate_execution()
-        .map_err(str::to_string)?;
-    if manifest.feature.memory.profile.enabled
-        && manifest.feature.memory.workspace_settings().as_ref() != Some(expected)
-    {
-        let actual = manifest
-            .feature
-            .memory
-            .workspace_settings()
-            .ok_or_else(|| {
-                "Workspace Worker restored without its bound Memory settings snapshot".to_string()
-            })?;
-        return Err(format!(
-            "Workspace Worker Memory settings snapshot mismatch: expected {} language {}, restored {} language {}",
-            expected.workspace_id, expected.language, actual.workspace_id, actual.language
-        ));
-    }
-    let subjektiv_settings = manifest.feature.subjektiv.workspace_settings();
-    if request.subjektiv_attached {
-        if !manifest.feature.subjektiv.profile.enabled {
-            return Err(
-                "subject-attached Worker restored with a Profile that disables subjektiv policy"
-                    .to_string(),
-            );
-        }
-        if subjektiv_settings.as_ref() != Some(expected) {
-            let actual = subjektiv_settings.ok_or_else(|| {
-                "subject-attached Worker restored without its bound subjektiv settings snapshot"
-                    .to_string()
-            })?;
-            return Err(format!(
-                "Workspace Worker subjektiv settings snapshot mismatch: expected {} language {}, restored {} language {}",
-                expected.workspace_id, expected.language, actual.workspace_id, actual.language
-            ));
-        }
-    } else if subjektiv_settings.is_some() {
-        return Err(
-            "ordinary Workspace Worker restored with an unauthorized subjektiv attachment"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -2342,7 +2272,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )?
             }
         };
-        bind_workspace_memory_settings(&mut manifest, &request.request)?;
+        self.initialization_registry.bind_manifest(
+            &mut manifest,
+            &feature_initialization_context(&request.request),
+        )?;
         if let Some(bundle) = request.config_bundle.as_ref()
             && let Some(resolution) =
                 self.observe_bundle_prompt_projection(bundle, observation_workspace_id.as_deref())?
@@ -2474,8 +2407,15 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .bind_backend_job(binding.clone())
                 .map_err(str::to_string)?;
         }
-        validate_worker_memory_settings(worker.manifest(), &request.request)?;
-        startup_failure::finalize_startup_binding(worker, request.request.subjektiv_attached)?;
+        self.initialization_registry.validate_manifest(
+            worker.manifest(),
+            &feature_initialization_context(&request.request),
+        )?;
+        startup_failure::finalize_startup_binding(
+            &self.initialization_registry,
+            worker,
+            &request.request.feature_initialization,
+        )?;
         let workdir_capabilities = request
             .workdir_attachments
             .keys()
@@ -2582,7 +2522,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .read_by_name(&worker_name)
                 .map_err(|error| format!("failed to read Worker metadata: {error}"))?
                 .ok_or_else(|| "Persisted Worker metadata is unavailable".to_string())?;
-            let (manifest, loader) = Self::manifest_for_restore(&metadata, &request.request)?;
+            let (manifest, loader) = self.restore_manifest(&metadata, &request.request)?;
             if let Some(active) = metadata.active.as_ref()
                 && let Some(segment_id) = active.segment_id
             {
@@ -2762,7 +2702,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .read_by_name(&worker_name)
                 .map_err(|_| "Worker metadata read failed")?
                 .ok_or("saved Worker metadata unavailable")?;
-            let (manifest, loader) = Self::manifest_for_restore(&metadata, &request.request)
+            let (manifest, loader) = self
+                .restore_manifest(&metadata, &request.request)
                 .map_err(|_| "saved manifest resolution failed")?;
             let store = CombinedStore::new(session_store, worker_metadata_store);
 
@@ -2838,7 +2779,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             #[cfg(test)]
             self.restore_checkpoint(stage)
                 .map_err(|_| "injected restore boundary failure")?;
-            validate_worker_memory_settings(candidate.manifest(), &request.request)
+            self.initialization_registry
+                .validate_manifest(
+                    candidate.manifest(),
+                    &feature_initialization_context(&request.request),
+                )
                 .map_err(|_| "saved memory settings mismatch")?;
             self.prepare_unpublished_restore(candidate, &request)
                 .await
@@ -3348,10 +3293,11 @@ impl ProfileRuntimeWorkerFactory {
                 .prepare_runtime_controller(
                     &run_dir,
                     worker::bootstrap::RestoredControllerBindings {
+                        initialization_registry: self.initialization_registry.clone(),
                         backend_job: request.request.backend_job.clone(),
                         workdir_sessions,
                         observation_provider,
-                        subjektiv_attached: request.request.subjektiv_attached,
+                        feature_initialization: request.request.feature_initialization.clone(),
                     },
                 )
                 .await
@@ -8915,6 +8861,10 @@ mod tests {
 
     include!("subject_delete_backend_tests.rs");
     include!("worker_backend/startup_binding_tests.rs");
+    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
+    include!("worker_backend/initialization_tests.rs");
+    #[cfg(all(feature = "fs-store", feature = "ws-server", feature = "http-server"))]
+    include!("worker_backend/subjektiv_initialization_tests.rs");
     include!("worker_backend/spawn_tool_startup_tests.rs");
     include!("worker_backend/termination_persistence_tests.rs");
     include!("worker_backend/submission_termination_tests.rs");
@@ -9228,12 +9178,15 @@ mod tests {
             workspace_id: "workspace-saved-subjektiv".to_string(),
             base_url: "http://workspace.invalid".to_string(),
         });
-        request.subjektiv_attached = true;
+        request.feature_initialization = crate::catalog::test_subject_initialization(
+            "workspace-saved-subjektiv",
+            "saved-subject",
+        );
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-saved-subjektiv".to_string(),
             language: "English".to_string(),
         });
-        bind_workspace_memory_settings(&mut saved, &request).unwrap();
+        bind_worker_initialization(&mut saved, &request).unwrap();
         (saved, request)
     }
 
@@ -9323,7 +9276,7 @@ mod tests {
             Some("workspace-saved-subjektiv")
         );
         // Transport for incomplete initial-head repair and subsequent operations.
-        // A normal materialized restore must use the saved attribution instead.
+        // A materialized restore rechecks Host identity but must use saved attribution.
         #[cfg(feature = "http-server")]
         {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9346,6 +9299,12 @@ mod tests {
                         })
                     },
                 ),
+            );
+            let app = app.route(
+                "/api/w/workspace-saved-subjektiv/subjektiv/worker-connection",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({
+                    "workspace_id":"workspace-saved-subjektiv", "subject_id":"saved-subject", "kind":"subject_body"
+                })) }),
             );
             let app = app.route(
                 "/api/w/workspace-saved-subjektiv/subjektiv/journal/startup",
@@ -10613,18 +10572,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(worker_allocation)]
     #[cfg(feature = "http-server")]
-    async fn profile_factory_saved_subjektiv_restores_without_server_communication() {
+    async fn profile_factory_saved_subjektiv_rechecks_host_without_replaying_registration() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store = root.path().join("runtime");
         let mut request = saved_subjektiv_restore_fixture(&runtime_store, true).await;
-        // Replace only the external Server with an unavailable endpoint. Every
-        // request is counted, so ignored errors cannot masquerade as offline restore.
+        // Permit only the owner connection check. Any registration or protected
+        // startup data request is counted and refused, never silently ignored.
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_calls = calls.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         request.request.workspace_api.as_mut().unwrap().base_url =
             format!("http://{}", listener.local_addr().unwrap());
-        let app = axum::Router::new().fallback(move || {
+        let app = axum::Router::new().route(
+            "/api/w/workspace-saved-subjektiv/subjektiv/worker-connection",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({
+                "workspace_id":"workspace-saved-subjektiv", "subject_id":"saved-subject", "kind":"subject_body"
+            })) }),
+        ).fallback(move || {
             let calls = observed_calls.clone();
             async move {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -10703,7 +10667,7 @@ mod tests {
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "normal restore must not contact the Server"
+            "normal restore must not replay registration or fetch startup data"
         );
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
@@ -10966,7 +10930,7 @@ mod tests {
         let mut wrong_settings = request.clone();
         wrong_settings.memory_settings.as_mut().unwrap().language = "different language".into();
         let mut detached = request.clone();
-        detached.subjektiv_attached = false;
+        detached.feature_initialization = Default::default();
         let mut missing_settings = request.clone();
         missing_settings.memory_settings = None;
         for (invalid, expected) in [
@@ -13080,7 +13044,7 @@ mod tests {
                 && workspace_context.workspace_id().is_some()
             {
                 assert!(
-                    !request.request.subjektiv_attached,
+                    request.request.feature_initialization.is_empty(),
                     "generic legacy fixture must never authorize a Subject Worker"
                 );
                 WorkerWorkspaceContext::with_client(
@@ -13340,60 +13304,8 @@ mod tests {
             worker_observation_grants: Vec::new(),
             workspace_api: None,
             memory_settings: None,
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
-        }
-    }
-
-    #[test]
-    fn backend_job_profile_policy_matches_trusted_grant_without_implicit_changes() {
-        let mut manifest = WorkerManifest::from_toml(
-            r#"
-            [worker]
-            name = "job-policy-test"
-            pwd = "./"
-            [model]
-            scheme = "anthropic"
-            model_id = "chosen-model"
-            auth = { kind = "none" }
-            [engine]
-            instruction = "default"
-            [[scope.allow]]
-            target = "./"
-            permission = "read"
-        "#,
-        )
-        .unwrap();
-        let mut request = create_request("policy");
-        for (granted, journal) in [(false, false), (true, false), (false, true)] {
-            request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
-                job_id: "job-1".into(),
-                attempt_id: "attempt-1".into(),
-                input_digest: None,
-                subjektiv_consolidation: granted,
-                subjektiv_journal: journal,
-            });
-            for tools in [false, true] {
-                for extraction in [false, true] {
-                    manifest.feature.subjektiv.profile.consolidation_tools = tools;
-                    manifest.feature.subjektiv.profile.extraction.enabled = extraction;
-                    let expected = tools == granted && (!(granted || journal) || !extraction);
-                    let before = serde_json::to_value(&manifest).unwrap();
-                    assert_eq!(
-                        validate_backend_job_profile(&manifest, &request).is_ok(),
-                        expected
-                    );
-                    assert_eq!(
-                        bind_workspace_memory_settings(&mut manifest, &request).is_ok(),
-                        expected
-                    );
-                    assert_eq!(
-                        validate_worker_memory_settings(&manifest, &request).is_ok(),
-                        expected
-                    );
-                    assert_eq!(serde_json::to_value(&manifest).unwrap(), before);
-                }
-            }
         }
     }
 
@@ -13435,25 +13347,26 @@ mod tests {
         });
         ordinary_request.memory_settings = Some(settings.clone());
         let mut ordinary = manifest();
-        bind_workspace_memory_settings(&mut ordinary, &ordinary_request).unwrap();
+        bind_worker_initialization(&mut ordinary, &ordinary_request).unwrap();
         assert!(ordinary.feature.subjektiv.profile.enabled);
         assert!(!ordinary.feature.subjektiv.execution_enabled());
-        validate_worker_memory_settings(&ordinary, &ordinary_request).unwrap();
+        validate_worker_initialization(&ordinary, &ordinary_request).unwrap();
 
         let mut attached_request = ordinary_request.clone();
-        attached_request.subjektiv_attached = true;
+        attached_request.feature_initialization =
+            crate::catalog::test_subject_initialization("workspace-subject", "subject-test");
         let mut attached = manifest();
-        bind_workspace_memory_settings(&mut attached, &attached_request).unwrap();
+        bind_worker_initialization(&mut attached, &attached_request).unwrap();
         assert!(attached.feature.subjektiv.execution_enabled());
         assert_eq!(
             attached.feature.subjektiv.workspace_settings(),
             Some(settings.clone())
         );
-        validate_worker_memory_settings(&attached, &attached_request).unwrap();
-        assert!(validate_worker_memory_settings(&attached, &ordinary_request).is_err());
+        validate_worker_initialization(&attached, &attached_request).unwrap();
+        assert!(validate_worker_initialization(&attached, &ordinary_request).is_err());
 
         attached_request.memory_settings = None;
-        assert!(bind_workspace_memory_settings(&mut manifest(), &attached_request).is_err());
+        assert!(bind_worker_initialization(&mut manifest(), &attached_request).is_err());
     }
 
     fn git(path: &std::path::Path, args: &[&str]) {

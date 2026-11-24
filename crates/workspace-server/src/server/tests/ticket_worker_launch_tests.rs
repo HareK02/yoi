@@ -556,7 +556,7 @@ impl LaunchFixture {
         }
         json!({
             "runtime_id": self.runtime_id, "display_name": "Explicit Ticket Worker", "profile": profile,
-            "initial_submit": segments, "workdir_attachments": [], "feature_connections": {},
+            "initial_submit": segments, "workdir_attachments": [], "feature_connections": [],
             "authorization": { "kind": "assignment", "assignment": null },
             "control_operation_id": format!("launch-{operation_id}"),
         })

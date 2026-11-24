@@ -1310,7 +1310,7 @@ async fn backend_job_restart_without_live_host_owner_keeps_cleanup_unconfirmed()
                 worker_observation_grants: Vec::new(),
                 workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
                 memory_settings: Some(test_worker_memory_settings()),
-                subjektiv_attached: false,
+                feature_initialization: Default::default(),
                 backend_job: None,
             },
         )

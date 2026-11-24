@@ -21,7 +21,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
             .collect::<Vec<_>>(),
         [
             109, 110, 111, 112, 113, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 133, 134,
-            135, 136, 137, 138, 139, 140, 141
+            135, 136, 137, 138, 139, 140, 141, 142
         ]
     );
     let expected_history: Vec<_> = history
@@ -68,7 +68,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
                 worker_input_handoff_store::MIGRATION_NAME
             );
             assert_eq!(
-                &upgraded[upgraded.len() - 11..],
+                &upgraded[upgraded.len() - 12..],
                 &[
                     (130, backend_job_current::MIGRATION_NAME.into()),
                     (131, crate::launch_policy::MIGRATION_NAME.into()),
@@ -87,6 +87,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
                     (139, backend_job_result_application::MIGRATION_NAME.into()),
                     (140, backend_job_recording_input::MIGRATION_NAME.into()),
                     (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
+                    (142, feature_initialization::MIGRATION_NAME.into()),
                 ]
             );
             assert_eq!(

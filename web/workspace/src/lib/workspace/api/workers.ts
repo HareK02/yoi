@@ -26,10 +26,15 @@ import type {
   WorkerWorkdirAttachmentSummary,
   WorkerWorkspaceSummary,
   WorkingDirectoryRepositoryOption,
-  WorkspaceWorkerFeatureConnectionsRequest,
 } from "#lib/generated/worker-launch-api.ts";
 import { parseAssignment } from "#lib/workspace/memory/permissions.ts";
 import type { Segment } from "#lib/generated/protocol.ts";
+import {
+  MAX_FEATURE_INITIALIZATIONS,
+  MAX_FEATURE_INITIALIZATION_BYTES,
+  MAX_FEATURE_INITIALIZATION_ID_BYTES,
+  MAX_FEATURE_INITIALIZATION_PAYLOAD_BYTES,
+} from "#lib/generated/protocol.ts";
 import {
   parseExternalWorkdirPermissions,
   parseWorkingDirectorySummary,
@@ -806,21 +811,34 @@ function workingDirectorySelection(
 function featureConnectionsRequest(
   value: unknown,
   label: string,
-): WorkspaceWorkerFeatureConnectionsRequest {
-  const item = record(value, label);
-  exact(item, ["subjektiv"], label);
-  const subjektiv = optional(
-    item.subjektiv,
-    `${label}.subjektiv`,
-    (value, itemLabel) => {
-      const connection = record(value, itemLabel);
-      exact(connection, ["subject_id"], itemLabel);
-      return {
-        subject_id: string(connection.subject_id, `${itemLabel}.subject_id`),
-      };
-    },
-  );
-  return subjektiv === undefined ? {} : { subjektiv };
+): CreateWorkspaceWorkerRequest["feature_connections"] {
+  const owners = new Set<string>();
+  const encodedBytes = (input: unknown) => new TextEncoder().encode(JSON.stringify(input)).length;
+  const connections = array(value, label, (input, itemLabel) => {
+    const item = record(input, itemLabel);
+    exact(item, ["feature_id", "version", "payload"], itemLabel);
+    const feature_id = string(item.feature_id, `${itemLabel}.feature_id`);
+    if (feature_id.length > MAX_FEATURE_INITIALIZATION_ID_BYTES ||
+      !/^[A-Za-z0-9_./-]+:[A-Za-z0-9_:./-]+$/.test(feature_id)) {
+      throw new Error(`${itemLabel}.feature_id must be a bounded source-qualified identifier`);
+    }
+    if (owners.has(feature_id)) throw new Error(`${label} has a duplicate Feature owner`);
+    owners.add(feature_id);
+    const version = unsignedInteger(item.version, `${itemLabel}.version`);
+    if (version === 0 || version > 0xffff_ffff) {
+      throw new Error(`${itemLabel}.version must be a nonzero compatibility epoch`);
+    }
+    const payload = record(item.payload, `${itemLabel}.payload`);
+    if (encodedBytes(payload) > MAX_FEATURE_INITIALIZATION_PAYLOAD_BYTES) {
+      throw new Error(`${itemLabel}.payload exceeds its byte limit`);
+    }
+    return { feature_id, version, payload };
+  });
+  if (connections.length > MAX_FEATURE_INITIALIZATIONS || encodedBytes(connections) > MAX_FEATURE_INITIALIZATION_BYTES) {
+    throw new Error(`${label} exceeds its initialization limit`);
+  }
+  // Only the Backend's registered owner interprets the payload and authorizes it.
+  return connections.sort((left, right) => left.feature_id < right.feature_id ? -1 : left.feature_id > right.feature_id ? 1 : 0);
 }
 
 function unsignedInteger(value: unknown, label: string): number {

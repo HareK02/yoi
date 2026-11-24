@@ -1874,7 +1874,9 @@ pub(crate) fn authorize_requested_manifest(
     Ok(())
 }
 
-fn build_feature_install_plan(
+/// Plan descriptor-only participants with the same exact-one and dependency
+/// checks as Feature installation, without constructing modules or running effects.
+pub fn build_feature_install_plan(
     descriptors: &[FeatureDescriptor],
 ) -> Result<FeatureInstallPlan, FeaturePlanError> {
     let mut feature_ids = BTreeSet::new();
@@ -2515,6 +2517,12 @@ pub use invocation::{
     FeatureInvocationHandlerError, FeatureInvocationRegistry, InvocationContributionRegistrar,
 };
 pub mod builtin;
+pub mod initialization;
+
+pub(crate) type PromptContribution = (
+    Option<Arc<dyn crate::worker::SystemPromptContributionSource>>,
+    Option<String>,
+);
 pub mod contracts;
 pub mod mcp;
 pub(crate) mod session;

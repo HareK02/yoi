@@ -171,31 +171,30 @@ async fn automatic_activity_delivery(parent_busy: bool, case: ActivityCase) {
     )
     .await;
     *policy.lock().unwrap() = Some(launch);
-    let Json(created) = create_workspace_worker_as_owner(
-        State(api.clone()),
-        HeaderMap::new(),
-        Json(CreateWorkspaceWorkerRequest {
-            runtime_id: CONNECTED_RUNTIME.into(),
-            display_name: "Activity parent".into(),
-            singleton_key: None,
-            profile: Some("project:messaging-origin".into()),
-            initial_submit: vec![protocol::Segment::Text {
-                content: "ACTIVITY_PARENT".into(),
-            }],
-            workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject,
-                }),
-            },
-            control_operation_id: Some(Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
-                assignment: None,
-            },
-        }),
-    )
-    .await
-    .unwrap();
+    let Json(created) =
+        create_workspace_worker_as_owner(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: CONNECTED_RUNTIME.into(),
+                display_name: "Activity parent".into(),
+                singleton_key: None,
+                profile: Some("project:messaging-origin".into()),
+                initial_submit: vec![protocol::Segment::Text {
+                    content: "ACTIVITY_PARENT".into(),
+                }],
+                workdir_attachments: vec![],
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(subject.into())
+                        .unwrap(),
+                control_operation_id: Some(Uuid::now_v7().to_string()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                    assignment: None,
+                },
+            }),
+        )
+        .await
+        .unwrap();
     let parent = RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id);
     let child = spawn_rx.recv().await.expect("public spawn result");
     if !parent_busy {
@@ -205,17 +204,33 @@ async fn automatic_activity_delivery(parent_busy: bool, case: ActivityCase) {
         .recv()
         .await
         .expect("child model entered its running gate");
-    if matches!(case, ActivityCase::Cancel | ActivityCase::RunningStop | ActivityCase::ParentStopped) {
+    if matches!(
+        case,
+        ActivityCase::Cancel | ActivityCase::RunningStop | ActivityCase::ParentStopped
+    ) {
         let runtime = api.runtime.clone();
-        let target = if case == ActivityCase::ParentStopped { parent.clone() } else { child.clone() };
-        api.host_executors.host().unwrap().run(move || {
-            if case == ActivityCase::Cancel {
-                runtime.cancel_worker(&target, WorkerLifecycleRequest::default()).unwrap();
-            } else {
-                runtime.stop_worker(&target, WorkerLifecycleRequest::default()).unwrap();
-            }
-            Ok::<(), crate::Error>(())
-        }).await.unwrap();
+        let target = if case == ActivityCase::ParentStopped {
+            parent.clone()
+        } else {
+            child.clone()
+        };
+        api.host_executors
+            .host()
+            .unwrap()
+            .run(move || {
+                if case == ActivityCase::Cancel {
+                    runtime
+                        .cancel_worker(&target, WorkerLifecycleRequest::default())
+                        .unwrap();
+                } else {
+                    runtime
+                        .stop_worker(&target, WorkerLifecycleRequest::default())
+                        .unwrap();
+                }
+                Ok::<(), crate::Error>(())
+            })
+            .await
+            .unwrap();
     }
     if !matches!(case, ActivityCase::Cancel | ActivityCase::RunningStop) {
         release_child.add_permits(1);
@@ -223,7 +238,10 @@ async fn automatic_activity_delivery(parent_busy: bool, case: ActivityCase) {
     if case != ActivityCase::RunningStop {
         activity_wait_idle(&h, &child).await;
     }
-    if matches!(case, ActivityCase::RelationRevoked | ActivityCase::BodyReplaced) {
+    if matches!(
+        case,
+        ActivityCase::RelationRevoked | ActivityCase::BodyReplaced
+    ) {
         api.config_store.with_conn(|conn| {
             conn.execute_batch("CREATE TRIGGER activity_hold_delivery BEFORE INSERT ON notification_requests BEGIN SELECT RAISE(ABORT,'hold before runtime send'); END;")?;
             Ok(())
@@ -241,15 +259,25 @@ async fn automatic_activity_delivery(parent_busy: bool, case: ActivityCase) {
             Ok(())
         }).unwrap();
         let recovery = api.clone();
-        api.host_executors.host().unwrap().run(move || {
-            worker_lifecycle_notifications::recover(&recovery);
-            assert!(recovery.store.pending_worker_lifecycle(TEST_WORKSPACE_ID, 20)?.is_empty());
-            recovery.config_store.with_conn(|conn| {
-                conn.execute_batch("DROP TRIGGER activity_fail_source")?;
-                Ok(())
-            })?;
-            Ok::<(), crate::Error>(())
-        }).await.unwrap();
+        api.host_executors
+            .host()
+            .unwrap()
+            .run(move || {
+                worker_lifecycle_notifications::recover(&recovery);
+                assert!(
+                    recovery
+                        .store
+                        .pending_worker_lifecycle(TEST_WORKSPACE_ID, 20)?
+                        .is_empty()
+                );
+                recovery.config_store.with_conn(|conn| {
+                    conn.execute_batch("DROP TRIGGER activity_fail_source")?;
+                    Ok(())
+                })?;
+                Ok::<(), crate::Error>(())
+            })
+            .await
+            .unwrap();
     }
     if case == ActivityCase::AutomaticHook {
         // Run the actual production subscription/timer owner. No explicit scan,
@@ -285,75 +313,156 @@ async fn automatic_activity_delivery(parent_busy: bool, case: ActivityCase) {
         .iter()
         .filter(|i| i.recipient_role == "worker_lifecycle")
         .collect();
-    if matches!(case, ActivityCase::RelationRevoked | ActivityCase::BodyReplaced) {
+    if matches!(
+        case,
+        ActivityCase::RelationRevoked | ActivityCase::BodyReplaced
+    ) {
         assert_eq!(lifecycle.len(), 1, "{diagnostics:?}");
-        let pending = api.store.pending_worker_lifecycle(TEST_WORKSPACE_ID, 20).unwrap();
+        let pending = api
+            .store
+            .pending_worker_lifecycle(TEST_WORKSPACE_ID, 20)
+            .unwrap();
         assert_eq!(pending.len(), 1);
         if case == ActivityCase::RelationRevoked {
-            api.store.revoke_worker_control_grant(TEST_WORKSPACE_ID, &pending[0].grant_id, &now_registry_timestamp()).unwrap();
+            api.store
+                .revoke_worker_control_grant(
+                    TEST_WORKSPACE_ID,
+                    &pending[0].grant_id,
+                    &now_registry_timestamp(),
+                )
+                .unwrap();
         } else {
             // Replace only the authoritative owner fixture, not the delivery or
             // authorization implementations. The new body has no child-observe grant.
-            let lease = api.store.retained_worker_singleton_lease(TEST_WORKSPACE_ID, &parent).unwrap().unwrap();
+            let lease = api
+                .store
+                .retained_worker_singleton_lease(TEST_WORKSPACE_ID, &parent)
+                .unwrap()
+                .unwrap();
             api.config_store.with_conn(|conn| {
                 let changed = conn.execute("UPDATE worker_singleton_owners SET runtime_id=?3,worker_id=?4,generation=generation+1 WHERE workspace_id=?1 AND singleton_key=?2", rusqlite::params![TEST_WORKSPACE_ID, lease.key, child.runtime_id, child.worker_id])?;
                 assert_eq!(changed, 1);
                 Ok(())
             }).unwrap();
         }
-        api.config_store.with_conn(|conn| {
-            conn.execute_batch("DROP TRIGGER activity_hold_delivery")?;
-            Ok(())
-        }).unwrap();
+        api.config_store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER activity_hold_delivery")?;
+                Ok(())
+            })
+            .unwrap();
         let recovery = api.clone();
-        api.host_executors.host().unwrap().run(move || {
-            worker_lifecycle_notifications::recover(&recovery);
-            Ok::<(), crate::Error>(())
-        }).await.unwrap();
-        assert!(observed_rx.try_recv().is_err(), "must not deliver to old body or revoked parent");
-        let still_pending = api.store.pending_worker_lifecycle(TEST_WORKSPACE_ID, 20).unwrap();
+        api.host_executors
+            .host()
+            .unwrap()
+            .run(move || {
+                worker_lifecycle_notifications::recover(&recovery);
+                Ok::<(), crate::Error>(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            observed_rx.try_recv().is_err(),
+            "must not deliver to old body or revoked parent"
+        );
+        let still_pending = api
+            .store
+            .pending_worker_lifecycle(TEST_WORKSPACE_ID, 20)
+            .unwrap();
         assert_eq!(still_pending.len(), 1);
         assert_eq!(still_pending[0].delivery_id, pending[0].delivery_id);
         for worker in [&parent, &child] {
             let worker_ref = worker_runtime::identity::WorkerRef::try_from(worker).unwrap();
             let snapshot = h.factory.retained_session_snapshot(&worker_ref).unwrap();
-            assert!(!snapshot.snapshot.entries.iter().any(|entry| serde_json::to_string(entry).unwrap().contains("committed activity")));
+            assert!(!snapshot.snapshot.entries.iter().any(|entry| {
+                serde_json::to_string(entry)
+                    .unwrap()
+                    .contains("committed activity")
+            }));
         }
         return;
     }
     if case == ActivityCase::ParentStopped {
         assert_eq!(lifecycle.len(), 1, "{diagnostics:?}");
-        assert_ne!(lifecycle[0].stage, server_api::NotificationDiagnosticStage::RuntimeAccepted);
+        assert_ne!(
+            lifecycle[0].stage,
+            server_api::NotificationDiagnosticStage::RuntimeAccepted
+        );
         assert!(observed_rx.try_recv().is_err());
-        assert_eq!(api.store.pending_worker_lifecycle(TEST_WORKSPACE_ID, 20).unwrap().len(), 1);
+        assert_eq!(
+            api.store
+                .pending_worker_lifecycle(TEST_WORKSPACE_ID, 20)
+                .unwrap()
+                .len(),
+            1
+        );
         let runtime = api.runtime.clone();
-        api.host_executors.host().unwrap().run(move || {
-            assert_eq!(runtime.worker(&parent).unwrap().state, "stopped", "notification must not restore parent");
-            Ok::<(), crate::Error>(())
-        }).await.unwrap();
+        api.host_executors
+            .host()
+            .unwrap()
+            .run(move || {
+                assert_eq!(
+                    runtime.worker(&parent).unwrap().state,
+                    "stopped",
+                    "notification must not restore parent"
+                );
+                Ok::<(), crate::Error>(())
+            })
+            .await
+            .unwrap();
         return;
     }
     if case == ActivityCase::RunningStop {
         assert!(!lifecycle.is_empty(), "{diagnostics:?}");
-        assert!(lifecycle.iter().all(|i| i.stage == server_api::NotificationDiagnosticStage::RuntimeAccepted));
-        observed_rx.recv().await.expect("running stop reached parent model");
+        assert!(
+            lifecycle
+                .iter()
+                .all(|i| i.stage == server_api::NotificationDiagnosticStage::RuntimeAccepted)
+        );
+        observed_rx
+            .recv()
+            .await
+            .expect("running stop reached parent model");
         activity_wait_idle(&h, &parent).await;
         let parent_ref = worker_runtime::identity::WorkerRef::try_from(&parent).unwrap();
         let snapshot = h.factory.retained_session_snapshot(&parent_ref).unwrap();
-        let notifications: Vec<_> = snapshot.snapshot.entries.iter().map(|e| serde_json::to_string(e).unwrap()).filter(|s| s.contains("committed activity")).collect();
-        assert!(notifications.iter().any(|s| s.contains("Stopped")), "{notifications:?}");
-        assert!(!notifications.iter().any(|s| s.contains("activity Completed")), "{notifications:?}");
+        let notifications: Vec<_> = snapshot
+            .snapshot
+            .entries
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .filter(|s| s.contains("committed activity"))
+            .collect();
+        assert!(
+            notifications.iter().any(|s| s.contains("Stopped")),
+            "{notifications:?}"
+        );
+        assert!(
+            !notifications
+                .iter()
+                .any(|s| s.contains("activity Completed")),
+            "{notifications:?}"
+        );
         return;
     }
     assert_eq!(lifecycle.len(), 1, "{diagnostics:?}");
     if case == ActivityCase::LostAck {
-        assert_ne!(lifecycle[0].stage, server_api::NotificationDiagnosticStage::RuntimeAccepted);
-        api.config_store.with_conn(|conn| {
-            conn.execute_batch("DROP TRIGGER activity_fail_ack")?;
-            Ok(())
-        }).unwrap();
+        assert_ne!(
+            lifecycle[0].stage,
+            server_api::NotificationDiagnosticStage::RuntimeAccepted
+        );
+        api.config_store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER activity_fail_ack")?;
+                Ok(())
+            })
+            .unwrap();
     } else {
-        assert_eq!(lifecycle[0].stage, server_api::NotificationDiagnosticStage::RuntimeAccepted, "{diagnostics:?}");
+        assert_eq!(
+            lifecycle[0].stage,
+            server_api::NotificationDiagnosticStage::RuntimeAccepted,
+            "{diagnostics:?}"
+        );
     }
     if parent_busy {
         assert!(
@@ -422,7 +531,10 @@ async fn automatic_activity_delivery(parent_busy: bool, case: ActivityCase) {
     );
 
     if case != ActivityCase::Normal {
-        let notifications: Vec<_> = snapshot.snapshot.entries.iter()
+        let notifications: Vec<_> = snapshot
+            .snapshot
+            .entries
+            .iter()
             .map(|entry| serde_json::to_string(entry).unwrap())
             .filter(|text| text.contains("committed activity"))
             .collect();
@@ -431,9 +543,15 @@ async fn automatic_activity_delivery(parent_busy: bool, case: ActivityCase) {
             ActivityCase::Cancel => "Cancelled",
             _ => "Completed",
         };
-        assert!(notifications[0].contains(&format!("activity {expected}")), "{notifications:?}");
+        assert!(
+            notifications[0].contains(&format!("activity {expected}")),
+            "{notifications:?}"
+        );
         assert!(!notifications[0].contains("private-provider-error"));
-        assert_eq!(diagnostic.items[0].stage, server_api::NotificationDiagnosticStage::RuntimeAccepted);
+        assert_eq!(
+            diagnostic.items[0].stage,
+            server_api::NotificationDiagnosticStage::RuntimeAccepted
+        );
         return;
     }
 
@@ -551,20 +669,51 @@ macro_rules! activity_fault_test {
     ($name:ident, $case:ident) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
         async fn $name() {
-            tokio::time::timeout(std::time::Duration::from_secs(120), automatic_activity_delivery(false, ActivityCase::$case))
-                .await.expect("bounded fault lifecycle delivery");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                automatic_activity_delivery(false, ActivityCase::$case),
+            )
+            .await
+            .expect("bounded fault lifecycle delivery");
         }
     };
 }
-activity_fault_test!(worker_lifecycle_automatic_recovery_owner_delivers_without_manual_scan, AutomaticHook);
-activity_fault_test!(worker_lifecycle_model_error_reaches_parent_without_private_error, ModelError);
-activity_fault_test!(worker_lifecycle_cancel_before_model_output_reaches_parent, Cancel);
-activity_fault_test!(worker_lifecycle_running_stop_reaches_parent_without_success, RunningStop);
-activity_fault_test!(worker_lifecycle_stopped_parent_retains_source_without_restore, ParentStopped);
-activity_fault_test!(worker_lifecycle_lost_ack_retries_without_duplicate_parent_input, LostAck);
-activity_fault_test!(worker_lifecycle_source_failure_recovers_without_advancing_cursor, SourceFailure);
-activity_fault_test!(worker_lifecycle_revocation_after_capture_prevents_delivery, RelationRevoked);
-activity_fault_test!(worker_lifecycle_body_replacement_never_delivers_to_old_body_or_transfers_rights, BodyReplaced);
+activity_fault_test!(
+    worker_lifecycle_automatic_recovery_owner_delivers_without_manual_scan,
+    AutomaticHook
+);
+activity_fault_test!(
+    worker_lifecycle_model_error_reaches_parent_without_private_error,
+    ModelError
+);
+activity_fault_test!(
+    worker_lifecycle_cancel_before_model_output_reaches_parent,
+    Cancel
+);
+activity_fault_test!(
+    worker_lifecycle_running_stop_reaches_parent_without_success,
+    RunningStop
+);
+activity_fault_test!(
+    worker_lifecycle_stopped_parent_retains_source_without_restore,
+    ParentStopped
+);
+activity_fault_test!(
+    worker_lifecycle_lost_ack_retries_without_duplicate_parent_input,
+    LostAck
+);
+activity_fault_test!(
+    worker_lifecycle_source_failure_recovers_without_advancing_cursor,
+    SourceFailure
+);
+activity_fault_test!(
+    worker_lifecycle_revocation_after_capture_prevents_delivery,
+    RelationRevoked
+);
+activity_fault_test!(
+    worker_lifecycle_body_replacement_never_delivers_to_old_body_or_transfers_rights,
+    BodyReplaced
+);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn worker_lifecycle_silent_child_notifies_idle_subject_through_real_controller() {

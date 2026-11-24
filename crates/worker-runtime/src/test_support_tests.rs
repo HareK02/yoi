@@ -132,7 +132,7 @@ fn request() -> CreateWorkerRequest {
             workspace_id: WORKSPACE.into(),
             language: "en".into(),
         }),
-        subjektiv_attached: false,
+        feature_initialization: Default::default(),
         backend_job: None,
     }
 }

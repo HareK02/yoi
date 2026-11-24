@@ -2002,7 +2002,7 @@
             "type": "string"
           },
           "feature_connections": {
-            "$ref": "#/components/schemas/WorkspaceWorkerFeatureConnectionsRequest",
+            "$ref": "#/components/schemas/FeatureInitializations",
             "description": "Explicit product Feature connections. Backend validation turns these into\ntrusted host attachments; Runtime and Profile inputs cannot self-attest them."
           },
           "initial_submit": {
@@ -3968,6 +3968,36 @@
           "context"
         ],
         "type": "object"
+      },
+      "FeatureInitialization": {
+        "additionalProperties": false,
+        "description": "One owner's versioned payload. Fields are private so in-process construction\nand wire decoding enforce the same transport bounds.",
+        "properties": {
+          "feature_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "payload": true,
+          "version": {
+            "format": "uint32",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "feature_id",
+          "version",
+          "payload"
+        ],
+        "type": "object"
+      },
+      "FeatureInitializations": {
+        "description": "A canonical set: ordering cannot change create intent, and duplicate owners\nare rejected rather than replaced. The selected Feature plan still decides\nwhether an owner/provider exists and is compatible with the saved composition.",
+        "items": {
+          "$ref": "#/components/schemas/FeatureInitialization"
+        },
+        "maxItems": 32,
+        "type": "array"
       },
       "FeatureInvocation": {
         "properties": {
@@ -19034,18 +19064,6 @@
           }
         ]
       },
-      "SubjektivWorkerConnectionRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "subject_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "subject_id"
-        ],
-        "type": "object"
-      },
       "SubscriptionWorkerAvailability": {
         "description": "Whether the Workspace Server has a current Runtime observation for a Worker.\n\n`Unavailable` deliberately does not imply `Stopped`: it means the last observed\nlifecycle state is retained while the Runtime observation source is unavailable.",
         "enum": [
@@ -27097,22 +27115,6 @@
         ],
         "type": "object"
       },
-      "WorkspaceWorkerFeatureConnectionsRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "subjektiv": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SubjektivWorkerConnectionRequest"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "type": "object"
-      },
       "WorkspaceWorkerSubject": {
         "oneOf": [
           {
@@ -27157,7 +27159,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:74f1717db2a5db8eadaf3bed6b73a2182397e4e9468762790aeaf4e530139b69"
+    "x-yoi-source-digest": "sha256:e2c06c114c3ea871ce1f2d00e949d3e841eb3a9e028314f99f90760e27e60661"
   },
   "openapi": "3.1.0",
   "paths": {

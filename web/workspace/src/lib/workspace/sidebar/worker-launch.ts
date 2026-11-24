@@ -144,8 +144,8 @@ export function buildCreateWorkspaceWorkerRequest(
     ],
     workdir_attachments: validatedAttachments(form.workdir_attachments),
     feature_connections: form.subjektiv_subject_id.trim()
-      ? { subjektiv: { subject_id: form.subjektiv_subject_id.trim() } }
-      : {},
+      ? [{ feature_id: "builtin:subjektiv", version: 1, payload: { subject_id: form.subjektiv_subject_id.trim() } }]
+      : [],
     authorization: { kind: "assignment", assignment: null },
     control_operation_id: operationId,
   });

@@ -274,7 +274,7 @@ impl ControllerFixture {
                 workspace_id: "local".into(),
                 language: "English".into(),
             }),
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
         };
         runtime.store_config_bundle(bundle).unwrap();

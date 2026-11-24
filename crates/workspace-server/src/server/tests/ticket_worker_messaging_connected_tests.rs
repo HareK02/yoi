@@ -241,7 +241,7 @@ async fn public_worker_spawn_refuses_legacy_scoped_authority_without_broadening_
     assert!(before_policy.legacy_constraints.is_some());
     let (status, source) = h.human(reqwest::Method::POST, &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
         json!({"runtime_id":CONNECTED_RUNTIME,"display_name":"Retained scoped source","profile":"project:public-ticket-origin",
-            "initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+            "initial_submit":[],"workdir_attachments":[],"feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject}}]})).await;
     assert_eq!(status, StatusCode::OK, "{source}");
     let origin = RuntimeWorkerRef::new(
         source["runtime_id"].as_str().unwrap(),
@@ -293,7 +293,7 @@ async fn public_worker_spawn_refuses_legacy_scoped_authority_without_broadening_
         &format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
         &json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:public-ticket-editor","display_name":"Must not allocate",
             "control_operation_id":"legacy-backend-spawn","authorization":authorization,
-            "initial_submit":[],"workdir_attachments":[],"feature_connections":{}})).await;
+            "initial_submit":[],"workdir_attachments":[],"feature_connections":[]})).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
         body["message"]

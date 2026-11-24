@@ -149,6 +149,8 @@ pub struct WorkerLifecycleSpawnRequest {
     /// Omission selects the shared Worker default; explicit selections are forwarded unchanged.
     #[serde(default)]
     pub authorization: server_api::launch_policy::WorkerCreationAuthorization,
+    #[serde(default)]
+    pub feature_connections: protocol::feature_initialization::FeatureInitializations,
     pub display_name: String,
     pub initial_submit: Vec<Segment>,
 }

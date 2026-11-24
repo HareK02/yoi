@@ -1020,7 +1020,7 @@ async fn connected_chat_delegation(scenario: Scenario) {
         let c = context.lock().unwrap();
         (c.a.clone(), c.b.clone())
     };
-    let source = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"display_name":"Restricted async chat","profile":"project:async-chat","authorization":{"kind":"assignment","assignment":null},"control_operation_id":"chat-subject-body","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}}))).await;
+    let source = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"display_name":"Restricted async chat","profile":"project:async-chat","authorization":{"kind":"assignment","assignment":null},"control_operation_id":"chat-subject-body","initial_submit":[],"workdir_attachments":[],"feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject}}]}))).await;
     let source = RuntimeWorkerRef::new(
         source["runtime_id"].as_str().unwrap(),
         source["worker_id"].as_str().unwrap(),

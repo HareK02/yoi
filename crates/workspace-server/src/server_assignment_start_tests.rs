@@ -168,7 +168,7 @@ fn start_worker_body(attachments: Value) -> Value {
         "profile": "builtin:intake",
         "initial_submit": [],
         "workdir_attachments": attachments,
-        "feature_connections": {},
+        "feature_connections": [],
         "control_operation_id": "partial-control-start",
         "authorization": authorization
     })

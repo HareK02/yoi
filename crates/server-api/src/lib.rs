@@ -25,6 +25,7 @@ pub mod configuration_publication;
 pub use configuration_publication::*;
 pub mod feature_permissions;
 pub use configuration_adoption::*;
+pub use subjektiv_api::worker_initialization::ResolvedWorkerConnection;
 pub use subjektiv_api::*;
 mod subject_body;
 pub use subject_body::*;
@@ -1994,6 +1995,14 @@ pub trait ServerApi {
         #[path] conversation_id: String,
         #[body] request: ChatUserMessageRequest,
     ) -> Result<ChatReceiveResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/subjektiv/worker-connection", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn subjektiv_worker_connection(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<ResolvedWorkerConnection, RepositoryApiError>;
 
     #[post("/api/w/{workspace_id}/subjektiv/chat/worker", status = 200, error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
@@ -11612,21 +11621,10 @@ pub struct BrowserWorkerWorkingDirectorySelection {
     pub relative_cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceWorkerFeatureConnectionsRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub subjektiv: Option<SubjektivWorkerConnectionRequest>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct SubjektivWorkerConnectionRequest {
-    pub subject_id: String,
-}
+/// Caller-authored Feature initialization intent. Each registered Feature owns
+/// its payload codec and authorization; no resolved Host attachment is accepted here.
+pub type WorkspaceWorkerFeatureConnectionsRequest =
+    protocol::feature_initialization::FeatureInitializations;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -12849,8 +12847,8 @@ pub fn worker_launch_api_typescript() -> String {
         WorkingDirectoryRepositoryOption::decl(&config),
         WorkerLaunchOptionsResponse::decl(&config),
         BrowserWorkerWorkingDirectorySelection::decl(&config),
-        SubjektivWorkerConnectionRequest::decl(&config),
-        WorkspaceWorkerFeatureConnectionsRequest::decl(&config),
+        protocol::feature_initialization::FeatureInitialization::decl(&config),
+        protocol::feature_initialization::FeatureInitializations::decl(&config),
         CreateWorkspaceWorkerRequest::decl(&config),
         BrowserCreateWorkerResponse::decl(&config),
         BrowserWorkspaceOrchestratorResponse::decl(&config),
@@ -14387,7 +14385,7 @@ mod tests {
                 "profile": null,
                 "initial_submit": [],
                 "workdir_attachments": [],
-                "feature_connections": {},
+                "feature_connections": [],
                 "control_operation_id": null,
                 "authorization": { "kind": "assignment", "assignment": null },
             })
@@ -14397,7 +14395,7 @@ mod tests {
     #[test]
     fn worker_creation_requests_default_omitted_authorization_and_reject_human_alias() {
         let mut workspace = serde_json::json!({
-            "runtime_id":"runtime-a", "display_name":"Worker", "feature_connections":{}
+            "runtime_id":"runtime-a", "display_name":"Worker", "feature_connections":[]
         });
         let mut runtime = serde_json::json!({
             "control_operation_id":"spawn-1", "intent":{"kind":"workspace_coding"},

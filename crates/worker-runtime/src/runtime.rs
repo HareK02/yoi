@@ -9485,11 +9485,11 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
     if let Some(binding) = &request.backend_job {
         binding
             .validate()
-            .map_err(|message| RuntimeError::InvalidRequest(message.into()))?;
-        if request.workspace_api.is_none()
-            || (binding.subjektiv_consolidation && !request.subjektiv_attached)
-        {
-            return Err(RuntimeError::InvalidRequest("Backend Job capability requires Workspace authority and consolidation requires trusted subject attachment".into()));
+            .map_err(|e| RuntimeError::InvalidRequest(e.into()))?;
+        if request.workspace_api.is_none() {
+            return Err(RuntimeError::InvalidRequest(
+                "Backend Job capability requires Workspace authority".into(),
+            ));
         }
     }
     if request.create_fingerprint.trim().is_empty() {
@@ -10617,7 +10617,7 @@ mod tests {
                 workspace_id: "local".to_string(),
                 language: "English".to_string(),
             }),
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
         }
     }
@@ -10745,7 +10745,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_job_binding_requires_workspace_and_consolidation_attachment() {
+    fn backend_job_binding_requires_workspace_and_valid_identity() {
         let mut request = task_request("Job binding validation");
         request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
             job_id: "job-1".into(),
@@ -10759,8 +10759,7 @@ mod tests {
             workspace_id: "local".into(),
             base_url: "https://backend.invalid".into(),
         });
-        assert!(validate_create_worker_request(&request).is_err());
-        request.subjektiv_attached = true;
+        // Feature-owned connection policy is checked by the selected factory adapter.
         assert!(validate_create_worker_request(&request).is_ok());
         request.backend_job.as_mut().unwrap().attempt_id.clear();
         assert!(validate_create_worker_request(&request).is_err());

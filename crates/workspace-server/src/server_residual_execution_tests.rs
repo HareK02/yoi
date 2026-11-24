@@ -761,7 +761,7 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
             "orchestrator-runtime",
             Some("builtin:coder".into()),
             Some(&creation),
-            false,
+            feature_initialization::CreationAuthority::Ordinary,
         )
         .unwrap();
         let reservation = fixture

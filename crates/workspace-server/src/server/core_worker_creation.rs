@@ -99,7 +99,7 @@ pub(super) fn resolve_creation_profile(
     runtime_id: &str,
     profile: Option<String>,
     resolved_control_operation: Option<&WorkerControlOperation>,
-    subject_connection: bool,
+    connection_authority: feature_initialization::CreationAuthority,
 ) -> ApiResult<(
     String,
     ProfileSelector,
@@ -207,7 +207,9 @@ pub(super) fn resolve_creation_profile(
                 .prompt_projection_cache
                 .resolve(&api.config.workspace_id, &config_state)?;
             let bundle = crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(&profile_projection, &config_state, &api.config.workspace_id, &api.config.workspace_created_at, &profile, prompt_catalog.as_ref())?.ok_or_else(|| Error::Config("resolved Worker Profile bundle is missing".into()))?;
-            let grant = if subject_connection {
+            let grant = if connection_authority
+                == feature_initialization::CreationAuthority::FeatureOwned
+            {
                 None
             } else {
                 Some(core_worker_creation::resolve_core_creation_grant(

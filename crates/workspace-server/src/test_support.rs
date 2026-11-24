@@ -61,7 +61,8 @@ pub fn seed_fixed_worker(
     }
     if !matches!(request.intent, WorkerSpawnIntent::WorkspaceCoding)
         || request.singleton_key.is_some()
-        || request.resolved_subjektiv_attached
+        || !request.feature_connections.is_empty()
+        || !request.resolved_feature_initialization.is_empty()
         || !request.workdir_attachment_requests.is_empty()
         || !request.resolved_workdir_attachment_requests.is_empty()
         || !request.resolved_workdir_attachments.is_empty()
@@ -154,6 +155,7 @@ pub fn seed_fixed_worker(
         &fingerprint,
         None,
         &memory,
+        &Default::default(),
         |tx| {
             require_seed_target(tx, &seed)?;
             Ok(Some(seed.worker_id))
@@ -383,7 +385,8 @@ mod tests {
             resolved_config_bundle: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
@@ -752,7 +755,16 @@ mod tests {
         request.intent = WorkerSpawnIntent::WorkspaceOrchestrator;
         requests.push(request);
         let mut request = base.clone();
-        request.resolved_subjektiv_attached = true;
+        request.resolved_feature_initialization =
+            protocol::feature_initialization::FeatureInitializations::new(vec![
+                protocol::feature_initialization::FeatureInitialization::encode(
+                    "test:connection",
+                    1,
+                    &serde_json::json!({"connection":"saved"}),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
         requests.push(request);
         let mut request = base.clone();
         request

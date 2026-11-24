@@ -448,6 +448,31 @@ impl WorkspaceApi {
                 },
             ));
         }
+        // Allocation may have crossed a slow Runtime/Host boundary. Recheck the
+        // frozen Job's current authority before sending its protected input to
+        // canonical Session admission, not merely before the later model call.
+        if let Err(error) = subject_authorization::authorize_job_input(self, &job.request) {
+            let primary = error.error;
+            let detail = primary.to_string();
+            let cause = crate::backend_job::operation_failure_cause(
+                &primary,
+                crate::backend_job::BackgroundJobCause::InputFailed,
+            );
+            return Err(crate::backend_job::record_operation_failure(
+                primary,
+                cause,
+                |cause| {
+                    self.finish_backend_job_attempt_with_cause(
+                        &attempt.job_id,
+                        &attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "input_authorization_denied",
+                        &detail,
+                        cause,
+                    )
+                },
+            ));
+        }
         let dispatched = self.runtime.send_input(worker, request.clone());
         if let Ok(result) = &dispatched {
             if receipt_matches(attempt, result) {
@@ -1425,7 +1450,14 @@ impl WorkspaceApi {
             resolved_memory_settings: None,
             // Journal Jobs use their independent frozen Job Host grant, not the
             // main-Subject/Memory attachment or its resident/extraction policy.
-            resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some(),
+            feature_connections: Default::default(),
+            resolved_feature_initialization: match request.grants.subjektiv_consolidation.as_ref() {
+                Some(grant) => subjektiv_worker_initialization::consolidation_connection(
+                    self.workspace_id(),
+                    grant.subject_id.clone(),
+                )?,
+                None => Default::default(),
+            },
             resolved_control_operation: Some(WorkerControlOperation {
                 operation_id: allocation_key(&attempt.attempt_id),
                 input_fingerprint: job.intent_fingerprint.clone(),

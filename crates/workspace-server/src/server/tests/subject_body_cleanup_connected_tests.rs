@@ -406,7 +406,7 @@ async fn stop_ack_cleanup_preserves_real_restored_sessions_and_rebound_connectio
                 "control_operation_id":"connected-stop-cleanup",
                 "authorization": test_worker_operation_authorization(&[("filesystem", &["filesystem.read", "filesystem.write"]), ("bash", &["bash.execute"])]),
                 "workdir_attachments":[{"alias":ALIAS,"working_directory_id":workdir}],
-                "feature_connections":{}
+                "feature_connections":[]
             }),
         )
         .await;

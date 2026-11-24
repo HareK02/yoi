@@ -975,11 +975,11 @@ async fn replaced_policy_and_body_never_revive_delegated_worker_control() {
             profile: Some("project:authority-source".into()),
             initial_submit: vec![],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: f.subject.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(
+                    f.subject.clone(),
+                )
+                .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,

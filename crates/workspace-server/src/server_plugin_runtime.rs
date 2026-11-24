@@ -121,7 +121,7 @@ impl WorkspaceApi {
                     return Err(Error::WorkspaceConfigConflict("Plugin Profile changed during launch".into()));
                 }
                 let saved = crate::plugin_plan::plugin_plan_create(tx, LAUNCH_ACTOR, &key, &plan)?;
-                let fingerprint = config_source::digest_bytes(&serde_json::to_vec(&(&reservation.create_fingerprint, &saved.fingerprint)).map_err(|_| Error::Config("Plugin launch encoding failed".into()))?);
+                let fingerprint = crate::plugin_plan::worker_launch_fingerprint(&reservation.create_fingerprint, &saved.fingerprint)?;
                 let updated = tx.execute("UPDATE worker_create_reservations SET create_fingerprint=?1 WHERE workspace_id=?2 AND runtime_id=?3 AND worker_id=?4 AND create_fingerprint=?5 AND state='reserved'",
                     params![fingerprint, self.workspace_id(), runtime, reservation.worker_id.to_string(), reservation.create_fingerprint])?;
                 if updated != 1 { return Err(Error::WorkspaceConfigConflict("Plugin launch reservation changed".into())); }

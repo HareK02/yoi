@@ -15,16 +15,40 @@ mod startup_binding_tests {
     enum Response {
         Rejected,
         Lost,
+        WrongSubject,
+        HostWorkspace,
+        HostSubject,
+        HostKind,
+        HostAfterSession,
+        HostAfterOwner,
+        HostAfterAttribution,
         BeforeSession,
         AfterSession,
         BeforeOwner,
         AfterOwner,
         AfterAttribution,
     }
+    impl Response {
+        fn host_mismatch(self) -> bool {
+            matches!(
+                self,
+                Self::HostWorkspace
+                    | Self::HostSubject
+                    | Self::HostKind
+                    | Self::HostAfterSession
+                    | Self::HostAfterOwner
+                    | Self::HostAfterAttribution
+            )
+        }
+        fn binding_mismatch(self) -> bool {
+            self.host_mismatch() || matches!(self, Self::WrongSubject)
+        }
+    }
     struct AttributionClient {
         response: Response,
         store: WorkerAggregateStore,
         name: String,
+        calls: std::sync::Mutex<Vec<&'static str>>,
     }
     impl std::fmt::Debug for AttributionClient {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,7 +65,70 @@ mod startup_binding_tests {
         fn is_available(&self) -> bool {
             true
         }
-        fn execute(&self, _: WorkspaceRequest) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path == "/api/w/startup-binding-workspace/subjektiv/worker-connection" {
+                assert_eq!(request.method, worker::WorkspaceRequestMethod::Get);
+                assert!(request.body.is_none());
+                self.calls.lock().unwrap().push("connection");
+                match self.response {
+                    Response::HostAfterSession => self
+                        .store
+                        .update_by_name(&self.name, |metadata| {
+                            metadata.active = Some(WorkerActiveSegmentRef::pending_segment(
+                                session_store::new_session_id(),
+                            ));
+                            metadata.subjektiv_session_attribution = None;
+                        })
+                        .unwrap(),
+                    Response::HostAfterOwner => self
+                        .store
+                        .update_by_name(&self.name, |metadata| {
+                            metadata.workspace_id = Some("replacement-owner".into());
+                        })
+                        .unwrap(),
+                    Response::HostAfterAttribution => self
+                        .store
+                        .update_by_name(&self.name, |metadata| {
+                            metadata.subjektiv_session_attribution =
+                                Some(session_store::SubjektivSessionAttributionState::Confirmed {
+                                    session_id: metadata.active.as_ref().unwrap().session_id,
+                                    subject_id: "replacement-subject".into(),
+                                });
+                        })
+                        .unwrap(),
+                    _ => self.store.read_by_name(&self.name).unwrap().unwrap(),
+                };
+                let mut actual = serde_json::json!({
+                    "workspace_id":"startup-binding-workspace", "subject_id":"subject-test", "kind":"subject_body"
+                });
+                match self.response {
+                    Response::HostWorkspace => {
+                        actual["workspace_id"] = "different-workspace".into()
+                    }
+                    Response::HostSubject
+                    | Response::HostAfterSession
+                    | Response::HostAfterOwner
+                    | Response::HostAfterAttribution => {
+                        actual["subject_id"] = "different-subject".into()
+                    }
+                    Response::HostKind => actual["kind"] = "memory_consolidation".into(),
+                    _ => {}
+                }
+                return Ok(WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: actual.to_string(),
+                });
+            }
+            assert_eq!(
+                request.path,
+                "/api/w/startup-binding-workspace/subjektiv/sessions"
+            );
+            assert_eq!(request.method, worker::WorkspaceRequestMethod::Post);
+            self.calls.lock().unwrap().push("session");
             match self.response {
                 Response::AfterSession => self
                     .store
@@ -70,6 +157,18 @@ mod startup_binding_tests {
                     .unwrap(),
                 _ => self.store.read_by_name(&self.name).unwrap().unwrap(),
             };
+            if matches!(self.response, Response::WrongSubject) {
+                let input: server_api::SubjektivRecordSessionRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                return Ok(WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: serde_json::json!({
+                        "session_id": input.session_id, "subject_id": "different-current-subject"
+                    })
+                    .to_string(),
+                });
+            }
             if matches!(self.response, Response::Lost) {
                 return Err(WorkspaceClientError::Request(
                     "response deliberately lost".into(),
@@ -106,8 +205,9 @@ mod startup_binding_tests {
             response,
             store: store.clone(),
             name: name.into(),
+            calls: Default::default(),
         });
-        let manifest = WorkerManifest::from_toml(
+        let mut manifest = WorkerManifest::from_toml(
             r#"
             [worker]
             name = "startup-binding"
@@ -122,6 +222,16 @@ mod startup_binding_tests {
         "#,
         )
         .unwrap();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest.feature.subjektiv.profile.extraction.enabled = false;
+        manifest
+            .feature
+            .subjektiv
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "startup-binding-workspace".into(),
+                language: "English".into(),
+            })
+            .unwrap();
         let llm: Box<dyn LlmClient> = Box::new(MockClient::new(Vec::new()));
         let mut worker = Worker::new(
             manifest,
@@ -129,7 +239,7 @@ mod startup_binding_tests {
             CombinedStore::new(session_store, store.clone()),
             WorkerWorkspaceContext::with_client(
                 Some(WorkspaceId::new("startup-binding-workspace").unwrap()),
-                client,
+                client.clone(),
             ),
             WorkerFilesystemAuthority::None,
             Scope::empty(),
@@ -153,9 +263,28 @@ mod startup_binding_tests {
                 .unwrap(),
             _ => store.read_by_name(name).unwrap().unwrap(),
         };
-        let failure = startup_failure::finalize_startup_binding(&worker, true)
-            .err()
-            .expect("failure must remain a failure");
+        let failure = startup_failure::finalize_startup_binding(
+            &feature_initializers(),
+            &worker,
+            &crate::catalog::test_subject_initialization(
+                "startup-binding-workspace",
+                "subject-test",
+            ),
+        )
+        .err()
+        .expect("failure must remain a failure");
+        let expected_calls: &[&str] = if response.host_mismatch()
+            || matches!(response, Response::BeforeSession | Response::BeforeOwner)
+        {
+            &["connection"]
+        } else {
+            &["connection", "session"]
+        };
+        assert_eq!(
+            client.calls.lock().unwrap().as_slice(),
+            expected_calls,
+            "read-only identity verification must precede the original typed Session operation; mismatch must not fall back"
+        );
         if matches!(response, Response::Lost | Response::Rejected) {
             let mut source = std::error::Error::source(&failure);
             let mut worker = false;
@@ -187,7 +316,9 @@ mod startup_binding_tests {
             };
             assert_eq!(
                 *primary.facts().cause(),
-                if matches!(response, Response::Lost) {
+                if response.binding_mismatch() {
+                    SessionRegistrationCause::binding_mismatch()
+                } else if matches!(response, Response::Lost) {
                     SessionRegistrationCause::outcome_unknown()
                 } else {
                     SessionRegistrationCause::denied(SessionPrincipal::Subject)
@@ -199,7 +330,12 @@ mod startup_binding_tests {
         let reopened = WorkerAggregateStore::new(root.path(), name).unwrap();
         let metadata = reopened.read_by_name(name).unwrap().unwrap();
         match response {
-            Response::Rejected | Response::Lost => {
+            Response::Rejected
+            | Response::Lost
+            | Response::WrongSubject
+            | Response::HostWorkspace
+            | Response::HostSubject
+            | Response::HostKind => {
                 assert_eq!(
                     result.startup_failure_persistence,
                     Some(StartupPersistenceOutcome::Persisted)
@@ -211,7 +347,9 @@ mod startup_binding_tests {
                 };
                 assert_eq!(
                     *cause.facts().cause(),
-                    if matches!(response, Response::Lost) {
+                    if response.binding_mismatch() {
+                        SessionRegistrationCause::binding_mismatch()
+                    } else if matches!(response, Response::Lost) {
                         SessionRegistrationCause::outcome_unknown()
                     } else {
                         SessionRegistrationCause::denied(SessionPrincipal::Subject)
@@ -221,14 +359,29 @@ mod startup_binding_tests {
                 let saved = serde_json::to_string(&metadata.startup_failure).unwrap();
                 assert!(!saved.contains("private token"));
                 assert!(!saved.contains("/internal/path"));
-                assert_eq!(
-                    metadata
-                        .subjektiv_session_attribution
-                        .as_ref()
-                        .unwrap()
-                        .session_id(),
-                    origin
-                );
+                if response.host_mismatch() {
+                    assert!(
+                        metadata.subjektiv_session_attribution.is_none(),
+                        "a read-only connection refusal must not begin Session attribution"
+                    );
+                } else {
+                    assert_eq!(
+                        metadata
+                            .subjektiv_session_attribution
+                            .as_ref()
+                            .unwrap()
+                            .session_id(),
+                        origin
+                    );
+                }
+                if matches!(response, Response::Rejected | Response::WrongSubject) {
+                    assert!(matches!(metadata.subjektiv_session_attribution.as_ref(),
+                        Some(session_store::SubjektivSessionAttributionState::Failed { session_id, .. }) if *session_id == origin));
+                }
+                let saved_attribution =
+                    serde_json::to_string(&metadata.subjektiv_session_attribution).unwrap();
+                assert!(!saved_attribution.contains("private token"));
+                assert!(!saved_attribution.contains("/internal/path"));
                 assert_eq!(
                     matches!(
                         metadata.subjektiv_session_attribution,
@@ -251,12 +404,19 @@ mod startup_binding_tests {
                     result.startup_failure_persistence,
                     Some(StartupPersistenceOutcome::Persisted)
                 );
-                if matches!(response, Response::BeforeSession | Response::AfterSession) {
+                if matches!(
+                    response,
+                    Response::BeforeSession | Response::AfterSession | Response::HostAfterSession
+                ) {
                     assert_ne!(metadata.active.unwrap().session_id, origin);
                 }
                 if matches!(
                     response,
-                    Response::BeforeOwner | Response::BeforeSession | Response::AfterSession
+                    Response::BeforeOwner
+                        | Response::BeforeSession
+                        | Response::AfterSession
+                        | Response::HostAfterSession
+                        | Response::HostAfterOwner
                 ) {
                     assert!(metadata.subjektiv_session_attribution.is_none());
                 }
@@ -268,13 +428,20 @@ mod startup_binding_tests {
                         )
                     ));
                 }
-                if matches!(response, Response::BeforeOwner | Response::AfterOwner) {
+                if matches!(
+                    response,
+                    Response::BeforeOwner | Response::AfterOwner | Response::HostAfterOwner
+                ) {
                     assert_eq!(metadata.workspace_id.as_deref(), Some("replacement-owner"));
                 }
-                if matches!(response, Response::AfterAttribution) {
+                if matches!(
+                    response,
+                    Response::AfterAttribution | Response::HostAfterAttribution
+                ) {
                     assert!(matches!(
-                        metadata.subjektiv_session_attribution,
-                        Some(session_store::SubjektivSessionAttributionState::Confirmed { .. })
+                        metadata.subjektiv_session_attribution.as_ref(),
+                        Some(session_store::SubjektivSessionAttributionState::Confirmed { session_id, subject_id })
+                            if *session_id == origin && subject_id == "replacement-subject"
                     ));
                 }
             }
@@ -296,7 +463,8 @@ mod startup_binding_tests {
             workspace_id: "adapter-test".into(),
             base_url: endpoint.clone(),
         });
-        request.subjektiv_attached = true;
+        request.feature_initialization =
+            crate::catalog::test_subject_initialization("adapter-test", "subject-test");
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "adapter-test".into(),
             language: "English".into(),
@@ -386,6 +554,34 @@ mod startup_binding_tests {
         );
         assert!(!format!("{failure:?} {failure}").contains(&endpoint));
         assert!(!serde_json::to_string(&result).unwrap().contains(&endpoint));
+    }
+
+    #[tokio::test]
+    async fn current_connection_mismatch_rejects_before_session_record_and_reopens_typed_cause() {
+        for response in [
+            Response::HostWorkspace,
+            Response::HostSubject,
+            Response::HostKind,
+        ] {
+            check_binding(response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn current_connection_failure_cannot_overwrite_replacement_session_owner_or_attribution()
+    {
+        for response in [
+            Response::HostAfterSession,
+            Response::HostAfterOwner,
+            Response::HostAfterAttribution,
+        ] {
+            check_binding(response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn initialization_identity_must_also_match_the_session_callback_result() {
+        check_binding(Response::WrongSubject).await;
     }
 
     #[tokio::test]

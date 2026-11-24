@@ -34,6 +34,7 @@ mod chat;
 mod core_worker_creation;
 mod external_grant_failure;
 mod external_operation_audit;
+mod feature_initialization;
 mod grant_cleanup;
 mod launch_policy_registry;
 mod mr_publication;
@@ -41,6 +42,7 @@ mod service_authority;
 mod session_registration;
 mod subject_authorization;
 mod subject_permission_policy;
+pub(crate) mod subjektiv_worker_initialization;
 mod worker_lifecycle_notifications;
 pub(crate) use launch_policy_registry::sync_launch_policy_permissions;
 mod subject_body;
@@ -6454,8 +6456,10 @@ impl WorkspaceApi {
         if let Some(singleton_key) = request.singleton_key.as_deref() {
             crate::store::validate_worker_singleton_key(singleton_key)?;
         }
+        let initialization_registry = feature_initialization::backend_initialization_registry();
+        let connection_authority = initialization_registry.validate_resolved(self, &request)?;
         if request.resolved_core_execution_grant.is_none()
-            && !request.resolved_subjektiv_attached
+            && connection_authority != feature_initialization::CreationAuthority::FeatureOwned
             && !matches!(&request.intent, WorkerSpawnIntent::BackendJob { .. })
         {
             return Err(Error::WorkspacePermissionDenied(
@@ -6526,21 +6530,12 @@ impl WorkspaceApi {
             .as_ref()
             .map(|operation| operation.operation_id.clone())
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
-        let body_subject = singleton_key
-            .as_deref()
-            .and_then(|key| key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX));
-        if let Some(subject) = body_subject
-            && let Err(error) = subjektiv_journal::recover_failed_subject_create(self, subject)
-        {
-            let diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
-            return Err(ApiError::with_diagnostics(error, diagnostics));
-        }
-        let subject = body_subject.or_else(|| {
-            request
-                .resolved_execution_grant
-                .as_ref()
-                .map(|grant| grant.subject_id.as_str())
-        });
+        // Delegated execution admission remains owned by the grant authority.
+        // Feature-owned singleton/domain admission is supplied by its adapter.
+        let subject = request
+            .resolved_execution_grant
+            .as_ref()
+            .map(|grant| grant.subject_id.as_str());
         let subject_gate = subject
             .map(|s| subjektiv_journal::lifecycle_lock(self, s))
             .transpose()?;
@@ -6554,52 +6549,60 @@ impl WorkspaceApi {
         if let Some(subject) = subject {
             subjektiv_deletion::require_available(self, subject)?;
         }
-        if let Some(subject) = body_subject {
-            subjektiv_journal::check_start_allowed(self, subject)?;
-        }
-        let reservation_result =
-            if let Some(grant) = request.resolved_core_execution_grant.as_ref() {
-                let operation = request.resolved_control_operation.as_ref().ok_or_else(|| {
-                    Error::Config("core Worker launch operation is missing".into())
-                })?;
-                let bundle = request
-                    .resolved_config_bundle
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("core Worker Profile bundle is missing".into()))?;
-                self.config_store.reserve_worker_create_with_core(
-                    &self.config.workspace_id,
-                    runtime_id,
-                    &allocation_key,
-                    &operation.input_fingerprint,
-                    &operation.input_fingerprint,
-                    singleton_key.as_deref(),
-                    &current_memory_settings,
-                    grant,
-                    bundle,
-                )
-            } else {
-                self.config_store.reserve_worker_create(
-                    &self.config.workspace_id,
-                    runtime_id,
-                    &allocation_key,
-                    &request_fingerprint,
-                    singleton_key.as_deref(),
-                    &current_memory_settings,
-                )
-            };
-        let reservation = match reservation_result {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                let error = match error {
-                    Error::RepositoryConflict(message) => Error::RepositoryConflict(message),
+        let reservation_result = initialization_registry.reserve(
+            self,
+            &request.resolved_feature_initialization,
+            &mut || {
+                let result = if let Some(grant) = request.resolved_core_execution_grant.as_ref() {
+                    let operation =
+                        request.resolved_control_operation.as_ref().ok_or_else(|| {
+                            Error::Config("core Worker launch operation is missing".into())
+                        })?;
+                    let bundle = request.resolved_config_bundle.as_ref().ok_or_else(|| {
+                        Error::Config("core Worker Profile bundle is missing".into())
+                    })?;
+                    self.config_store
+                        .reserve_worker_create_with_core_initialization(
+                            &self.config.workspace_id,
+                            runtime_id,
+                            &allocation_key,
+                            &operation.input_fingerprint,
+                            &operation.input_fingerprint,
+                            singleton_key.as_deref(),
+                            &current_memory_settings,
+                            grant,
+                            bundle,
+                            &request.resolved_feature_initialization,
+                        )
+                } else {
+                    self.config_store.reserve_worker_create_with_initialization(
+                        &self.config.workspace_id,
+                        runtime_id,
+                        &allocation_key,
+                        &request_fingerprint,
+                        singleton_key.as_deref(),
+                        &current_memory_settings,
+                        &request.resolved_feature_initialization,
+                    )
+                };
+                result.map_err(|error| match error {
+                    Error::RepositoryConflict(message) => Error::RepositoryConflict(message).into(),
                     error => Error::RuntimeOperationFailed {
                         runtime_id: runtime_id.to_string(),
-                        code: "workspace_worker_allocation_conflict".to_string(),
+                        code: "workspace_worker_allocation_conflict".into(),
                         message: error.to_string(),
-                    },
-                };
-                let diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
-                return Err(ApiError::with_diagnostics(error, diagnostics));
+                    }
+                    .into(),
+                })
+            },
+        );
+        let reservation = match reservation_result {
+            Ok(reservation) => reservation,
+            Err(mut error) => {
+                error
+                    .diagnostics
+                    .extend(cleanup_spawn_created_workdirs(self, &spawned_workdir_ids));
+                return Err(error);
             }
         };
         let worker_id = reservation.worker_id;
@@ -6616,6 +6619,15 @@ impl WorkspaceApi {
         // above. Do not reserve its already-linked attachments again, redispatch
         // initial input, or compensate an existing Worker on a replay failure.
         let reserved_worker = RuntimeWorkerRef::new(runtime_id, worker_id.to_string());
+        *reserved_identity = Some(reserved_worker.clone());
+        initialization_registry.reserved(&feature_initialization::ReservedConnection {
+            api: self,
+            worker: &reserved_worker,
+            allocation_key: &allocation_key,
+            operation: request.resolved_control_operation.as_ref(),
+            reservation: &reservation,
+        })?;
+        request.resolved_feature_initialization = reservation.feature_initialization.clone();
         if request.resolved_control_operation.is_some()
             && !self
                 .store
@@ -8194,6 +8206,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         ))
         .merge(server_api::server_api_axum::chat_messages(service.clone()))
         .merge(server_api::server_api_axum::chat_receive(service.clone()))
+        .merge(server_api::server_api_axum::subjektiv_worker_connection(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::chat_worker_operation(
             service.clone(),
         ))
@@ -8760,7 +8775,8 @@ fn worker_spawn_request_from_api(
         resolved_config_bundle: None,
         resolved_workspace_api: None,
         resolved_memory_settings: None,
-        resolved_subjektiv_attached: false,
+        feature_connections: Default::default(),
+        resolved_feature_initialization: Default::default(),
         resolved_worker_observation_enabled: false,
         resolved_worker_observation_grants: Vec::new(),
         resolved_control_operation: None,
@@ -11004,6 +11020,22 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map_err(ApiError::into_repository_api_error)
     }
+    async fn subjektiv_worker_connection(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::ResolvedWorkerConnection, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        api.store
+            .db_executor()
+            .run(move || {
+                subjektiv_worker_initialization::current_connection(&api, &workspace_id, &context)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn chat_worker_operation(
         &self,
         context: server_api::ServerRequestContext,
@@ -27841,7 +27873,8 @@ fn start_memory_staging_consolidation(
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_control_operation: Some(creation),
             resolved_execution_grant: None,
             authorization: Some(authorization),
@@ -29746,7 +29779,8 @@ async fn scoped_start_workspace_orchestrator(
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
             authorization: Some(authorization.clone()),
@@ -29759,7 +29793,7 @@ async fn scoped_start_workspace_orchestrator(
     };
     let (_, profile, bundle, grant) = core_worker_creation::resolve_creation_profile(
         &api, None, Some(&actor.account_id), &authorization, EMBEDDED_WORKER_RUNTIME_ID,
-        Some("builtin:orchestrator".into()), Some(&operation), false,
+        Some("builtin:orchestrator".into()), Some(&operation), feature_initialization::CreationAuthority::Ordinary,
     )?;
     request.profile = profile;
     request.resolved_config_bundle = bundle;
@@ -36131,10 +36165,23 @@ async fn create_workspace_worker_authenticated_on_host(
     } else {
         None
     };
-    let subject_connection = feature_connections.subjektiv.is_some();
-    if source.is_some() && (singleton_key.is_some() || subject_connection) {
+    let source_worker = source
+        .as_ref()
+        .map(|source| RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id));
+    let initialization_registry = feature_initialization::backend_initialization_registry();
+    let connection_authority = initialization_registry.authorize(
+        &feature_initialization::ConnectionCaller {
+            api: &api,
+            source: source_worker.as_ref(),
+            account: account.as_deref(),
+            authorization: &authorization,
+            singleton_key: singleton_key.as_deref(),
+        },
+        &feature_connections,
+    )?;
+    if source.is_some() && singleton_key.is_some() {
         return Err(Error::WorkspacePermissionDenied(
-            "delegated Workers cannot acquire Subject body or singleton identity".into(),
+            "delegated Workers cannot acquire singleton identity".into(),
         )
         .into());
     }
@@ -36144,25 +36191,7 @@ async fn create_workspace_worker_authenticated_on_host(
                 "Worker creation must use the authenticated worker-control reservation path".into(),
             )
         })?)
-    } else if subject_connection {
-        if !matches!(
-            &authorization,
-            server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None }
-        ) {
-            return Err(Error::WorkspacePermissionDenied(
-                "Subject body attachment has dedicated authority, not an ordinary initial grant"
-                    .into(),
-            )
-            .into());
-        }
-        let account = account.as_deref().ok_or_else(|| {
-            Error::WorkspacePermissionDenied(
-                "Subject attachment requires the Workspace owner".into(),
-            )
-        })?;
-        api.config_store.with_conn(|connection| {
-            crate::launch_policy::require_owner(connection, api.workspace_id(), account)
-        })?;
+    } else if connection_authority == feature_initialization::CreationAuthority::FeatureOwned {
         resolved_control_operation
     } else {
         let account = account.as_deref().ok_or_else(|| {
@@ -36213,36 +36242,23 @@ async fn create_workspace_worker_authenticated_on_host(
             &runtime_id,
             profile,
             resolved_control_operation.as_ref(),
-            subject_connection,
+            connection_authority,
         )?;
-    let resolved_subjektiv_attached = match feature_connections.subjektiv {
-        None => {
-            validate_caller_worker_singleton_key(singleton_key.as_deref())?;
-            false
-        }
-        Some(connection) => {
-            if singleton_key.is_some() {
-                return Err(Error::InvalidInput(
-                    "singleton_key must be omitted when a subjektiv subject connection is requested"
-                        .to_string(),
-                )
-                .into());
-            }
-            let profile_manifest =
-                crate::profile_settings::resolve_profile_manifest_from_config_bundle(
-                    resolved_config_bundle.as_ref().ok_or_else(|| {
-                        Error::Config("resolved Worker Profile bundle is missing".to_string())
-                    })?,
-                    &profile,
-                )?;
-            let attachment = open_subjektiv_store(&api)?
-                .authorize_worker_attachment(&connection.subject_id, &profile_manifest)
-                .map_err(subjektiv_store_error)?;
-            crate::store::validate_worker_singleton_key(&attachment.singleton_key)?;
-            singleton_key = Some(attachment.singleton_key);
-            true
-        }
-    };
+    let profile_manifest = crate::profile_settings::resolve_profile_manifest_from_config_bundle(
+        resolved_config_bundle
+            .as_ref()
+            .ok_or_else(|| Error::Config("resolved Worker Profile bundle is missing".into()))?,
+        &profile,
+    )?;
+    let resolved_feature_initialization = initialization_registry.resolve(
+        &api,
+        &profile_manifest,
+        &feature_connections,
+        &mut singleton_key,
+    )?;
+    if connection_authority == feature_initialization::CreationAuthority::Ordinary {
+        validate_caller_worker_singleton_key(singleton_key.as_deref())?;
+    }
     let display_name = sanitize_worker_display_name(&display_name).ok_or_else(|| {
         settings_bad_request(
             "invalid_worker_display_name",
@@ -36291,21 +36307,13 @@ async fn create_workspace_worker_authenticated_on_host(
         resolved_core_execution_grant,
         resolved_workspace_api: None,
         resolved_memory_settings: None,
-        resolved_subjektiv_attached,
+        feature_connections,
+        resolved_feature_initialization: resolved_feature_initialization.clone(),
     };
     let result = api.spawn_workspace_worker(&runtime_id, request)?;
-    let result = if resolved_subjektiv_attached {
-        restore_reused_subject_worker(&api, result)?
-    } else {
-        result
-    };
+    let result =
+        initialization_registry.accepted(&api, &resolved_feature_initialization, result)?;
     let response = record_browser_worker_spawn(&api, runtime_id, display_name, result)?;
-    if resolved_subjektiv_attached {
-        dispatch_orchestrator_assignment_attention(
-            &api,
-            &RuntimeWorkerRef::new(&response.runtime_id, &response.worker_id),
-        );
-    }
     Ok(Json(response))
 }
 
@@ -37545,7 +37553,7 @@ async fn create_runtime_worker_authenticated_on_host(
         &runtime_id,
         Some(profile),
         Some(&operation),
-        false,
+        feature_initialization::CreationAuthority::Ordinary,
     )?;
     request.profile = profile;
     request.resolved_config_bundle = bundle;
@@ -41943,6 +41951,7 @@ mod tests {
     mod drive_web_roundtrip_tests;
     mod embedded_owned_execution_tests;
     mod external_checkout_tests;
+    mod feature_initialization_connected_tests;
     mod protocol_backpressure_tests;
     mod repository_http_contract_tests;
     mod restore_workdir_tests;
@@ -42091,12 +42100,13 @@ mod tests {
                         profile: Some("builtin:companion".into()),
                         initial_submit: vec![],
                         workdir_attachments: vec![],
-                        feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                            subjektiv: attached.then(|| {
-                                server_api::SubjektivWorkerConnectionRequest {
-                                    subject_id: subject.clone(),
-                                }
-                            }),
+                        feature_connections: if attached {
+                            crate::server::subjektiv_worker_initialization::subject_connection(
+                                subject.clone(),
+                            )
+                            .unwrap()
+                        } else {
+                            Default::default()
                         },
                         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                         authorization:
@@ -48069,7 +48079,8 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
             authorization: None,
@@ -48227,7 +48238,7 @@ mod tests {
 
     #[test]
     fn old_spawn_claim_fields_are_rejected_not_ignored() {
-        let input = json!({"runtime_id":"runtime", "display_name":"worker", "profile":"builtin:coder", "ticket_assignment":{"ticket_id":"T-1","operation_id":"old"}, "feature_connections":{}});
+        let input = json!({"runtime_id":"runtime", "display_name":"worker", "profile":"builtin:coder", "ticket_assignment":{"ticket_id":"T-1","operation_id":"old"}, "feature_connections":[]});
         assert!(serde_json::from_value::<CreateWorkspaceWorkerRequest>(input).is_err());
         assert!(
             serde_json::from_value::<server_api::RuntimeWorkerSpawnIntent>(
@@ -48800,7 +48811,7 @@ mod tests {
                     "working_directory_id": fixture.read_only_workdir_id,
                 }
             ],
-            "feature_connections": {},
+            "feature_connections": [],
             "control_operation_id": operation_id,
             "authorization": fixture.child_authorization,
         })
@@ -49287,7 +49298,7 @@ mod tests {
                     "working_directory_id": read_only_workdir_id,
                 }
             ],
-            "feature_connections": {},
+            "feature_connections": [],
             "control_operation_id": "guarded-strict-remote-success",
             "authorization": child_authorization,
         });
@@ -50120,7 +50131,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: None,
@@ -51152,13 +51164,14 @@ mod tests {
                 profile: Some(profile.to_string()),
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: subject_id.map(|subject_id| {
-                        server_api::SubjektivWorkerConnectionRequest {
-                            subject_id: subject_id.to_string(),
-                        }
-                    }),
-                },
+                feature_connections: subject_id
+                    .map(|subject_id| {
+                        crate::server::subjektiv_worker_initialization::subject_connection(
+                            subject_id.into(),
+                        )
+                        .unwrap()
+                    })
+                    .unwrap_or_default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
@@ -51287,11 +51300,11 @@ mod tests {
                 profile: Some("builtin:companion".into()),
                 initial_submit: vec![],
                 workdir_attachments: vec![],
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: subject.id.clone(),
-                    }),
-                },
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(
+                        subject.id.clone(),
+                    )
+                    .unwrap(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
@@ -51457,11 +51470,11 @@ mod tests {
             profile: Some("builtin:companion".to_string()),
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.id.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(
+                    subject.id.clone(),
+                )
+                .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
@@ -52652,7 +52665,8 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_execution_grant: None,
             authorization: None,
             resolved_core_execution_grant: None,
@@ -52698,7 +52712,7 @@ mod tests {
             WorkdirlessFixtureRuntime::RUNTIME_ID,
             Some("builtin:companion".into()),
             Some(&operation),
-            false,
+            feature_initialization::CreationAuthority::Ordinary,
         )
         .unwrap();
         let memory = api
@@ -52994,7 +53008,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: Some(
@@ -55144,7 +55159,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: None,
@@ -56611,7 +56627,7 @@ mod tests {
             deletion["blockers"][0]["kind"], "last_accessible_workspace",
             "{deletion}"
         );
-        let worker = request_json_authenticated(app.clone(), "POST", &format!("{scoped}/workers"), Some(json!({"runtime_id": "embedded-worker-runtime", "control_operation_id": "repository-free-worker", "authorization": {"kind": "assignment"}, "display_name": "Worker", "initial_submit": [], "feature_connections": {}})), &owner, StatusCode::OK).await;
+        let worker = request_json_authenticated(app.clone(), "POST", &format!("{scoped}/workers"), Some(json!({"runtime_id": "embedded-worker-runtime", "control_operation_id": "repository-free-worker", "authorization": {"kind": "assignment"}, "display_name": "Worker", "initial_submit": [], "feature_connections": []})), &owner, StatusCode::OK).await;
         assert!(worker["worker_id"].is_string(), "{worker}");
         let detail = request_json_authenticated(
             app.clone(),
@@ -60140,7 +60156,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
                 resolved_memory_settings: Some(test_worker_memory_settings()),
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: None,
@@ -61913,7 +61930,8 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
-                    resolved_subjektiv_attached: false,
+                    feature_connections: Default::default(),
+                    resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
                     resolved_execution_grant: None,
                     authorization: None,
@@ -62015,7 +62033,8 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
             resolved_memory_settings: Some(test_worker_memory_settings()),
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
             authorization: None,
@@ -62569,7 +62588,8 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
-                    resolved_subjektiv_attached: false,
+                    feature_connections: Default::default(),
+                    resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
                     resolved_execution_grant: None,
                     authorization: None,
@@ -62636,7 +62656,8 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
-                    resolved_subjektiv_attached: false,
+                    feature_connections: Default::default(),
+                    resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
                     resolved_execution_grant: None,
                     authorization: None,
@@ -64220,7 +64241,7 @@ mod tests {
                 runtime_id,
                 Some(profile),
                 Some(&operation),
-                false,
+                feature_initialization::CreationAuthority::Ordinary,
             )?;
             (profile, bundle, grant)
         };
@@ -64258,7 +64279,8 @@ mod tests {
                 resolved_worker_observation_grants: vec![],
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 resolved_core_execution_grant: None,
@@ -64867,7 +64889,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: None,
@@ -64943,7 +64966,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: None,
@@ -65086,7 +65110,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: None,
@@ -68914,7 +68939,8 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                feature_connections: Default::default(),
+                resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
                 authorization: None,
@@ -70143,7 +70169,7 @@ mod tests {
             worker_observation_grants: Vec::new(),
             workspace_api: None,
             memory_settings: Some(memory_settings),
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
         }
     }
@@ -70748,7 +70774,7 @@ mod tests {
                     "working_directory_id": working_directory_id,
                     "relative_cwd": "../escape"
                 }],
-                "feature_connections": {}
+                "feature_connections": []
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -71908,7 +71934,7 @@ mod tests {
                 "authorization": {"kind": "assignment"},
                 "display_name": "",
                 "initial_submit": [],
-                "feature_connections": {}
+                "feature_connections": []
             })),
             &owner,
             StatusCode::OK,
@@ -72840,7 +72866,8 @@ mod tests {
                         "embedded-worker-runtime",
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
-                    resolved_subjektiv_attached: false,
+                    feature_connections: Default::default(),
+                    resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
                     resolved_execution_grant: None,
                     authorization: None,
@@ -74272,7 +74299,8 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
             authorization: None,
@@ -75167,7 +75195,8 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
+            feature_connections: Default::default(),
+            resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
             authorization: None,

@@ -322,6 +322,9 @@ pub use worker::BackendJobExecutionBinding;
 /// binding. Browser-facing status for materialized working directories is
 /// summarized without exposing raw host paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// Legacy attachment bits cannot attest a saved identity. In particular, reject
+// old true records explicitly instead of silently defaulting to no connection.
+#[serde(deny_unknown_fields)]
 pub struct CreateWorkerRequest {
     /// Workspace-owned stable identity reserved before this request reaches a Runtime.
     pub worker_id: WorkerId,
@@ -355,10 +358,9 @@ pub struct CreateWorkerRequest {
     pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_execution: Option<runtime_api::PluginExecutionSnapshot>,
-    /// Backend-attested subject or consolidation attachment. A reusable Profile
-    /// may enable subjektiv policy, but only this host-owned bit activates it.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub subjektiv_attached: bool,
+    /// Durable Feature-owned initialization expectations.
+    #[serde(default)]
+    pub feature_initialization: protocol::feature_initialization::FeatureInitializations,
     /// Backend-only immutable Job/attempt capability. Never inferred from Profile policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_job: Option<BackendJobExecutionBinding>,
@@ -535,4 +537,22 @@ mod tests {
             assert!(!object.contains_key(forbidden), "unexpected {forbidden}");
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_subject_initialization(
+    workspace_id: &str,
+    subject_id: &str,
+) -> protocol::feature_initialization::FeatureInitializations {
+    protocol::feature_initialization::FeatureInitializations::new(vec![
+        protocol::feature_initialization::FeatureInitialization::encode(
+            "builtin:subjektiv",
+            1,
+            &serde_json::json!({
+                "workspace_id": workspace_id, "subject_id": subject_id, "kind": "subject_body"
+            }),
+        )
+        .unwrap(),
+    ])
+    .unwrap()
 }

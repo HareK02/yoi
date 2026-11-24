@@ -53,7 +53,7 @@ impl Fixture {
                 WorkdirlessFixtureRuntime::RUNTIME_ID,
                 Some("builtin:coder".into()),
                 Some(&operation),
-                false,
+                feature_initialization::CreationAuthority::Ordinary,
             )
             .unwrap();
             let mut grant = grant.unwrap();
@@ -957,7 +957,7 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
                 json!({
                     "runtime_id": WorkdirlessFixtureRuntime::RUNTIME_ID, "display_name": "callback parent",
                     "profile": "builtin:companion", "initial_submit": [],
-                    "feature_connections": {"subjektiv":{"subject_id":subject.id}},
+                    "feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject.id}}],
                 }),
             )
         } else {
