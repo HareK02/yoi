@@ -305,9 +305,15 @@ fn start(peer: &mut impl Peer, script: &str) -> Result<CommandHandle> {
     }
 }
 fn collect(peer: &mut impl Peer, handle: CommandHandle) -> Result<(CommandTerminal, Vec<u8>)> {
+    collect_from(peer, handle, 0, Vec::new())
+}
+fn collect_from(
+    peer: &mut impl Peer,
+    handle: CommandHandle,
+    mut cursor: u64,
+    mut stdout: Vec<u8>,
+) -> Result<(CommandTerminal, Vec<u8>)> {
     let deadline = Instant::now() + Duration::from_secs(25);
-    let mut cursor = 0;
-    let mut stdout = Vec::new();
     loop {
         if Instant::now() >= deadline {
             return Err(failure("command output deadline; command is not retried"));
@@ -339,6 +345,44 @@ fn collect(peer: &mut impl Peer, handle: CommandHandle) -> Result<(CommandTermin
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+fn await_script_start(peer: &mut impl Peer, handle: &CommandHandle) -> Result<(u64, Vec<u8>)> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut cursor = 0;
+    let mut prefix = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(failure(
+                "independent script did not reach its start barrier",
+            ));
+        }
+        let OpResult::CommandOutput(page) =
+            peer.operation(Op::CommandOutput(CommandOutputRequest {
+                handle: handle.clone(),
+                cursor,
+                limit: 65536,
+                wait: false,
+            }))?
+        else {
+            return Err(failure("wrong barrier output result"));
+        };
+        assert!(
+            page.terminal.is_none(),
+            "independent script exited before release"
+        );
+        cursor = page.next_cursor;
+        for chunk in page.chunks {
+            if chunk.stream == workdir::CommandStream::Stdout {
+                prefix.extend(chunk.bytes);
+            }
+        }
+        assert!(b"independent-before".starts_with(&prefix));
+        if prefix == b"independent-before" {
+            eprintln!("independent script start barrier observed before OOM dispatch");
+            return Ok((cursor, prefix));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 fn expect_complete(terminal: &CommandTerminal) {
     assert!(
         terminal.metadata_valid()
@@ -361,6 +405,7 @@ fn exercise(affected: &mut impl Peer, independent: &mut impl Peer) -> Result<()>
         independent,
         "printf independent-before; while ! test -f independent-release; do sleep 0.02; done; printf independent-after",
     )?;
+    let (sibling_cursor, sibling_prefix) = await_script_start(independent, &sibling)?;
     // Confirm the fixed, small limit in the command itself before attempting OOM.
     // One shell child allocates >32MiB; it is never a host-global pressure test.
     let oom = start(
@@ -398,7 +443,7 @@ fn exercise(affected: &mut impl Peer, independent: &mut impl Peer) -> Result<()>
     let (released, _) = collect(independent, release)?;
     expect_complete(&released);
     assert_eq!(released.status, CommandStatus::Completed);
-    let (terminal, bytes) = collect(independent, sibling)?;
+    let (terminal, bytes) = collect_from(independent, sibling, sibling_cursor, sibling_prefix)?;
     expect_complete(&terminal);
     assert_eq!(terminal.status, CommandStatus::Completed);
     assert_eq!(bytes, b"independent-beforeindependent-after");

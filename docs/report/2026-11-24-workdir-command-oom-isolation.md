@@ -38,6 +38,12 @@ systemctl show "user@$(id -u).service" -p OOMPolicy -p ControlGroup -p MemoryMax
 
 共通の`user@UID.service`のpolicyが不適切な場合は、system managerを管理する運用担当者が、その利用者のunitに対する`user@UID.service.d/`の`[Service] OOMPolicy=continue`を検討する。全利用者へ一律適用する変更とは区別する。reloadや再起動を要する適用は別の保守判断であり、稼働中の自分のRuntimeやpaneをこの検証のために停止しない。
 
+### 所有するtmux生成元での隔離確認
+
+独立レビュー後の追加調査では、共有tmux設定ではなく、専用socketと専用設定のtmuxを起動した。専用の`default-command`がpaneごとに一意の`tmux-spawn-yoi-t879-….scope`を生成し、その生成要求に`OOMPolicy=continue`を指定した。既存scopeへの`set-property`は使わず、初期paneに続く`new-window`でも同じ生成元を通した。両paneの実所属は`user@1000.service/session.slice/…`、実propertyは`OOMPolicy=continue`・`KillMode=control-group`だった。最初のpaneから`app.slice/yoi-command-t879-….scope`へ別の32 MiBコマンドを起動し、その`Result=oom-kill`後にも両paneのシェルが応答した。pane側も有限上限と自動終了期限を持ち、専用tmux・全owned unit・一時rootの回収を確認した。
+
+この確認は、生成元へ明示的なtransient propertyを指定する上記方針に対応する。dash-prefix drop-inの適用やreload・稼働中のtmux生成元の変更は行っておらず、その経路や実運用deploymentを検証したものではない。検証時の専用設定、スクリプト、実階層・property・終了・回収の証拠はMRのR3検証記録で特定する。運用側は自分の生成元がdrop-inと明示propertyのどちらを使うかを区別して判断する。
+
 `OOMPolicy=continue`は、kernelが選んだプロセスを復活させない。メモリ枯渇そのもの、Runtime自身のkernel OOM kill、上位の有限予算によるOOM、systemd-oomdの独立した選択を防ぐ保証でもない。コマンドの有限上限と制御プロセスの余裕を別に確保する。
 
 ## Hostの予算と失敗時の扱い
