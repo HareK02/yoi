@@ -42547,9 +42547,26 @@ mod tests {
         observation.worker.availability =
             protocol::subscription::SubscriptionWorkerAvailability::Observed;
         observation.worker.state = protocol::subscription::SubscriptionWorkerState::Stopped;
-        observation.worker.lifecycle = Some(protocol::WorkerLifecycleState::AwaitingRestore);
+        observation.worker.lifecycle = Some(protocol::WorkerLifecycleState::Stopped);
         observation.worker.worker_state = None;
-        let observed_stopped = worker_summary_from_projection(&observed_stopped).unwrap();
+        observation.worker.restore_observation_token = Some("stopped-observation".into());
+        let stopped = worker_summary_from_projection(&observed_stopped).unwrap();
+        assert_eq!(
+            stopped.restore_observation_token.as_deref(),
+            Some("stopped-observation")
+        );
+        assert_eq!(
+            stopped.observation,
+            runtime_api::WorkerObservationState::Unavailable
+        );
+        assert!(!stopped.is_current_idle());
+        let observation = observed_stopped.observation.as_mut().unwrap();
+        observation.availability = protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+        let disconnected = worker_summary_from_projection(&observed_stopped).unwrap();
+        assert_eq!(disconnected.state, "unavailable");
+        assert!(disconnected.restore_observation_token.is_none());
+        assert!(disconnected.worker_state.is_none());
+        let observed_stopped = stopped;
         assert_eq!(
             observed_stopped.availability,
             protocol::subscription::SubscriptionWorkerAvailability::Observed
@@ -42557,7 +42574,7 @@ mod tests {
         assert_eq!(observed_stopped.state, "stopped");
         assert_eq!(
             observed_stopped.lifecycle,
-            Some(protocol::WorkerLifecycleState::AwaitingRestore)
+            Some(protocol::WorkerLifecycleState::Stopped)
         );
         assert_eq!(observed_stopped.worker_state, None);
     }

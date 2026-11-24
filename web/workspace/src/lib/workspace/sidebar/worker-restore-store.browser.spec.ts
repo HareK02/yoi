@@ -5,6 +5,7 @@ import type {
   SubscriptionWorker,
 } from "#lib/generated/protocol.ts";
 import type { WorkspaceWorkersState } from "./worker-subscription";
+import { canRestoreWorker, canStopSidebarWorker } from "./worker-actions";
 
 const mock = vi.hoisted(() => ({ handlers: null as any }));
 vi.mock("#lib/workspace/multiplexer.ts", () => ({
@@ -122,6 +123,58 @@ describe("shared catalog observation refresh", () => {
     expect(latest.catalogWorkers?.[0].retention_state).toBe("pinned");
     expect(latest.workers[0].lifecycleState).toBe("stopped");
     expect(latest.workers[0].restore_observation_token).toBe("generation-1");
+  });
+  it("keeps observed Stop restorable without a foreground snapshot, but fences a disconnected source", async () => {
+    let availability: SubscriptionWorker["availability"] = "observed";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (!url.endsWith("/workers")) return Response.json({ items: [] });
+        return Response.json({
+          workspace_id: "team",
+          limit: 100,
+          source: "catalog",
+          diagnostics: [],
+          items: [{
+            ...summary(),
+            availability,
+            lifecycle: "stopped",
+            state: availability === "observed" ? "stopped" : "unavailable",
+            worker_state: null,
+            restore_observation_token: availability === "observed"
+              ? "generation-1"
+              : null,
+          }],
+        });
+      }),
+    );
+    let latest!: WorkspaceWorkersState;
+    unsubscribe = workspaceWorkersStore("team").subscribe((state) =>
+      latest = state
+    );
+    for (const current of ["observed", "unavailable"] as const) {
+      availability = current;
+      const frame = snapshot();
+      if (
+        frame.frame !== "response" || frame.message.result !== "subscribed" ||
+        frame.message.payload.snapshot.topic !== "workers"
+      ) throw new Error("expected Worker snapshot");
+      Object.assign(frame.message.payload.snapshot.data.workers[0], {
+        availability,
+        lifecycle: "stopped",
+        worker_state: null,
+      });
+      mock.handlers.onFrame(frame);
+      expect(canRestoreWorker(latest.workers[0])).toBe(current === "observed");
+      await refreshWorkspaceWorkers("team");
+      expect(latest.catalogRefreshing).toBe(false);
+      expect(latest.workers[0].state).toBe(
+        current === "observed" ? "stopped" : "unknown",
+      );
+      expect(latest.workers[0].worker_state).toBeNull();
+      expect(canRestoreWorker(latest.workers[0])).toBe(current === "observed");
+      expect(canStopSidebarWorker(latest.workers[0])).toBe(false);
+    }
   });
   it("invalidates dependent plans before refresh and discards a GET superseded by a newer catalog event", async () => {
     const pending: Array<(response: Response) => void> = [];

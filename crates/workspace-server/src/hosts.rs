@@ -401,8 +401,16 @@ impl InternalWorkerSummary {
 }
 
 fn observation_availability(
+    lifecycle: protocol::WorkerLifecycleState,
     observation: &runtime_api::WorkerObservationState,
 ) -> protocol::subscription::SubscriptionWorkerAvailability {
+    // A successful Runtime read can confirm an inactive lifecycle without a Controller snapshot.
+    if matches!(
+        lifecycle,
+        protocol::WorkerLifecycleState::Stopped | protocol::WorkerLifecycleState::NotStarted
+    ) {
+        return protocol::subscription::SubscriptionWorkerAvailability::Observed;
+    }
     match observation {
         runtime_api::WorkerObservationState::Current { .. } => {
             protocol::subscription::SubscriptionWorkerAvailability::Observed
@@ -3507,7 +3515,7 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability: observation_availability(&summary.observation),
+            availability: observation_availability(summary.lifecycle, &summary.observation),
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -3555,7 +3563,7 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability: observation_availability(&detail.observation),
+            availability: observation_availability(detail.lifecycle, &detail.observation),
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             execution_reconstructed: detail.execution_reconstructed,
@@ -6330,7 +6338,7 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability: observation_availability(&summary.observation),
+            availability: observation_availability(summary.lifecycle, &summary.observation),
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -6376,7 +6384,7 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability: observation_availability(&detail.observation),
+            availability: observation_availability(detail.lifecycle, &detail.observation),
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             execution_reconstructed: detail.execution_reconstructed,
@@ -12342,6 +12350,22 @@ mod tests {
                 .is_none()
         );
         assert_eq!(stopped_detail.state, "stopped");
+        for stopped in [&workers.items[0], &stopped_detail] {
+            assert_eq!(
+                stopped.availability,
+                protocol::subscription::SubscriptionWorkerAvailability::Observed
+            );
+            assert_eq!(
+                stopped.observation,
+                runtime_api::WorkerObservationState::Unavailable
+            );
+            assert!(stopped.worker_state.is_none());
+            assert!(!stopped.is_current_idle());
+        }
+        assert_eq!(
+            workers.items[4].availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Unavailable
+        );
         assert_eq!(
             stopped_detail.lifecycle,
             Some(protocol::WorkerLifecycleState::Stopped)

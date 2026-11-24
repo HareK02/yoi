@@ -609,6 +609,18 @@ fn stopped_source_with_queue(
     RuntimeWorkspaceScope,
     crate::catalog::WorkerDetail,
 ) {
+    stopped_source_with_inputs(queued, 0)
+}
+
+fn stopped_source_with_inputs(
+    queued: bool,
+    notifications: usize,
+) -> (
+    tempfile::TempDir,
+    EmbeddedRuntime,
+    RuntimeWorkspaceScope,
+    crate::catalog::WorkerDetail,
+) {
     let root = tempfile::tempdir().unwrap();
     let started = Arc::new(tokio::sync::Notify::new());
     let backend = Arc::new(
@@ -656,6 +668,13 @@ fn stopped_source_with_queue(
                 &worker.worker_ref,
                 WorkerInput::user("accepted waiting input"),
             )
+            .unwrap();
+    }
+    for index in 0..notifications {
+        let mut notification = WorkerInput::notify(format!("unconsumed notification {index}"));
+        notification.submission_request_id = Some(format!("notification-{index}"));
+        runtime
+            .send_input(&worker.worker_ref, notification)
             .unwrap();
     }
     runtime.stop_worker(&worker.worker_ref, None).unwrap();
@@ -977,6 +996,105 @@ fn aggregate_cleanup_does_not_spread_a_session_tombstone_to_pinned_siblings() {
             assert!(retention.pins(sibling).unwrap().is_empty());
         }
         assert!(!sources.worker_root().exists());
+    }
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn removal_preserves_unconsumed_notifications_under_selected_retention_without_restore() {
+    for disposition in [SessionDisposition::Archive, SessionDisposition::Purge] {
+        let (root, runtime, scope, worker) = stopped_source_with_inputs(false, 2);
+        let owner = WorkerSessionSources::new(
+            root.path(),
+            WorkerSessionOwner {
+                workspace_id: scope.workspace_id.clone(),
+                worker_id: worker.worker_id.to_string(),
+            },
+        )
+        .unwrap();
+        let metadata = WorkerAggregateStore::open_read_only(
+            owner.worker_root(),
+            ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker.worker_ref),
+        )
+        .unwrap()
+        .read_read_only()
+        .unwrap()
+        .unwrap();
+        let active = metadata.active.unwrap();
+        let store =
+            WorkerSessionStore::open_read_only(owner.worker_root().join("session")).unwrap();
+        let (entries, _) = store
+            .read_all_read_only_bounded(active.session_id, active.segment_id.unwrap(), u64::MAX)
+            .unwrap();
+        let replay = session_store::segment_log::collect_state(&entries);
+        let queue = &replay
+            .extensions
+            .iter()
+            .rev()
+            .find(|(domain, _)| domain == "worker.pending_activations.v1")
+            .unwrap()
+            .1;
+        assert_eq!(
+            queue["activating_notification"].as_array().unwrap().len()
+                + queue["pending_notifications"].as_array().unwrap().len(),
+            2,
+            "both accepted notifications remain unconsumed",
+        );
+        assert_eq!(queue["notification_receipts"].as_array().unwrap().len(), 2);
+        let originals = persisted_files(&owner.worker_root().join("session"))
+            .into_iter()
+            .filter(|(path, _)| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect::<BTreeMap<_, _>>();
+        assert!(!originals.is_empty());
+        drop(runtime);
+
+        // A saved stopped source must be removable without starting a Controller.
+        let no_launch = root.path().join("must-not-launch");
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(ProfileRuntimeWorkerFactory::new(&no_launch))
+                .unwrap(),
+        );
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            FsRuntimeStoreOptions::new(root.path()).with_runtime_id("runtime-test"),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.bind_runtime_identity("runtime-test").unwrap();
+        let mut request = removal_request(worker.worker_id);
+        request.session_disposition = disposition;
+        request.archive_id =
+            (disposition == SessionDisposition::Archive).then(|| "notifications-archive".into());
+        let frozen = runtime
+            .freeze_worker_removal_scoped(&scope, &request)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .freeze_worker_removal_scoped(&scope, &request)
+                .unwrap(),
+            frozen
+        );
+        let result = runtime.execute_worker_retention(&request).unwrap();
+        assert!(result.source_removed);
+        assert!(!owner.worker_root().exists());
+        assert_eq!(runtime.execute_worker_retention(&request).unwrap(), result);
+        if let Some(archive) = result.archive {
+            let saved = root
+                .path()
+                .join("archives/workers")
+                .join(archive.archive_id)
+                .join("session");
+            for (path, bytes) in originals {
+                assert_eq!(
+                    std::fs::read(saved.join(path)).unwrap(),
+                    bytes,
+                    "archive preserves notification bodies, pending status and receipts verbatim"
+                );
+            }
+        } else {
+            assert_eq!(disposition, SessionDisposition::Purge);
+        }
+        assert!(backend.workers.lock().unwrap().is_empty());
+        assert!(!no_launch.exists());
     }
 }
 

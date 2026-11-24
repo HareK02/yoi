@@ -665,5 +665,20 @@ mod observation_sync_tests {
         let unavailable = runtime.worker_detail(&created.worker_ref).unwrap();
         assert_eq!(unavailable.observation, WorkerObservationState::Unavailable);
         assert!(unavailable.worker_state.is_none());
+        let subscription = runtime
+            .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
+            .unwrap();
+        let SubscriptionSnapshot::Workers { workers } = subscription.snapshot() else {
+            panic!("expected Worker snapshot");
+        };
+        assert_eq!(
+            workers[0].lifecycle,
+            Some(protocol::WorkerLifecycleState::Active)
+        );
+        assert_eq!(
+            workers[0].availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Unavailable
+        );
+        assert!(workers[0].worker_state.is_none());
     }
 }

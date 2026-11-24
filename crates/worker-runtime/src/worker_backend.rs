@@ -6139,10 +6139,11 @@ fn pending_bridge_log_events(
     let mut events = Vec::new();
     for _ in 0..pending.saturating_add(1) {
         match streams.log_entries.try_recv() {
-            Ok(entry) => events.push(
-                live_log_entry_event(entry)
-                    .ok_or_else(|| "Worker log entry has no protocol projection".to_string())?,
-            ),
+            Ok(entry) => {
+                if let Some(event) = live_log_entry_event(entry) {
+                    events.push(event);
+                }
+            }
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                 return Err(format!(
                     "Worker session log stream lagged by {skipped} entries"
@@ -6284,10 +6285,11 @@ async fn run_protocol_bridge(
                 entry = streams.log_entries.recv() => {
                     match entry {
                         Ok(entry) => {
-                            let event = live_log_entry_event(entry).ok_or_else(|| {
-                                "Worker log entry has no protocol projection".to_string()
-                            })?;
-                            publish_bridge_event(event, &mut streams, &current, &mut resubscribe, &mut publish)?;
+                            // Private reasoning and response boundaries have no public
+                            // projection. This is not a lost log entry or stream failure.
+                            if let Some(event) = live_log_entry_event(entry) {
+                                publish_bridge_event(event, &mut streams, &current, &mut resubscribe, &mut publish)?;
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // The current segment snapshot cannot prove recovery
@@ -8860,6 +8862,8 @@ where
 #[cfg(test)]
 mod tests {
     mod command_admission_tests;
+    #[cfg(feature = "ws-server")]
+    mod private_log_tests;
     #[cfg(all(feature = "fs-store", feature = "ws-server"))]
     mod removal_tests {
         include!("worker_backend/removal_tests.rs");

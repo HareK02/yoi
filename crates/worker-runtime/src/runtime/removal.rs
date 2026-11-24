@@ -127,6 +127,12 @@ fn source_error(error: session_store::StoreError) -> RuntimeError {
     source_unavailable(error.to_string())
 }
 
+#[derive(Clone, Copy)]
+enum RecordingScopePurpose {
+    Removal,
+    SubjectRelease,
+}
+
 // Both Remove and explicit Release enumerate the same producer-owned Session union.
 // The caller owns the exclusive publication lock and, for live Release, an actual
 // Controller reservation. Only Remove additionally requires canonical Stop receipts.
@@ -137,6 +143,11 @@ fn recording_scope_members(
     worker_id: WorkerId,
     termination: Option<&crate::execution::WorkerExecutionTermination>,
 ) -> Result<Vec<WorkerRemovalSessionMember>, RuntimeError> {
+    let purpose = if termination.is_some() {
+        RecordingScopePurpose::Removal
+    } else {
+        RecordingScopePurpose::SubjectRelease
+    };
     let retention = crate::retention::runtime_session_retention(root);
     let worker_ref = WorkerRef::new(worker_id);
     let mut members = Vec::new();
@@ -167,7 +178,7 @@ fn recording_scope_members(
             let (entries, _) = store
                 .read_all_read_only_bounded(active.session_id, segment, u64::MAX)
                 .map_err(source_error)?;
-            ensure_inputs_settled(&entries)?;
+            ensure_inputs_settled(&entries, purpose)?;
             let mut receipts = std::collections::HashSet::new();
             for source_segment in session_store::Store::list_segments(&store, active.session_id)
                 .map_err(source_error)?
@@ -278,7 +289,7 @@ fn recording_scope_members(
             u64::MAX,
         )
         .map_err(source_error)?;
-        ensure_inputs_settled(&entries)?;
+        ensure_inputs_settled(&entries, purpose)?;
         let descriptors = session_store::capture::recording_union_catalog_fs_guarded(
             &owner.retained_root(),
             binding.session_id,
@@ -1243,7 +1254,10 @@ impl Runtime {
 // The Runtime adapter inspects the existing Worker-owned queue checkpoint, not
 // a public snapshot (which deliberately omits queues on retained reads). It never
 // reconstructs inputs from previews or treats an unknown checkpoint as empty.
-fn ensure_inputs_settled(entries: &[session_store::LogEntry]) -> Result<(), RuntimeError> {
+fn ensure_inputs_settled(
+    entries: &[session_store::LogEntry],
+    purpose: RecordingScopePurpose,
+) -> Result<(), RuntimeError> {
     #[derive(Deserialize)]
     struct Queue {
         activating: Option<serde_json::Value>,
@@ -1268,10 +1282,15 @@ fn ensure_inputs_settled(entries: &[session_store::LogEntry]) -> Result<(), Runt
                 .activating_notification
                 .as_array()
                 .is_some_and(|items| items.is_empty());
+        // A stopped Remove preserves these durable notifications in the archive
+        // or purges them with the Session under the selected retention policy.
+        // It must not require consumption or pretend they entered model history.
+        // Live Subject release still requires the notification queue to settle.
+        let notifications_block = matches!(purpose, RecordingScopePurpose::SubjectRelease)
+            && (!notifications_settled || !queue.pending_notifications.is_empty());
         if queue.activating.is_some()
-            || !notifications_settled
+            || notifications_block
             || !queue.pending.is_empty()
-            || !queue.pending_notifications.is_empty()
             || queue.invocation_recovery_blocked
         {
             return Err(execution_unconfirmed(
@@ -1281,6 +1300,9 @@ fn ensure_inputs_settled(entries: &[session_store::LogEntry]) -> Result<(), Runt
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn check_retention_freeze(
     root: &Path,

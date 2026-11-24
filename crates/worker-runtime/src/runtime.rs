@@ -7749,7 +7749,10 @@ impl RuntimeState {
             worker_id,
             runtime_id: None,
             resource_key: None,
-            availability: if worker.worker_state().is_some() && worker.active_execution().is_some()
+            // A settled inactive lifecycle is observable without a foreground snapshot.
+            // Keep missing Active observations unavailable; they are not evidence of Stop.
+            availability: if worker.is_settled_inactive()
+                || (worker.worker_state().is_some() && worker.active_execution().is_some())
             {
                 protocol::subscription::SubscriptionWorkerAvailability::Observed
             } else {
@@ -12679,10 +12682,33 @@ mod tests {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
                 assert_eq!(worker.state, SubscriptionWorkerState::Stopped);
+                assert_eq!(
+                    worker.lifecycle,
+                    Some(protocol::WorkerLifecycleState::Stopped)
+                );
+                assert_eq!(
+                    worker.availability,
+                    protocol::subscription::SubscriptionWorkerAvailability::Observed
+                );
+                assert!(worker.worker_state.is_none());
+                assert!(worker.restore_observation_token.is_some());
                 assert!(!worker.has_running_internal_workers);
             }
             payload => panic!("unexpected subscription payload: {payload:?}"),
         }
+        let reconnected = runtime
+            .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
+            .unwrap();
+        let SubscriptionSnapshot::Workers { workers } = reconnected.snapshot() else {
+            panic!("expected Worker snapshot");
+        };
+        assert_eq!(workers[0].state, SubscriptionWorkerState::Stopped);
+        assert_eq!(
+            workers[0].availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert!(workers[0].worker_state.is_none());
+        assert!(workers[0].restore_observation_token.is_some());
         runtime.stop_runtime().unwrap();
     }
 
