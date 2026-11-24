@@ -184,6 +184,7 @@ async fn embedded_overflow_requires_explicit_reconnect_and_stop_ends_the_new_con
 
 async fn backpressure_browser_context(api: &WorkspaceApi) -> (WorkerOperationContext, String) {
     seed_test_api_token(api.store.as_ref(), "backpressure-browser");
+    seed_test_workspace_member(api, "backpressure-browser").await;
     let token = "backpressure-browser-session";
     let token_hash = crate::auth::token_hash(token);
     api.store
@@ -697,6 +698,9 @@ async fn assert_same_worker_reconnect_and_stop(
 }
 
 async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
+    // Delivery now revalidates SQLite authority. Keep time live until that external
+    // work reaches the deterministic stalled sink, then measure transport deadlines.
+    tokio::time::resume();
     let workspace = tempfile::tempdir().unwrap();
     let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
     let identity = spawn_ticket_check_source(&api, "stalled-browser-output");
@@ -720,7 +724,7 @@ async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
         dropped: Some(dropped_sender),
         written: written.clone(),
     };
-    let started = tokio::time::Instant::now();
+    let started;
     {
         let session = workspace_worker_protocol_session(connection, socket, context.clone());
         tokio::pin!(session);
@@ -736,6 +740,8 @@ async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
         tokio::time::timeout(PROTOCOL_TEST_TIMEOUT, output_accepted)
             .await
             .expect("attached snapshot never reached the stalled browser output");
+        tokio::time::pause();
+        started = tokio::time::Instant::now();
         {
             let messages = written.lock().unwrap();
             assert_eq!(messages.len(), 1);
@@ -755,6 +761,8 @@ async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
             assert!(futures::poll!(session.as_mut()).is_pending());
             assert_eq!(termination.reason(), None);
             tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            // Tokio timers round a live-to-paused deadline to millisecond ticks.
+            tokio::time::advance(std::time::Duration::from_millis(2)).await;
         }
         assert!(futures::poll!(session.as_mut()).is_pending());
         assert_eq!(
@@ -788,6 +796,8 @@ async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
         tokio::time::advance(std::time::Duration::from_secs(9)).await;
         assert!(futures::poll!(session.as_mut()).is_pending());
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        // Tokio timers round a live-to-paused deadline to millisecond ticks.
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
         tokio::time::timeout(PROTOCOL_TEST_TIMEOUT, session.as_mut())
             .await
             .expect("stalled terminal Close did not reach its deadline");
@@ -797,9 +807,11 @@ async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
         .expect("completed browser session retained its stalled sink")
         .expect("browser sink dropped without its ownership signal");
     assert_eq!(written.lock().unwrap().len(), 2);
-    assert_eq!(
-        tokio::time::Instant::now() - started,
-        std::time::Duration::from_secs(if explicit_termination { 10 } else { 20 })
+    let expected = std::time::Duration::from_secs(if explicit_termination { 10 } else { 20 });
+    let elapsed = tokio::time::Instant::now() - started;
+    assert!(
+        elapsed >= expected && elapsed <= expected + std::time::Duration::from_millis(5),
+        "transport deadlines drifted: {elapsed:?}"
     );
     assert!(execution.protocol_methods().is_empty());
     // SQLite jobs run on external threads; paused Tokio time cannot observe their

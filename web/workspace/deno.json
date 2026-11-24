@@ -32,6 +32,7 @@
     "check:ticket-api": "cd ../.. && cargo run -q -p server-api --example generate_ticket_api_types -- --check",
     "test:browser:addition-code": "cd ../.. && deno run --config tools/web-ux/deno.json -A tools/web-ux/browser-tests/passkey-addition-code-review.ts after",
     "test:browser:auth": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/auth-browser/auth-shell.browser.test.ts test/auth-browser/passkey-state.browser.test.ts",
+    "test:browser:members": "cd ../.. && deno run --config tools/web-ux/deno.json -A tools/web-ux/browser-tests/workspace-members-review.ts after",
     "test:browser:entry": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/auth-browser/entry-shell.browser.test.ts test/auth-browser/sidebar-shell.browser.test.ts"
   },
   "imports": {

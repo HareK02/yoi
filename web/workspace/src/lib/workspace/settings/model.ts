@@ -3,6 +3,7 @@ import type { Diagnostic as ServerApiDiagnostic } from "#lib/generated/legacy-se
 export type Diagnostic = ServerApiDiagnostic;
 
 export type SettingsSectionId =
+  | "members"
   | "runtimes"
   | "configuration-sources"
   | "repositories"
@@ -29,6 +30,13 @@ export const SETTINGS_PERMISSION_NOTICE =
   "Workspace settings use authenticated account authority and Workspace-scoped typed Backend APIs. Repository secret management requires the current Workspace owner; this surface does not expose secret material or grant Runtime execution authority.";
 
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
+  {
+    id: "members",
+    label: "Members",
+    status: "editable",
+    summary: "Add existing accounts to this Workspace and revoke membership.",
+    bullets: ["Only the Workspace owner can manage membership."],
+  },
   {
     id: "runtimes",
     label: "Runtimes",
@@ -123,6 +131,8 @@ export const SETTINGS_PATTERNS: readonly SettingsPattern[] = [
 
 export function settingsSectionHref(id: SettingsSectionId): string {
   switch (id) {
+    case "members":
+      return `${SETTINGS_ROUTE}/members`;
     case "runtimes":
       return `${SETTINGS_ROUTE}/runtimes`;
     case "configuration-sources":

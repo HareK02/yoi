@@ -19,7 +19,7 @@ import {
 import { workspaceApiPath } from "#lib/workspace/api/http.ts";
 
 export type WorkspaceMultiplexerFailure = {
-  kind: "protocol" | "transport";
+  kind: "protocol" | "transport" | "authorization";
   message: string;
 };
 
@@ -94,6 +94,8 @@ export class WorkspaceMultiplexer {
   #socket: WebSocket | null = null;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #disconnectFailure: WorkspaceMultiplexerFailure | null = null;
+  #accessCheck: AbortController | null = null;
+  #authorizationFailure: WorkspaceMultiplexerFailure | null = null;
   #closed = false;
 
   constructor(workspaceId: string) {
@@ -179,8 +181,12 @@ export class WorkspaceMultiplexer {
 
   #ensureConnected(): void {
     if (
-      !browser || this.#socket || this.#closed || !this.#hasClients()
+      !browser || this.#socket || this.#closed || !this.#hasClients() || this.#accessCheck
     ) return;
+    if (this.#authorizationFailure) {
+      this.#notifyAuthorizationFailure(this.#authorizationFailure);
+      return;
+    }
     for (const subscription of this.#subscriptions.values()) {
       subscription.listener.onStatus?.("connecting");
     }
@@ -227,9 +233,50 @@ export class WorkspaceMultiplexer {
         subscription.listener.onStatus?.("closed", failure);
       }
       if (!this.#closed && this.#hasClients()) {
-        this.#reconnectTimer = setTimeout(() => this.#ensureConnected(), 500);
+        void this.#checkAccessBeforeReconnect();
       }
     });
+  }
+
+  #notifyAuthorizationFailure(failure: WorkspaceMultiplexerFailure): void {
+    this.#authorizationFailure = failure;
+    for (const subscription of this.#subscriptions.values()) subscription.listener.onStatus?.("closed", failure);
+    for (const listener of this.#messaging.values()) listener.onStatus("closed", failure);
+  }
+
+  async #checkAccessBeforeReconnect(): Promise<void> {
+    // ブラウザのWS失敗イベントからHTTP拒否を推測しない。現在の認可をHTTPで確認する。
+    const controller = new AbortController();
+    this.#accessCheck = controller;
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    let status: number | undefined;
+    try {
+      const response = await fetch(workspaceApiPath(this.#workspaceId, "/workspace"), {
+        credentials: "same-origin", cache: "no-store", signal: controller.signal,
+      });
+      status = response.status;
+      await response.body?.cancel();
+    } catch {
+      // 通信失敗・timeoutは権限拒否ではない。通常の再接続を維持する。
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (this.#accessCheck !== controller) return;
+    this.#accessCheck = null;
+    if (this.#closed || !this.#hasClients()) return;
+    if (status === 401 || status === 403 || status === 404) {
+      this.#notifyAuthorizationFailure({
+        kind: "authorization",
+        message: status === 401
+          ? "Sign in again to connect to this Workspace."
+          : "Workspace access is unavailable. Ask the owner to check your membership, then reload.",
+      });
+      return;
+    }
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      this.#ensureConnected();
+    }, 500);
   }
 
   #sendSubscribe(subscription: ActiveSubscription): void {
@@ -373,6 +420,8 @@ export class WorkspaceMultiplexer {
     }
     if (!this.#hasClients()) {
       this.#closed = true;
+      this.#accessCheck?.abort();
+      this.#accessCheck = null;
       if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
       this.#socket?.close();
       this.#socket = null;
@@ -381,6 +430,9 @@ export class WorkspaceMultiplexer {
 
   dispose(): void {
     this.#closed = true;
+    this.#accessCheck?.abort();
+    this.#accessCheck = null;
+    this.#authorizationFailure = null;
     if (this.#reconnectTimer) {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;

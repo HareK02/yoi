@@ -181,6 +181,7 @@ mod schema_convergence {
                                 (140, backend_job_recording_input::MIGRATION_NAME),
                                 (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME),
                                 (142, passkey_addition_code::MIGRATION_NAME),
+                                (143, workspace_members::MIGRATION_NAME),
                             ]
                             .into_iter()
                             .map(|(version, name)| {

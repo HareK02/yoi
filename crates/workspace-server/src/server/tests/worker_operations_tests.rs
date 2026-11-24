@@ -72,6 +72,7 @@ fn operation_cleanup_candidate(identity: &RuntimeWorkerRef) -> CleanupWorkerCand
 
 async fn browser_operation_context(api: &WorkspaceApi) -> (WorkerOperationContext, String) {
     seed_test_api_token(api.store.as_ref(), "worker-operation-browser");
+    seed_test_workspace_member(api, "worker-operation-browser").await;
     let token = "worker-operation-browser-session";
     api.store
         .create_browser_session(&BrowserSessionRecord {
@@ -613,53 +614,77 @@ async fn browser_protocol_sender_rejects_job_input_and_all_live_methods() {
 }
 
 #[tokio::test]
-async fn connected_browser_sender_rechecks_revoked_credentials_before_each_method() {
-    let workspace = tempfile::tempdir().unwrap();
-    let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
-    let identity = spawn_ticket_check_source(&api, "operation-browser-revocation");
-    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
-    let (context, token_hash) = browser_operation_context(&api).await;
-    let mut connection = handle.connect_protocol(&context).await.unwrap();
-    assert!(matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), connection.events.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-        protocol::Event::Snapshot { .. }
-    ));
-    // Prove these credentials were usable before revocation, then keep the same sender.
-    handle.set_pinned(&context, true).await.unwrap();
-    assert!(
-        api.store
-            .revoke_browser_session(&token_hash, &now_registry_timestamp())
-            .unwrap()
-    );
-    assert!(matches!(
-        handle.connect_protocol(&context).await,
-        Err(Error::WorkspacePermissionDenied(_))
-    ));
-    for method in browser_operation_methods() {
+async fn connected_browser_sender_rechecks_revoked_credentials_or_membership_before_each_method() {
+    for revoke_membership in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
+        let identity = spawn_ticket_check_source(&api, "operation-browser-revocation");
+        let handle =
+            WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+        let (context, token_hash) = browser_operation_context(&api).await;
+        let mut connection = handle.connect_protocol(&context).await.unwrap();
         assert!(matches!(
-            connection.sender.send(&context, method).await,
+            tokio::time::timeout(std::time::Duration::from_secs(2), connection.events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            protocol::Event::Snapshot { .. }
+        ));
+        // Prove these credentials were usable before revocation, then keep the same sender.
+        handle.set_pinned(&context, true).await.unwrap();
+        if revoke_membership {
+            let owner = api
+                .store
+                .get_workspace(TEST_WORKSPACE_ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_account_id;
+            api.store
+                .workspace_members_remove(
+                    TEST_WORKSPACE_ID,
+                    &owner,
+                    "account-worker-operation-browser",
+                    &server_api::WorkspaceMemberRemoveRequest {
+                        operation_key: "remove-browser".into(),
+                        expected_membership_key: "member-worker-operation-browser".into(),
+                    },
+                )
+                .unwrap();
+        } else {
+            assert!(
+                api.store
+                    .revoke_browser_session(&token_hash, &now_registry_timestamp())
+                    .unwrap()
+            );
+        }
+        assert!(matches!(
+            handle.connect_protocol(&context).await,
             Err(Error::WorkspacePermissionDenied(_))
         ));
+        for method in browser_operation_methods() {
+            assert!(matches!(
+                connection.sender.send(&context, method).await,
+                Err(Error::WorkspacePermissionDenied(_))
+            ));
+        }
+        assert!(matches!(
+            handle.set_pinned(&context, false).await.unwrap_err().error,
+            Error::WorkspacePermissionDenied(_)
+        ));
+        assert!(
+            execution.protocol_methods().is_empty(),
+            "revoked credentials must not reach the execution channel"
+        );
+        assert_eq!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &identity)
+                .unwrap()
+                .unwrap()
+                .retention_state,
+            "pinned"
+        );
     }
-    assert!(matches!(
-        handle.set_pinned(&context, false).await.unwrap_err().error,
-        Error::WorkspacePermissionDenied(_)
-    ));
-    assert!(
-        execution.protocol_methods().is_empty(),
-        "revoked credentials must not reach the execution channel"
-    );
-    assert_eq!(
-        api.store
-            .get_worker_registry(TEST_WORKSPACE_ID, &identity)
-            .unwrap()
-            .unwrap()
-            .retention_state,
-        "pinned"
-    );
 }
 
 fn operation_request_context(

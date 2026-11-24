@@ -385,6 +385,16 @@ async fn drive_two_workers_and_non_owner_use_grants_without_workdir_or_profile_a
     let mut api = test_api(temp.path()).await;
     let owner = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let member = seed_test_api_token(api.store.as_ref(), "member");
+    user_call(
+        &api,
+        &member,
+        "GET",
+        &format!("{}/root", base()),
+        None,
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    seed_test_workspace_member(&api, "member").await;
     let (_runtime, workers) = workers(&api).await;
     let identity = RuntimeIdentityMaterial::generate(&workers[0].runtime_id).unwrap();
     configure_runtime_request_auth(&mut api, &identity, &workers[0].runtime_id);
@@ -1425,4 +1435,66 @@ async fn drive_capabilities_expose_only_authenticated_current_caller_ceiling() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn drive_membership_revocation_stops_buffered_and_subsequent_download_chunks() {
+    let temp = tempfile::tempdir().unwrap();
+    let api = test_api(temp.path()).await;
+    let owner = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
+    let member = seed_test_api_token(api.store.as_ref(), "download-member");
+    seed_test_workspace_member(&api, "download-member").await;
+    let root = root_id(&api, &member).await;
+    let bytes = vec![b'a'; 128 * 1024];
+    let path = upload_url(
+        "member-stream",
+        &root,
+        "large",
+        "application/octet-stream",
+        &bytes,
+    );
+    let response = build_router(api.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("authorization", format!("Bearer {member}"))
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let saved = response_json(response, StatusCode::OK).await;
+    let id = saved["entry"]["entry"]["node_id"].as_str().unwrap();
+    let path = format!(
+        "{}/download?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}",
+        base()
+    );
+    let download = || {
+        build_router(api.clone()).oneshot(
+            Request::builder()
+                .uri(&path)
+                .header("authorization", format!("Bearer {member}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let response = download().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let buffered = download().await.unwrap();
+    assert_eq!(buffered.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    assert_eq!(stream.next().await.unwrap().unwrap().len(), 64 * 1024);
+    user_call(&api,&owner,"DELETE",&format!("/api/w/{TEST_WORKSPACE_ID}/members/account-download-member"),Some(json!({"operation_key":"remove-download","expected_membership_key":"member-download-member"})),StatusCode::OK).await;
+    assert!(stream.next().await.unwrap().is_err());
+    assert!(
+        buffered
+            .into_body()
+            .into_data_stream()
+            .next()
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(download().await.unwrap().status(), StatusCode::FORBIDDEN);
 }

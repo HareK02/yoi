@@ -120,6 +120,16 @@ impl WorkerOperationContext {
         }
     }
 
+    pub(crate) async fn revalidate_connection(
+        &self,
+        api: &WorkspaceApi,
+        action: bool,
+    ) -> Result<()> {
+        self.authorize_workspace_request(api, action)
+            .await
+            .map_err(|e| e.error)
+    }
+
     pub(super) async fn authorize_workspace(&self, api: &WorkspaceApi) -> ApiResult<()> {
         self.authorize_workspace_request(api, true).await
     }
@@ -159,6 +169,7 @@ impl WorkerOperationContext {
                 )
                 .into());
             }
+            require_workspace_member(api, api.workspace_id(), &actor).await?;
             if !api
                 .store
                 .get_workspace(api.workspace_id())
@@ -930,6 +941,12 @@ pub(crate) struct WorkspaceWorkerConnection {
     pub(crate) events: tokio::sync::mpsc::Receiver<protocol::Event>,
 }
 impl WorkspaceWorkerMethodSender {
+    pub(super) async fn authorize_delivery(
+        &self,
+        context: &WorkerOperationContext,
+    ) -> ApiResult<()> {
+        context.authorize_workspace_read(&self.worker.api).await
+    }
     pub(crate) fn end_status(&self) -> tokio::sync::watch::Receiver<Option<WorkerProtocolEnd>> {
         self.termination.subscribe()
     }
@@ -1049,6 +1066,7 @@ impl WorkspaceWorkerMethodSender {
         let session_lock = current_worker_session_lock(&self.worker.api, &self.worker.identity);
         let _session_guard = session_lock.lock().await;
         self.worker.ensure_interactive().await?;
+        context.authorize_workspace(&self.worker.api).await?;
         let WorkerOperationContext::Browser { source, .. } = context else {
             return Err(Error::WorkspacePermissionDenied(
                 "Browser Worker protocol context required".into(),

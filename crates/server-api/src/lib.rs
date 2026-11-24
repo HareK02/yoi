@@ -57,6 +57,8 @@ mod ticket_browse;
 pub use ticket_browse::*;
 pub mod repository_openapi_typescript;
 pub use drive::*;
+mod workspace_members;
+pub use workspace_members::*;
 mod workspace_config;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -501,6 +503,12 @@ impl_openapi_schema!(
     WorkspaceDeletionRequest,
     WorkspaceListQuery,
     WorkspaceCatalogListResponse,
+    WorkspaceMemberListQuery,
+    WorkspaceMember,
+    WorkspaceMemberListResponse,
+    WorkspaceMemberAddRequest,
+    WorkspaceMemberRemoveRequest,
+    WorkspaceMemberMutationResponse,
     CreateWorkspaceRepositoryRequest,
     CreateWorkspaceRepositoryResponse,
     WorkdirOperationApiError,
@@ -1136,6 +1144,29 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[body] request: WorkspaceCreateRequest,
     ) -> Result<WorkspaceCreateResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/members", status = 200, error_status = 400, additional_error_statuses = [401,403,404,500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_members_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: WorkspaceMemberListQuery,
+    ) -> Result<WorkspaceMemberListResponse, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/members", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_members_add(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceMemberAddRequest,
+    ) -> Result<WorkspaceMemberMutationResponse, RepositoryApiError>;
+    #[delete("/api/w/{workspace_id}/members/{account_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_members_remove(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] account_id: String,
+        #[body] request: WorkspaceMemberRemoveRequest,
+    ) -> Result<WorkspaceMemberMutationResponse, RepositoryApiError>;
 
     #[get(
         "/api/workspaces/{workspace_id}/deletion",
@@ -12770,6 +12801,12 @@ pub fn legacy_catalog_typescript() -> String {
     let declarations = [
         WorkspaceSummary::decl(&config),
         WorkspaceCatalogListResponse::decl(&config),
+        WorkspaceMemberListQuery::decl(&config),
+        WorkspaceMember::decl(&config),
+        WorkspaceMemberListResponse::decl(&config),
+        WorkspaceMemberAddRequest::decl(&config),
+        WorkspaceMemberRemoveRequest::decl(&config),
+        WorkspaceMemberMutationResponse::decl(&config),
         WorkspaceRepositoryRecord::decl(&config),
         WorkspaceCreateResponse::decl(&config),
         WorkspaceAuthConfig::decl(&config),

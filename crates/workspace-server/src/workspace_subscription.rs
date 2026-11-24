@@ -24,6 +24,19 @@ use crate::server::{
     WorkspaceWorkerMethodSender,
 };
 
+fn connection_close(error: crate::Error) -> WsMessage {
+    let denied = matches!(error, crate::Error::WorkspacePermissionDenied(_));
+    WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+        code: if denied { 1008 } else { 1011 },
+        reason: if denied {
+            "Workspace access denied"
+        } else {
+            "Workspace authorization unavailable"
+        }
+        .into(),
+    }))
+}
+
 const OUTBOUND_CAPACITY: usize = 256;
 const WORKER_PROTOCOL_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -56,14 +69,30 @@ pub(crate) async fn serve_workspace_subscription<S>(
     let (control_outbound, mut control_receiver) = mpsc::channel::<WsMessage>(OUTBOUND_CAPACITY);
     let (protocol_outbound, mut protocol_receiver) = mpsc::channel::<WsMessage>(OUTBOUND_CAPACITY);
     let (writer_done, finished) = tokio::sync::oneshot::channel();
+    let writer_api = api.clone();
+    let writer_context = context.clone();
     let mut writer = SubscriptionTask(tokio::spawn(async move {
+        let mut recheck = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut rejection = None;
         loop {
             let message = tokio::select! {
                 biased;
                 message = control_receiver.recv() => message,
                 message = protocol_receiver.recv() => message,
+                _ = recheck.tick() => {
+                    if let Err(error) = writer_context.revalidate_connection(&writer_api, false).await { rejection = Some(connection_close(error)); break; }
+                    continue;
+                },
             };
             let Some(message) = message else { break };
+            if let Err(error) = writer_context
+                .revalidate_connection(&writer_api, false)
+                .await
+            {
+                rejection = Some(connection_close(error));
+                break;
+            }
+            let closing = matches!(&message, WsMessage::Close(_));
             if !matches!(
                 tokio::time::timeout(
                     WORKER_PROTOCOL_SNAPSHOT_TIMEOUT,
@@ -74,6 +103,14 @@ pub(crate) async fn serve_workspace_subscription<S>(
             ) {
                 break;
             }
+            if closing {
+                break;
+            }
+        }
+        if let Some(close) = rejection {
+            let _ =
+                tokio::time::timeout(WORKER_PROTOCOL_SNAPSHOT_TIMEOUT, socket_sender.send(close))
+                    .await;
         }
         let _ = writer_done.send(());
     }));
@@ -84,6 +121,12 @@ pub(crate) async fn serve_workspace_subscription<S>(
     let receiving = async {
         while let Some(message) = socket_receiver.next().await {
             let Ok(message) = message else { break };
+            if let Err(error) = context.revalidate_connection(&api, true).await {
+                // Let the single writer deliver a bounded close; it revalidates before
+                // any queued data, so a revoked receiver cannot release old snapshots.
+                let _ = control_outbound.send(connection_close(error)).await;
+                return std::future::pending::<()>().await;
+            }
             match message {
                 WsMessage::Text(text) => {
                     let Ok(frame) = serde_json::from_str::<SubscriptionFrame>(text.as_str()) else {

@@ -178,7 +178,10 @@ pub(crate) use subject_release_input_handoff_store::{
 mod launch_policy_identity_migration;
 #[path = "passkey_addition_code.rs"]
 mod passkey_addition_code;
-const LATEST_SCHEMA_VERSION: i64 = 142;
+#[path = "workspace_members.rs"]
+mod workspace_members;
+pub(crate) use workspace_members::require_member;
+const LATEST_SCHEMA_VERSION: i64 = 143;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -666,6 +669,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 142,
         name: passkey_addition_code::MIGRATION_NAME,
         apply: passkey_addition_code::migrate,
+    },
+    Migration {
+        version: 143,
+        name: workspace_members::MIGRATION_NAME,
+        apply: workspace_members::migrate,
     },
 ];
 
@@ -1560,6 +1568,27 @@ pub struct BackendJobRecoveryCursor {
 
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
+    fn workspace_account_has_access(&self, workspace: &str, account: &str) -> Result<bool>;
+    fn workspace_members_list(
+        &self,
+        workspace: &str,
+        actor: &str,
+        query: &server_api::WorkspaceMemberListQuery,
+    ) -> Result<server_api::WorkspaceMemberListResponse>;
+    fn workspace_members_add(
+        &self,
+        workspace: &str,
+        actor: &str,
+        request: &server_api::WorkspaceMemberAddRequest,
+    ) -> Result<server_api::WorkspaceMemberMutationResponse>;
+    fn workspace_members_remove(
+        &self,
+        workspace: &str,
+        actor: &str,
+        account: &str,
+        request: &server_api::WorkspaceMemberRemoveRequest,
+    ) -> Result<server_api::WorkspaceMemberMutationResponse>;
+
     fn plugin_upload(
         &self,
         root: &Path,
@@ -5808,6 +5837,35 @@ fn insert_workspace_runtime_binding_audit(
 
 #[async_trait]
 impl ControlPlaneStore for SqliteWorkspaceStore {
+    fn workspace_account_has_access(&self, workspace: &str, account: &str) -> Result<bool> {
+        self.with_conn(|conn| workspace_members::access(conn, workspace, account))
+    }
+    fn workspace_members_list(
+        &self,
+        workspace: &str,
+        actor: &str,
+        query: &server_api::WorkspaceMemberListQuery,
+    ) -> Result<server_api::WorkspaceMemberListResponse> {
+        workspace_members::list(self, workspace, actor, query)
+    }
+    fn workspace_members_add(
+        &self,
+        workspace: &str,
+        actor: &str,
+        request: &server_api::WorkspaceMemberAddRequest,
+    ) -> Result<server_api::WorkspaceMemberMutationResponse> {
+        workspace_members::add(self, workspace, actor, request)
+    }
+    fn workspace_members_remove(
+        &self,
+        workspace: &str,
+        actor: &str,
+        account: &str,
+        request: &server_api::WorkspaceMemberRemoveRequest,
+    ) -> Result<server_api::WorkspaceMemberMutationResponse> {
+        workspace_members::remove(self, workspace, actor, account, request)
+    }
+
     fn plugin_upload(
         &self,
         root: &Path,
@@ -17740,6 +17798,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(backend_job_recording_input::SCHEMA_SQL)?;
     install_external_workdir_session_columns(conn)?;
     conn.execute_batch(include_str!("passkey_addition_code_schema.sql"))?;
+    conn.execute_batch(include_str!("workspace_members_schema.sql"))?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!("fresh Ticket schema verification failed: {error}"))
     })?;
@@ -20298,6 +20357,10 @@ mod tests {
                     WorkspaceSchemaMigrationStep {
                         version: 142,
                         name: passkey_addition_code::MIGRATION_NAME.into(),
+                    },
+                    WorkspaceSchemaMigrationStep {
+                        version: 143,
+                        name: workspace_members::MIGRATION_NAME.into()
                     }
                 ]
             );
@@ -20438,7 +20501,10 @@ mod tests {
             conn.execute_batch("DROP TRIGGER reject_session_cleanup_fence;")
                 .unwrap();
             apply_migrations(&conn).unwrap();
-            assert_eq!(current_schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+            assert_eq!(
+                current_schema_version(&conn).unwrap(),
+                LATEST_SCHEMA_VERSION
+            );
             assert!(
                 crate::grant_cleanup_operation::read_intent(&conn, "legacy-ws", "legacy-online")
                     .unwrap()
@@ -22479,6 +22545,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("activation_tests.rs");
     include!("schema_equivalence_tests.rs");
     include!("passkey_addition_code_store_tests.rs");
+    include!("workspace_members_store_tests.rs");
     include!("schema_convergence_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
@@ -23044,6 +23111,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 142,
                 name: passkey_addition_code::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 143,
+                name: workspace_members::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -23198,6 +23269,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     (140, backend_job_recording_input::MIGRATION_NAME.into()),
                     (141, EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME.into()),
                     (142, passkey_addition_code::MIGRATION_NAME.into()),
+                    (143, workspace_members::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);

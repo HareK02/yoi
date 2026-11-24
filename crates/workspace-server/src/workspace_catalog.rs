@@ -68,15 +68,21 @@ impl WorkspaceCatalogService {
         Ok(self.store.list_workspaces()?.is_empty())
     }
 
-    pub fn list(&self, owner_account_id: &str, limit: usize) -> Result<Vec<WorkspaceRecord>> {
+    pub fn list(&self, account_id: &str, limit: usize) -> Result<Vec<WorkspaceRecord>> {
         let limit = limit.clamp(1, 200);
-        Ok(self
-            .store
-            .list_workspaces()?
-            .into_iter()
-            .filter(|workspace| workspace.owner_account_id == owner_account_id)
-            .take(limit)
-            .collect())
+        let mut visible = Vec::new();
+        for workspace in self.store.list_workspaces()? {
+            if self
+                .store
+                .workspace_account_has_access(&workspace.workspace_id, account_id)?
+            {
+                visible.push(workspace);
+                if visible.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(visible)
     }
 
     pub fn create(

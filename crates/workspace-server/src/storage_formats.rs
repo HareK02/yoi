@@ -90,6 +90,7 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     verify_job_recording_shape(conn, current)?;
     verify_external_session_shape(conn, current)?;
     verify_addition_code_shape(conn, current)?;
+    verify_membership_shape(conn, current)?;
     let tail = failure_tail(conn, current, &rows)?;
     verify_failure_shape(conn, current, tail)?;
     let journal = tail == FailureTail::Journal || current >= 127;
@@ -439,6 +440,7 @@ impl FailureTail {
         tail.push((140, super::backend_job_recording_input::MIGRATION_NAME));
         tail.push((141, super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME));
         tail.push((142, super::passkey_addition_code::MIGRATION_NAME));
+        tail.push((143, super::workspace_members::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -647,6 +649,21 @@ fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> R
         .collect();
     if actual != expected {
         return Err(invalid("Service outcome receipt/shape mismatch"));
+    }
+    Ok(())
+}
+
+fn verify_membership_shape(conn: &Connection, current: i64) -> Result<()> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(include_str!("workspace_members_schema.sql"))?;
+    let expected = snapshot(&reference)?;
+    let tables: BTreeSet<_> = expected.values().map(|object| object.1.clone()).collect();
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| tables.contains(&object.1))
+        .collect();
+    if (current >= 143 && actual != expected) || (current < 143 && !actual.is_empty()) {
+        return Err(invalid("Workspace membership receipt/shape mismatch"));
     }
     Ok(())
 }
@@ -1614,6 +1631,7 @@ mod failure_format_tests {
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
         124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
+        143,
     ];
 
     #[test]

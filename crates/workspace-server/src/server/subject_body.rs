@@ -159,7 +159,7 @@ async fn read_context(
 ) -> ApiResult<(String, WorkerOperationContext)> {
     validate_workspace_scope(api, workspace)?;
     let actor = subject_authorization::administration_actor(context)?;
-    require_workspace_owner(api, workspace, actor, "Subject body lifecycle").await?;
+    require_workspace_member(api, workspace, actor).await?;
     let authority = WorkerOperationContext::from_request_async(api, context)
         .await
         .map_err(|error| Error::WorkspacePermissionDenied(error.message))?;

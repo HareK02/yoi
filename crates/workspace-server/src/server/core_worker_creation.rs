@@ -53,11 +53,11 @@ pub(super) fn resolve_core_creation_grant(
         (None, WorkerCreationAuthorization::Assignment { assignment }) => {
             let account = account.ok_or_else(|| {
                 Error::WorkspacePermissionDenied(
-                    "initial grant requires an authenticated Workspace owner".into(),
+                    "initial grant requires an authenticated Workspace member".into(),
                 )
             })?;
             api.config_store.with_conn(|connection| {
-                crate::launch_policy::require_owner(connection, api.workspace_id(), account)
+                crate::store::require_member(connection, api.workspace_id(), account)
             })?;
             api.refresh_plugin_permission_registry()?;
             let registry = api
@@ -110,11 +110,11 @@ pub(super) fn resolve_creation_profile(
         (None, WorkerCreationAuthorization::Assignment { .. }) => {
             let account = account.ok_or_else(|| {
                 Error::WorkspacePermissionDenied(
-                    "Worker creation requires authenticated owner context".into(),
+                    "Worker creation requires authenticated member context".into(),
                 )
             })?;
             api.config_store.with_conn(|conn| {
-                crate::launch_policy::require_owner(conn, api.workspace_id(), account)
+                crate::store::require_member(conn, api.workspace_id(), account)
             })?;
         }
         (Some(_), WorkerCreationAuthorization::Policy { .. })

@@ -3911,6 +3911,87 @@ fn is_workspace_config_editor_path(path: &str) -> bool {
         || resource.starts_with("settings/profiles/")
 }
 
+fn is_workspace_members_path(path: &str) -> bool {
+    path.strip_prefix("/api/w/")
+        .and_then(|p| p.split_once('/'))
+        .is_some_and(|(_, p)| p == "members" || p.starts_with("members/"))
+}
+
+// Configuration remains owner-facing. Runtime/Worker projections and delegated
+// operations retain their separate explicit authorization, not human membership.
+fn is_workspace_owner_path(path: &str, method: &Method) -> bool {
+    is_workspace_members_path(path)
+        || is_workspace_config_editor_path(path)
+        || path
+            .strip_prefix("/api/w/")
+            .and_then(|p| p.split_once('/'))
+            .is_some_and(|(_, p)| {
+                p == "settings"
+                    || p.starts_with("settings/")
+                    || (p == "flows" && method == Method::PUT)
+            })
+}
+
+async fn authorize_workspace_account(
+    store: Arc<dyn ControlPlaneStore>,
+    workspace_id: &str,
+    actor: &RequestActor,
+    path: &str,
+    method: &Method,
+) -> std::result::Result<(), Response> {
+    let workspace = workspace_id.to_owned();
+    let account = actor.account_id.clone();
+    let check = store.clone();
+    if !store
+        .db_executor()
+        .run(move || check.workspace_account_has_access(&workspace, &account))
+        .await
+        .map_err(server_error_response)?
+    {
+        return Err(repository_api_rejection(
+            path,
+            StatusCode::FORBIDDEN,
+            "Workspace membership required",
+        ));
+    }
+    if is_workspace_owner_path(path, method)
+        && !store
+            .get_workspace(workspace_id)
+            .await
+            .map_err(server_error_response)?
+            .is_some_and(|w| w.owner_account_id == actor.account_id)
+    {
+        return Err(repository_api_rejection(
+            path,
+            StatusCode::FORBIDDEN,
+            "Workspace settings require the owner account",
+        ));
+    }
+    Ok(())
+}
+
+async fn require_workspace_member(
+    api: &WorkspaceApi,
+    workspace: &str,
+    actor: &RequestActor,
+) -> ApiResult<()> {
+    validate_workspace_scope(api, workspace)?;
+    let store = api.store.clone();
+    let workspace = workspace.to_owned();
+    let account = actor.account_id.clone();
+    if !api
+        .store
+        .db_executor()
+        .run(move || store.workspace_account_has_access(&workspace, &account))
+        .await?
+    {
+        return Err(
+            Error::WorkspacePermissionDenied("Workspace membership required".into()).into(),
+        );
+    }
+    Ok(())
+}
+
 async fn authorize_scoped_workspace_request(
     api: &WorkspaceServerApi,
     workspace_id: &str,
@@ -3968,7 +4049,9 @@ async fn authorize_scoped_workspace_request(
         .map_err(|error| {
             runtime_request_proof_rejection(&method, &request_path, workspace_id, &error)
         })?;
-        if is_workspace_config_editor_path(&request_path) || plugin::is_catalog_path(&request_path)
+        if is_workspace_members_path(&request_path)
+            || is_workspace_config_editor_path(&request_path)
+            || plugin::is_catalog_path(&request_path)
         {
             return Err(repository_api_rejection(
                 &request_path,
@@ -4007,24 +4090,14 @@ async fn authorize_scoped_workspace_request(
             ));
         }
     }
-    // The Journal browser uses POST only to carry bounded typed read selectors. Its
-    // action set is read-only and follows the same user read authority as Memory GET.
-    if (mutating && !subjektiv_journal_browser::is_read_path(&request_path, workspace_id))
-        || request.headers().contains_key(axum::http::header::UPGRADE)
-    {
-        let workspace = api
-            .store
-            .get_workspace(workspace_id)
-            .await
-            .map_err(server_error_response)?;
-        if !workspace.is_some_and(|workspace| workspace.owner_account_id == actor.account_id) {
-            return Err(repository_api_rejection(
-                &request_path,
-                StatusCode::FORBIDDEN,
-                "Workspace mutations and interactive control require the owner account",
-            ));
-        }
-    }
+    authorize_workspace_account(
+        api.store.clone(),
+        workspace_id,
+        &actor,
+        &request_path,
+        request.method(),
+    )
+    .await?;
     request.extensions_mut().insert(actor);
     require_active_scoped_workspace(api, workspace_id, &request_path).await
 }
@@ -4122,7 +4195,9 @@ async fn authorize_workspace_api_request(
                 );
             }
         };
-        if is_workspace_config_editor_path(&request_path) || plugin::is_catalog_path(&request_path)
+        if is_workspace_members_path(&request_path)
+            || is_workspace_config_editor_path(&request_path)
+            || plugin::is_catalog_path(&request_path)
         {
             return repository_api_rejection(
                 &request_path,
@@ -4182,20 +4257,17 @@ async fn authorize_workspace_api_request(
             );
         }
     }
-    if !public_server_api
-        && ((mutating && !subjektiv_journal_browser::is_read_path(&request_path, &workspace_id))
-            || request.headers().contains_key(axum::http::header::UPGRADE))
-    {
-        let workspace = match api.store.get_workspace(&workspace_id).await {
-            Ok(workspace) => workspace,
-            Err(error) => return server_error_response(error),
-        };
-        if !workspace.is_some_and(|workspace| workspace.owner_account_id == actor.account_id) {
-            return repository_api_rejection(
-                &request_path,
-                StatusCode::FORBIDDEN,
-                "Workspace mutations and interactive control require the owner account",
-            );
+    if !public_server_api {
+        if let Err(response) = authorize_workspace_account(
+            api.store.clone(),
+            &workspace_id,
+            &actor,
+            &request_path,
+            request.method(),
+        )
+        .await
+        {
+            return response;
         }
     }
     request.extensions_mut().insert(actor);
@@ -8067,6 +8139,15 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
     let service = Arc::new(service);
     Router::new()
         .merge(drive::router(service.clone()))
+        .merge(server_api::server_api_axum::workspace_members_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_members_add(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_members_remove(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::workspace_current(
             service.clone(),
         ))
@@ -9904,6 +9985,76 @@ impl server_api::ServerApi for ServerApiContractService {
                 Vec::new(),
             )
         })
+    }
+
+    async fn workspace_members_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::WorkspaceMemberListQuery,
+    ) -> std::result::Result<server_api::WorkspaceMemberListResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?;
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(|e| e.into_repository_api_error())?
+            .clone();
+        validate_workspace_scope(api, &workspace_id).map_err(|e| e.into_repository_api_error())?;
+        let store = api.store.clone();
+        api.store
+            .db_executor()
+            .run(move || store.workspace_members_list(&workspace_id, &actor.account_id, &query))
+            .await
+            .map_err(|e| ApiError::from(e).into_repository_api_error())
+    }
+    async fn workspace_members_add(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceMemberAddRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceMemberMutationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?;
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(|e| e.into_repository_api_error())?
+            .clone();
+        validate_workspace_scope(api, &workspace_id).map_err(|e| e.into_repository_api_error())?;
+        let store = api.store.clone();
+        api.store
+            .db_executor()
+            .run(move || store.workspace_members_add(&workspace_id, &actor.account_id, &request))
+            .await
+            .map_err(|e| ApiError::from(e).into_repository_api_error())
+    }
+    async fn workspace_members_remove(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        account_id: String,
+        request: server_api::WorkspaceMemberRemoveRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceMemberMutationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?;
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(|e| e.into_repository_api_error())?
+            .clone();
+        validate_workspace_scope(api, &workspace_id).map_err(|e| e.into_repository_api_error())?;
+        let store = api.store.clone();
+        api.store
+            .db_executor()
+            .run(move || {
+                store.workspace_members_remove(
+                    &workspace_id,
+                    &actor.account_id,
+                    &account_id,
+                    &request,
+                )
+            })
+            .await
+            .map_err(|e| ApiError::from(e).into_repository_api_error())
     }
 
     async fn workspace_current(
@@ -22106,13 +22257,11 @@ async fn project_ticket_parent_eligibility(
             .await?;
     }
     detail.action_eligibility.can_set_parent = match context.actor.as_ref() {
-        Some(actor) if context.runtime_source.is_none() && context.worker_source.is_none() => api
-            .store
-            .get_workspace(workspace_id)
-            .await?
-            .is_some_and(|workspace| {
-                workspace.owner_account_id == actor.account_id && workspace.state == "active"
-            }),
+        Some(actor) if context.runtime_source.is_none() && context.worker_source.is_none() => {
+            require_workspace_member(api, workspace_id, actor)
+                .await
+                .is_ok()
+        }
         _ => false,
     };
     Ok(())
@@ -30779,10 +30928,33 @@ async fn external_workdir_provider_upgrade(
         .on_upgrade(move |socket| serve_external_workdir_provider(api, grant, socket)))
 }
 
+async fn external_provider_membership(
+    api: &WorkspaceApi,
+    grant: &ExternalWorkdirGrantRecord,
+) -> Result<()> {
+    let store = api.store.clone();
+    let workspace = grant.workspace_id.clone();
+    let account = grant.created_by.clone();
+    if !api
+        .store
+        .db_executor()
+        .run(move || store.workspace_account_has_access(&workspace, &account))
+        .await?
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "External provider creator membership revoked".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn send_external_workdir_server_frame(
+    api: &WorkspaceApi,
+    grant: &ExternalWorkdirGrantRecord,
     socket: &mut WebSocket,
     frame: &ExternalWorkdirServerFrame,
 ) -> Result<()> {
+    external_provider_membership(api, grant).await?;
     let text = serde_json::to_string(frame).map_err(Error::ExternalWorkdirFrameEncoding)?;
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -30861,6 +31033,12 @@ async fn serve_external_workdir_provider(
                 return;
             }
         };
+    if external_provider_membership(&api, &initial_grant)
+        .await
+        .is_err()
+    {
+        return;
+    }
     let registration_frame =
         match serde_json::from_str::<ExternalWorkdirProviderFrame>(&registration_text) {
             Ok(frame) => frame,
@@ -31156,7 +31334,9 @@ async fn serve_external_workdir_provider(
             heartbeat_interval_ms: 10_000,
             max_in_flight_operations: 16,
         });
-    if let Err(error) = send_external_workdir_server_frame(&mut socket, &registered).await {
+    if let Err(error) =
+        send_external_workdir_server_frame(&api, &initial_grant, &mut socket, &registered).await
+    {
         let primary = Arc::new(error);
         let stage_primary = primary.clone();
         let stage_api = api.clone();
@@ -31227,7 +31407,7 @@ async fn serve_external_workdir_provider(
                     generation: connection.generation,
                     sequence: heartbeat_sequence,
                 });
-                if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
+                if let Err(error) = send_external_workdir_server_frame(&api, &initial_grant, &mut socket, &frame).await {
                     break ("offline", Closed::SendFailed, Some(error));
                 }
             }
@@ -31276,7 +31456,7 @@ async fn serve_external_workdir_provider(
                         operation,
                     });
                     pending.insert(id.clone(), response);
-                    if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
+                    if let Err(error) = send_external_workdir_server_frame(&api, &initial_grant, &mut socket, &frame).await {
                         pending.remove(&id);
                         break ("offline", Closed::SendFailed, Some(error));
                     }
@@ -31287,7 +31467,7 @@ async fn serve_external_workdir_provider(
                         generation: connection.generation,
                         operation_id,
                     });
-                    if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
+                    if let Err(error) = send_external_workdir_server_frame(&api, &initial_grant, &mut socket, &frame).await {
                         break ("offline", Closed::SendFailed, Some(error));
                     }
                 }
@@ -31300,7 +31480,7 @@ async fn serve_external_workdir_provider(
                         generation: connection.generation,
                         reason,
                     });
-                    if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
+                    if let Err(error) = send_external_workdir_server_frame(&api, &initial_grant, &mut socket, &frame).await {
                         break ("offline", Closed::SendFailed, Some(error));
                     }
                     revoking = true;
@@ -31309,7 +31489,11 @@ async fn serve_external_workdir_provider(
                     reason: Reason::GrantConnectionTransportFailed,
                 })),
             },
-            incoming = socket.next() => match incoming {
+            incoming = async {
+                let incoming = socket.next().await;
+                if external_provider_membership(&api, &initial_grant).await.is_err() { return None; }
+                incoming
+            } => match incoming {
                 Some(Ok(WsMessage::Text(text)))
                     if text.len() <= workdir::external::MAX_EXTERNAL_PROVIDER_FRAME_BYTES => {
                     let frame = match serde_json::from_str::<ExternalWorkdirProviderFrame>(&text) {
@@ -41873,6 +42057,7 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::RuntimeOperationFailed { runtime_id, .. } if runtime_id == "workspace-auth" => {
             StatusCode::BAD_REQUEST
         }
+        Error::WorkspaceMemberAccountNotFound => StatusCode::NOT_FOUND,
         Error::BrowserReopenConfirmationRequired | Error::WorkspacePermissionDenied(_) => {
             StatusCode::FORBIDDEN
         }
@@ -47283,10 +47468,14 @@ mod tests {
                             }
                             request.body(Body::empty()).unwrap()
                         };
-                        // Existing authenticated read-only projections remain accessible.
+                        // Hosting authority is not Workspace membership, including reads.
                         assert_eq!(
                             response(app.clone(), request(false)).await.0,
-                            StatusCode::OK
+                            if owns_workspace {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::FORBIDDEN
+                            }
                         );
                         assert_eq!(
                             response(app.clone(), request(true)).await.0,
@@ -47383,6 +47572,37 @@ mod tests {
                 3
             );
         }
+    }
+
+    include!("server_workspace_members_tests.rs");
+
+    async fn seed_test_workspace_member(api: &WorkspaceApi, suffix: &str) {
+        let owner = api
+            .store
+            .get_workspace(api.workspace_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_account_id;
+        let observation = api
+            .store
+            .workspace_members_list(
+                api.workspace_id(),
+                &owner,
+                &server_api::WorkspaceMemberListQuery::default(),
+            )
+            .unwrap();
+        api.store
+            .workspace_members_add(
+                api.workspace_id(),
+                &owner,
+                &server_api::WorkspaceMemberAddRequest {
+                    operation_key: format!("member-{suffix}"),
+                    account_handle: format!("user-{suffix}"),
+                    expected_membership_change_key: observation.membership_change_key,
+                },
+            )
+            .unwrap();
     }
 
     async fn seed_test_workspace_owner_token(

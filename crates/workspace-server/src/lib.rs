@@ -261,6 +261,8 @@ pub enum Error {
     WorkerLifecycleObservationStale,
     #[error("Repository key {repository_key} already exists with different registration intent")]
     RepositoryRegistrationConflict { repository_key: String },
+    #[error("Active user account handle was not found")]
+    WorkspaceMemberAccountNotFound,
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

@@ -201,11 +201,16 @@ pub(super) async fn workspace_worker_protocol_session<S>(
     S: Stream<Item = std::result::Result<WsMessage, axum::Error>> + Sink<WsMessage> + Unpin,
 {
     let termination = connection.sender.termination.clone();
+    let mut recheck = tokio::time::interval(std::time::Duration::from_secs(1));
     let session = async {
         loop {
             tokio::select! {
+                _ = recheck.tick() => {
+                    if connection.sender.authorize_delivery(&context).await.is_err() { return WorkerProtocolEnd::Disconnected; }
+                },
                 inbound = socket.next() => match inbound {
                     Some(Ok(WsMessage::Text(text))) => {
+                        if connection.sender.authorize_delivery(&context).await.is_err() { return WorkerProtocolEnd::Disconnected; }
                         let result = match decode_method(&text) {
                             Ok(method) => connection.sender.send(&context, method).await.map_err(|error| error.to_string()),
                             Err(error) => Err(error.to_string()),
@@ -224,6 +229,7 @@ pub(super) async fn workspace_worker_protocol_session<S>(
                 },
                 event = connection.events.recv() => {
                     let Some(event) = event else { return WorkerProtocolEnd::Disconnected; };
+                    if connection.sender.authorize_delivery(&context).await.is_err() { return WorkerProtocolEnd::Disconnected; }
                     let shutdown = matches!(event, protocol::Event::Shutdown);
                     let Ok(text) = protocol::stream::encode_event(&event) else { return WorkerProtocolEnd::Disconnected; };
                     if let Err(reason) = browser_send(&mut socket, WsMessage::Text(text.into())).await { return reason; }

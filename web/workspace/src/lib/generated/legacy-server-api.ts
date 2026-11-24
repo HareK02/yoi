@@ -17,6 +17,52 @@ export type WorkspaceSummary = {
 
 export type WorkspaceCatalogListResponse = Array<WorkspaceSummary>;
 
+export type WorkspaceMemberListQuery = {
+  limit: number | null;
+  after_account_id: string | null;
+};
+
+export type WorkspaceMember = {
+  account_id: string;
+  handle: string;
+  display_name: string;
+  is_owner: boolean;
+  membership_key: string | null;
+};
+
+export type WorkspaceMemberListResponse = {
+  workspace_id: string;
+  membership_change_key: string | null;
+  members: Array<WorkspaceMember>;
+  next_after_account_id: string | null;
+};
+
+export type WorkspaceMemberAddRequest = {
+  operation_key: string;
+  account_handle: string;
+  /**
+   * Explicit null means the membership collection has never changed, not an omitted CAS.
+   */
+  expected_membership_change_key: string | null;
+};
+
+export type WorkspaceMemberRemoveRequest = {
+  operation_key: string;
+  expected_membership_key: string;
+};
+
+export type WorkspaceMemberMutationResponse = {
+  workspace_id: string;
+  account_id: string;
+  membership_key: string | null;
+  membership_change_key: string;
+  present: boolean;
+  /**
+   * A historical receipt; clients must reread before making another change.
+   */
+  replayed: boolean;
+};
+
 export type WorkspaceRepositoryRecord = {
   workspace_id: string;
   repository_key: string;

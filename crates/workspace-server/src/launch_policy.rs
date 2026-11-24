@@ -280,7 +280,7 @@ pub(crate) fn bind_core_grant(
             )
         }
         CoreWorkerGrantSource::Account { account_id } => {
-            require_owner(conn, &grant.workspace_id, account_id)?;
+            crate::store::require_member(conn, &grant.workspace_id, account_id)?;
             (None, None)
         }
         CoreWorkerGrantSource::Delegation { .. } => (None, None),

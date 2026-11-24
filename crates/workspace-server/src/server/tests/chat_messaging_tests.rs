@@ -347,7 +347,7 @@ async fn messaging_paginated_snapshot_race_reconnect_and_current_revocation_use_
     a.socket.close(None).await.unwrap();
     let offline = user(&f, &c.id, "offline", "while disconnected").await;
     let mut b = Wire::connect(&url, &f.owner).await;
-    let (id, restored) = subscribe(&mut b, selector(&f, &c, cursor), "resume").await;
+    let (_, restored) = subscribe(&mut b, selector(&f, &c, cursor), "resume").await;
     assert_eq!(restored.messages, vec![offline.message]);
     f.api
         .config_store
@@ -360,7 +360,15 @@ async fn messaging_paginated_snapshot_race_reconnect_and_current_revocation_use_
         })
         .unwrap();
     let _ = f.api.chat_changes.send(c.id);
-    assert!(matches!(b.take(|f| matches!(f, SubscriptionFramePayload::MessagingEvent(MessagingEvent::Closed { subscription_id, .. }) if subscription_id == &id)).await, SubscriptionFramePayload::MessagingEvent(MessagingEvent::Closed { reason: server_api::MessagingTermination::AccessRevoked, .. })));
+    // Account revocation now ends the entire Workspace connection, not only chat.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), b.socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(closed,Message::Close(Some(frame)) if frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

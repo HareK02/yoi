@@ -66,7 +66,7 @@ async fn read_context(
     let actor = context.actor.as_ref().ok_or_else(|| {
         Error::WorkspacePermissionDenied("chat requires an authenticated Account".into())
     })?;
-    require_workspace_owner(api, workspace, actor, "chat account access").await?;
+    require_workspace_member(api, workspace, actor).await?;
     let authority = WorkerOperationContext::from_request_async(api, context)
         .await
         .map_err(|error| Error::WorkspacePermissionDenied(error.message))?;
@@ -84,6 +84,9 @@ pub(super) async fn create(
     api.store
         .db_executor()
         .run(move || -> ApiResult<_> {
+            api.config_store.with_conn(|conn| {
+                crate::store::require_member(conn, api.workspace_id(), &account)
+            })?;
             open_subjektiv_store(&api)?
                 .chat_create_conversation(&account, &request)
                 .map_err(domain)
@@ -102,6 +105,9 @@ pub(super) async fn messages(
     api.store
         .db_executor()
         .run(move || -> ApiResult<_> {
+            api.config_store.with_conn(|conn| {
+                crate::store::require_member(conn, api.workspace_id(), &account)
+            })?;
             open_subjektiv_store(&api)?
                 .chat_messages_for_account(&account, &conversation, &query)
                 .map_err(domain)
@@ -122,6 +128,9 @@ pub(super) async fn receive(
         .store
         .db_executor()
         .run(move || -> ApiResult<_> {
+            save_api.config_store.with_conn(|conn| {
+                crate::store::require_member(conn, save_api.workspace_id(), &account)
+            })?;
             let store = open_subjektiv_store(&save_api)?;
             let message = store
                 .chat_append_user_message(&account, &conversation, &request)

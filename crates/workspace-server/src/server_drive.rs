@@ -794,6 +794,12 @@ async fn streaming_download(
                         .map_err(|_| stream_error())?
                     }
                 };
+                let check = drive.clone();
+                blocking(DriveFailureOperation::Read, false, move || {
+                    check.check_authorized(false)
+                })
+                .await
+                .map_err(|_| stream_error())?;
                 let next = offset + chunk.bytes.len() as u64;
                 let eof = chunk.eof;
                 Ok::<_, std::io::Error>(Some((

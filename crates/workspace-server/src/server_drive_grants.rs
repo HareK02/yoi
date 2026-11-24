@@ -92,12 +92,13 @@ pub(super) async fn authorized_drive(
         let account = actor.account_id.clone();
         let user = actor.user_id.clone();
         let drive = api.drive().await.map_err(pre_error)?;
-        // Ordinary Workspace use is member-facing: the current Server policy
-        // admits persisted authenticated users, not only the Workspace owner.
+        // Attached-authority transactions recheck membership, including after body reception.
         drive.with_authorizer(move |conn, _write| {
             let member: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM yoi_workspace_authority.workspaces ws
                 CROSS JOIN yoi_workspace_authority.users u
-                WHERE ws.workspace_id=?1 AND ws.state='active' AND u.account_id=?2 AND u.user_id=?3)",
+                WHERE ws.workspace_id=?1 AND ws.state='active' AND u.account_id=?2 AND u.user_id=?3
+                AND (ws.owner_account_id=?2 OR EXISTS(SELECT 1 FROM yoi_workspace_authority.workspace_members m WHERE m.workspace_id=ws.workspace_id AND m.account_id=?2))
+                AND NOT EXISTS(SELECT 1 FROM yoi_workspace_authority.user_activations p WHERE p.user_id=u.user_id))",
                 params![workspace,account,user],|row|row.get(0))?;
             if !member { return Err(workspace_drive::Error::Denied); }
             Ok(())

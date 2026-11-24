@@ -62,6 +62,7 @@ class FakeWebSocket {
 beforeEach(() => {
   FakeWebSocket.instances = [];
   vi.stubGlobal('WebSocket', FakeWebSocket);
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 200 })));
 });
 
 afterEach(() => {
@@ -69,7 +70,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test('invalid inbound frame closes before dispatch and reconnects for a fresh snapshot', () => {
+test('invalid inbound frame closes before dispatch and reconnects for a fresh snapshot', async () => {
   vi.useFakeTimers();
   const multiplexer = new WorkspaceMultiplexer('workspace-validation-test');
   const onFrame = vi.fn();
@@ -105,7 +106,7 @@ test('invalid inbound frame closes before dispatch and reconnects for a fresh sn
   });
   expect(JSON.stringify(onStatus.mock.calls)).not.toContain('untrusted detail');
 
-  vi.advanceTimersByTime(500);
+  await vi.advanceTimersByTimeAsync(500);
   const second = FakeWebSocket.instances[1];
   expect(second).toBeDefined();
   second.open();
@@ -286,7 +287,7 @@ test('messaging-only disconnect reconnects and an aborted late subscribe is expl
   const multiplexer = new WorkspaceMultiplexer('messaging-reconnect');
   const chat = multiplexer.connectMessaging({ onEvent: vi.fn(), onStatus: vi.fn() });
   const first = FakeWebSocket.instances[0]; first.open(); first.close();
-  vi.advanceTimersByTime(500);
+  await vi.advanceTimersByTimeAsync(500);
   const socket = FakeWebSocket.instances[1]; expect(socket).toBeDefined(); socket.open();
   const controller = new AbortController();
   const selector = { subject_id: 's', conversation_id: 'c', after_sequence: 0 };
@@ -325,4 +326,56 @@ test('a timed-out messaging subscribe cleans up its late ACK and a fresh subscri
   socket.message(JSON.stringify({ protocol_version: 2, frame: 'response', message: { result: 'subscribed', payload: { request_id: workers.message.params.request_id, subscription_id: 'workers', selector: { topic: 'workspace_workers' }, snapshot: { topic: 'workers', data: { workers: [] } } } } }));
   expect(workerFrames).toHaveBeenCalledOnce();
   mux.dispose();
+});
+
+for (const status of [401, 403, 404]) {
+  test(`WS failure followed by HTTP ${status} stops retries and exposes access failure`, async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status }));
+    vi.stubGlobal('fetch', fetcher);
+    const mux = new WorkspaceMultiplexer('workspace-a');
+    const onStatus = vi.fn();
+    mux.subscribe({ topic: 'workspace_workers' }, { onFrame: vi.fn(), onStatus });
+    FakeWebSocket.instances[0].close();
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls[0][0]).toBe('/api/w/workspace-a/workspace');
+    expect(onStatus.mock.lastCall?.[1].kind).toBe('authorization');
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    mux.subscribe({ topic: 'workspace_workers' }, { onFrame: vi.fn(), onStatus });
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    mux.dispose();
+  });
+}
+
+for (const response of ['server-error', 'offline'] as const) {
+  test(`${response} during access check does not invent a permission denial`, async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', response === 'offline'
+      ? vi.fn().mockRejectedValue(new TypeError('offline'))
+      : vi.fn().mockResolvedValue(new Response(null, { status: 500 })));
+    const mux = new WorkspaceMultiplexer('workspace-a');
+    const onStatus = vi.fn();
+    mux.subscribe({ topic: 'workspace_workers' }, { onFrame: vi.fn(), onStatus });
+    FakeWebSocket.instances[0].close();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(onStatus.mock.calls.some(call => call[1]?.kind === 'authorization')).toBe(false);
+    mux.dispose();
+  });
+}
+
+test('disposed connection ignores late access check and cannot reconnect', async () => {
+  vi.useFakeTimers();
+  let resolve!: (response: Response) => void;
+  vi.stubGlobal('fetch', () => new Promise(r => { resolve = r; }));
+  const mux = new WorkspaceMultiplexer('workspace-a');
+  const onStatus = vi.fn();
+  mux.subscribe({ topic: 'workspace_workers' }, { onFrame: vi.fn(), onStatus });
+  FakeWebSocket.instances[0].close();
+  mux.dispose();
+  resolve(new Response(null, { status: 403 }));
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(FakeWebSocket.instances).toHaveLength(1);
+  expect(onStatus.mock.calls.some(call => call[1]?.kind === 'authorization')).toBe(false);
 });
