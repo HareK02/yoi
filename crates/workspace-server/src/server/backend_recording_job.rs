@@ -202,13 +202,18 @@ fn own(api: &WorkspaceApi, id: &str) {
         loop {
             if api.backend_job_recovery.stopping.load(Ordering::Acquire) { break; }
             let worker=api.clone();let job=id.clone();
+            #[cfg(test)]
+            api.backend_job_recovery.recording_before_admission.notify_one();
+            let admission=api.backend_job_recovery.step_admission.lock().await;
+            if api.backend_job_recovery.stopping.load(Ordering::Acquire) { break; }
             let result=match api.host_executors.host() {
                 Ok(executor)=>executor.run(move || step(&worker,&job)).await,
                 Err(error)=>Err(error),
             };
+            drop(admission);
             match result {
                 Ok(true)=>break,
-                Ok(false)=>failures=0,
+                Ok(false)=>failures=failures.saturating_add(1),
                 Err(error)=>{
                     failures=failures.saturating_add(1);
                     tracing::warn!(job_id=%id,%error,"Recording Job retains its immutable input and unfinished effects");
@@ -375,6 +380,37 @@ fn session_executions_released(api: &WorkspaceApi, session: &str) -> Result<bool
     }
 }
 
+fn session_prefix_can_resume(api: &WorkspaceApi, input: &BackendJobRecordingInput) -> Result<bool> {
+    let mut after = None;
+    loop {
+        let jobs = api.store.list_backend_journal_jobs(
+            api.workspace_id(),
+            &input.scope.session_id,
+            after.as_deref(),
+            100,
+        )?;
+        for job in &jobs {
+            if subjektiv_journal::can_resume_partial(job)
+                && job
+                    .request
+                    .grants
+                    .subjektiv_journal
+                    .as_ref()
+                    .is_some_and(|grant| {
+                        grant.subject_id == input.scope.subject_id
+                            && grant.binding_id == input.scope.binding_id
+                    })
+            {
+                return Ok(true);
+            }
+        }
+        if jobs.len() < 100 {
+            return Ok(false);
+        }
+        after = jobs.last().map(|job| job.request.job_id.clone());
+    }
+}
+
 pub(super) fn step(api: &WorkspaceApi, id: &str) -> Result<bool> {
     let Some(input) = api
         .config_store
@@ -494,9 +530,46 @@ pub(super) fn step(api: &WorkspaceApi, id: &str) -> Result<bool> {
         return Ok(true);
     }
     if cursor < position(input.scope.start) {
-        return Err(Error::RepositoryConflict(
-            "Recording Job cannot skip an unaccepted prefix".into(),
-        ));
+        let prefix = api.config_store.find_backend_job_recording_prefix(
+            api.workspace_id(),
+            &input.scope,
+            RecordingPosition {
+                canonical_order: cursor.0,
+                byte_offset: cursor.1,
+            },
+        )?;
+        if prefix.as_ref().is_some_and(|(_, state)| {
+            matches!(
+                state,
+                BackendJobState::Pending | BackendJobState::Finalizing
+            )
+        }) || !session_executions_released(api, &input.scope.session_id)?
+            || session_prefix_can_resume(api, &input)?
+        {
+            return Ok(false);
+        }
+        // A retained failed input is not progress. Stop this dependent owner
+        // without skipping the Journal cursor, replacing work, or dropping bytes.
+        let (category, detail) = if let Some((id, _)) = prefix {
+            (
+                "recording_prefix_failed",
+                format!(
+                    "Earlier recording Job {id} failed before this input's start; retained inputs and checkpoints require recovery"
+                ),
+            )
+        } else {
+            ("recording_prefix_missing", "No accepted recording input covers the unprocessed prefix; this Job's original input remains retained".into())
+        };
+        api.config_store.finish_backend_job_recording(
+            api.workspace_id(),
+            id,
+            &BackendJobRecordingOutcome::Failed {
+                category: category.into(),
+                detail,
+            },
+            &now(),
+        )?;
+        return Ok(true);
     }
     let mut child_count = 0usize;
     let mut after = None;

@@ -425,6 +425,292 @@ async fn erased_recording_target_is_not_required(delete_subject: bool) {
 }
 
 #[tokio::test]
+async fn finite_recording_waits_for_accepted_prefix_and_settles_failed_dependency_without_losing_bytes()
+ {
+    use session_store::capture::RecordingPosition;
+    let f = RecordingFixture::new(true).await;
+    let api = &f.fixture.api;
+    let mut scope = api
+        .config_store
+        .get_backend_job_recording_input(TEST_WORKSPACE_ID, &f.job_id)
+        .unwrap()
+        .unwrap()
+        .scope;
+    scope.start = RecordingPosition {
+        canonical_order: 0,
+        byte_offset: 8,
+    };
+    let tail_id = backend_recording_job::admit(api, scope, &f.chunks[1..]).unwrap();
+    api.stop_backend_job_recovery().await;
+    let original = api
+        .config_store
+        .get_backend_job_recording_chunks(TEST_WORKSPACE_ID, &tail_id, 0, 16)
+        .unwrap();
+    for _ in 0..2 {
+        assert!(
+            !backend_recording_job::step(api, &tail_id).unwrap(),
+            "an accepted unfinished prefix is a dependency wait, not a conflict"
+        );
+    }
+    assert!(
+        api.config_store
+            .list_backend_job_recording_child_ids(TEST_WORKSPACE_ID, &tail_id, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    api.config_store
+        .finish_backend_job_recording(
+            TEST_WORKSPACE_ID,
+            &f.job_id,
+            &crate::store::BackendJobRecordingOutcome::Failed {
+                category: "fixture_prefix_failure".into(),
+                detail: "No child or external effects were started".into(),
+            },
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+    let mut legacy = f.fixture.request.clone();
+    legacy.job_id = "legacy-prefix-continuation".into();
+    legacy.limits.max_attempts = 2;
+    let legacy = api
+        .store
+        .reserve_backend_job(TEST_WORKSPACE_ID, &legacy, &Utc::now().to_rfc3339())
+        .unwrap();
+    api.finish_backend_job_attempt(
+        &legacy.job.request.job_id,
+        &legacy.attempt.attempt_id,
+        BackendJobAttemptState::Failed,
+        "journal_attempt_fenced",
+        "No Worker allocated",
+    )
+    .unwrap();
+    api.finish_backend_job_cleanup_retirement(
+        &legacy.job.request.job_id,
+        &legacy.attempt.attempt_id,
+    )
+    .unwrap();
+    let eligible = api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &legacy.job.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert!(subjektiv_journal::can_resume_partial(&eligible));
+    // Cleanup release must not close the recovery window before the legacy
+    // owner reserves its next attempt. No Runtime termination is fabricated.
+    assert!(!backend_recording_job::step(api, &tail_id).unwrap());
+    assert!(subjektiv_journal::resume_partial_job(api, &legacy.job.request.job_id).unwrap());
+    let retry = api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &legacy.job.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.current_attempt, 2);
+    assert!(!backend_recording_job::step(api, &tail_id).unwrap());
+    let attempt = api
+        .store
+        .list_backend_job_attempts(TEST_WORKSPACE_ID, &legacy.job.request.job_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    api.finish_backend_job_attempt(
+        &legacy.job.request.job_id,
+        &attempt.attempt_id,
+        BackendJobAttemptState::Failed,
+        "deadline_exceeded",
+        "No Worker allocated",
+    )
+    .unwrap();
+    api.finish_backend_job_cleanup_retirement(&legacy.job.request.job_id, &attempt.attempt_id)
+        .unwrap();
+    let reopened = f.reopened_api();
+    assert!(backend_recording_job::step(&reopened, &tail_id).unwrap());
+    let failed = reopened
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &tail_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.state, BackendJobState::Failed);
+    assert_eq!(
+        failed.failure_category.as_deref(),
+        Some("recording_prefix_failed")
+    );
+    assert!(failed.result.is_none());
+    assert!(backend_recording_job::step(&reopened, &tail_id).unwrap());
+    assert_eq!(
+        reopened
+            .store
+            .get_backend_job(TEST_WORKSPACE_ID, &tail_id)
+            .unwrap()
+            .unwrap(),
+        failed
+    );
+    assert_eq!(
+        reopened
+            .config_store
+            .get_backend_job_recording_chunks(TEST_WORKSPACE_ID, &tail_id, 0, 16)
+            .unwrap(),
+        original
+    );
+    f.assert_saved_chunks(&reopened);
+    assert!(f.fixture.execution.take_inputs().is_empty());
+    let journal = f
+        .fixture
+        .store
+        .read_journal(&f.fixture.host, &f.fixture.id)
+        .unwrap();
+    assert_eq!((journal.process_order, journal.process_byte), (0, 0));
+}
+
+#[tokio::test]
+async fn finite_recording_recovery_waits_outside_host_lane_and_shutdown_rechecks_admission() {
+    let f = RecordingFixture::new(false).await;
+    let api = &f.fixture.api;
+    let gate = api.backend_job_recovery.pause_steps_for_test().await;
+    api.backend_job_recovery.resume_after_test_pause();
+    backend_recording_job::recover(api).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        api.backend_job_recovery
+            .recording_before_admission
+            .notified(),
+    )
+    .await
+    .unwrap();
+    // Snapshot actual accepted Host work. A recording step bypassing the gate
+    // would have created its first child before this drain completes.
+    api.host_executors.host().unwrap().drain().await.unwrap();
+    let children = api
+        .config_store
+        .list_backend_job_recording_child_ids(TEST_WORKSPACE_ID, &f.job_id, None, 100)
+        .unwrap();
+    api.backend_job_recovery
+        .stopping
+        .store(true, Ordering::Release);
+    drop(gate);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        api.stop_backend_job_recovery(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        children.is_empty(),
+        "recording recovery must share ordinary Job admission before entering Host"
+    );
+    assert!(
+        api.config_store
+            .list_backend_job_recording_child_ids(TEST_WORKSPACE_ID, &f.job_id, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    f.assert_saved_chunks(api);
+    assert!(f.fixture.execution.take_inputs().is_empty());
+}
+
+#[tokio::test]
+async fn finite_recording_reopens_multiple_pages_without_flooding_host_control() {
+    let f = RecordingFixture::new(false).await;
+    let api = &f.fixture.api;
+    let input = api
+        .config_store
+        .get_backend_job_recording_input(TEST_WORKSPACE_ID, &f.job_id)
+        .unwrap()
+        .unwrap();
+    let template = api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &f.job_id)
+        .unwrap()
+        .unwrap()
+        .request;
+    for index in 0..120 {
+        let mut request = template.clone();
+        request.job_id = format!("backlog:{index:03}");
+        api.config_store
+            .reserve_backend_job_recording_input(
+                TEST_WORKSPACE_ID,
+                &request,
+                &input.scope,
+                &f.chunks,
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+    }
+    f.fixture
+        .store
+        .begin_subject_deletion(&input.scope.subject_id, "backlog-target-deleted")
+        .unwrap();
+    let gate = api.backend_job_recovery.pause_steps_for_test().await;
+    api.backend_job_recovery.resume_after_test_pause();
+    backend_recording_job::recover(api).unwrap();
+    backend_recording_job::recover(api).unwrap();
+    let owner_count = api.backend_job_recovery.recovery_owner_ids().len();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        api.backend_job_recovery
+            .recording_before_admission
+            .notified(),
+    )
+    .await
+    .unwrap();
+    let control = api
+        .host_executors
+        .host()
+        .unwrap()
+        .run(|| Ok::<_, Error>("control admitted"))
+        .await;
+    drop(gate);
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let changed = api.backend_job_recovery.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if api.backend_job_recovery.recovery_owner_ids().is_empty() {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await;
+    api.stop_backend_job_recovery().await;
+    assert_eq!(
+        owner_count, 121,
+        "one owner per saved input across pages, even after repeated recovery"
+    );
+    assert_eq!(control.unwrap(), "control admitted");
+    settled.expect("all recording owners must finish without starving later pages");
+    let reopened = f.reopened_api();
+    assert!(
+        reopened
+            .config_store
+            .list_active_backend_job_recording_ids(TEST_WORKSPACE_ID, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    for index in 0..120 {
+        let id = format!("backlog:{index:03}");
+        let job = reopened
+            .store
+            .get_backend_job(TEST_WORKSPACE_ID, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, BackendJobState::Completed);
+        assert_eq!(
+            job.result,
+            Some(serde_json::json!({"application":"not_required"}))
+        );
+        assert!(
+            reopened
+                .config_store
+                .list_backend_job_recording_child_ids(TEST_WORKSPACE_ID, &id, None, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    f.assert_saved_chunks(&reopened);
+    assert!(f.fixture.execution.take_inputs().is_empty());
+}
+
+#[tokio::test]
 async fn finite_recording_deleted_subject_finishes_not_required_without_recreation() {
     erased_recording_target_is_not_required(true).await;
 }

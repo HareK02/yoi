@@ -155,6 +155,98 @@ fn settle_child(store: &SqliteWorkspaceStore, id: &str) {
 }
 
 #[test]
+fn recording_prefix_lookup_matches_source_lifetime_and_half_open_interval() {
+    let store = store();
+    reserve(&store, "prefix");
+    let scope = scope();
+    let cursor = scope.start;
+    assert_eq!(
+        store
+            .find_backend_job_recording_prefix("w", &scope, cursor)
+            .unwrap(),
+        Some(("prefix".into(), BackendJobState::Pending))
+    );
+    assert!(
+        store
+            .find_backend_job_recording_prefix("other", &scope, cursor)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .find_backend_job_recording_prefix("w", &scope, scope.end)
+            .unwrap()
+            .is_none()
+    );
+    for field in 0..8 {
+        let mut other = scope.clone();
+        match field {
+            0 => other.subject_id = "other".into(),
+            1 => other.session_id = "other".into(),
+            2 => other.binding_id = "other".into(),
+            3 => other.worker.worker_id = "other".into(),
+            4 => other.worker.runtime_id = "other".into(),
+            5 => other.database.scope = "other".into(),
+            6 => other.database.feature = "other".into(),
+            _ => other.database.physical = "other".into(),
+        }
+        assert!(
+            store
+                .find_backend_job_recording_prefix("w", &other, cursor)
+                .unwrap()
+                .is_none(),
+            "identity field {field} must not borrow another source's progress"
+        );
+    }
+    store
+        .finish_backend_job_recording(
+            "w",
+            "prefix",
+            &BackendJobRecordingOutcome::Completed {
+                result: serde_json::json!({"fixture":"no external execution"}),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        store
+            .find_backend_job_recording_prefix("w", &scope, cursor)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn recording_prefix_lookup_prefers_live_recovery_over_retained_failure() {
+    let store = store();
+    reserve(&store, "a-failed");
+    store
+        .finish_backend_job_recording(
+            "w",
+            "a-failed",
+            &BackendJobRecordingOutcome::Failed {
+                category: "fixture_rejected".into(),
+                detail: "No external execution".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .find_backend_job_recording_prefix("w", &scope(), scope().start)
+            .unwrap(),
+        Some(("a-failed".into(), BackendJobState::Failed))
+    );
+    reserve(&store, "z-live");
+    assert_eq!(
+        store
+            .find_backend_job_recording_prefix("w", &scope(), scope().start)
+            .unwrap(),
+        Some(("z-live".into(), BackendJobState::Pending))
+    );
+}
+
+#[test]
 fn reservation_owns_complete_captured_bytes_without_a_source_worker_and_replays_exact_intent() {
     let store = store();
     let first = reserve(&store, "host");

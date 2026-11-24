@@ -448,6 +448,55 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| load(conn, workspace, id))
     }
 
+    pub(crate) fn find_backend_job_recording_prefix(
+        &self,
+        workspace: &str,
+        scope: &BackendJobRecordingScope,
+        cursor: RecordingPosition,
+    ) -> Result<Option<(String, BackendJobState)>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT i.job_id,i.scope_json,j.state FROM backend_job_recording_inputs i
+                 JOIN backend_jobs j USING(workspace_id,job_id)
+                 WHERE i.workspace_id=?1 AND json_extract(i.scope_json,'$.subject_id')=?2
+                 AND json_extract(i.scope_json,'$.session_id')=?3
+                 AND json_extract(i.scope_json,'$.binding_id')=?4
+                 AND j.state IN ('pending','finalizing','failed') ORDER BY i.job_id",
+            )?;
+            let mut rows = statement.query(params![
+                workspace,
+                scope.subject_id,
+                scope.session_id,
+                scope.binding_id
+            ])?;
+            let mut failed = None;
+            while let Some(row) = rows.next()? {
+                let saved: BackendJobRecordingScope =
+                    serde_json::from_str(&row.get::<_, String>(1)?)
+                        .map_err(|error| Error::Store(error.to_string()))?;
+                if saved.worker != scope.worker
+                    || saved.database != scope.database
+                    || position(saved.start) > position(cursor)
+                    || position(saved.end) <= position(cursor)
+                {
+                    continue;
+                }
+                let id = row.get::<_, String>(0)?;
+                let state = BackendJobState::parse(&row.get::<_, String>(2)?)?;
+                match state {
+                    BackendJobState::Pending | BackendJobState::Finalizing => {
+                        return Ok(Some((id, state)));
+                    }
+                    BackendJobState::Failed => {
+                        failed = Some((id, state));
+                    }
+                    BackendJobState::Completed => {}
+                }
+            }
+            Ok(failed)
+        })
+    }
+
     pub fn list_active_backend_job_recording_ids(
         &self,
         workspace: &str,

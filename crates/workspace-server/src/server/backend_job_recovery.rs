@@ -25,7 +25,9 @@ pub(super) struct RecoveryOwners {
     // Already accepted owners take fair turns before entering the finite Host
     // lane. Immediate rejection plus independent retry timers otherwise lets
     // earlier reservations monopolize every slot after a large reopen.
-    step_admission: tokio::sync::Mutex<()>,
+    pub(super) step_admission: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(super) recording_before_admission: tokio::sync::Notify,
     #[cfg(test)]
     pub(super) storage_probe_started: tokio::sync::Notify,
     #[cfg(test)]
