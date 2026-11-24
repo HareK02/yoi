@@ -210,14 +210,16 @@
       const result = await getSubjectBodyStopOutcome(fetch, workspace, subject, frozen.request);
       if (!current(generation, account, workspace, subject)) return;
       // 停止照会のbodyは表示状態へ転記しない。現在の本体は独立したGETで更新する。
-      if (result.outcome === 'stopped') {
+      if (result.outcome !== 'not_found' && result.outcome !== 'pending') {
         receipt = null;
-        operationError = null;
+        operationError = result.outcome === "stopped" ? null : result.outcome === "interrupted"
+          ? "The Stop request was interrupted. This does not confirm execution termination. Check current observations before another action."
+          : "The Stop request failed (" + result.outcome.failed.cause + "). This is not a successful Stop; execution termination and persistence may differ. Check current observations before another action.";
         try {
           clearSubjectBodyAttempt(sessionStorage, account, frozen);
           attempt = null;
         } catch {
-          storageError = 'The historical stop was confirmed, but its saved retry input could not be cleared. Reload to reconcile the retained request; do not create another request.';
+          storageError = 'The historical Stop request ended, but its saved retry input could not be cleared. Reload to reconcile the retained request; do not create another request.';
         }
       }
       // not_found/pendingとGET更新のいずれも、凍結した停止依頼を消さない。

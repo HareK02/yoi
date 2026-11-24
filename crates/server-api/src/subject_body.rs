@@ -184,6 +184,7 @@ pub fn subject_body_api_typescript() -> String {
     use ts_rs::TS;
     let config = ts_rs::Config::default();
     let declarations = [
+        protocol::control_failure::RuntimeControlCause::decl(&config),
         SubjectBodyRequestResolution::decl(&config),
         SubjectBodyFailedRequest::decl(&config),
         SubjectBodyApiError::decl(&config),

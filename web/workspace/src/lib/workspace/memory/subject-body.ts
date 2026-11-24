@@ -1,3 +1,4 @@
+import type { RuntimeControlCause } from "#lib/generated/runtime-api.ts";
 import type {
   SubjectBodyFailedRequest,
   SubjectBodyMutationResponse,
@@ -6,6 +7,7 @@ import type {
   SubjectBodyRef,
   SubjectBodyResponse,
   SubjectBodyStartRequest,
+  SubjectBodyStopOutcome,
   SubjectBodyStopOutcomeResponse,
   SubjectBodyStopRequest,
 } from "#lib/generated/subject-body-api.ts";
@@ -13,6 +15,51 @@ import { parseWorkerSummary } from "#lib/workspace/api/workers.ts";
 import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 
 type Diagnostic = SubjectBodyMutationResponse["diagnostics"][number];
+const runtimeControlCauses = new Set<string>(
+  [
+    "runtime_missing",
+    "worker_missing",
+    "invalid_worker_identifier",
+    "runtime_stopped",
+    "execution_unavailable",
+    "execution_failed",
+    "execution_rejected",
+    "restore_observation_stale",
+    "restore_observation_conflict",
+    "restore_admission_busy",
+    "stop_observation_conflict",
+    "stop_request_conflict",
+    "stop_admission_busy",
+    "stop_request_interrupted",
+    "stop_terminated_persistence_failed",
+    "stop_terminated_persistence_outcome_unknown",
+    "stop_terminated_cleanup_failed",
+    "create_request_conflict",
+    "invalid_request",
+    "workspace_binding_mismatch",
+    "configuration_unavailable",
+    "working_directory_failed",
+    "persistence_failed",
+    "persistence_outcome_unknown",
+    "store_unavailable",
+    "recording_source_unavailable",
+    "recording_ownership_unknown",
+    "recording_execution_unconfirmed",
+    "state_unavailable",
+    "authorization_failed",
+    "connection_failed",
+    "transport_failed",
+    "timed_out",
+    "request_encoding_failed",
+    "client_setup_failed",
+    "response_too_large",
+    "invalid_response",
+    "result_unavailable",
+    "unsupported_operation",
+    "remote_rejected",
+  ] satisfies RuntimeControlCause[],
+);
+
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_SAVED_LENGTH = 16 * 1024;
 
@@ -211,11 +258,20 @@ export function parseSubjectBodyStopOutcomeResponse(
   if (request_id !== requestId) {
     throw new Error("Subject body stop outcome does not match the request");
   }
-  const outcome = item.outcome;
+  let outcome: SubjectBodyStopOutcome;
   if (
-    outcome !== "not_found" && outcome !== "pending" && outcome !== "stopped"
+    item.outcome === "not_found" || item.outcome === "pending" ||
+    item.outcome === "stopped" || item.outcome === "interrupted"
   ) {
-    throw new Error("Subject body stop outcome is invalid");
+    outcome = item.outcome;
+  } else {
+    const failed = record(item.outcome, ["failed"]);
+    const details = record(failed.failed, ["cause"]);
+    const cause = details.cause;
+    if (typeof cause !== "string" || !runtimeControlCauses.has(cause)) {
+      throw new Error("Subject body stop failure cause is invalid");
+    }
+    outcome = { failed: { cause: cause as RuntimeControlCause } };
   }
   return {
     request_id,
