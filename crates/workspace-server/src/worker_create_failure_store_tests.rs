@@ -34,9 +34,7 @@ fn reserve(store: &SqliteWorkspaceStore) -> WorkerCreateReservation {
         conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
             VALUES('failure-owner','user','failure-owner','Owner','1','1');
             INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
-            VALUES('failure-workspace','failure-owner','Failure workspace','active','1','1');
-            INSERT INTO workspace_memory_settings(workspace_id,language,created_at,updated_at)
-            VALUES('failure-workspace','en','1','1');")?;
+            VALUES('failure-workspace','failure-owner','Failure workspace','active','1','1');")?;
         Ok(())
     }).unwrap();
     store
@@ -46,7 +44,6 @@ fn reserve(store: &SqliteWorkspaceStore) -> WorkerCreateReservation {
             "manual:startup-failure",
             "sha256:startup-failure",
             Some("subjektiv:failed-create"),
-            &store.get_workspace_memory_settings(WORKSPACE).unwrap(),
         )
         .unwrap()
 }

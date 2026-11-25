@@ -3,94 +3,54 @@
 
 import type { Diagnostic, WorkerSummary } from "./worker-launch-api.ts";
 
-export type SubjectBodyRequestResolution =
-  | "not_accepted"
-  | "superseded"
-  | "unresolved";
+export type RuntimeControlCause = "runtime_missing" | "worker_missing" | "invalid_worker_identifier" | "runtime_stopped" | "execution_unavailable" | "execution_failed" | "execution_rejected" | "restore_observation_stale" | "restore_observation_conflict" | "restore_admission_busy" | "stop_observation_conflict" | "stop_request_conflict" | "stop_admission_busy" | "stop_request_interrupted" | "stop_terminated_persistence_failed" | "stop_terminated_persistence_outcome_unknown" | "stop_terminated_cleanup_failed" | "create_request_conflict" | "invalid_request" | "workspace_binding_mismatch" | "configuration_unavailable" | "working_directory_failed" | "persistence_failed" | "persistence_outcome_unknown" | "store_unavailable" | "recording_source_unavailable" | "recording_ownership_unknown" | "recording_execution_unconfirmed" | "state_unavailable" | "authorization_failed" | "connection_failed" | "transport_failed" | "timed_out" | "request_encoding_failed" | "client_setup_failed" | "response_too_large" | "invalid_response" | "result_unavailable" | "unsupported_operation" | "remote_rejected";
 
-export type SubjectBodyFailedRequest = {
-  workspace_id: string;
-  subject_id: string;
-  request_id: string;
-  resolution: SubjectBodyRequestResolution;
-};
+export type SubjectBodyRequestResolution = "not_accepted" | "superseded" | "unresolved";
 
-export type SubjectBodyApiError = {
-  error: string;
-  message: string;
-  diagnostics: Array<Diagnostic>;
-  request: SubjectBodyFailedRequest | null;
-};
+export type SubjectBodyFailedRequest = { workspace_id: string, subject_id: string, request_id: string, resolution: SubjectBodyRequestResolution, };
 
-export type SubjectBodyRef = {
-  runtime_id: string;
-  worker_id: string;
-  /**
-   * Decimal text preserves the full singleton generation through browsers.
-   */
-  generation: string;
-};
+export type SubjectBodyApiError = { error: string, message: string, diagnostics: Array<Diagnostic>, request: SubjectBodyFailedRequest | null, };
 
-export type SubjectBodyObservation =
-  | { "kind": "absent" }
-  | { "kind": "failed_create" }
-  | { "kind": "available"; worker: WorkerSummary }
-  | { "kind": "unavailable"; diagnostics: Array<Diagnostic> };
+export type SubjectBodyRef = { runtime_id: string, worker_id: string,
+/**
+ * Decimal text preserves the full singleton generation through browsers.
+ */
+generation: string, };
 
-export type SubjectBodyResponse = {
-  workspace_id: string;
-  subject_id: string;
-  current: SubjectBodyRef | null;
-  observation: SubjectBodyObservation;
-  /**
-   * Account authority, not a claim that Profile/model/Runtime admission will succeed.
-   */
-  can_start: boolean;
-  can_stop: boolean;
-};
+export type SubjectBodyObservation = { "kind": "absent" } | { "kind": "failed_create" } | { "kind": "available", worker: WorkerSummary, } | { "kind": "unavailable", diagnostics: Array<Diagnostic>, };
 
-export type SubjectBodyStartRequest = {
-  request_id: string;
-  /**
-   * Null explicitly means the caller observed no owner, not an unspecified target.
-   */
-  expected_current: SubjectBodyRef | null;
-  expected_observation_token: string | null;
-};
+export type SubjectBodyResponse = { workspace_id: string, subject_id: string, current: SubjectBodyRef | null, observation: SubjectBodyObservation,
+/**
+ * Account authority, not a claim that Profile/model/Runtime admission will succeed.
+ */
+can_start: boolean, can_stop: boolean, };
 
-export type SubjectBodyRecoverRequest = {
-  request_id: string;
-  /**
-   * Recovery releases only this failed reservation; it never starts a replacement.
-   */
-  expected_current: SubjectBodyRef;
-};
+export type SubjectBodyStartRequest = { request_id: string,
+/**
+ * Null explicitly means the caller observed no owner, not an unspecified target.
+ */
+expected_current: SubjectBodyRef | null, expected_observation_token: string | null, };
 
-export type SubjectBodyStopRequest = {
-  request_id: string;
-  expected_current: SubjectBodyRef;
-  expected_observation_token: string;
-};
+export type SubjectBodyRecoverRequest = { request_id: string,
+/**
+ * Recovery releases only this failed reservation; it never starts a replacement.
+ */
+expected_current: SubjectBodyRef, };
+
+export type SubjectBodyStopRequest = { request_id: string, expected_current: SubjectBodyRef, expected_observation_token: string, };
 
 export type SubjectBodyDisposition = "accepted" | "rejected" | "unknown";
 
-export type SubjectBodyMutationResponse = {
-  request_id: string;
-  disposition: SubjectBodyDisposition;
-  diagnostics: Array<Diagnostic>;
-  /**
-   * Fresh observation is independent of the historical operation receipt.
-   */
-  body: SubjectBodyResponse | null;
-};
+export type SubjectBodyMutationResponse = { request_id: string, disposition: SubjectBodyDisposition, diagnostics: Array<Diagnostic>,
+/**
+ * Fresh observation is independent of the historical operation receipt.
+ */
+body: SubjectBodyResponse | null, };
 
-export type SubjectBodyStopOutcome = "not_found" | "pending" | "stopped";
+export type SubjectBodyStopOutcome = "not_found" | "pending" | "interrupted" | { "failed": { cause: RuntimeControlCause, } } | "stopped";
 
-export type SubjectBodyStopOutcomeResponse = {
-  request_id: string;
-  /**
-   * Historical operation evidence, never the current body's running state.
-   */
-  outcome: SubjectBodyStopOutcome;
-  body: SubjectBodyResponse | null;
-};
+export type SubjectBodyStopOutcomeResponse = { request_id: string,
+/**
+ * Historical operation evidence, never the current body's running state.
+ */
+outcome: SubjectBodyStopOutcome, body: SubjectBodyResponse | null, };

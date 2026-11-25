@@ -348,9 +348,7 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
             singleton_key: None, profile: Some("builtin:companion".into()),
             initial_submit: vec![protocol::Segment::Text { content: "User chose B rather than A. Continue the partial work without assuming success.".into() }],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest { subject_id: subject.into() }),
-            }, control_operation_id: Some(uuid::Uuid::now_v7().to_string()), authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None },
+            feature_connections: crate::server::subjektiv_worker_initialization::subject_connection(subject.into()).unwrap(), control_operation_id: Some(uuid::Uuid::now_v7().to_string()), authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None },
         }),
     ).await.unwrap();
     RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
@@ -859,10 +857,6 @@ async fn signed_compaction_read_does_not_contact_runtime_or_wait_for_active_gene
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("snapshot").unwrap())
         .unwrap();
-    let settings = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reserve = |key: String, operation: &str| {
         api.config_store
             .reserve_worker_create(
@@ -871,7 +865,6 @@ async fn signed_compaction_read_does_not_contact_runtime_or_wait_for_active_gene
                 operation,
                 &"f".repeat(64),
                 Some(&key),
-                &settings,
             )
             .unwrap()
             .worker_id
@@ -993,12 +986,19 @@ fn connected_host_reader(
         &worker.worker_id,
     )
     .with_runtime_request_source(&EMBEDDED_RUNTIME_REQUEST_IDENTITY, audience);
+    let language = api.config_store.with_conn(|conn| {
+        Ok(conn.query_row(
+            "SELECT subjektiv_memory_language FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+            rusqlite::params![TEST_WORKSPACE_ID, worker.runtime_id, worker.worker_id],
+            |row| row.get::<_, String>(0),
+        )?)
+    }).unwrap();
     let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
     config.profile.enabled = true;
     config
-        .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+        .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: TEST_WORKSPACE_ID.into(),
-            language: "English".into(),
+            language,
         })
         .unwrap();
     worker::subjektiv::SubjektivHostConnection::new(
@@ -1530,22 +1530,23 @@ async fn seed_unstarted_pending_head(
     .unwrap()
     .unwrap();
     let archive = bundle.profile_source_archive.clone().unwrap();
-    let settings = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let singleton = crate::subjektiv::subject_worker_singleton_key(subject_id).unwrap();
     // Reserve only: this supplies the real Host's Worker/Subject binding, but is
     // deliberately not completed as an accepted create operation.
+    let initialization = subjektiv_worker_initialization::fixture_subject_initialization(
+        TEST_WORKSPACE_ID,
+        subject_id,
+    )
+    .unwrap();
     let reservation = api
         .config_store
-        .reserve_worker_create(
+        .reserve_worker_create_with_initialization(
             TEST_WORKSPACE_ID,
             EMBEDDED_WORKER_RUNTIME_ID,
             "pending-head-fixture-reservation",
             &"f".repeat(64),
             Some(&singleton),
-            &settings,
+            &initialization,
         )
         .unwrap();
     let worker = RuntimeWorkerRef::new(
@@ -1588,8 +1589,8 @@ async fn seed_unstarted_pending_head(
         worker_observation_enabled: false,
         worker_observation_grants: Vec::new(),
         workspace_api: Some(api.workspace_api_ref(EMBEDDED_WORKER_RUNTIME_ID)),
-        memory_settings: Some(reservation.memory_settings.clone()),
-        subjektiv_attached: true,
+        memory_settings: reservation.subjektiv_memory_settings.clone(),
+        feature_initialization: initialization,
         backend_job: None,
     };
     let aggregate = root.join("workers").join(worker.worker_id.as_str());
@@ -1643,7 +1644,7 @@ enabled = false
     manifest
         .feature
         .subjektiv
-        .bind_workspace_settings(reservation.memory_settings)
+        .bind_workspace_settings(reservation.subjektiv_memory_settings.unwrap())
         .unwrap();
     let sessions = session_store::WorkerSessionStore::new(aggregate.join("session")).unwrap();
     let metadata = session_store::WorkerAggregateStore::new(&aggregate, &name).unwrap();
@@ -1701,14 +1702,23 @@ struct ConnectedRestoreFixture {
     _dir: tempfile::TempDir,
 }
 
-async fn connected_restore_fixture() -> ConnectedRestoreFixture {
-    connected_restore_fixture_with_pending_head(false).await
+#[derive(Clone, Copy)]
+enum ConnectedRestoreSource {
+    Stopped,
+    PendingHead,
+    RetiredMemoryPendingHead,
 }
 
-async fn connected_restore_fixture_with_pending_head(
-    pending_head: bool,
+async fn connected_restore_fixture() -> ConnectedRestoreFixture {
+    connected_restore_fixture_with_source(ConnectedRestoreSource::Stopped).await
+}
+
+async fn connected_restore_fixture_with_source(
+    source: ConnectedRestoreSource,
 ) -> ConnectedRestoreFixture {
     use std::sync::atomic::Ordering::SeqCst;
+
+    let pending_head = !matches!(source, ConnectedRestoreSource::Stopped);
 
     // Guard the resolved global paths before factory/config/allocation access.
     // No Git or Workdir attachment is needed for this connected regression.
@@ -1829,6 +1839,42 @@ async fn connected_restore_fixture_with_pending_head(
     } else {
         None
     };
+    let migration_expected = if matches!(source, ConnectedRestoreSource::RetiredMemoryPendingHead) {
+        let (worker, _) = pending_worker.as_ref().unwrap();
+        let root = &config.embedded_runtime_store_root;
+        let aggregate = root.join("workers").join(&worker.worker_id);
+        let read = |path: &std::path::Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let write = |path: &std::path::Path, value: &Value| {
+            std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        };
+        // Only never-started fixture data is changed. The final Runtime owner
+        // performs its production ordered migration before connected Restore.
+        let mut runtime = read(&root.join("runtime.json"));
+        let mut record = read(&aggregate.join("worker.json"));
+        let metadata = read(&aggregate.join("metadata.json"));
+        let request = record["execution_state"]["execution"]["request"].clone();
+        assert!(!request["feature_initialization"].is_null());
+        assert!(!request["memory_settings"].is_null());
+        let mut old_metadata = metadata.clone();
+        old_metadata["resolved_manifest_snapshot"]["manifest"]["feature"]["memory"] = json!({"profile":{"enabled":false,"resident":{"inject_summary":true},
+                "extraction":{"enabled":true}}});
+        assert!(
+            manifest::read_persisted_worker_manifest_snapshot(
+                old_metadata["resolved_manifest_snapshot"].clone()
+            )
+            .is_err()
+        );
+        runtime["schema_version"] = json!(20);
+        record["schema_version"] = json!(20);
+        write(&root.join("runtime.json"), &runtime);
+        write(&aggregate.join("worker.json"), &record);
+        write(&aggregate.join("metadata.json"), &old_metadata);
+        Some((worker.clone(), request, metadata))
+    } else {
+        None
+    };
     let api = if pending_head {
         shutdown_workspace_feature_storage(&api).await.unwrap();
         drop(store);
@@ -1846,6 +1892,22 @@ async fn connected_restore_fixture_with_pending_head(
     } else {
         api
     };
+    if let Some((worker, request, metadata)) = migration_expected {
+        let root = &api.config.embedded_runtime_store_root;
+        let aggregate = root.join("workers").join(&worker.worker_id);
+        let read = |path: &std::path::Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        assert_eq!(read(&root.join("runtime.json"))["schema_version"], 21);
+        let record = read(&aggregate.join("worker.json"));
+        assert_eq!(record["schema_version"], 21);
+        assert_eq!(record["execution_state"]["execution"]["request"], request);
+        assert_eq!(
+            read(&aggregate.join("metadata.json")),
+            metadata,
+            "migration must remove only retired policy, preserving the complete frozen Subject snapshot and pending Session"
+        );
+    }
     seed_test_delivery_binding(&api);
     let requests = Arc::new(Mutex::new(Vec::new()));
     let observed = requests.clone();
@@ -1943,11 +2005,11 @@ async fn connected_restore_fixture_with_pending_head(
                 profile: Some("builtin:companion".into()),
                 initial_submit: vec![],
                 workdir_attachments: vec![],
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: subject.id.clone(),
-                    }),
-                },
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(
+                        subject.id.clone(),
+                    )
+                    .unwrap(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
@@ -2241,10 +2303,149 @@ async fn confirmed_restore_preserves_attribution_with_revoked_host_trust_but_pro
     shutdown_workspace_feature_storage(api).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn confirmed_restore_rejects_changed_saved_identity_before_effects_without_implicit_repair() {
+    use session_store::{Store as _, WorkerMetadataStore as _};
+    use std::sync::atomic::Ordering::SeqCst;
+    use worker_runtime::execution::WorkerExecutionBackend as _;
+
+    for change in ["subject", "session", "unconfirmed"] {
+        let fixture = connected_restore_fixture().await;
+        let api = &fixture.api;
+        let worker = &fixture.worker;
+        let probe = &fixture.probe;
+        let aggregate = api
+            .config
+            .embedded_runtime_store_root
+            .join("workers")
+            .join(&worker.worker_id);
+        let name = format!("worker-runtime-{}", worker.worker_id);
+        let metadata = session_store::WorkerAggregateStore::new(&aggregate, &name).unwrap();
+        let saved = metadata.read_by_name(&name).unwrap().unwrap();
+        let active = saved.active.as_ref().unwrap();
+        let sessions =
+            session_store::WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+        let before = serde_json::to_value(
+            sessions
+                .read_all_read_only(active.session_id, active.segment_id.unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let store = open_subjektiv_store(api).unwrap();
+        let attributions = store
+            .subject_session_attributions(&fixture.subject_id)
+            .unwrap();
+        let model_before = fixture.model.calls.load(SeqCst);
+        let request = runtime_api::WorkerRestoreRequest {
+            expected_observation_token: api
+                .runtime
+                .worker(worker)
+                .unwrap()
+                .restore_observation_token
+                .unwrap(),
+            request_id: format!("restore-changed-{change}"),
+            preparation: Some(runtime_api::WorkerRestorePreparation::default()),
+        };
+        fixture.requests.lock().unwrap().clear();
+        fixture.callbacks.lock().unwrap().clear();
+        let runtime = api.runtime.clone();
+        let target = worker.clone();
+        let restoring =
+            tokio::task::spawn_blocking(move || runtime.restore_worker(&target, request));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            probe.prepared.notified(),
+        )
+        .await
+        .unwrap();
+        // Inject a competing saved-state change only after the real read-only
+        // candidate exists. Do not alter its frozen connection or trust grants.
+        metadata
+            .update_by_name(&name, |metadata| {
+                metadata.subjektiv_session_attribution = Some(match change {
+                    "subject" => session_store::SubjektivSessionAttributionState::Confirmed {
+                        session_id: active.session_id,
+                        subject_id: "different-subject".into(),
+                    },
+                    "session" => session_store::SubjektivSessionAttributionState::Confirmed {
+                        session_id: session_store::new_session_id(),
+                        subject_id: fixture.subject_id.clone(),
+                    },
+                    _ => session_store::SubjektivSessionAttributionState::OutcomeUnknown {
+                        session_id: active.session_id,
+                        diagnostic: "concurrent attribution acknowledgement loss".into(),
+                    },
+                });
+            })
+            .unwrap();
+        let changed = metadata.read_by_name(&name).unwrap().unwrap();
+        probe.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), restoring)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.state,
+            server_api::WorkerRestoreState::ReconciliationRequired,
+            "{change}: {result:?}"
+        );
+        assert_eq!(probe.prepares.load(SeqCst), 1);
+        assert_eq!(probe.publications.load(SeqCst), 0);
+        assert_eq!(fixture.model.calls.load(SeqCst), model_before);
+        assert!(
+            fixture.callbacks.lock().unwrap().is_empty(),
+            "{change}: ordinary restore must not repair a changed attribution"
+        );
+        assert_eq!(
+            metadata
+                .read_by_name(&name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution,
+            changed.subjektiv_session_attribution
+        );
+        assert_eq!(
+            serde_json::to_value(
+                sessions
+                    .read_all_read_only(active.session_id, active.segment_id.unwrap())
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .subject_session_attributions(&fixture.subject_id)
+                .unwrap(),
+            attributions
+        );
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(aggregate.join("worker.json")).unwrap()).unwrap();
+        assert!(
+            record["restore_guard"]["owners"][format!("restore-changed-{change}")]["receipt"]
+                .is_null()
+        );
+        let worker_ref = worker_runtime::identity::WorkerRef::try_from(worker).unwrap();
+        assert!(fixture.execution.worker_snapshot(&worker_ref).is_none());
+        let stop = worker_runtime::execution::WorkerExecutionStopRequest {
+            worker_ref: worker_ref.clone(),
+            operation_id: worker_runtime::execution::WorkerLifecycleOperationId::new(),
+        };
+        let cleanup = fixture.execution.stop_worker_operation(stop.clone());
+        assert!(cleanup.is_accepted(), "{change}: {cleanup:?}");
+        assert!(cleanup.termination.as_ref().is_some_and(|receipt| {
+            receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)
+        }));
+        shutdown_workspace_feature_storage(api).await.unwrap();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ConnectedRepair {
     IncompleteAttribution,
     PendingHead,
+    RetiredMemoryPendingHead,
     RevokedAttribution,
 }
 
@@ -2259,6 +2460,11 @@ async fn explicit_repair_pending_head_creates_one_session_after_lost_real_host_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn retired_memory_migration_preserves_frozen_subject_through_connected_restore_and_repair() {
+    connected_explicit_repair(ConnectedRepair::RetiredMemoryPendingHead).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn explicit_repair_replay_rejects_revoked_real_host_trust_without_false_accepted() {
     connected_explicit_repair(ConnectedRepair::RevokedAttribution).await;
 }
@@ -2268,8 +2474,15 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
     use std::sync::atomic::Ordering::SeqCst;
     use worker_runtime::execution::WorkerExecutionBackend as _;
 
-    let pending = matches!(scenario, ConnectedRepair::PendingHead);
-    let fixture = connected_restore_fixture_with_pending_head(pending).await;
+    let source = match scenario {
+        ConnectedRepair::PendingHead => ConnectedRestoreSource::PendingHead,
+        ConnectedRepair::RetiredMemoryPendingHead => {
+            ConnectedRestoreSource::RetiredMemoryPendingHead
+        }
+        _ => ConnectedRestoreSource::Stopped,
+    };
+    let pending = !matches!(source, ConnectedRestoreSource::Stopped);
+    let fixture = connected_restore_fixture_with_source(source).await;
     let api = &fixture.api;
     let probe = &fixture.probe;
     let worker = &fixture.worker;
@@ -2551,15 +2764,28 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
             server_api::WorkerRestoreState::ReconciliationRequired,
             "{replay:?}"
         );
-        assert!(
-            fixture
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(path, status)| path.ends_with("/subjektiv/sessions")
-                    && *status == StatusCode::UNAUTHORIZED)
-        );
+        {
+            let requests = fixture.requests.lock().unwrap();
+            assert!(requests.iter().any(|(path, status)| {
+                path.ends_with("/subjektiv/worker-connection")
+                    && *status == StatusCode::UNAUTHORIZED
+            }));
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(path, _)| path.ends_with("/subjektiv/sessions"))
+                    .count(),
+                1,
+                "current Host verification must refuse the replay before a second Session registration"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|(path, status)| path.ends_with("/subjektiv/sessions")
+                        && *status == StatusCode::OK),
+                "the first registration committed before its response was lost"
+            );
+        }
         assert_eq!(probe.prepares.load(SeqCst), 0);
         assert_eq!(probe.activations.load(SeqCst), 0);
         assert_eq!(probe.publications.load(SeqCst), 0);
@@ -2722,8 +2948,8 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
         );
         assert_eq!(
             callbacks.len(),
-            2,
-            "only the initial registration recovery and its same-operation retry contact the Host"
+            if revoked { 1 } else { 2 },
+            "revoked replay must stop at connection verification; otherwise only the initial registration and same-operation retry reach Session registration"
         );
         assert!(
             callbacks

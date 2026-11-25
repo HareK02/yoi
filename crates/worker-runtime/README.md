@@ -24,7 +24,7 @@ It does not add a product endpoint or change create/restore authorization.
    using normal setup. Preserve the template's Runtime and Workspace IDs.
 3. Call `template.install(&options, request, &resolved_manifest)` before starting
    the Runtime. Supply a fresh typed `CreateWorkerRequest` (including config/profile
-   references and trusted memory settings) and `manifest::WorkerManifest` resolved
+   references) and `manifest::WorkerManifest` resolved
    for that environment. Its Worker name must equal `template.worker_name()`.
 4. Start normally and use the ordinary explicit restore operation. Installation
    itself creates no execution and leaves the Worker stopped with a fresh guard.

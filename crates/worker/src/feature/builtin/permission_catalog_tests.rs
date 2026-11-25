@@ -77,6 +77,17 @@ fn builtin_declarations_preserve_legacy_exact_keys_without_using_legacy_resource
             }
         }
     }
+    for removed in [
+        "memory.document.read",
+        "memory.document.update",
+        "memory.audit.append",
+        "memory.staging.close",
+    ] {
+        assert!(
+            !keys.contains(removed),
+            "retired Workspace Memory operation {removed}"
+        );
+    }
     assert!(!keys.contains("mcp"));
     assert!(!keys.contains("subject.orchestrate"));
     assert!(!keys.contains("subject.delegate"));

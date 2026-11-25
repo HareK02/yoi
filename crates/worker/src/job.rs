@@ -450,7 +450,6 @@ fn validate_profile_with_grant(
         filesystem_write,
         bash,
         task,
-        memory,
         subjektiv,
         web,
         image,
@@ -476,12 +475,6 @@ fn validate_profile_with_grant(
         ),
         ("feature.bash", bash.enabled),
         ("feature.task", task.enabled),
-        (
-            "feature.memory",
-            memory.profile.enabled
-                || memory.profile.staging_tools
-                || memory.workspace_settings.is_some(),
-        ),
         (
             "feature.subjektiv",
             subjektiv.profile.enabled

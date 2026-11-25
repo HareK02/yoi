@@ -11,7 +11,7 @@ Workspace Webは、Workspaceの確定した状態を確認し、注意が必要�
 ## ナビゲーションの区分
 
 - Globalでは、Workspaceの選択・作成、Account、Device Loginなど、Workspaceを選ぶ前の操作を扱う。
-- Workspaceでは、Tickets、Objectives、Merge Requests、Drive、Memory、Workersなど、選択中のWorkspaceで日常的に扱う対象へ移動する。
+- Workspaceでは、Tickets、Objectives、Merge Requests、Drive、Subjects、Workersなど、選択中のWorkspaceで日常的に扱う対象へ移動する。MemoryはSubjectを選択して扱い、Workspace共通の記憶として表示しない。
 - Settingsでは、Runtime、Repositoryとそのアクセス設定、Configuration Sources、Profile Sources、Workspace Identityなど、Workspaceの管理と構成を扱う。これらを日常作業のナビゲーションへ混ぜない。
 
 存在しないWorkspace、閲覧できないWorkspace、読込みに失敗したWorkspaceは区別し、別のWorkspaceへ暗黙に切り替えない。読取り専用の場合も、利用できる閲覧機能を残す。

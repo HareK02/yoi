@@ -2,7 +2,6 @@
 mod lifecycle_tests {
     use super::*;
     use crate::catalog::WorkerLifecycleState;
-    use crate::fs_store::PersistedWorkerStopProgress;
 
     fn stored_runtime(options: FsRuntimeStoreOptions) -> (Runtime, Arc<TestExecutionBackend>) {
         let backend = Arc::new(TestExecutionBackend::default());
@@ -80,7 +79,7 @@ mod lifecycle_tests {
                 let record = state.worker(&worker.worker_ref).unwrap();
                 assert!(record.pending_stop().is_none());
                 assert!(record.pending_restore().is_none());
-                assert!(record.restore_guard.stop_owners.is_empty());
+                assert!(record.restore_guard.stop_results.is_empty());
                 assert!(record.restore_guard.completed_stop_facts.is_empty());
                 state.persist_worker(&worker.worker_id).unwrap();
             }
@@ -261,7 +260,7 @@ mod lifecycle_tests {
                     .expect("new Create must have a durable operation id");
                 assert!(create.request.is_some());
                 assert!(saved.restore_guard.execution_termination.is_none());
-                assert!(saved.restore_guard.stop_owners.is_empty());
+                assert!(saved.restore_guard.stop_results.is_empty());
                 assert!(saved.restore_guard.completed_stop_facts.is_empty());
                 let state = runtime.lock().unwrap();
                 let WorkerExecutionState::Creating(current) =
@@ -366,8 +365,8 @@ mod lifecycle_tests {
             serde_json::to_value(&before.restore_guard.owners).unwrap()
         );
         assert_eq!(
-            serde_json::to_value(&after.restore_guard.stop_owners).unwrap(),
-            serde_json::to_value(&before.restore_guard.stop_owners).unwrap()
+            serde_json::to_value(&after.restore_guard.stop_results).unwrap(),
+            serde_json::to_value(&before.restore_guard.stop_results).unwrap()
         );
         assert_eq!(
             serde_json::to_value(&after.restore_guard.completed_stop_facts).unwrap(),
@@ -396,20 +395,19 @@ mod lifecycle_tests {
             Some(&receipt)
         );
         assert_eq!(
-            serde_json::to_value(&record.restore_guard.stop_owners).unwrap(),
-            serde_json::to_value(&before.restore_guard.stop_owners).unwrap()
+            serde_json::to_value(&record.restore_guard.stop_results).unwrap(),
+            serde_json::to_value(&before.restore_guard.stop_results).unwrap()
         );
     }
 
-    // Only the factory-owned cleanup boundary is faulted. The backend below is
-    // production saved-Stop reconciliation; no Controller may be spawned again.
-    struct CleanupRetryFactory {
-        fail: Arc<AtomicBool>,
+    // Tripwire at the factory-owned resource boundary: reopen must neither retry
+    // cleanup as a saved Stop nor spawn a replacement Controller.
+    struct CleanupFailureFactory {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
-    impl crate::worker_backend::RuntimeWorkerFactory for CleanupRetryFactory {
+    impl crate::worker_backend::RuntimeWorkerFactory for CleanupFailureFactory {
         async fn spawn_controller(
             &self,
             _: WorkerExecutionSpawnRequest,
@@ -417,7 +415,7 @@ mod lifecycle_tests {
             crate::worker_backend::RuntimeWorkerController,
             crate::worker_backend::RuntimeRestoreFailure,
         > {
-            panic!("saved Stop cleanup must not spawn a Controller")
+            panic!("historical Stop must not spawn a Controller")
         }
 
         async fn prepare_restore(
@@ -427,34 +425,30 @@ mod lifecycle_tests {
             Box<dyn crate::worker_backend::RuntimeRestoreCandidate>,
             crate::worker_backend::RuntimeRestoreFailure,
         > {
-            panic!("saved Stop cleanup must not prepare a replacement")
+            panic!("historical Stop must not prepare a replacement")
         }
 
         async fn reconcile_stopped_worker(&self, _: &WorkerRef) -> Result<(), String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail.load(Ordering::SeqCst) {
-                Err("factory artifact cleanup still pending".into())
-            } else {
-                Ok(())
-            }
+            Err("factory artifact cleanup still pending".into())
         }
     }
 
     #[test]
-    fn scope_terminated_cleanup_failure_reopens_and_retries_same_stop_without_second_stop() {
+    fn scope_terminated_cleanup_failure_is_stopped_history_without_startup_retry() {
         let dir = tempfile::tempdir().unwrap();
         let options =
-            FsRuntimeStoreOptions::new(dir.path()).with_runtime_id("stop-cleanup-progress");
+            FsRuntimeStoreOptions::new(dir.path()).with_runtime_id("stop-cleanup-history");
         let (runtime, backend) = stored_runtime(options.clone());
         let worker = runtime
-            .create_worker(task_request("joined scope, pending cleanup"))
+            .create_worker(task_request("joined scope, failed cleanup"))
             .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "cleanup-failed");
         let operation_id = WorkerLifecycleOperationId::new();
         runtime
-            .begin_stop_operation(&worker.worker_ref, operation_id)
+            .begin_stop_operation_request(&worker.worker_ref, operation_id, Some(request.clone()))
             .unwrap();
-        // Substitute only the execution-owner join response, as in existing
-        // execution_termination_tests. All lifecycle/save/reopen work is real.
+        // Substitute only the execution-owner response. Lifecycle/save/reopen are real.
         let mut result = backend.stop_worker_operation(WorkerExecutionStopRequest {
             worker_ref: worker.worker_ref.clone(),
             operation_id,
@@ -466,94 +460,28 @@ mod lifecycle_tests {
             runtime.commit_stopped_worker(&worker.worker_ref, operation_id, result),
             Err(RuntimeError::WorkerExecutionRejected { .. })
         ));
-        let saved = runtime_store(&runtime)
-            .read_worker_record(&worker.worker_ref)
-            .unwrap();
-        let PersistedWorkerExecutionState::ReconciliationRequired(
-            PersistedWorkerLifecycleOperation::Stop(stop),
-        ) = saved.execution_state
-        else {
-            panic!("cleanup failure must retain Stop, not settle Stopped")
-        };
-        assert_eq!(stop.operation_id, operation_id);
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().lifecycle,
+            WorkerLifecycleState::Stopped
+        );
         assert!(
-            matches!(stop.progress, PersistedWorkerStopProgress::ScopeTerminated(ref original) if original == &termination)
-        );
-        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
-        drop(runtime);
-
-        let reopened = Runtime::with_fs_store(options.clone()).unwrap();
-        assert_no_current_execution(&reopened, &worker.worker_ref);
-        {
-            let state = reopened.lock().unwrap();
-            let record = state.worker(&worker.worker_ref).unwrap();
-            assert_eq!(record.lifecycle(), WorkerLifecycleState::RecoveryRequired);
-            assert_eq!(record.pending_stop().unwrap().operation_id, operation_id);
-            assert!(
-                matches!(&record.stop_operation().unwrap().progress, StopProgress::ScopeTerminated(original) if original == &termination)
-            );
-        }
-        drop(reopened);
-
-        let fail = Arc::new(AtomicBool::new(true));
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let production = Arc::new(
-            crate::worker_backend::WorkerRuntimeExecutionBackend::new(CleanupRetryFactory {
-                fail: fail.clone(),
-                calls: calls.clone(),
-            })
-            .unwrap(),
-        );
-        // Startup invokes the production factory cleanup hook, and must leave
-        // the same canonical progress unresolved when that hook fails again.
-        let reopened =
-            Runtime::with_fs_store_and_execution_backend(options.clone(), production).unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            reopened
-                .worker_detail(&worker.worker_ref)
-                .unwrap()
-                .lifecycle,
-            WorkerLifecycleState::RecoveryRequired
-        );
-        assert_eq!(
-            reopened
+            runtime
                 .lock()
                 .unwrap()
                 .worker(&worker.worker_ref)
                 .unwrap()
                 .pending_stop()
-                .unwrap()
-                .operation_id,
-            operation_id
+                .is_none()
         );
         assert_eq!(
-            reopened.execution_termination(&worker.worker_ref).unwrap(),
-            Some(termination.clone())
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Failed {
+                cause: RuntimeControlCause::StopTerminatedCleanupFailed
+            }
         );
-        fail.store(false, Ordering::SeqCst);
-        {
-            let operation_lock = reopened.worker_operation_lock(worker.worker_id).unwrap();
-            let _guard = operation_lock.lock().unwrap();
-            reopened
-                .reconcile_pending_stop_under_lock(&worker.worker_ref)
-                .unwrap();
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
-        assert_eq!(
-            backend.stop_operation_ids.lock().unwrap().as_slice(),
-            &[operation_id]
-        );
-        assert_eq!(
-            reopened
-                .worker_detail(&worker.worker_ref)
-                .unwrap()
-                .lifecycle,
-            WorkerLifecycleState::Stopped
-        );
-        assert_no_current_execution(&reopened, &worker.worker_ref);
-        let saved = runtime_store(&reopened)
+        let saved = runtime_store(&runtime)
             .read_worker_record(&worker.worker_ref)
             .unwrap();
         assert!(matches!(
@@ -564,15 +492,84 @@ mod lifecycle_tests {
             saved.restore_guard.execution_termination,
             Some(termination.clone())
         );
-        assert_eq!(saved.restore_guard.completed_stop_facts.len(), 1);
+        assert!(
+            saved.restore_guard.stop_results["cleanup-failed"]
+                .receipt
+                .is_some()
+        );
         assert!(
             saved
                 .restore_guard
                 .completed_stop_facts
                 .contains_key(&operation_id.to_string())
         );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        drop(runtime);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let production = Arc::new(
+            crate::worker_backend::WorkerRuntimeExecutionBackend::new(CleanupFailureFactory {
+                calls: calls.clone(),
+            })
+            .unwrap(),
+        );
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), production).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "startup must not resume old cleanup as Stop"
+        );
+        assert_no_current_execution(&reopened, &worker.worker_ref);
+        assert_eq!(
+            reopened
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .lifecycle,
+            WorkerLifecycleState::Stopped
+        );
+        assert!(
+            reopened
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_stop()
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Failed {
+                cause: RuntimeControlCause::StopTerminatedCleanupFailed
+            }
+        );
+        let replay = reopened
+            .stop_worker_request(&worker.worker_ref, request)
+            .unwrap_err();
+        assert_eq!(replay.control_cause(), RuntimeControlCause::StopTerminatedCleanupFailed);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "historical replay must not retry resource cleanup"
+        );
+        assert_eq!(
+            reopened.execution_termination(&worker.worker_ref).unwrap(),
+            Some(termination.clone())
+        );
+
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
         drop(reopened);
-        let reopened = Runtime::with_fs_store(options).unwrap();
+        let cold_backend = Arc::new(
+            crate::worker_backend::WorkerRuntimeExecutionBackend::new(CleanupFailureFactory {
+                calls: calls.clone(),
+            })
+            .unwrap(),
+        );
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options, cold_backend).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             reopened
                 .worker_detail(&worker.worker_ref)
@@ -581,14 +578,378 @@ mod lifecycle_tests {
             WorkerLifecycleState::Stopped
         );
         assert_eq!(
-            runtime_store(&reopened)
-                .read_worker_record(&worker.worker_ref)
-                .unwrap()
-                .restore_guard
-                .execution_termination,
+            reopened.execution_termination(&worker.worker_ref).unwrap(),
             Some(termination)
         );
         assert_no_current_execution(&reopened, &worker.worker_ref);
+    }
+
+    #[test]
+    fn stop_timeout_or_error_restores_owned_execution_and_persists_terminal_failure() {
+        for message in ["shutdown wait timed out", "execution owner stop error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let options =
+                FsRuntimeStoreOptions::new(dir.path()).with_runtime_id("failed-stop-history");
+            let (runtime, backend) = stored_runtime(options.clone());
+            let worker = runtime
+                .create_worker(task_request("still owned execution"))
+                .unwrap();
+            let before = runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .active_execution()
+                .unwrap()
+                .clone();
+            let request = test_stop_request(&runtime, &worker.worker_ref, "failed-stop");
+            backend.set_stop_result(WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Stop,
+                message,
+            ));
+            assert!(matches!(
+                runtime.stop_worker_request(&worker.worker_ref, request.clone()),
+                Err(RuntimeError::WorkerExecutionRejected { .. })
+            ));
+            {
+                let state = runtime.lock().unwrap();
+                let record = state.worker(&worker.worker_ref).unwrap();
+                assert!(record.pending_stop().is_none());
+                assert_eq!(record.lifecycle(), WorkerLifecycleState::Active);
+                let active = record
+                    .active_execution()
+                    .expect("failed stop retains the old owned execution");
+                assert_eq!(active.snapshot, before.snapshot);
+                assert!(
+                    !active.observation_valid,
+                    "failure must not claim fresh observation"
+                );
+                assert!(record.restore_guard.execution_termination.is_none());
+                assert!(record.restore_guard.completed_stop_facts.is_empty());
+            }
+            assert_eq!(
+                runtime
+                    .worker_stop_outcome(&worker.worker_ref, request.clone())
+                    .unwrap(),
+                crate::catalog::WorkerStopOutcome::Failed {
+                    cause: RuntimeControlCause::ExecutionRejected
+                }
+            );
+            assert!(matches!(
+                runtime.stop_worker_request(&worker.worker_ref, request.clone()),
+                Err(RuntimeError::StopRequestFailed {
+                    cause: RuntimeControlCause::ExecutionRejected,
+                    ..
+                })
+            ));
+            assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+            let saved = runtime_store(&runtime)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            assert!(matches!(
+                saved.execution_state,
+                PersistedWorkerExecutionState::Suspended(Some(_))
+            ));
+            assert!(saved.restore_guard.automatic_restore_suppressed);
+            assert_eq!(
+                saved.restore_guard.stop_results["failed-stop"].failure,
+                Some(RuntimeControlCause::ExecutionRejected)
+            );
+            drop(runtime);
+            let cold_backend = Arc::new(TestExecutionBackend::default());
+            let reopened =
+                Runtime::with_fs_store_and_execution_backend(options, cold_backend.clone())
+                    .unwrap();
+            assert_eq!(*cold_backend.restore_count.lock().unwrap(), 0);
+            assert_eq!(*cold_backend.stop_count.lock().unwrap(), 0);
+            assert_no_current_execution(&reopened, &worker.worker_ref);
+            assert_eq!(
+                reopened
+                    .worker_detail(&worker.worker_ref)
+                    .unwrap()
+                    .lifecycle,
+                WorkerLifecycleState::AwaitingRestore
+            );
+            assert!(
+                reopened
+                    .lock()
+                    .unwrap()
+                    .worker(&worker.worker_ref)
+                    .unwrap()
+                    .pending_stop()
+                    .is_none()
+            );
+            assert_eq!(
+                reopened
+                    .worker_stop_outcome(&worker.worker_ref, request)
+                    .unwrap(),
+                crate::catalog::WorkerStopOutcome::Failed {
+                    cause: RuntimeControlCause::ExecutionRejected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_stop_admission_reopens_suspended_and_explicit_restore_rechecks_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let options =
+            FsRuntimeStoreOptions::new(dir.path()).with_runtime_id("interrupted-admission");
+        let (runtime, backend) = stored_runtime(options.clone());
+        let worker = runtime
+            .create_worker(task_request("interrupted before dispatch"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "interrupted-stop");
+        assert_eq!(
+            runtime
+                .coordinate_worker_stop(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Pending
+        );
+        let saved = runtime_store(&runtime)
+            .read_worker_record(&worker.worker_ref)
+            .unwrap();
+        assert!(matches!(
+            saved.execution_state,
+            PersistedWorkerExecutionState::Suspended(Some(_))
+        ));
+        assert!(saved.restore_guard.automatic_restore_suppressed);
+        assert!(
+            saved.restore_guard.stop_results["interrupted-stop"]
+                .receipt
+                .is_none()
+        );
+        assert!(
+            saved.restore_guard.stop_results["interrupted-stop"]
+                .failure
+                .is_none()
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        drop(runtime);
+        let cold_backend = Arc::new(TestExecutionBackend::default());
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), cold_backend.clone())
+                .unwrap();
+        assert_eq!(*cold_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(*cold_backend.stop_count.lock().unwrap(), 0);
+        assert_no_current_execution(&reopened, &worker.worker_ref);
+        assert!(
+            reopened
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_stop()
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Interrupted
+        );
+        assert!(matches!(
+            reopened.stop_worker_request(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::StopRequestInterrupted { .. })
+        ));
+
+        // Only the execution-owner preflight response is substituted. Interrupted
+        // history must not bypass current resource-owner rejection or block retry.
+        *cold_backend.preflight_restore_result.lock().unwrap() =
+            Some(WorkerExecutionResult::unsupported(
+                WorkerExecutionOperation::Restore,
+                "resource owner requires cleanup",
+            ));
+        let denied = reopened
+            .restore_worker_operation(
+                &worker.worker_ref,
+                reopened.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
+        assert_eq!(denied.state, WorkerRestoreState::Rejected);
+        assert_eq!(*cold_backend.restore_count.lock().unwrap(), 0);
+        *cold_backend.preflight_restore_result.lock().unwrap() = None;
+        let restored = reopened
+            .restore_worker_operation(
+                &worker.worker_ref,
+                reopened.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
+        assert_eq!(restored.state, WorkerRestoreState::Accepted);
+        assert_eq!(*cold_backend.restore_count.lock().unwrap(), 1);
+        let token = reopened
+            .worker_detail(&worker.worker_ref)
+            .unwrap()
+            .restore_observation_token;
+        assert!(matches!(
+            reopened.stop_worker_request(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::StopRequestInterrupted { .. })
+        ));
+        assert_eq!(
+            reopened
+                .worker_stop_outcome(&worker.worker_ref, request)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Interrupted
+        );
+        assert_eq!(
+            reopened
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token,
+            token
+        );
+        assert_eq!(*cold_backend.stop_count.lock().unwrap(), 0);
+        assert!(
+            !runtime_store(&reopened)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap()
+                .restore_guard
+                .automatic_restore_suppressed
+        );
+    }
+
+    #[test]
+    fn stopped_save_failure_keeps_actual_termination_and_never_resumes_stop_on_reopen() {
+        use crate::fs_store::AtomicWriteFault;
+        for fault in [
+            AtomicWriteFault::BeforeRename,
+            AtomicWriteFault::AfterRename,
+        ] {
+            for warm_retry in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let options =
+                    FsRuntimeStoreOptions::new(dir.path()).with_runtime_id("stop-save-failed");
+                let (runtime, backend) = stored_runtime(options.clone());
+                let worker = runtime
+                    .create_worker(task_request("terminated before save fault"))
+                    .unwrap();
+                let request = test_stop_request(&runtime, &worker.worker_ref, "save-failed-stop");
+                let operation_id = WorkerLifecycleOperationId::new();
+                runtime
+                    .begin_stop_operation_request(
+                        &worker.worker_ref,
+                        operation_id,
+                        Some(request.clone()),
+                    )
+                    .unwrap();
+                let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
+                    worker_ref: worker.worker_ref.clone(),
+                    operation_id,
+                });
+                let termination = result.termination.clone().unwrap();
+                let store = runtime_store(&runtime);
+                store.fail_next_worker_write(fault);
+                if matches!(fault, AtomicWriteFault::AfterRename) {
+                    store.fail_next_worker_reconcile_sync();
+                }
+                let error = runtime
+                    .commit_stopped_worker(&worker.worker_ref, operation_id, result)
+                    .unwrap_err();
+                let RuntimeError::WorkerStopPersistenceFailed { result, source, .. } = error else {
+                    panic!("confirmed termination must return a distinct persistence failure")
+                };
+                assert_eq!(result.termination, Some(termination.clone()));
+                assert!(
+                    matches!(*source, RuntimeError::StoreCommitOutcomeUnknown { .. })
+                        == matches!(fault, AtomicWriteFault::AfterRename)
+                );
+                {
+                    let state = runtime.lock().unwrap();
+                    let record = state.worker(&worker.worker_ref).unwrap();
+                    assert_eq!(record.lifecycle(), WorkerLifecycleState::Stopped);
+                    assert!(record.pending_stop().is_none());
+                    assert_eq!(
+                        record.restore_guard.execution_termination,
+                        Some(termination.clone())
+                    );
+                }
+                assert_no_current_execution(&runtime, &worker.worker_ref);
+                if warm_retry {
+                    if matches!(fault, AtomicWriteFault::AfterRename) {
+                        assert!(matches!(
+                            runtime.worker_stop_outcome(&worker.worker_ref, request.clone()),
+                            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+                        ));
+                        let ack = runtime
+                            .stop_worker_request(&worker.worker_ref, request.clone())
+                            .unwrap();
+                        assert!(ack.replayed);
+                    } else {
+                        assert_eq!(
+                            runtime.worker_stop_outcome(&worker.worker_ref, request.clone()).unwrap(),
+                            crate::catalog::WorkerStopOutcome::Failed {
+                                cause: RuntimeControlCause::StopTerminatedPersistenceFailed
+                            }
+                        );
+                        assert!(runtime.stop_worker_request(&worker.worker_ref, request.clone()).is_err());
+                        // A new request can save settled facts, but cannot turn
+                        // the previous failed save into a successful receipt.
+                        let fresh = test_stop_request(&runtime, &worker.worker_ref, "save-settled-facts");
+                        runtime.stop_worker_request(&worker.worker_ref, fresh).unwrap();
+                    }
+                }
+                assert_eq!(
+                    *backend.stop_count.lock().unwrap(),
+                    1,
+                    "saving or replaying must not repeat physical Stop"
+                );
+                drop(store);
+                drop(runtime);
+                let cold_backend = Arc::new(TestExecutionBackend::default());
+                let reopened =
+                    Runtime::with_fs_store_and_execution_backend(options, cold_backend.clone())
+                        .unwrap();
+                assert_eq!(*cold_backend.restore_count.lock().unwrap(), 0);
+                assert_eq!(*cold_backend.stop_count.lock().unwrap(), 0);
+                assert!(
+                    reopened
+                        .lock()
+                        .unwrap()
+                        .worker(&worker.worker_ref)
+                        .unwrap()
+                        .pending_stop()
+                        .is_none()
+                );
+                assert_no_current_execution(&reopened, &worker.worker_ref);
+                let disk = runtime_store(&reopened)
+                    .read_worker_record(&worker.worker_ref)
+                    .unwrap();
+                if !warm_retry && matches!(fault, AtomicWriteFault::BeforeRename) {
+                    assert!(matches!(
+                        disk.execution_state,
+                        PersistedWorkerExecutionState::Suspended(Some(_))
+                    ));
+                    assert!(
+                        disk.restore_guard.execution_termination.is_none(),
+                        "lost save must not fabricate durable join evidence"
+                    );
+                    assert_eq!(
+                        reopened
+                            .worker_stop_outcome(&worker.worker_ref, request)
+                            .unwrap(),
+                        crate::catalog::WorkerStopOutcome::Interrupted
+                    );
+                } else {
+                    assert!(matches!(
+                        disk.execution_state,
+                        PersistedWorkerExecutionState::Stopped(_)
+                    ));
+                    assert_eq!(disk.restore_guard.execution_termination, Some(termination));
+                    if matches!(fault, AtomicWriteFault::BeforeRename) {
+                        assert_eq!(
+                            reopened.worker_stop_outcome(&worker.worker_ref, request).unwrap(),
+                            crate::catalog::WorkerStopOutcome::Failed {
+                                cause: RuntimeControlCause::StopTerminatedPersistenceFailed
+                            }
+                        );
+                    } else {
+                        assert!(
+                            matches!(reopened.worker_stop_outcome(&worker.worker_ref, request).unwrap(), crate::catalog::WorkerStopOutcome::Stopped { ack } if ack.replayed)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -765,7 +1126,7 @@ mod lifecycle_tests {
             WorkerExecutionOperation::Input,
             "input rejected",
         ));
-        // The gate substitutes only the stop response after the durable owner is
+        // The gate substitutes only the stop response after the memory-only Stop is
         // admitted, so its matching operation ID is observed, not guessed.
         backend.set_stop_result(WorkerExecutionResult::accepted(
             WorkerExecutionOperation::Stop,
@@ -809,8 +1170,12 @@ mod lifecycle_tests {
         );
         let state = runtime.lock().unwrap();
         let record = state.worker(&worker_ref).unwrap();
-        assert_eq!(record.pending_stop().unwrap().operation_id, operation_id);
-        assert!(record.stop_termination().is_none());
+        assert!(record.pending_stop().is_none());
+        assert!(matches!(
+            record.execution,
+            WorkerExecutionState::RecoveryRequired(WorkerLifecycleOperation::Create(_))
+        ));
+        assert!(record.restore_guard.execution_termination.is_none());
         assert!(record.restore_guard.completed_stop_facts.is_empty());
         drop(state);
         assert!(matches!(
@@ -819,7 +1184,7 @@ mod lifecycle_tests {
                 .unwrap()
                 .execution_state,
             PersistedWorkerExecutionState::ReconciliationRequired(
-                PersistedWorkerLifecycleOperation::Stop(_)
+                PersistedWorkerLifecycleOperation::Create(_)
             )
         ));
     }
@@ -942,7 +1307,7 @@ mod lifecycle_tests {
         assert_eq!(record.lifecycle(), WorkerLifecycleState::Active);
     }
     #[test]
-    fn stop_owns_finalization_across_failed_backend_terminal_save_and_cold_retry() {
+    fn interrupted_stop_preserves_restore_finalization_and_new_stop_uses_fresh_memory_owner() {
         for receipt_stored in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
@@ -997,21 +1362,13 @@ mod lifecycle_tests {
             let canonical = runtime_store(&resumed)
                 .read_worker_record(&worker.worker_ref)
                 .unwrap();
-            let PersistedWorkerExecutionState::ReconciliationRequired(
-                PersistedWorkerLifecycleOperation::Stop(stop),
-            ) = &canonical.execution_state
+            let PersistedWorkerExecutionState::RestoreFinalization(finalization) =
+                &canonical.execution_state
             else {
-                panic!("Stop admission lost its phase")
+                panic!("Stop must preserve independent Restore finalization, not persist a Stop")
             };
-            assert_eq!(stop.operation_id, stop_operation);
-            assert!(
-                stop.pending_restore.is_none(),
-                "finalization is not an uncommitted restore"
-            );
-            assert_eq!(
-                stop.restore_finalization.as_ref().unwrap().operation_id,
-                restore_operation
-            );
+            assert_eq!(finalization.operation_id, restore_operation);
+            assert!(canonical.restore_guard.automatic_restore_suppressed);
             let failure = WorkerExecutionResult::errored(
                 WorkerExecutionOperation::Stop,
                 "backend unavailable",
@@ -1021,32 +1378,42 @@ mod lifecycle_tests {
                     .commit_stopped_worker(&worker.worker_ref, stop_operation, failure)
                     .is_err()
             );
-            runtime_store(&resumed)
-                .read_worker_record(&worker.worker_ref)
-                .unwrap();
-            drop(resumed);
-
-            let resumed = Runtime::with_fs_store(options.clone()).unwrap();
-            let backend = Arc::new(TestExecutionBackend::default());
-            resumed.lock().unwrap().execution_backend =
-                Some(crate::execution::WorkerExecutionBackendRef::new(backend.clone()).unwrap());
-            assert_eq!(
+            assert!(
                 resumed
                     .lock()
                     .unwrap()
                     .worker(&worker.worker_ref)
                     .unwrap()
                     .pending_stop()
+                    .is_none()
+            );
+            let saved = runtime_store(&resumed)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            assert_eq!(saved.execution_state, canonical.execution_state);
+            drop(resumed);
+
+            let resumed = Runtime::with_fs_store(options.clone()).unwrap();
+            let backend = Arc::new(TestExecutionBackend::default());
+            resumed.lock().unwrap().execution_backend =
+                Some(crate::execution::WorkerExecutionBackendRef::new(backend.clone()).unwrap());
+            assert!(
+                resumed
+                    .lock()
                     .unwrap()
-                    .operation_id,
-                stop_operation
+                    .worker(&worker.worker_ref)
+                    .unwrap()
+                    .pending_stop()
+                    .is_none()
             );
             runtime_store(&resumed)
                 .fail_next_worker_write(crate::fs_store::AtomicWriteFault::BeforeRename);
             assert!(resumed.stop_worker(&worker.worker_ref, None).is_err());
-            runtime_store(&resumed)
-                .read_worker_record(&worker.worker_ref)
-                .unwrap();
+            assert_eq!(
+                *backend.stop_count.lock().unwrap(),
+                0,
+                "failed intent save must not dispatch Stop"
+            );
             drop(resumed);
 
             let resumed = Runtime::with_fs_store(options).unwrap();
@@ -1076,13 +1443,11 @@ mod lifecycle_tests {
                 );
             }
             assert_eq!(*backend.restore_count.lock().unwrap(), 0);
-            assert!(
-                backend
-                    .stop_operation_ids
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|id| *id == stop_operation)
+            let ids = backend.stop_operation_ids.lock().unwrap();
+            assert_eq!(ids.len(), 1);
+            assert_ne!(
+                ids[0], stop_operation,
+                "a new Stop is not the old interrupted call"
             );
         }
     }
@@ -1125,6 +1490,15 @@ mod lifecycle_tests {
                 }
             }
             remove_lifecycle(&mut document);
+            let guard = document["restore_guard"].as_object_mut().unwrap();
+            guard.remove("automatic_restore_suppressed");
+            if let Some(mut results) = guard.remove("stop_results") {
+                for result in results.as_object_mut().unwrap().values_mut() {
+                    result["operation_id"] = serde_json::json!(WorkerLifecycleOperationId::new());
+                    result.as_object_mut().unwrap().remove("failure");
+                }
+                guard.insert("stop_owners".into(), results);
+            }
             document["schema_version"] = serde_json::json!(17);
             document["status"] = serde_json::json!(status);
             document["execution_state"] = serde_json::json!({"state":"unavailable"});

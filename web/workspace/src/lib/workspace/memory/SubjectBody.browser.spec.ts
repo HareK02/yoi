@@ -617,7 +617,7 @@ test.each(["not_found", "pending"])(
   },
 );
 
-test("historical stopped outcome settles only the old request while restored body remains running", async () => {
+test.each(["stopped", "interrupted", { failed: { cause: "stop_terminated_persistence_failed" } }, { failed: { cause: "stop_terminated_persistence_outcome_unknown" } }, { failed: { cause: "stop_terminated_cleanup_failed" } }])("historical terminal outcome %j settles only the old request while restored body remains running", async (outcome) => {
   const posts: { path: string; body: string }[] = [];
   let observation = available("idle");
   vi.stubGlobal(
@@ -630,7 +630,7 @@ test("historical stopped outcome settles only the old request while restored bod
         observation = available("running", "restored-observation");
         return Response.json({
           request_id: request.request_id,
-          outcome: "stopped",
+          outcome,
           body: observation,
         });
       }
@@ -670,6 +670,7 @@ test("historical stopped outcome settles only the old request while restored bod
     .toHaveLength(1);
   expect(posts[1].path.endsWith("/stop/outcome")).toBe(true);
   expect(posts[1].body).toBe(posts[0].body);
+  if (outcome !== "stopped") expect(screen.getByText(/The Stop request (was interrupted|failed)/)).toBeTruthy();
 });
 
 test.each([

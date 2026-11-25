@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(value["slug"], "default");
         assert_eq!(value["feature"]["task"]["enabled"], true);
         assert_eq!(value["feature"]["sub_worker"]["enabled"], true);
-        assert_eq!(value["feature"]["memory"]["enabled"], false);
+        assert!(value["feature"].get("memory").is_none());
         assert_eq!(value["feature"]["ticket"]["enabled"], false);
         assert_eq!(value["feature"]["worker"]["enabled"], false);
         assert_eq!(value["feature"]["manage_workdir"]["enabled"], false);
@@ -173,7 +173,36 @@ mod tests {
         assert_eq!(value["delegation_scope"]["intent"], "workspace_write");
         assert_eq!(value["delegation_scope"]["symlink_policy"], "logical");
         assert_eq!(value["feature"]["sub_worker"]["enabled"], true);
-        assert_eq!(value["feature"]["memory"]["enabled"], false);
+        assert!(value["feature"].get("memory").is_none());
+    }
+
+    #[test]
+    fn builtin_catalog_removes_workspace_memory_but_keeps_subject_consolidation() {
+        let catalog = builtin_profile_catalog_snapshot();
+        assert!(
+            !catalog
+                .entrypoints
+                .contains_key("builtin:memory-consolidation")
+        );
+        assert!(
+            !catalog
+                .sources
+                .contains_key("profiles/memory-consolidation.dcdl")
+        );
+        assert!(
+            resolve_builtin_profile_artifact("builtin:memory-consolidation")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .entrypoints
+                .contains_key("builtin:subjektiv-memory-consolidation")
+        );
+        for selector in catalog.entrypoints.keys() {
+            let value = resolve_builtin_profile_artifact(selector).unwrap().unwrap();
+            assert!(value["feature"].get("memory").is_none(), "{selector}");
+        }
     }
 
     #[test]

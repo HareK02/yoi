@@ -134,8 +134,6 @@ pub struct FeatureConfig {
     pub bash: FeatureFlagConfig,
     #[serde(default)]
     pub task: FeatureFlagConfig,
-    #[serde(default)]
-    pub memory: ResolvedMemoryFeatureConfig,
     /// Subject-scoped Memory extraction. Subject identity is resolved by the
     /// Workspace host from the Worker's keyed singleton lease, never from this
     /// model-visible manifest.
@@ -228,7 +226,6 @@ impl Default for FeatureConfig {
             filesystem_write: FeatureFlagConfig::enabled(),
             bash: FeatureFlagConfig::enabled(),
             task: FeatureFlagConfig::disabled(),
-            memory: ResolvedMemoryFeatureConfig::default(),
             subjektiv: ResolvedSubjektivFeatureConfig::default(),
             web: FeatureFlagConfig::disabled(),
             image: FeatureFlagConfig::disabled(),
@@ -313,56 +310,6 @@ const fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct MemoryFeatureProfileConfig {
-    pub enabled: bool,
-    /// Exposes Memory staging queue tools in addition to normal Memory CRUD/query tools.
-    pub staging_tools: bool,
-    pub resident: MemoryResidentProfileConfig,
-    pub extraction: MemoryExtractionProfileConfig,
-    pub consolidation: MemoryConsolidationProfileConfig,
-}
-
-impl MemoryFeatureProfileConfig {
-    pub fn disabled() -> Self {
-        Self::default()
-    }
-
-    pub fn enabled() -> Self {
-        Self {
-            enabled: true,
-            ..Self::default()
-        }
-    }
-}
-
-impl Default for MemoryFeatureProfileConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            staging_tools: false,
-            resident: MemoryResidentProfileConfig::default(),
-            extraction: MemoryExtractionProfileConfig::default(),
-            consolidation: MemoryConsolidationProfileConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct MemoryResidentProfileConfig {
-    pub inject_summary: bool,
-}
-
-impl Default for MemoryResidentProfileConfig {
-    fn default() -> Self {
-        Self {
-            inject_summary: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
 pub struct MemoryExtractionProfileConfig {
     pub enabled: bool,
     pub model: Option<ModelManifest>,
@@ -380,71 +327,6 @@ impl Default for MemoryExtractionProfileConfig {
             threshold: Some(50_000),
             worker_max_turns: defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS,
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct MemoryConsolidationProfileConfig {
-    pub request_enabled: bool,
-}
-
-impl Default for MemoryConsolidationProfileConfig {
-    fn default() -> Self {
-        Self {
-            request_enabled: true,
-        }
-    }
-}
-
-/// Immutable Memory execution configuration persisted in a resolved Worker Manifest.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct ResolvedMemoryFeatureConfig {
-    pub profile: MemoryFeatureProfileConfig,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_settings: Option<WorkspaceMemorySettingsSnapshot>,
-}
-
-impl ResolvedMemoryFeatureConfig {
-    pub fn enabled(&self) -> bool {
-        self.profile.enabled
-    }
-
-    pub fn bind_workspace_settings(
-        &mut self,
-        settings: WorkspaceMemorySettingsSnapshot,
-    ) -> Result<(), &'static str> {
-        if !self.profile.enabled {
-            if self.workspace_settings.is_some() {
-                return Err("disabled Memory feature must not carry Workspace settings");
-            }
-            return Ok(());
-        }
-        if self.workspace_settings.is_some() {
-            return Err("memory Workspace settings are already bound");
-        }
-        self.workspace_settings = Some(settings);
-        Ok(())
-    }
-
-    pub fn workspace_settings(&self) -> Option<WorkspaceMemorySettingsSnapshot> {
-        self.workspace_settings.clone()
-    }
-
-    pub fn validate_execution(&self) -> Result<(), &'static str> {
-        if self.profile.enabled && self.workspace_settings.is_none() {
-            return Err("enabled Memory feature requires trusted Workspace settings");
-        }
-        if !self.profile.enabled && self.workspace_settings.is_some() {
-            return Err("disabled Memory feature must not carry Workspace settings");
-        }
-        if let Some(settings) = &self.workspace_settings
-            && !is_normalized_workspace_memory_language(&settings.language)
-        {
-            return Err("Memory Workspace settings snapshot metadata is invalid");
-        }
-        Ok(())
     }
 }
 
@@ -481,7 +363,7 @@ impl Default for SubjektivFeatureProfileConfig {
 pub struct ResolvedSubjektivFeatureConfig {
     pub profile: SubjektivFeatureProfileConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_settings: Option<WorkspaceMemorySettingsSnapshot>,
+    pub workspace_settings: Option<SubjektivMemorySettingsSnapshot>,
 }
 
 impl ResolvedSubjektivFeatureConfig {
@@ -497,7 +379,7 @@ impl ResolvedSubjektivFeatureConfig {
 
     pub fn bind_workspace_settings(
         &mut self,
-        settings: WorkspaceMemorySettingsSnapshot,
+        settings: SubjektivMemorySettingsSnapshot,
     ) -> Result<(), &'static str> {
         if !self.profile.enabled {
             if self.workspace_settings.is_some() {
@@ -512,7 +394,7 @@ impl ResolvedSubjektivFeatureConfig {
         Ok(())
     }
 
-    pub fn workspace_settings(&self) -> Option<WorkspaceMemorySettingsSnapshot> {
+    pub fn workspace_settings(&self) -> Option<SubjektivMemorySettingsSnapshot> {
         self.workspace_settings.clone()
     }
 
@@ -524,7 +406,7 @@ impl ResolvedSubjektivFeatureConfig {
             return Err("disabled subjektiv feature must not carry Workspace settings");
         }
         if let Some(settings) = &self.workspace_settings
-            && !is_normalized_workspace_memory_language(&settings.language)
+            && !is_normalized_subjektiv_memory_language(&settings.language)
         {
             return Err("subjektiv Workspace settings snapshot metadata is invalid");
         }
@@ -762,21 +644,21 @@ pub struct WebFetchConfig {
     pub allow_private_addresses: Option<bool>,
 }
 
-/// Maximum Unicode scalar values accepted in a normalized Workspace Memory language name.
-pub const MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS: usize = 64;
+/// Maximum Unicode scalar values accepted in a normalized Subjektiv Memory language name.
+pub const MAX_SUBJEKTIV_MEMORY_LANGUAGE_CHARS: usize = 64;
 
-/// Return whether a Workspace Memory language is already normalized and safe to persist.
-pub fn is_normalized_workspace_memory_language(language: &str) -> bool {
+/// Return whether a Subjektiv Memory language is already normalized and safe to persist.
+pub fn is_normalized_subjektiv_memory_language(language: &str) -> bool {
     !language.is_empty()
         && language == language.trim()
-        && language.chars().count() <= MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS
+        && language.chars().count() <= MAX_SUBJEKTIV_MEMORY_LANGUAGE_CHARS
         && !language.chars().any(char::is_control)
 }
 
-/// Immutable Workspace Memory settings bound into a Worker launch snapshot.
+/// Immutable Subjektiv Memory settings bound into a Worker launch snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkspaceMemorySettingsSnapshot {
+pub struct SubjektivMemorySettingsSnapshot {
     /// Workspace that owns these settings.
     pub workspace_id: String,
     /// Normalized language used for Memory extraction and consolidation output.
@@ -1154,7 +1036,6 @@ impl WorkerManifest {
     pub fn requires_persisted_execution_snapshot(&self) -> bool {
         self.profile.is_some()
             || !self.plugins.is_empty()
-            || self.feature.memory.workspace_settings.is_some()
             || self.feature.subjektiv.workspace_settings.is_some()
     }
 
@@ -1168,38 +1049,9 @@ impl WorkerManifest {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct LegacyMemoryFeatureConfig {
-    enabled: bool,
-    staging: bool,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct LegacyMemoryConfig {
-    #[serde(rename = "workspace_root")]
-    _workspace_root: Option<PathBuf>,
-    #[serde(rename = "query_result_limit")]
-    _query_result_limit: Option<usize>,
-    #[serde(rename = "query_excerpt_lines")]
-    _query_excerpt_lines: Option<usize>,
-    inject_summary: Option<bool>,
-    workspace_id: Option<String>,
-    #[serde(rename = "settings_revision")]
-    legacy_settings_counter: Option<u64>,
-    language: Option<String>,
-    extract_model: Option<ModelManifest>,
-    extract_threshold: Option<u64>,
-    extract_worker_max_turns: Option<u32>,
-    consolidation_model: Option<ModelManifest>,
-    consolidation_threshold_files: Option<usize>,
-    consolidation_threshold_bytes: Option<u64>,
-}
-
 const RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 5;
 const MERGE_REQUEST_READINESS_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 4;
-const MEMORY_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 3;
+const SUBJEKTIV_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 3;
 const PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION: u64 = 2;
 
 /// Serialize a resolved Worker Manifest for durable Worker-specific storage.
@@ -1256,7 +1108,7 @@ pub fn read_persisted_worker_manifest_snapshot(
         })?;
         if version != RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION
             && version != MERGE_REQUEST_READINESS_MANIFEST_SNAPSHOT_SCHEMA_VERSION
-            && version != MEMORY_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION
+            && version != SUBJEKTIV_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION
             && version != PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION
         {
             return Err(serde_json::Error::io(std::io::Error::new(
@@ -1288,13 +1140,13 @@ pub fn read_persisted_worker_manifest_snapshot(
         if version == PREVIOUS_RESOLVED_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
             migrate_legacy_manifest_authority(&mut manifest)?;
         }
-        if version <= MEMORY_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
-            migrate_legacy_memory_settings_counter(&mut manifest)?;
+        if version <= SUBJEKTIV_COUNTER_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
+            migrate_legacy_subjektiv_settings_counter(&mut manifest)?;
         }
         if version <= MERGE_REQUEST_READINESS_MANIFEST_SNAPSHOT_SCHEMA_VERSION {
             migrate_legacy_merge_request_readiness(&mut manifest)?;
         }
-        return validate_persisted_worker_manifest(serde_json::from_value(manifest)?);
+        return serde_json::from_value(manifest);
     }
 
     migrate_legacy_resolved_manifest_snapshot(snapshot)
@@ -1320,45 +1172,27 @@ fn migrate_legacy_merge_request_readiness(
     Ok(())
 }
 
-fn validate_persisted_worker_manifest(
-    manifest: WorkerManifest,
-) -> Result<WorkerManifest, serde_json::Error> {
-    manifest
-        .feature
-        .memory
-        .validate_execution()
-        .map_err(|message| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                message,
-            ))
-        })?;
-    Ok(manifest)
-}
-
 /// Frozen migration for schema 2/3 resolved manifests. During persisted snapshot
 /// decoding, reject an invalid old counter; do not compare it for execution freshness.
 /// Keep actual Workspace identity and language unchanged; the sequence has no execution role.
-fn migrate_legacy_memory_settings_counter(
+fn migrate_legacy_subjektiv_settings_counter(
     manifest: &mut serde_json::Value,
 ) -> Result<(), serde_json::Error> {
-    for namespace in ["memory", "subjektiv"] {
-        let Some(settings) = manifest
-            .get_mut("feature")
-            .and_then(|feature| feature.get_mut(namespace))
-            .and_then(|feature| feature.get_mut("workspace_settings"))
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            continue;
-        };
-        if let Some(counter) = settings.remove("settings_revision")
-            && !counter.as_u64().is_some_and(|counter| counter > 0)
-        {
-            return Err(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "legacy Workspace Memory settings snapshot has an invalid counter",
-            )));
-        }
+    let Some(settings) = manifest
+        .get_mut("feature")
+        .and_then(|feature| feature.get_mut("subjektiv"))
+        .and_then(|feature| feature.get_mut("workspace_settings"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    if let Some(counter) = settings.remove("settings_revision")
+        && !counter.as_u64().is_some_and(|counter| counter > 0)
+    {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy Subjektiv Memory settings snapshot has an invalid counter",
+        )));
     }
     Ok(())
 }
@@ -1409,110 +1243,10 @@ fn migrate_legacy_manifest_authority(
 fn migrate_legacy_resolved_manifest_snapshot(
     mut snapshot: serde_json::Value,
 ) -> Result<WorkerManifest, serde_json::Error> {
-    let root = snapshot.as_object_mut().ok_or_else(|| {
-        serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "legacy resolved Worker manifest snapshot must be an object",
-        ))
-    })?;
-    let legacy_memory = root.remove("memory");
-    let feature = root
-        .entry("feature")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "legacy resolved Worker manifest feature must be an object",
-            ))
-        })?;
-    let legacy_feature_memory: LegacyMemoryFeatureConfig = serde_json::from_value(
-        feature
-            .remove("memory")
-            .unwrap_or_else(|| serde_json::json!({})),
-    )?;
-    let requested_enabled = legacy_feature_memory.enabled;
-    let staging_tools = legacy_feature_memory.staging;
-
-    let legacy_memory: LegacyMemoryConfig =
-        serde_json::from_value(legacy_memory.unwrap_or_else(|| serde_json::json!({})))?;
-    let mut workspace_settings = match (
-        legacy_memory.workspace_id,
-        legacy_memory.legacy_settings_counter,
-        legacy_memory.language,
-    ) {
-        (Some(workspace_id), Some(legacy_settings_counter), Some(language)) => {
-            Some(serde_json::json!({
-                "workspace_id": workspace_id,
-                "settings_revision": legacy_settings_counter,
-                "language": language,
-            }))
-        }
-        (None, None, None) => None,
-        _ => {
-            return Err(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "legacy resolved Worker manifest contains a partial Memory settings snapshot",
-            )));
-        }
-    };
-    if !requested_enabled {
-        workspace_settings = None;
-    }
-    // Legacy standalone manifests could enable process-local Memory without a
-    // Workspace-owned settings snapshot. That authority no longer exists, so
-    // migration safely disables Memory instead of treating the whole Worker
-    // snapshot as corrupt.
-    let enabled = requested_enabled && workspace_settings.is_some();
-    let extraction_enabled = legacy_memory.extract_threshold.is_some();
-    if legacy_memory.consolidation_model.is_some() {
-        return Err(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "legacy resolved Worker manifest uses a Worker-owned consolidation model that cannot be migrated to Backend authority",
-        )));
-    }
-    let consolidation_enabled = match (
-        legacy_memory.consolidation_threshold_files,
-        legacy_memory.consolidation_threshold_bytes,
-    ) {
-        (None, None) => false,
-        (Some(5), Some(50_000)) => true,
-        _ => {
-            return Err(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "legacy resolved Worker manifest uses custom consolidation thresholds that cannot be migrated to Backend policy",
-            )));
-        }
-    };
-    let mut resolved = serde_json::json!({
-        "profile": {
-            "enabled": enabled,
-            "staging_tools": staging_tools,
-            "resident": {
-                "inject_summary": legacy_memory.inject_summary.unwrap_or(true),
-            },
-            "extraction": {
-                "enabled": extraction_enabled,
-                "model": serde_json::to_value(legacy_memory.extract_model)?,
-                "threshold": legacy_memory.extract_threshold,
-                "worker_max_turns": legacy_memory.extract_worker_max_turns,
-            },
-            "consolidation": {
-                "request_enabled": consolidation_enabled,
-            },
-        },
-    });
-    if let Some(workspace_settings) = workspace_settings {
-        resolved
-            .as_object_mut()
-            .expect("resolved Memory config is an object")
-            .insert("workspace_settings".to_string(), workspace_settings);
-    }
-    feature.insert("memory".to_string(), resolved);
     migrate_legacy_manifest_authority(&mut snapshot)?;
-    migrate_legacy_memory_settings_counter(&mut snapshot)?;
+    migrate_legacy_subjektiv_settings_counter(&mut snapshot)?;
     migrate_legacy_merge_request_readiness(&mut snapshot)?;
-    validate_persisted_worker_manifest(serde_json::from_value(snapshot)?)
+    serde_json::from_value(snapshot)
 }
 
 #[cfg(test)]
@@ -1546,11 +1280,7 @@ permission = "write"
         };
         for version in [None, Some(2), Some(3), Some(4)] {
             for readiness in [false, true] {
-                let mut value = serde_json::to_value(&manifest).unwrap();
-                if version.is_none() {
-                    value["feature"]["memory"] =
-                        serde_json::json!({"enabled": false, "staging": false});
-                }
+                let value = serde_json::to_value(&manifest).unwrap();
                 let snapshot = match version {
                     None => value,
                     Some(version) => {
@@ -1617,10 +1347,6 @@ permission = "write"
                 serde_json::json!({}),
             ] {
                 let mut value = serde_json::to_value(&manifest).unwrap();
-                if version.is_none() {
-                    value["feature"]["memory"] =
-                        serde_json::json!({"enabled": false, "staging": false});
-                }
                 value["feature"]["merge_request"]["readiness_check"] = invalid;
                 let old = match version {
                     None => value,
@@ -1678,10 +1404,7 @@ permission = "write"
         value["permissions"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<WorkerManifest>(value.clone()).is_err());
         for version in [None, Some(2), Some(3), Some(4), Some(5)] {
-            let mut saved = value.clone();
-            if version.is_none() {
-                saved["feature"]["memory"] = serde_json::json!({"enabled":false, "staging":false});
-            }
+            let saved = value.clone();
             let snapshot = match version {
                 None => saved,
                 Some(version) => serde_json::json!({"schema_version":version, "manifest":saved}),
@@ -1706,24 +1429,7 @@ permission = "write"
             assert_eq!(restored.feature, expected.feature);
             assert!(!restored.feature.filesystem_write.enabled);
             assert!(!restored.feature.bash.enabled);
-            if version.is_none() {
-                // The raw legacy reader reconstructs Memory from legacy thresholds,
-                // not from today's resolved Feature defaults. Null Tool policy
-                // must not change that pre-existing normalization.
-                assert!(!restored.feature.memory.profile.enabled);
-                assert!(!restored.feature.memory.profile.extraction.enabled);
-                assert!(
-                    !restored
-                        .feature
-                        .memory
-                        .profile
-                        .consolidation
-                        .request_enabled
-                );
-                assert!(restored.feature.memory.workspace_settings.is_none());
-            } else {
-                assert_eq!(restored.feature, manifest.feature);
-            }
+            assert_eq!(restored.feature, manifest.feature);
             let rewritten = write_persisted_worker_manifest_snapshot(&restored).unwrap();
             assert!(rewritten["manifest"].get("permissions").is_none());
         }
@@ -2088,68 +1794,22 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn omitted_memory_feature_is_disabled() {
-        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        assert!(!manifest.feature.memory.profile.enabled);
-        assert!(manifest.feature.memory.workspace_settings.is_none());
-    }
-
-    #[test]
-    fn resolved_memory_feature_requires_nested_profile_and_trusted_snapshot() {
-        let toml = format!(
-            "{MINIMAL_REQUIRED}\n\
-             [feature.memory.profile]\n\
-             enabled = true\n\
-             staging_tools = false\n\n\
-             [feature.memory.profile.resident]\n\
-             inject_summary = false\n\n\
-             [feature.memory.profile.extraction]\n\
-             enabled = true\n\
-             threshold = 42000\n\
-             worker_max_turns = 2\n\n\
-             [feature.memory.workspace_settings]\n\
-             workspace_id = \"workspace-1\"\n\
-             language = \"日本語\"\n"
-        );
-        let manifest = WorkerManifest::from_toml(&toml).unwrap();
-        assert!(manifest.feature.memory.profile.enabled);
-        assert!(!manifest.feature.memory.profile.resident.inject_summary);
-        assert_eq!(
-            manifest.feature.memory.profile.extraction.threshold,
-            Some(42_000)
-        );
-        assert_eq!(
-            manifest
-                .feature
-                .memory
-                .workspace_settings()
-                .unwrap()
-                .language,
-            "日本語"
-        );
-    }
-
-    #[test]
-    fn resolved_memory_execution_validation_fails_closed() {
-        let snapshot = WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-1".to_string(),
-            language: "English".to_string(),
-        };
-        let mut enabled = ResolvedMemoryFeatureConfig::default();
-        enabled.profile.enabled = true;
-        assert!(enabled.validate_execution().is_err());
-        enabled.bind_workspace_settings(snapshot.clone()).unwrap();
-        assert!(enabled.validate_execution().is_ok());
-
-        let mut disabled = ResolvedMemoryFeatureConfig::default();
-        disabled.workspace_settings = Some(snapshot.clone());
-        assert!(disabled.validate_execution().is_err());
-        assert!(disabled.bind_workspace_settings(snapshot).is_err());
+    fn resolved_manifest_rejects_removed_workspace_memory() {
+        for section in [
+            "[feature.memory]\nenabled = false\n",
+            "[feature.memory]\nenabled = true\n",
+            "[feature.memory.profile]\nenabled = false\n",
+            "[feature.memory.workspace_settings]\nworkspace_id = \"workspace-1\"\n",
+        ] {
+            let error =
+                WorkerManifest::from_toml(&format!("{MINIMAL_REQUIRED}\n{section}")).unwrap_err();
+            assert!(error.to_string().contains("memory"), "{error}");
+        }
     }
 
     #[test]
     fn resolved_subjektiv_policy_is_inert_until_trusted_attachment() {
-        let snapshot = WorkspaceMemorySettingsSnapshot {
+        let snapshot = SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-1".to_string(),
             language: "English".to_string(),
         };
@@ -2174,20 +1834,14 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn persisted_counter_migration_preserves_memory_and_subject_settings() {
+    fn persisted_counter_migration_preserves_subject_settings() {
         for version in [2, 3] {
             let mut manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-            manifest.feature.memory.profile.enabled = true;
             manifest.feature.subjektiv.profile.enabled = true;
-            let settings = WorkspaceMemorySettingsSnapshot {
+            let settings = SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-1".into(),
                 language: "日本語".into(),
             };
-            manifest
-                .feature
-                .memory
-                .bind_workspace_settings(settings.clone())
-                .unwrap();
             manifest
                 .feature
                 .subjektiv
@@ -2195,41 +1849,33 @@ model_id = "claude-sonnet-4-20250514"
                 .unwrap();
             let mut snapshot = write_persisted_worker_manifest_snapshot(&manifest).unwrap();
             snapshot["schema_version"] = version.into();
-            for namespace in ["memory", "subjektiv"] {
-                snapshot["manifest"]["feature"][namespace]["workspace_settings"]["settings_revision"] =
-                    99.into();
-            }
+            snapshot["manifest"]["feature"]["subjektiv"]["workspace_settings"]["settings_revision"] =
+                99.into();
             let restored = read_persisted_worker_manifest_snapshot(snapshot).unwrap();
-            assert_eq!(
-                restored.feature.memory.workspace_settings(),
-                Some(settings.clone())
-            );
             assert_eq!(
                 restored.feature.subjektiv.workspace_settings(),
                 Some(settings)
             );
             let current = write_persisted_worker_manifest_snapshot(&restored).unwrap();
             assert_eq!(current["schema_version"], 5);
-            for namespace in ["memory", "subjektiv"] {
-                assert_eq!(
-                    current["manifest"]["feature"][namespace]["workspace_settings"],
-                    serde_json::json!({
-                        "workspace_id": "workspace-1", "language": "日本語"
-                    })
-                );
-            }
+            assert_eq!(
+                current["manifest"]["feature"]["subjektiv"]["workspace_settings"],
+                serde_json::json!({
+                    "workspace_id": "workspace-1", "language": "日本語"
+                })
+            );
             read_persisted_worker_manifest_snapshot(current).unwrap();
         }
     }
 
     #[test]
-    fn newer_persisted_snapshots_do_not_reapply_legacy_memory_counter_migration() {
+    fn newer_persisted_snapshots_do_not_reapply_legacy_subjektiv_counter_migration() {
         let mut manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        manifest.feature.memory.profile.enabled = true;
+        manifest.feature.subjektiv.profile.enabled = true;
         manifest
             .feature
-            .memory
-            .bind_workspace_settings(WorkspaceMemorySettingsSnapshot {
+            .subjektiv
+            .bind_workspace_settings(SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-1".into(),
                 language: "English".into(),
             })
@@ -2237,7 +1883,7 @@ model_id = "claude-sonnet-4-20250514"
         for version in [4, 5] {
             let mut snapshot = write_persisted_worker_manifest_snapshot(&manifest).unwrap();
             snapshot["schema_version"] = version.into();
-            snapshot["manifest"]["feature"]["memory"]["workspace_settings"]["settings_revision"] =
+            snapshot["manifest"]["feature"]["subjektiv"]["workspace_settings"]["settings_revision"] =
                 99.into();
             assert!(read_persisted_worker_manifest_snapshot(snapshot).is_err());
         }
@@ -2246,21 +1892,21 @@ model_id = "claude-sonnet-4-20250514"
     #[test]
     fn current_settings_snapshot_rejects_unknown_fields_and_invalid_language() {
         assert!(
-            serde_json::from_value::<WorkspaceMemorySettingsSnapshot>(serde_json::json!({
+            serde_json::from_value::<SubjektivMemorySettingsSnapshot>(serde_json::json!({
                 "workspace_id": "workspace-1", "language": "English", "unexpected_state_guard": 9
             }))
             .is_err()
         );
-        let settings: WorkspaceMemorySettingsSnapshot = serde_json::from_value(serde_json::json!({
+        let settings: SubjektivMemorySettingsSnapshot = serde_json::from_value(serde_json::json!({
             "workspace_id": "workspace-1", "language": "English"
         }))
         .unwrap();
-        let mut memory = ResolvedMemoryFeatureConfig::default();
+        let mut memory = ResolvedSubjektivFeatureConfig::default();
         memory.profile.enabled = true;
         memory.bind_workspace_settings(settings.clone()).unwrap();
         assert!(memory.validate_execution().is_ok());
         for language in ["", " English", "English\n"] {
-            memory.workspace_settings = Some(WorkspaceMemorySettingsSnapshot {
+            memory.workspace_settings = Some(SubjektivMemorySettingsSnapshot {
                 language: language.into(),
                 ..settings.clone()
             });
@@ -2269,66 +1915,40 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn persisted_manifest_adapter_migrates_legacy_memory_authority() {
-        let mut manifest =
-            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
-        manifest["feature"]["memory"] = serde_json::json!({
-            "enabled": true,
-            "staging": true,
-        });
-        manifest["memory"] = serde_json::json!({
-            "workspace_root": "/discarded",
-            "query_result_limit": 999,
-            "inject_summary": false,
-            "workspace_id": "workspace-1",
-            "settings_revision": 9,
-            "language": "Français",
-            "extract_threshold": 1234,
-            "extract_worker_max_turns": 3,
-            "consolidation_threshold_files": 5,
-            "consolidation_threshold_bytes": 50000,
-        });
-
-        let migrated = read_persisted_worker_manifest_snapshot(manifest).unwrap();
-        assert!(migrated.feature.memory.profile.enabled);
-        assert!(migrated.feature.memory.profile.staging_tools);
-        assert!(!migrated.feature.memory.profile.resident.inject_summary);
-        assert_eq!(
-            migrated.feature.memory.profile.extraction.threshold,
-            Some(1234)
-        );
-        assert!(
-            migrated
-                .feature
-                .memory
-                .profile
-                .consolidation
-                .request_enabled
-        );
-        assert_eq!(
-            migrated
-                .feature
-                .memory
-                .workspace_settings()
-                .unwrap()
-                .language,
-            "Français"
-        );
-        let current = write_persisted_worker_manifest_snapshot(&migrated).unwrap();
-        assert_eq!(current["schema_version"], 5);
-        assert!(current["manifest"].get("memory").is_none());
-
-        let mut disabled =
-            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
-        disabled["feature"]["memory"] = serde_json::json!({ "enabled": false });
-        disabled["memory"] = serde_json::json!({
-            "workspace_id": "workspace-1",
-            "settings_revision": 9,
-            "language": "Français",
-        });
-        let disabled = read_persisted_worker_manifest_snapshot(disabled).unwrap();
-        assert!(!disabled.feature.memory.profile.enabled);
-        assert!(disabled.feature.memory.workspace_settings.is_none());
+    fn persisted_manifest_rejects_removed_workspace_memory_in_every_schema() {
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        for memory in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": false}),
+            serde_json::json!({"enabled": true, "staging": true}),
+            serde_json::json!({"profile": {"enabled": false}}),
+            serde_json::json!({
+                "profile": {"enabled": true},
+                "workspace_settings": {"workspace_id": "workspace-1", "language": "English"}
+            }),
+            serde_json::Value::Null,
+        ] {
+            for top_level in [false, true] {
+                let mut value = serde_json::to_value(&manifest).unwrap();
+                if top_level {
+                    value["memory"] = memory.clone();
+                } else {
+                    value["feature"]["memory"] = memory.clone();
+                }
+                let error = serde_json::from_value::<WorkerManifest>(value.clone()).unwrap_err();
+                assert!(error.to_string().contains("memory"), "{error}");
+                for version in [None, Some(2), Some(3), Some(4), Some(5)] {
+                    let snapshot = match version {
+                        None => value.clone(),
+                        Some(version) => {
+                            serde_json::json!({"schema_version": version, "manifest": value})
+                        }
+                    };
+                    let error = read_persisted_worker_manifest_snapshot(snapshot).unwrap_err();
+                    assert!(error.to_string().contains("memory"), "{error}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2371,61 +1991,17 @@ model_id = "claude-sonnet-4-20250514"
         assert_eq!(current["manifest"]["feature"]["ticket"]["workflow"], true);
 
         let mut legacy = serde_json::to_value(manifest).unwrap();
-        legacy.as_object_mut().unwrap().remove("memory");
-        legacy["feature"]["memory"] = serde_json::json!({
-            "enabled": true,
-            "staging": false
-        });
         legacy["feature"]["plugins"] = serde_json::json!({ "enabled": false });
         legacy["plugins"] = serde_json::json!({ "enabled": [] });
         let legacy = read_persisted_worker_manifest_snapshot(legacy).unwrap();
         let current = write_persisted_worker_manifest_snapshot(&legacy).unwrap();
-        assert_eq!(
-            current["manifest"]["feature"]["memory"]["profile"]["enabled"],
-            false
-        );
+        assert!(current["manifest"].get("plugins").is_none());
+        assert!(current["manifest"]["feature"].get("plugins").is_none());
     }
 
     #[test]
-    fn persisted_manifest_adapter_rejects_mixed_or_future_authority() {
-        let manifest =
-            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
-        let mut mixed = manifest.clone();
-        mixed["feature"]["memory"] = serde_json::json!({ "enabled": true, "profile": {} });
-        mixed["memory"] = serde_json::json!({});
-        assert!(read_persisted_worker_manifest_snapshot(mixed).is_err());
-
-        let mut custom_policy =
-            serde_json::to_value(WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap()).unwrap();
-        custom_policy["feature"]["memory"] = serde_json::json!({ "enabled": true });
-        custom_policy["memory"] = serde_json::json!({
-            "workspace_id": "workspace-1",
-            "settings_revision": 1,
-            "language": "English",
-            "consolidation_threshold_files": 99,
-            "consolidation_threshold_bytes": 50000,
-        });
-        assert!(read_persisted_worker_manifest_snapshot(custom_policy).is_err());
-
-        let current = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        let mut current = write_persisted_worker_manifest_snapshot(&current).unwrap();
-        current["manifest"]["memory"] = serde_json::json!({
-            "workspace_id": "workspace-1",
-            "settings_revision": 1,
-            "language": "English",
-        });
-        assert!(read_persisted_worker_manifest_snapshot(current).is_err());
-
-        let mut missing_settings = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        missing_settings.feature.memory.profile.enabled = true;
-        let missing_settings = write_persisted_worker_manifest_snapshot(&missing_settings).unwrap();
-        assert!(read_persisted_worker_manifest_snapshot(missing_settings).is_err());
-
-        let mut malformed_legacy = manifest.clone();
-        malformed_legacy["feature"]["memory"] = serde_json::json!({ "enabled": "yes" });
-        malformed_legacy["memory"] = serde_json::json!({ "unknown": true });
-        assert!(read_persisted_worker_manifest_snapshot(malformed_legacy).is_err());
-
+    fn persisted_manifest_adapter_rejects_future_schema() {
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert!(
             read_persisted_worker_manifest_snapshot(serde_json::json!({
                 "schema_version": 6,
@@ -2436,14 +2012,14 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn workspace_memory_language_validation_is_bounded_free_form_utf8() {
-        assert!(is_normalized_workspace_memory_language("Français"));
-        assert!(is_normalized_workspace_memory_language("日本語"));
-        assert!(!is_normalized_workspace_memory_language(""));
-        assert!(!is_normalized_workspace_memory_language(" English "));
-        assert!(!is_normalized_workspace_memory_language("English\n"));
-        assert!(!is_normalized_workspace_memory_language(
-            &"x".repeat(MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS + 1)
+    fn subjektiv_memory_language_validation_is_bounded_free_form_utf8() {
+        assert!(is_normalized_subjektiv_memory_language("Français"));
+        assert!(is_normalized_subjektiv_memory_language("日本語"));
+        assert!(!is_normalized_subjektiv_memory_language(""));
+        assert!(!is_normalized_subjektiv_memory_language(" English "));
+        assert!(!is_normalized_subjektiv_memory_language("English\n"));
+        assert!(!is_normalized_subjektiv_memory_language(
+            &"x".repeat(MAX_SUBJEKTIV_MEMORY_LANGUAGE_CHARS + 1)
         ));
     }
 

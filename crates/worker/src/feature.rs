@@ -1874,7 +1874,9 @@ pub(crate) fn authorize_requested_manifest(
     Ok(())
 }
 
-fn build_feature_install_plan(
+/// Plan descriptor-only participants with the same exact-one and dependency
+/// checks as Feature installation, without constructing modules or running effects.
+pub fn build_feature_install_plan(
     descriptors: &[FeatureDescriptor],
 ) -> Result<FeatureInstallPlan, FeaturePlanError> {
     let mut feature_ids = BTreeSet::new();
@@ -2515,6 +2517,12 @@ pub use invocation::{
     FeatureInvocationHandlerError, FeatureInvocationRegistry, InvocationContributionRegistrar,
 };
 pub mod builtin;
+pub mod initialization;
+
+pub(crate) type PromptContribution = (
+    Option<Arc<dyn crate::worker::SystemPromptContributionSource>>,
+    Option<String>,
+);
 pub mod contracts;
 pub mod mcp;
 pub(crate) mod session;
@@ -2574,7 +2582,6 @@ mod tests {
         // Enabling each config key independently also detects default-on flags.
         for name in [
             "task",
-            "memory",
             "subjektiv",
             "web",
             "image",
@@ -2592,7 +2599,7 @@ mod tests {
             "orchestration",
         ] {
             let mut value = serde_json::to_value(&config).unwrap();
-            if name == "memory" || name == "subjektiv" {
+            if name == "subjektiv" {
                 value[name]["profile"]["enabled"] = json!(true);
             } else if name == "merge_request" {
                 value[name]["show"] = json!(true);

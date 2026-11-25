@@ -132,7 +132,6 @@ impl RealDriveFixture {
             public_key: identity.public_key.clone(),
             public_key_fingerprint: String::new(),
             binding_id: "binding-drive-test".to_string(),
-
             authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
 
             created_at: "1".into(),

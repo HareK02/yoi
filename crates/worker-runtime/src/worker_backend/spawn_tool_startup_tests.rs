@@ -163,8 +163,6 @@ mod spawn_tool_startup_tests {
                 max_tokens = 100
                 [scope]
                 allow = []
-                [feature.memory.profile]
-                enabled = false
                 [feature.subjektiv.profile]
                 enabled = false
             "#,

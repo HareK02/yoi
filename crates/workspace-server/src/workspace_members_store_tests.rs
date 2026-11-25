@@ -230,7 +230,7 @@ mod membership_store {
             conn.execute_batch("INSERT INTO accounts VALUES('member-owner','user','member-owner','Owner','1','1'); INSERT INTO accounts VALUES('member-stranger','user','member-stranger','Stranger','1','1'); INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('membership-workspace','member-owner','Preserved','active','1','1');").unwrap();
             drop(conn);
             let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
-            assert_eq!(plan.target_schema_version, 143);
+            assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
             let unchanged = Connection::open(&path).unwrap();
             assert_eq!(current_schema_version(&unchanged).unwrap(), version);
             assert!(!table_exists(&unchanged, "workspace_members").unwrap());
@@ -269,7 +269,11 @@ mod membership_store {
     fn membership_migration_rolls_back_and_rejects_unreceipted_or_changed_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("migration.sqlite");
-        prepare_retained_schema(&path, 142);
+        prepare_retained_schema(&path, 141);
+        let legacy = Connection::open(&path).unwrap();
+        configure_sqlite(&legacy).unwrap();
+        passkey_addition_code::migrate(&legacy).unwrap();
+        drop(legacy);
         let c = Connection::open(&path).unwrap();
         configure_sqlite(&c).unwrap();
         c.execute_batch("CREATE TRIGGER fail_membership_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=143 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();

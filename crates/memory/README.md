@@ -1,11 +1,11 @@
 # memory
 
-Defines shared Memory schemas, extraction candidates, evidence, and typed communication.
-Does not own persistence or implicitly convert between legacy single-document Workspace Memory and per-subject Memory.
+Defines shared Subject Memory candidates, evidence, extraction progress, and Host communication.
+Does not own persistence, execution authority, or a Workspace-wide Memory store.
+Hosts bind operations to explicit Subjects; `subjektiv` owns the stored Memory domain.
 
 ## Main entry points
 
-- [`backend`]: legacy Workspace Memory operation contracts and resident responses
-- [`extract`]: candidate extraction and progress pointers
-- [`schema`]: shared document and evidence types
-- [`audit`]: audit-event transport types
+- [`subject`]: Subject-bound candidate operations and resident surface responses
+- [`extract`]: candidate records and extraction progress payloads
+- [`schema`]: bounded evidence and Session source references

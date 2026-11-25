@@ -3,6 +3,7 @@
 //! Unpublished endpoints allow deterministic delivery/admission fault injection;
 //! published endpoints exercise public APIs through state validation and effects.
 use super::*;
+use crate::feature::FeatureRegistryBuilder;
 use futures_util::poll;
 use session_store::{CombinedStore, FsStore, FsWorkerStore};
 use tempfile::TempDir;

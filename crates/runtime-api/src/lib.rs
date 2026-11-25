@@ -623,6 +623,7 @@ pub struct PluginExecutionSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateWorkerRequest {
     pub worker_id: WorkerId,
     pub create_fingerprint: String,
@@ -648,13 +649,16 @@ pub struct CreateWorkerRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_api: Option<WorkspaceApiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    pub memory_settings: Option<manifest::SubjektivMemorySettingsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_execution: Option<PluginExecutionSnapshot>,
-    /// Backend-attested subject or consolidation attachment. Profile policy alone
-    /// never activates subjektiv for an ordinary Workspace Worker.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub subjektiv_attached: bool,
+    /// Host-resolved, versioned Feature connections. Owners validate their saved
+    /// meaning against the fresh Host context before any protected initialization.
+    #[serde(
+        default,
+        skip_serializing_if = "protocol::feature_initialization::FeatureInitializations::is_empty"
+    )]
+    pub feature_initialization: protocol::feature_initialization::FeatureInitializations,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_job: Option<BackendJobExecutionBinding>,
 }
@@ -844,7 +848,13 @@ pub struct WorkerStopIntent {
 pub enum WorkerStopOutcome {
     NotFound,
     Pending,
-    Stopped { ack: WorkerLifecycleAck },
+    Interrupted,
+    Failed {
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
+    Stopped {
+        ack: WorkerLifecycleAck,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

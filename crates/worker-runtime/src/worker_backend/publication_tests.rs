@@ -44,10 +44,6 @@ fn publication_fences_live_workdir_and_requires_current_worker_on_each_execution
         alias: alias.clone(),
         working_directory: working_directory_request(remote.path()),
     }];
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: "publication-workspace".into(),
-        language: "English".into(),
-    });
     let detail = runtime
         .create_worker_scoped(
             &crate::runtime::RuntimeWorkspaceScope::new(

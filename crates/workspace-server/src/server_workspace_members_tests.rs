@@ -105,6 +105,71 @@ mod workspace_membership_api {
     }
 
     #[tokio::test]
+    async fn journal_read_post_requires_current_member_and_never_grants_owner_writes() {
+        let f = Fixture::new().await;
+        let subject = open_subjektiv_store(&f.api)
+            .unwrap()
+            .create_subject(crate::subjektiv::SubjectRole::new("member-journal").unwrap())
+            .unwrap();
+        let path = f.path(&format!(
+            "subjektiv/subjects/{}/journal-browser",
+            subject.id
+        ));
+        let read = json!({"action":"sessions","after":null,"limit":10});
+        assert_eq!(
+            f.request(None, "POST", &path, Some(read.clone())).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        for token in [&f.member, &f.outsider] {
+            assert_eq!(
+                f.request(Some(token), "POST", &path, Some(read.clone()))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        let added = f.add().await;
+        for token in [&f.owner, &f.member] {
+            let (status, body) = f
+                .request(Some(token), "POST", &path, Some(read.clone()))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        for bad in [
+            json!({"action":"delete","journal_id":"x"}),
+            json!({"action":"sessions","after":null,"limit":10,"write":true}),
+            json!({"action":"sessions","after":null,"limit":100000}),
+        ] {
+            assert!(
+                f.request(Some(&f.member), "POST", &path, Some(bad))
+                    .await
+                    .0
+                    .is_client_error()
+            );
+        }
+        assert_eq!(
+            f.request(Some(&f.member), "PUT", &f.path("flows"), Some(json!({})))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let cross = path.replace(TEST_WORKSPACE_ID, "other-workspace");
+        assert!(
+            f.request(Some(&f.member), "POST", &cross, Some(read.clone()))
+                .await
+                .0
+                .is_client_error()
+        );
+        f.remove(&added["membership_key"]).await;
+        assert_eq!(
+            f.request(Some(&f.member), "POST", &path, Some(read))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
     async fn membership_api_denies_nonmembers_filters_catalog_and_separates_owner_settings() {
         let f = Fixture::new().await;
         let admin = f

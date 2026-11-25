@@ -581,7 +581,7 @@ async fn ticket_source_ref_reads_and_ready_publication_leave_sql_and_tokio_free(
         observed(
             fixture
                 .executor
-                .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+                .run(move || store.list_workspace_runtime_bindings(WORKSPACE, false)),
         )
         .await
         .unwrap();
@@ -692,7 +692,7 @@ async fn worker_control_source_lookup_waits_off_tokio_and_retains_finite_host_ow
     observed(
         fixture
             .executor
-            .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+            .run(move || store.list_workspace_runtime_bindings(WORKSPACE, false)),
     )
     .await
     .unwrap();
@@ -734,10 +734,6 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
             &format!("http://{}", reply.address),
             false,
         );
-        let memory = fixture
-            .store
-            .get_workspace_memory_settings(WORKSPACE)
-            .unwrap();
         // Keep the legacy singleton to prove it cannot impersonate a Subject,
         // but issue explicit ordinary-Worker authority through the current owner.
         let creation = WorkerControlOperation {
@@ -761,7 +757,7 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
             "orchestrator-runtime",
             Some("builtin:coder".into()),
             Some(&creation),
-            false,
+            feature_initialization::CreationAuthority::Ordinary,
         )
         .unwrap();
         let reservation = fixture
@@ -773,7 +769,6 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
                 &creation.input_fingerprint,
                 &creation.input_fingerprint,
                 Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY),
-                &memory,
                 &grant.unwrap(),
                 &bundle.unwrap(),
             )
@@ -879,7 +874,7 @@ async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtim
         observed(
             fixture
                 .executor
-                .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+                .run(move || store.list_workspace_runtime_bindings(WORKSPACE, false)),
         )
         .await
         .unwrap();
@@ -1132,7 +1127,7 @@ async fn session_workdir_and_upload_callers_keep_provider_waits_off_sql_and_toki
         observed(
             fixture
                 .executor
-                .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+                .run(move || store.list_workspace_runtime_bindings(WORKSPACE, false)),
         )
         .await
         .unwrap();
@@ -1326,7 +1321,7 @@ async fn drive_and_config_preflight_keep_live_authority_owned_and_report_overloa
         observed(
             fixture
                 .executor
-                .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+                .run(move || store.list_workspace_runtime_bindings(WORKSPACE, false)),
         )
         .await
         .unwrap();

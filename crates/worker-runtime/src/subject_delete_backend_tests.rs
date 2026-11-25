@@ -34,10 +34,6 @@ fn subject_delete_running_controller_confirms_shutdown_and_preserves_history() {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
     });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())
         .unwrap();
@@ -369,10 +365,6 @@ fn subject_delete_terminal_release_history_consumes_prior_canonical_stop() {
         runtime.store_config_bundle(test_bundle()).unwrap();
         let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "server-test");
         let mut create = create_request("prior Stop Subject deletion");
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
-        });
         create.workspace_api = Some(WorkspaceApiRef {
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://workspace.invalid".into(),
@@ -533,12 +525,10 @@ impl RuntimeWorkerFactory for SubjectCleanupFaultFactory {
 
 #[test]
 #[cfg(feature = "fs-store")]
-fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
-    use crate::fs_store::{
-        PersistedWorkerExecutionState as Execution, PersistedWorkerLifecycleOperation as Operation,
-    };
-    // Both direct Subject retry of pending B and ordinary startup reconciliation
-    // must consume the same saved whole receipt, without a warm successful Stop.
+fn subject_delete_termination_survives_cold_resource_cleanup_without_stop_resume() {
+    use crate::fs_store::PersistedWorkerExecutionState as Execution;
+    // Startup never resumes Stop or cleanup. Explicit deletion retry uses the
+    // resource owner while preserving the original completed execution fact.
     for startup_recovers in [false, true] {
         let temp = tempfile::tempdir_in(".").unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -578,10 +568,6 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://workspace.invalid".into(),
         });
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
-        });
         let worker = runtime
             .create_worker_scoped(&scope, create.clone())
             .unwrap();
@@ -610,22 +596,13 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
             .test_runtime_store()
             .read_worker_record(&worker.worker_ref)
             .unwrap();
-        assert!(
-            matches!(before.execution_state, Execution::ReconciliationRequired(Operation::Stop(ref pending))
-            if pending.operation_id == original.stop_operation_id)
-        );
-        // Read the pending Stop's progress from the saved aggregate, not the
-        // adapter's still-warm cache or the guard's settled Stop history.
-        let progress = serde_json::to_value(&before.execution_state).unwrap()["execution"]["intent"]
-            ["progress"]
-            .clone();
-        assert_eq!(progress["phase"], "scope_terminated");
+        assert!(matches!(
+            before.execution_state,
+            Execution::Stopped(Some(_))
+        ));
         assert_eq!(
-            progress["termination"],
+            serde_json::to_value(&before.restore_guard).unwrap()["execution_termination"],
             serde_json::to_value(&original).unwrap()
-        );
-        assert!(
-            serde_json::to_value(&before.restore_guard).unwrap()["execution_termination"].is_null()
         );
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         drop(execution);
@@ -641,35 +618,22 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
             .test_runtime_store()
             .read_worker_record(&worker.worker_ref)
             .unwrap();
+        assert!(matches!(
+            loaded.execution_state,
+            Execution::Stopped(Some(_))
+        ));
+        assert_eq!(loaded.status, crate::catalog::WorkerStatus::Stopped);
+        assert_eq!(
+            serde_json::to_value(&loaded.restore_guard).unwrap()["execution_termination"],
+            serde_json::to_value(&original).unwrap()
+        );
         if !startup_recovers {
             assert!(
-                matches!(loaded.execution_state, Execution::ReconciliationRequired(Operation::Stop(ref pending))
-                if pending.operation_id == original.stop_operation_id)
-            );
-            let progress = serde_json::to_value(&loaded.execution_state).unwrap()["execution"]
-                ["intent"]["progress"]
-                .clone();
-            assert_eq!(progress["phase"], "scope_terminated");
-            assert_eq!(
-                progress["termination"],
-                serde_json::to_value(&original).unwrap()
-            );
-            assert!(
-                serde_json::to_value(&loaded.restore_guard).unwrap()["execution_termination"]
-                    .is_null()
+                reopened
+                    .subject_delete_worker_scoped(&scope, deletion.clone())
+                    .is_err()
             );
             cleanup_allowed.store(true, Ordering::SeqCst);
-        } else {
-            assert!(matches!(
-                loaded.execution_state,
-                Execution::Stopped(Some(_))
-            ));
-            assert_eq!(loaded.status, crate::catalog::WorkerStatus::Stopped);
-            // Only successful cleanup moves the receipt into settled history.
-            assert_eq!(
-                serde_json::to_value(&loaded.restore_guard).unwrap()["execution_termination"],
-                serde_json::to_value(&original).unwrap()
-            );
         }
         let cleanup_before = cleanup_calls.load(Ordering::SeqCst);
         reopened
@@ -681,11 +645,7 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
                     serde_json::to_value(&loaded.restore_guard).unwrap(),
                 )
             });
-        if startup_recovers {
-            assert_eq!(cleanup_calls.load(Ordering::SeqCst), cleanup_before);
-        } else {
-            assert!(cleanup_calls.load(Ordering::SeqCst) > cleanup_before);
-        }
+        assert!(cleanup_calls.load(Ordering::SeqCst) > cleanup_before);
         let settled = reopened
             .test_runtime_store()
             .read_worker_record(&worker.worker_ref)
@@ -705,11 +665,8 @@ fn subject_delete_pending_actual_termination_survives_cold_cleanup_retry() {
         );
         assert_eq!(
             cold.admissions.lock().unwrap()[&worker.worker_ref].deletion_stop_operation_id,
-            if startup_recovers {
-                None
-            } else {
-                Some(original.stop_operation_id)
-            }
+            None,
+            "cold resource cleanup does not create a deletion Stop owner"
         );
         assert!(cold.completed_stops.lock().unwrap().is_empty());
         assert!(cold.workers.lock().unwrap().is_empty());
@@ -838,10 +795,6 @@ fn subject_delete_first_stop_saves_original_child_and_reconciles_interrupted_com
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://workspace.invalid".into(),
         });
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
-        });
         let worker = runtime
             .create_worker_scoped(&scope, create.clone())
             .unwrap();
@@ -885,8 +838,8 @@ fn subject_delete_first_stop_saves_original_child_and_reconciles_interrupted_com
                     .is_err()
             );
         }
-        // BeforeRename retains the same pending operation; AfterRename must
-        // reread/sync the committed original, never begin/clear/retag it.
+        // Retry saves settled facts after BeforeRename, or rereads/syncs the
+        // original after AfterRename. Neither path resumes a Stop call.
         runtime
             .subject_delete_worker_scoped(&scope, request.clone())
             .unwrap();
@@ -954,10 +907,6 @@ fn subject_delete_cold_settled_state_rejects_replacement_without_rechecking_stop
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
     });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())
         .unwrap();
@@ -1001,12 +950,6 @@ fn subject_delete_cold_settled_state_rejects_replacement_without_rechecking_stop
                 request.workspace_scope.as_mut().unwrap().workspace_id = "foreign-workspace".into();
                 request.request.workspace_api.as_mut().unwrap().workspace_id =
                     "foreign-workspace".into();
-                request
-                    .request
-                    .memory_settings
-                    .as_mut()
-                    .unwrap()
-                    .workspace_id = "foreign-workspace".into();
             }
             let operation_id = request.operation_id;
             assert!(matches!(
@@ -1085,7 +1028,10 @@ fn subject_delete_cold_settled_state_rejects_replacement_without_rechecking_stop
         } else {
             assert!(!result.unwrap().originals_absent);
         }
-        let canonical = runtime.test_runtime_store().read_worker_record(&worker.worker_ref).unwrap();
+        let canonical = runtime
+            .test_runtime_store()
+            .read_worker_record(&worker.worker_ref)
+            .unwrap();
         assert_eq!(
             serde_json::to_value(&canonical.restore_guard).unwrap()["execution_termination"],
             serde_json::to_value(&original).unwrap()
@@ -1271,10 +1217,6 @@ fn subject_delete_confirmed_removal_retries_warm_and_cold_without_new_stop() {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
     });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())
         .unwrap();
@@ -1316,11 +1258,16 @@ fn subject_delete_confirmed_removal_retries_warm_and_cold_without_new_stop() {
     let completed_cleanup_calls = cleanup_calls.load(Ordering::SeqCst);
     cleanup_allowed.store(false, Ordering::SeqCst);
     assert_eq!(
-        reopened.subject_delete_worker_scoped(&scope, deletion.clone()).unwrap(),
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .unwrap(),
         expected,
         "completed removal must not repeat Stop-owned factory cleanup"
     );
-    assert_eq!(cleanup_calls.load(Ordering::SeqCst), completed_cleanup_calls);
+    assert_eq!(
+        cleanup_calls.load(Ordering::SeqCst),
+        completed_cleanup_calls
+    );
     cleanup_allowed.store(true, Ordering::SeqCst);
     let material = options
         .root
@@ -1394,10 +1341,6 @@ fn subject_delete_removal_first_accepts_missing_shutdown_and_rechecks_cold_remov
     create.workspace_api = Some(WorkspaceApiRef {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
-    });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
     });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())
@@ -1534,9 +1477,13 @@ fn subject_delete_removal_first_accepts_missing_shutdown_and_rechecks_cold_remov
     assert!(
         runtime
             .subject_delete_worker_scoped(&scope, deletion.clone())
-            .unwrap().originals_absent
+            .unwrap()
+            .originals_absent
     );
-    assert_eq!(cleanup_calls.load(Ordering::SeqCst), completed_cleanup_calls);
+    assert_eq!(
+        cleanup_calls.load(Ordering::SeqCst),
+        completed_cleanup_calls
+    );
     cleanup_allowed.store(true, Ordering::SeqCst);
     let confirmed = runtime
         .subject_delete_worker_scoped(&scope, deletion.clone())
@@ -1623,7 +1570,10 @@ fn subject_delete_removal_first_accepts_missing_shutdown_and_rechecks_cold_remov
         confirmed,
         "completed original removal must not repeat Stop-owned cleanup"
     );
-    assert_eq!(cleanup_calls.load(Ordering::SeqCst), completed_cleanup_calls);
+    assert_eq!(
+        cleanup_calls.load(Ordering::SeqCst),
+        completed_cleanup_calls
+    );
     cleanup_allowed.store(true, Ordering::SeqCst);
     let material = options
         .root

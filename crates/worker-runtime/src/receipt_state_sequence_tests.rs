@@ -9,8 +9,12 @@ fn receipt_sequence_document(worker: &PersistedWorkerRecord, schema: u32) -> ser
         "last_finished_submission_request_id": "retained-finished-input",
         "state": {"kind": "idle"}
     });
-    document["restore_guard"]["stop_owners"]["retained-stop"] = serde_json::json!({
-        "operation_id": WorkerLifecycleOperationId::new(),
+    let history_key = if schema == SCHEMA_VERSION {
+        "stop_results"
+    } else {
+        "stop_owners"
+    };
+    document["restore_guard"][history_key]["retained-stop"] = serde_json::json!({
         "request": {"reason": "original reason", "stop_intent": {
             "request_id": "retained-stop",
             "expected_observation_token": document["restore_guard"]["observation_token"]
@@ -24,6 +28,14 @@ fn receipt_sequence_document(worker: &PersistedWorkerRecord, schema: u32) -> ser
             }}
         }
     });
+    if schema != SCHEMA_VERSION {
+        document["restore_guard"][history_key]["retained-stop"]["operation_id"] =
+            serde_json::json!(WorkerLifecycleOperationId::new());
+        document["restore_guard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("automatic_restore_suppressed");
+    }
     document
 }
 
@@ -54,7 +66,18 @@ fn schema18_receipt_sequences_migrate_without_reapplying_lifecycle_conversion() 
         }
         let mut expected = document.clone();
         expected["schema_version"] = serde_json::json!(SCHEMA_VERSION);
-        let receipt = &mut expected["restore_guard"]["stop_owners"]["retained-stop"]["receipt"];
+        let mut history = expected["restore_guard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stop_owners")
+            .unwrap();
+        history["retained-stop"]
+            .as_object_mut()
+            .unwrap()
+            .remove("operation_id");
+        expected["restore_guard"]["stop_results"] = history;
+        expected["restore_guard"]["automatic_restore_suppressed"] = serde_json::json!(false);
+        let receipt = &mut expected["restore_guard"]["stop_results"]["retained-stop"]["receipt"];
         receipt["worker_state"]["state_sequence"] = serde_json::json!(sequence.unwrap_or(0));
         receipt["command"]["acknowledgement"]["state"]["state_sequence"] =
             serde_json::json!(sequence.unwrap_or(0));
@@ -119,4 +142,50 @@ fn current_receipt_decoder_requires_sequence_without_legacy_defaults() {
     let error = store.read_worker_record(&worker.worker_ref).unwrap_err();
     assert!(error.to_string().contains("state_sequence"));
     assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn current_receipt_history_roundtrips_without_stop_operation_identity() {
+    let (_temp, store, worker, path) = canonical_worker_store();
+    let mut document = receipt_sequence_document(&worker, SCHEMA_VERSION);
+    let receipt = &mut document["restore_guard"]["stop_results"]["retained-stop"]["receipt"];
+    receipt["worker_state"]["state_sequence"] = serde_json::json!(91);
+    receipt["command"]["acknowledgement"]["state"]["state_sequence"] = serde_json::json!(91);
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let saved = store.read_worker_record(&worker.worker_ref).unwrap();
+    store.write_worker_record(&saved).unwrap();
+    let disk: serde_json::Value = read_json(&path, "read current receipt history").unwrap();
+    assert_eq!(
+        disk["restore_guard"]["stop_results"],
+        document["restore_guard"]["stop_results"]
+    );
+    assert!(disk["restore_guard"].get("stop_owners").is_none());
+    assert!(
+        disk["restore_guard"]["stop_results"]["retained-stop"]
+            .get("operation_id")
+            .is_none()
+    );
+    store.read_worker_record(&worker.worker_ref).unwrap();
+}
+
+#[test]
+fn current_decoder_rejects_stop_owner_and_history_operation_identity() {
+    for legacy_owner in [false, true] {
+        let (_temp, store, worker, path) = canonical_worker_store();
+        let mut document = receipt_sequence_document(&worker, SCHEMA_VERSION);
+        let receipt = &mut document["restore_guard"]["stop_results"]["retained-stop"]["receipt"];
+        receipt["worker_state"]["state_sequence"] = serde_json::json!(91);
+        receipt["command"]["acknowledgement"]["state"]["state_sequence"] = serde_json::json!(91);
+        document["restore_guard"]["stop_results"]["retained-stop"]["operation_id"] =
+            serde_json::json!(WorkerLifecycleOperationId::new());
+        if legacy_owner {
+            let guard = document["restore_guard"].as_object_mut().unwrap();
+            let history = guard.remove("stop_results").unwrap();
+            guard.insert("stop_owners".into(), history);
+        }
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(store.read_worker_record(&worker.worker_ref).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 }

@@ -19,9 +19,11 @@ use agen::{
     RunInterruptionReason, ToolExecutionPolicy, ToolOutputLimits, UsageRecord,
 };
 use arc_swap::ArcSwap;
+#[cfg(test)]
+use session_store::SubjektivSessionAttributionState;
 use session_store::{
     LogEntry, PasteArtifactLimits, PromptRenderProvenance, SegmentId, SessionExtension, SessionId,
-    Store, StoreError, SubjektivSessionAttributionState, SystemItem, segment_log,
+    Store, StoreError, SystemItem, segment_log,
 };
 use session_store::{
     WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
@@ -54,7 +56,6 @@ use crate::compact::telemetry::{
 use crate::compact::usage_tracker::{UsageTracker, persist_pending_usage};
 use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
 use crate::feature::builtin::TaskFeature;
-use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::contracts::WorkerObservationProvider;
 use crate::feature::session::{
     CommittedRunExit, CommittedSessionCapture, CommittedSessionCaptureHandle, FeatureSessionError,
@@ -858,7 +859,7 @@ fn workspace_server_json_request<T: serde::Serialize>(
     ))
 }
 
-fn encode_workspace_path_segment(value: &str) -> String {
+pub(crate) fn encode_workspace_path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -3696,7 +3697,6 @@ const PROTECTED_INPUTS_DOMAIN: &str = "worker.protected_inputs.v1";
 )]
 #[serde(rename_all = "kebab-case")]
 enum ProtectedInputKind {
-    WorkspaceMemory,
     SubjectResident,
     Journal,
     JournalStartup,
@@ -3726,7 +3726,6 @@ impl ProtectedInputKind {
 
     fn parse(kind: &str) -> Result<Self, String> {
         match kind {
-            "workspace-memory" => Ok(Self::WorkspaceMemory),
             "subject-resident" => Ok(Self::SubjectResident),
             "journal" => Ok(Self::Journal),
             "journal-startup" => Ok(Self::JournalStartup),
@@ -3739,7 +3738,6 @@ impl ProtectedInputKind {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::WorkspaceMemory => "workspace-memory",
             Self::SubjectResident => "subject-resident",
             Self::Journal => "journal",
             Self::JournalStartup => "journal-startup",
@@ -3969,10 +3967,6 @@ impl ProtectedInputProvenance {
                 && !saved.feature.subjektiv.profile.consolidation_tools
             {
                 provenance.kinds.insert(ProtectedInputKind::SubjectResident);
-            } else if saved.feature.memory.enabled()
-                && saved.feature.memory.profile.resident.inject_summary
-            {
-                provenance.kinds.insert(ProtectedInputKind::WorkspaceMemory);
             }
         }
         provenance.observe_history(history.iter().map(|entry| &entry.annotation));
@@ -5297,41 +5291,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.session_context_source = None;
     }
 
+    pub(crate) fn explicit_subjektiv_host(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::subjektiv::SubjektivHost>> {
+        self.subjektiv_host.clone()
+    }
+
     pub fn subjektiv_host_connection(
         &self,
     ) -> std::io::Result<Option<crate::subjektiv::SubjektivHostConnection>> {
-        use crate::subjektiv::{
-            BackendSubjektivHost, SubjektivHostConnection, SubjektivHostContext,
-        };
-        let config = &self.manifest.feature.subjektiv;
-        config.validate_execution().map_err(std::io::Error::other)?;
-        if !config.profile.enabled {
-            return Ok(None);
-        }
-        let host = if let Some(host) = &self.subjektiv_host {
-            if config.workspace_settings.is_some()
-                || self.workspace_id().is_some()
-                || self.workspace_client().workspace_id().is_some()
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "explicit local subjektiv Host cannot replace trusted Backend Workspace authority",
-                ));
-            }
-            Some(host.clone())
-        } else {
-            BackendSubjektivHost::from_resolved_config(config, self.workspace_client_handle())?
-        };
-        host.map(|host| {
-            SubjektivHostConnection::new(
-                host,
-                SubjektivHostContext {
-                    worker_id: self.manifest.worker.name.clone(),
-                    session_id: self.session_id().to_string(),
-                },
-            )
-        })
-        .transpose()
+        crate::feature::builtin::subjektiv_initialization::host_connection(self)
     }
 
     /// Bind the host-owned Worker-session observation projection. The provider
@@ -6948,6 +6917,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     ts: segment_log::now_millis(),
                     entry_id: None,
                 })?;
+                self.dispatch_run_committed(
+                    uuid::Uuid::now_v7().to_string(),
+                    RunCommittedExit::Interrupted,
+                )
+                .await;
             }
             return Ok(WorkerRunResult::RolledBack);
         }
@@ -7860,6 +7834,37 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
+    /// Dispatch only after persistence succeeds, using the current committed
+    /// history so an empty-turn rollback cannot expose its removed input.
+    async fn dispatch_run_committed(&mut self, run_id: String, exit: RunCommittedExit) {
+        let committed_invocation = self.hook_invocation_context(Some(run_id));
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = RunCommittedContext {
+                invocation: committed_invocation.clone(),
+                exit,
+                committed_history: self.hook_history_range(),
+            };
+            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_committed(&context))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "run-committed hook requires attention");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("run-committed");
+                    tracing::warn!("run-committed hook chain exceeded its host deadline");
+                }
+            }
+        }
+        if let Err(error) = self
+            .feature_background_tasks
+            .start_run_committed(committed_invocation)
+        {
+            tracing::warn!(error = %error, "run-committed background task start failed");
+        }
+    }
+
     /// Handle one Engine execution boundary: persist its turn and transition,
     /// then compact and resume when Engine yielded for compaction.
     ///
@@ -7915,32 +7920,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         });
         self.persist_turn(history_before, &result, request_block_message.as_deref())
             .await?;
-        let committed_invocation = self.hook_invocation_context(Some(run_id));
-        if let Some(hooks) = self.hook_registry.clone() {
-            let context = RunCommittedContext {
-                invocation: committed_invocation.clone(),
-                exit: hook_exit,
-                committed_history: self.hook_history_range(),
-            };
-            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_committed(&context))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "run-committed hook requires attention");
-                }
-                Err(_) => {
-                    hooks.record_chain_timeout("run-committed");
-                    tracing::warn!("run-committed hook chain exceeded its host deadline");
-                }
-            }
-        }
-        if let Err(error) = self
-            .feature_background_tasks
-            .start_run_committed(committed_invocation)
-        {
-            tracing::warn!(error = %error, "run-committed background task start failed");
-        }
+        self.dispatch_run_committed(run_id, hook_exit).await;
 
         if let Some(block) = request_block {
             let error = automatic_compact_block_error(block);
@@ -9553,38 +9533,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubjektivSessionAttributionLifecycle {
-    NewSession,
-    RestoredSession,
-}
-
-fn incomplete_subjektiv_attribution_state(
-    session_id: SessionId,
-    create_if_missing: bool,
-    diagnostic: String,
-) -> SubjektivSessionAttributionState {
-    if create_if_missing {
-        SubjektivSessionAttributionState::OutcomeUnknown {
-            session_id,
-            diagnostic,
-        }
-    } else {
-        SubjektivSessionAttributionState::LegacyUnknown {
-            session_id,
-            diagnostic,
-        }
-    }
-}
-
-fn bounded_attribution_diagnostic(mut diagnostic: String) -> String {
-    const MAX_CHARS: usize = 1024;
-    if diagnostic.chars().count() > MAX_CHARS {
-        diagnostic = diagnostic.chars().take(MAX_CHARS).collect();
-        diagnostic.push('…');
-    }
-    diagnostic
-}
+pub use crate::feature::builtin::subjektiv_initialization::SubjektivSessionAttributionLifecycle;
 
 fn worker_language(cfg: &manifest::EngineManifest) -> &str {
     let language = cfg.language.trim();
@@ -9592,49 +9541,6 @@ fn worker_language(cfg: &manifest::EngineManifest) -> &str {
         manifest::defaults::WORKER_LANGUAGE
     } else {
         language
-    }
-}
-
-impl<C: LlmClient + 'static, St: Store + WorkerMetadataStore> Worker<C, St> {
-    /// Check saved Session attribution without contacting the Host. Restoring a
-    /// Controller reconstructs existing state, not current Subject authority.
-    /// Protected operations check current authority at their own boundaries.
-    pub(crate) fn validate_saved_subjektiv_attribution(&self) -> Result<(), WorkerError> {
-        if self
-            .backend_job()
-            .is_some_and(crate::BackendJobExecutionBinding::has_subjektiv_job_grant)
-        {
-            return Ok(());
-        }
-        let Some(metadata) = self.store.read_by_name(&self.manifest.worker.name)? else {
-            return Ok(());
-        };
-        let Some(attribution) = metadata.subjektiv_session_attribution.as_ref() else {
-            return Ok(());
-        };
-        let denied = |message: String| WorkerError::SubjektivSessionAttribution {
-            state: "publication_denied",
-            message: bounded_attribution_diagnostic(message),
-        };
-        let session_id = self.session_id();
-        if metadata.active.as_ref().map(|active| active.session_id) != Some(session_id)
-            || attribution.session_id() != session_id
-        {
-            return Err(denied(
-                "retained body attribution does not match the constructed Session".into(),
-            ));
-        }
-        let SubjektivSessionAttributionState::Confirmed { subject_id, .. } = attribution else {
-            return Err(denied(
-                "body publication requires separately confirmed Session attribution".into(),
-            ));
-        };
-        if subject_id.trim().is_empty() || subject_id.chars().any(char::is_control) {
-            return Err(denied(
-                "saved Session attribution has an invalid Subject identity".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -9834,266 +9740,6 @@ where
         self.write_worker_metadata_pending()
             .map_err(|error| self.construction_failure(error))?;
         Ok(self)
-    }
-
-    /// Complete the Host-owned Session-to-Subject attribution boundary before a
-    /// runtime-managed Worker is exposed or accepts input. The authoritative
-    /// attachment bit and lifecycle kind come from the Runtime create/restore
-    /// request; names, Profiles, and current singleton ownership are never used
-    /// as historical identity.
-    ///
-    /// New Sessions persist `OutcomeUnknown` before create-if-missing network I/O.
-    /// A restore retries creation only for that durable state (or `Failed`). An
-    /// unmarked legacy restore is verification-only and persists `LegacyUnknown`,
-    /// so current ownership can never invent historical attribution.
-    pub fn finalize_subjektiv_session_attribution(
-        &self,
-        subjektiv_attached: bool,
-        lifecycle: SubjektivSessionAttributionLifecycle,
-    ) -> Result<(), WorkerError> {
-        self.finalize_subjektiv_session_attribution_observed(
-            subjektiv_attached,
-            lifecycle,
-            &mut None,
-        )
-    }
-
-    /// Retain a failed startup against its constructed Session and Workspace. Only
-    /// this operation's successful CAS transitions advance the attribution expectation;
-    /// a reread never adopts a replacement owner or another operation's attribution.
-    pub fn finalize_subjektiv_session_attribution_retaining_startup_failure(
-        &self,
-        subjektiv_attached: bool,
-        lifecycle: SubjektivSessionAttributionLifecycle,
-    ) -> Result<(), WorkerError> {
-        let mut expected = None;
-        self.finalize_subjektiv_session_attribution_observed(
-            subjektiv_attached,
-            lifecycle,
-            &mut expected,
-        )
-        .map_err(|error| match expected {
-            Some(expected) => crate::startup_failure::persist_binding_startup_failure(
-                &self.store,
-                &expected,
-                error,
-            ),
-            None => error,
-        })
-    }
-
-    fn finalize_subjektiv_session_attribution_observed(
-        &self,
-        subjektiv_attached: bool,
-        lifecycle: SubjektivSessionAttributionLifecycle,
-        observation: &mut Option<session_store::worker_metadata::StartupFailureExpectation>,
-    ) -> Result<(), WorkerError> {
-        let _admission = self.segment_state.mutation_authority.enter()?;
-        let worker_name = self.manifest.worker.name.as_str();
-        let metadata = self.store.read_by_name(worker_name)?.ok_or_else(|| {
-            WorkerError::SubjektivSessionAttribution {
-                state: "metadata_missing",
-                message: "Worker metadata disappeared before Session attribution".to_string(),
-            }
-        })?;
-        let active =
-            metadata
-                .active
-                .as_ref()
-                .ok_or_else(|| WorkerError::SubjektivSessionAttribution {
-                    state: "session_missing",
-                    message: "Worker metadata has no active Session attribution target".to_string(),
-                })?;
-        let session_id = self.session_id();
-        if active.session_id != session_id {
-            return Err(WorkerError::SubjektivSessionAttribution {
-                state: "session_mismatch",
-                message: format!(
-                    "Worker metadata Session {} does not match constructed Session {session_id}",
-                    active.session_id
-                ),
-            });
-        }
-
-        if metadata.worker_name != worker_name
-            || metadata.workspace_id.as_deref() != self.workspace_id().map(|id| id.as_str())
-        {
-            return Err(WorkerError::SubjektivSessionAttribution {
-                state: "owner_mismatch",
-                message: "Worker metadata does not match constructed Workspace ownership".into(),
-            });
-        }
-        *observation =
-            session_store::worker_metadata::StartupFailureExpectation::from_metadata(&metadata);
-        let mut persist_attribution =
-            |previous: Option<&SubjektivSessionAttributionState>,
-             next: SubjektivSessionAttributionState| {
-                let expected = observation
-                    .as_mut()
-                    .expect("validated active Session has an expectation");
-                if expected.attribution.as_ref() != previous {
-                    return Err(WorkerError::SubjektivSessionAttribution {
-                        state: "attribution_conflict",
-                        message: "startup attribution expectation changed".into(),
-                    });
-                }
-                crate::subjektiv_metadata::compare_and_swap_attribution(&self.store, expected, next)
-            };
-
-        if self
-            .backend_job()
-            .is_some_and(crate::BackendJobExecutionBinding::has_subjektiv_job_grant)
-        {
-            if metadata.subjektiv_session_attribution.is_some() {
-                return Err(WorkerError::SubjektivSessionAttribution {
-                    state: "job_attribution_forbidden",
-                    message: "Subject maintenance Job execution must not carry subject-body Session attribution".into(),
-                });
-            }
-            return Ok(());
-        }
-        if !subjektiv_attached {
-            if metadata.subjektiv_session_attribution.is_some() {
-                return Err(WorkerError::SubjektivSessionAttribution {
-                    state: "attachment_missing",
-                    message:
-                        "persisted Subjektiv Session attribution state requires an authorized attachment"
-                            .to_string(),
-                });
-            }
-            return Ok(());
-        }
-
-        let create_if_missing = match metadata.subjektiv_session_attribution.as_ref() {
-            Some(state) => {
-                if state.session_id() != session_id {
-                    return Err(WorkerError::SubjektivSessionAttribution {
-                        state: "session_mismatch",
-                        message: format!(
-                            "persisted Subjektiv attribution targets Session {}, not {session_id}",
-                            state.session_id()
-                        ),
-                    });
-                }
-                match state {
-                    SubjektivSessionAttributionState::Confirmed { subject_id, .. } => {
-                        return self
-                            .retain_journal_source_before_publication(session_id, subject_id);
-                    }
-                    SubjektivSessionAttributionState::OutcomeUnknown { .. }
-                    | SubjektivSessionAttributionState::Failed { .. } => true,
-                    SubjektivSessionAttributionState::LegacyUnknown { .. } => false,
-                }
-            }
-            None => matches!(lifecycle, SubjektivSessionAttributionLifecycle::NewSession),
-        };
-        let initial_diagnostic = if create_if_missing {
-            "attribution creation started; completion is not yet confirmed"
-        } else {
-            "legacy Session has no local attribution evidence; immutable Backend verification started"
-        };
-        let pending_attribution = incomplete_subjektiv_attribution_state(
-            session_id,
-            create_if_missing,
-            initial_diagnostic.to_string(),
-        );
-        persist_attribution(
-            metadata.subjektiv_session_attribution.as_ref(),
-            pending_attribution.clone(),
-        )?;
-        let output = if self.subjektiv_host.is_some() {
-            self.subjektiv_host_connection()
-                .map_err(|error| crate::subjektiv::SubjektivHostError::session_registration(
-                    protocol::session_failure::SessionRegistrationCause::outcome_unknown(), error,
-                ))
-                .and_then(|connection| connection.ok_or_else(|| {
-                    crate::subjektiv::SubjektivHostError::SessionRegistration {
-                        cause: protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
-                        source: None,
-                    }
-                }))
-                .and_then(|connection| connection.host.record_session(&connection.context, create_if_missing))
-        } else {
-            crate::subjektiv::record_backend_session(
-                self.workspace_client(), &session_id.to_string(), create_if_missing,
-            )
-        }.and_then(|output| crate::subjektiv::validate_session_registration(output, &session_id.to_string()));
-        let output = match output {
-            Ok(output) => output,
-            Err(error) => {
-                use protocol::session_failure::SessionRegistrationReason;
-                let cause = error.session_registration_cause();
-                let rejected = matches!(
-                    cause.reason,
-                    SessionRegistrationReason::PermissionDenied
-                        | SessionRegistrationReason::AttributionMissing
-                        | SessionRegistrationReason::BindingMismatch
-                );
-                // The legacy lifecycle diagnostic is a fixed domain label, never a
-                // transport body, credential, path or upstream Display string.
-                let diagnostic = cause.to_string();
-                let next = if create_if_missing && rejected {
-                    SubjektivSessionAttributionState::Failed {
-                        session_id,
-                        diagnostic,
-                    }
-                } else {
-                    incomplete_subjektiv_attribution_state(
-                        session_id,
-                        create_if_missing,
-                        diagnostic,
-                    )
-                };
-                let source = WorkerError::SessionRegistration { source: error };
-                let saved = persist_attribution(Some(&pending_attribution), next);
-                return Err(crate::startup_failure::retain_attribution_save_failure(
-                    source, saved,
-                ));
-            }
-        };
-        persist_attribution(
-            Some(&pending_attribution),
-            SubjektivSessionAttributionState::Confirmed {
-                session_id,
-                subject_id: output.subject_id.clone(),
-            },
-        )?;
-        self.retain_journal_source_before_publication(session_id, &output.subject_id)
-    }
-
-    fn retain_journal_source_before_publication(
-        &self,
-        session_id: SessionId,
-        subject_id: &str,
-    ) -> Result<(), WorkerError> {
-        let Some(connection) = self.subjektiv_host_connection().map_err(|error| {
-            WorkerError::SubjektivSessionAttribution {
-                state: "retention_unconfirmed",
-                message: error.to_string(),
-            }
-        })?
-        else {
-            return Ok(());
-        };
-        if !connection.host.journal_recording_granted() {
-            return Ok(());
-        }
-        let pin = session_store::retention::SessionRetentionPin(
-            match self.workspace_client().workspace_id() {
-                Some(workspace) => subjektiv::journal::source_retention_pin(
-                    workspace,
-                    subject_id,
-                    &session_id.to_string(),
-                ),
-                None => session_id,
-            },
-        );
-        // Confirmation can be replayed after response loss. Persist this intent before
-        // exposing the Worker to input, not after the first RunCommitted notification.
-        // It does not claim that an original Session has materialized yet.
-        self.store
-            .retain_session_before_publication(session_id, pin)?;
-        Ok(())
     }
 
     /// Build an in-process Internal Worker without machine-wide allocation or durable Worker metadata.
@@ -11755,9 +11401,6 @@ pub enum WorkerError {
     #[error(transparent)]
     Skill(#[from] SkillClientError),
 
-    #[error(transparent)]
-    WorkspaceMemoryBackend(#[from] WorkspaceMemoryBackendError),
-
     #[error("feature install failed: {0}")]
     FeatureInstall(String),
 
@@ -12326,7 +11969,7 @@ permission = "write"
     }
 
     #[test]
-    fn workspace_memory_settings_snapshot_is_persisted_through_versioned_adapter() {
+    fn subjektiv_memory_settings_snapshot_is_persisted_through_versioned_adapter() {
         let mut manifest = WorkerManifest::from_toml(
             r#"
 [worker]
@@ -12349,11 +11992,11 @@ permission = "read"
 "#,
         )
         .unwrap();
-        manifest.feature.memory.profile.enabled = true;
+        manifest.feature.subjektiv.profile.enabled = true;
         manifest
             .feature
-            .memory
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .subjektiv
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
 
                 language: "Japanese".to_string(),
@@ -12368,8 +12011,8 @@ permission = "read"
         )
         .unwrap();
         assert_eq!(
-            restored.feature.memory.workspace_settings(),
-            Some(manifest::WorkspaceMemorySettingsSnapshot {
+            restored.feature.subjektiv.workspace_settings(),
+            Some(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-a".to_string(),
 
                 language: "Japanese".to_string(),
@@ -12412,75 +12055,8 @@ mod build_summary_prompt_tests {
     }
 
     #[derive(Debug)]
-    struct RestoreLegacyResidentClient {
-        content: String,
-        load_count: Arc<AtomicUsize>,
-    }
-
-    impl WorkspaceClient for RestoreLegacyResidentClient {
-        fn workspace_id(&self) -> Option<&str> {
-            Some("workspace-test")
-        }
-
-        fn kind(&self) -> &str {
-            "restore-legacy-resident-test"
-        }
-
-        fn is_available(&self) -> bool {
-            true
-        }
-
-        fn execute(
-            &self,
-            request: WorkspaceRequest,
-        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-            if request.path.ends_with("/authorization/check") {
-                return Ok(WorkspaceResponse {
-                    content_type: None,
-status: 200,
-                    body: serde_json::json!({"scope": {"kind":"workspace", "workspace_id":"workspace-test"}}).to_string(),
-                });
-            }
-            let request: server_api::MemoryBackendRequest =
-                serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
-            assert!(matches!(
-                request.0,
-                memory::backend::MemoryBackendOperation::ResidentSummary(_)
-            ));
-            self.load_count.fetch_add(1, Ordering::SeqCst);
-            Ok(WorkspaceResponse {
-                content_type: None,
-                status: 200,
-                body: serde_json::to_string(&server_api::MemoryBackendResponse(
-                    memory::backend::MemoryBackendHttpResponse::Ok {
-                        result: memory::backend::MemoryBackendOperationResult::ResidentSummary(
-                            memory::backend::MemoryResidentSummaryOutput {
-                                availability:
-                                    memory::backend::MemoryResidentSummaryAvailability::Ready,
-                                content: Some(self.content.clone()),
-                            },
-                        ),
-                    },
-                ))
-                .unwrap(),
-            })
-        }
-    }
-
-    fn legacy_resident_client(content: &str) -> (Arc<dyn WorkspaceClient>, Arc<AtomicUsize>) {
-        let load_count = Arc::new(AtomicUsize::new(0));
-        (
-            Arc::new(RestoreLegacyResidentClient {
-                content: content.to_string(),
-                load_count: Arc::clone(&load_count),
-            }),
-            load_count,
-        )
-    }
-
-    #[derive(Debug)]
     struct RestoreSubjectResidentClient {
-        availability: memory::backend::MemoryResidentSummaryAvailability,
+        availability: memory::subject::MemoryResidentSummaryAvailability,
         content: Option<String>,
         load_count: Arc<AtomicUsize>,
         behavior_md: Option<Arc<Mutex<String>>>,
@@ -12537,7 +12113,7 @@ status: 200,
                                 || "restore behavior".to_string(),
                                 |body| body.lock().unwrap().clone(),
                             ),
-                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                            memory_surface: memory::subject::MemoryResidentSummaryOutput {
                                 availability: self.availability,
                                 content: self.content.clone(),
                             },
@@ -12551,7 +12127,7 @@ status: 200,
 
     fn subject_resident_source_for_restore(
         manifest: &WorkerManifest,
-        availability: memory::backend::MemoryResidentSummaryAvailability,
+        availability: memory::subject::MemoryResidentSummaryAvailability,
         content: Option<&str>,
     ) -> (Arc<dyn SystemPromptContributionSource>, Arc<AtomicUsize>) {
         let load_count = Arc::new(AtomicUsize::new(0));
@@ -13498,6 +13074,54 @@ status: 200,
 
     #[tokio::test]
     async fn empty_turn_direct_cancel_and_pause_still_remove_only_unmaterialized_input() {
+        struct CommittedCancellationHook {
+            store: session_store::FsStore,
+            location: SegmentLocation,
+            expected_history: HookHistoryRange,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Hook<crate::hook::RunCommitted> for CommittedCancellationHook {
+            async fn call(
+                &self,
+                context: &RunCommittedContext,
+            ) -> Result<(), crate::hook::HookError> {
+                assert_eq!(context.exit, RunCommittedExit::Interrupted);
+                assert_eq!(context.committed_history, self.expected_history);
+                assert!(context.invocation.run_id.is_some());
+                let entries = self
+                    .store
+                    .read_all(self.location.session_id, self.location.segment_id)
+                    .unwrap();
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry,
+                                LogEntry::RunCancelled {
+                                    entry_id: Some(_),
+                                    ..
+                                }
+                            )
+                        })
+                        .count(),
+                    1,
+                    "the cancellation must already be durable when the hook runs"
+                );
+                assert!(
+                    !entries.iter().any(|entry| matches!(
+                        entry,
+                        LogEntry::Invoke { .. } | LogEntry::AnnotatedUserInput { .. }
+                    )),
+                    "the hook must not see rolled-back speculative input"
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
         for pause in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let store = session_store::FsStore::new(dir.path()).unwrap();
@@ -13513,8 +13137,18 @@ status: 200,
             .await
             .unwrap();
             worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
-            worker.materialize_durable_session_head().await.unwrap();
             let loc = worker.segment_state.location();
+            let committed_calls = Arc::new(AtomicUsize::new(0));
+            let expected_history = worker.hook_history_range();
+            worker
+                .hook_builder
+                .add_run_committed(CommittedCancellationHook {
+                    store: store.clone(),
+                    location: loc,
+                    expected_history,
+                    calls: committed_calls.clone(),
+                });
+            worker.materialize_durable_session_head().await.unwrap();
             let before = store.read_all(loc.session_id, loc.segment_id).unwrap();
             let signal = if pause {
                 worker.engine().pause_sender()
@@ -13530,6 +13164,11 @@ status: 200,
             .await
             .unwrap();
             assert_eq!(result.unwrap(), WorkerRunResult::RolledBack);
+            assert_eq!(
+                committed_calls.load(Ordering::SeqCst),
+                usize::from(!pause),
+                "only persisted cancellation, not empty-turn pause, dispatches committed hooks"
+            );
             let after = store.read_all(loc.session_id, loc.segment_id).unwrap();
             let cancelled = after
                 .iter()
@@ -13807,7 +13446,7 @@ status: 200,
                     .manifest
                     .feature
                     .subjektiv
-                    .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                    .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                         workspace_id: "workspace-test".into(),
                         language: "English".into(),
                     })
@@ -17475,17 +17114,6 @@ status: 200,
         ));
     }
 
-    #[derive(Clone, Copy)]
-    struct ResidentInjectionGates {
-        summary: bool,
-    }
-
-    impl ResidentInjectionGates {
-        fn all(enabled: bool) -> Self {
-            Self { summary: enabled }
-        }
-    }
-
     // Real Worker wiring, filesystem Store, log writer and reconnect buffers;
     // only the model client is inert because this test never invokes the engine.
     #[tokio::test]
@@ -17643,11 +17271,11 @@ permission = "write"
             cwd.display()
         ))
         .unwrap();
-        manifest.feature.memory.profile.enabled = true;
+        manifest.feature.subjektiv.profile.enabled = true;
         manifest
             .feature
-            .memory
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .subjektiv
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-test".to_string(),
 
                 language: "English".to_string(),
@@ -17672,22 +17300,14 @@ permission = "write"
             )
             .unwrap(),
         );
-        let (legacy_client, initial_legacy_loads) =
-            legacy_resident_client("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH");
-        let legacy_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
+        let (initial_source, initial_loads) = subject_resident_source_for_restore(
             &manifest,
-            legacy_client,
-            original.prompts().load_full(),
-        )
-        .unwrap()
-        .unwrap();
-        let legacy_source = legacy_plan.resident_summary_source.clone();
-        let report = original
-            .install_features(FeatureRegistryBuilder::new().with_module(legacy_plan.module));
-        assert!(!report.has_errors());
-        original.install_system_prompt_contribution(legacy_source, None);
+            memory::subject::MemoryResidentSummaryAvailability::Ready,
+            Some("previous subject surface"),
+        );
+        original.install_system_prompt_contribution(Some(initial_source), None);
         original.materialize_durable_session_head().await.unwrap();
-        assert_eq!(initial_legacy_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(initial_loads.load(Ordering::SeqCst), 1);
         let session_id = original.session_id();
         let segment_id = original.segment_id();
         assert!(
@@ -17695,14 +17315,11 @@ permission = "write"
                 .engine()
                 .get_system_prompt()
                 .unwrap()
-                .contains("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH")
+                .contains("previous subject surface")
         );
         drop(original);
 
-        // A legacy Memory resident source remains an initial-prompt contribution
-        // only. The generic restore lifecycle does not infer subjektiv behavior
-        // from the presence of a shared resident source.
-        let mut legacy_only_restore =
+        let mut restored =
             Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
                 session_id,
                 segment_id,
@@ -17715,59 +17332,10 @@ permission = "write"
             )
             .await
             .unwrap();
-        let legacy_history = legacy_only_restore.history().to_vec();
-        let (legacy_client, legacy_loads) =
-            legacy_resident_client("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH");
-        let legacy_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
-            &manifest,
-            legacy_client,
-            legacy_only_restore.prompts().load_full(),
-        )
-        .unwrap()
-        .unwrap();
-        let legacy_source = legacy_plan.resident_summary_source.clone();
-        let report = legacy_only_restore
-            .install_features(FeatureRegistryBuilder::new().with_module(legacy_plan.module));
-        assert!(!report.has_errors());
-        legacy_only_restore.install_system_prompt_contribution(legacy_source, None);
-        legacy_only_restore
-            .materialize_durable_session_head()
-            .await
-            .unwrap();
-        assert_eq!(legacy_loads.load(Ordering::SeqCst), 0);
-        assert_eq!(legacy_only_restore.history(), legacy_history);
-        drop(legacy_only_restore);
-
-        let mut subject_manifest = manifest.clone();
-        subject_manifest.feature.memory = Default::default();
-        subject_manifest.feature.subjektiv.profile.enabled = true;
-        subject_manifest
-            .feature
-            .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace-test".to_string(),
-
-                language: "English".to_string(),
-            })
-            .unwrap();
-
-        let mut restored =
-            Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
-                session_id,
-                segment_id,
-                subject_manifest.clone(),
-                store.clone(),
-                crate::prompt::source::PromptCatalogSource::builtins_only(),
-                WorkerWorkspaceContext::no_workspace(),
-                authority.clone(),
-                Some(Box::new(NoopClient)),
-            )
-            .await
-            .unwrap();
         let history_before = restored.history().to_vec();
         let (current_source, current_loads) = subject_resident_source_for_restore(
-            &subject_manifest,
-            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            &manifest,
+            memory::subject::MemoryResidentSummaryAvailability::Ready,
             Some("latest subject surface"),
         );
         let report = restored.install_features(FeatureRegistryBuilder::new().with_module(
@@ -17791,7 +17359,7 @@ permission = "write"
             .to_string();
         assert!(refresh.contains("latest subject surface"));
         assert!(refresh.contains("supersedes every resident memory summary"));
-        assert!(!refresh.contains("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH"));
+        assert!(!refresh.contains("unavailable subject surface must not refresh"));
         let refreshed_len = restored.history().len();
         restored.materialize_durable_session_head().await.unwrap();
         assert_eq!(restored.history().len(), refreshed_len);
@@ -17801,7 +17369,7 @@ permission = "write"
             Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
                 session_id,
                 segment_id,
-                subject_manifest.clone(),
+                manifest.clone(),
                 store.clone(),
                 crate::prompt::source::PromptCatalogSource::builtins_only(),
                 WorkerWorkspaceContext::no_workspace(),
@@ -17811,8 +17379,8 @@ permission = "write"
             .await
             .unwrap();
         let (empty_source, empty_loads) = subject_resident_source_for_restore(
-            &subject_manifest,
-            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            &manifest,
+            memory::subject::MemoryResidentSummaryAvailability::Ready,
             None,
         );
         let report = empty_restore.install_features(FeatureRegistryBuilder::new().with_module(
@@ -17843,14 +17411,14 @@ permission = "write"
         drop(empty_restore);
 
         for availability in [
-            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
-            memory::backend::MemoryResidentSummaryAvailability::Stale,
-            memory::backend::MemoryResidentSummaryAvailability::Failed,
+            memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
+            memory::subject::MemoryResidentSummaryAvailability::Stale,
+            memory::subject::MemoryResidentSummaryAvailability::Failed,
         ] {
             let mut unavailable_restore = Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
                 session_id,
                 segment_id,
-                subject_manifest.clone(),
+                manifest.clone(),
                 store.clone(),
                 crate::prompt::source::PromptCatalogSource::builtins_only(),
                 WorkerWorkspaceContext::no_workspace(),
@@ -17861,9 +17429,9 @@ permission = "write"
             .unwrap();
             let history_before = unavailable_restore.history().to_vec();
             let (source, loads) = subject_resident_source_for_restore(
-                &subject_manifest,
+                &manifest,
                 availability,
-                Some("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH"),
+                Some("unavailable subject surface must not refresh"),
             );
             let report =
                 unavailable_restore.install_features(FeatureRegistryBuilder::new().with_module(
@@ -17892,230 +17460,29 @@ permission = "write"
                 .unwrap()
                 .to_string();
             let unavailable_message = match availability {
-                memory::backend::MemoryResidentSummaryAvailability::Ungenerated => {
+                memory::subject::MemoryResidentSummaryAvailability::Ungenerated => {
                     "No generated Memory surface exists yet"
                 }
-                memory::backend::MemoryResidentSummaryAvailability::Stale => {
+                memory::subject::MemoryResidentSummaryAvailability::Stale => {
                     "generated Memory surface is stale"
                 }
-                memory::backend::MemoryResidentSummaryAvailability::Failed => {
+                memory::subject::MemoryResidentSummaryAvailability::Failed => {
                     "Generation of the Memory surface failed"
                 }
-                memory::backend::MemoryResidentSummaryAvailability::Unavailable => {
+                memory::subject::MemoryResidentSummaryAvailability::Unavailable => {
                     "Host could not fetch the Subject resident context"
                 }
-                memory::backend::MemoryResidentSummaryAvailability::Ready => unreachable!(),
+                memory::subject::MemoryResidentSummaryAvailability::Ready => unreachable!(),
             };
             assert!(tombstone.contains(unavailable_message));
             assert!(!tombstone.contains("latest subject surface"));
-            assert!(!tombstone.contains("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH"));
+            assert!(!tombstone.contains("unavailable subject surface must not refresh"));
             let entries = store.read_all(session_id, segment_id).unwrap();
             assert!(matches!(
                 entries.last(),
                 Some(LogEntry::AnnotatedSystemItem { entry, .. }) if input_schema(entry) == Some("memory:resident-summary")
             ));
         }
-    }
-
-    #[tokio::test]
-    async fn memory_consolidation_prompt_uses_bound_workspace_language() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("workspace");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
-        let mut manifest = minimal_manifest();
-        manifest.profile = Some(manifest::ProfileManifestSnapshot {
-            source: manifest::ProfileSource::Registry {
-                source: manifest::ProfileRegistrySource::Builtin,
-                name: "memory-consolidation".to_string(),
-                path: None,
-                provenance: None,
-            },
-            profile: None,
-        });
-        let mut memory = manifest::ResolvedMemoryFeatureConfig::default();
-        memory.profile.enabled = true;
-        memory
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace-test".to_string(),
-
-                language: "Japanese".to_string(),
-            })
-            .unwrap();
-        manifest.feature.memory = memory;
-        let mut worker = Worker::new(
-            manifest,
-            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
-            store,
-            WorkerWorkspaceContext::no_workspace(),
-            WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
-            Scope::writable(&cwd).unwrap(),
-        )
-        .await
-        .unwrap();
-        worker.set_system_prompt_template(
-            SystemPromptTemplate::parse(
-                "default",
-                crate::prompt::source::PromptCatalogSource::builtins_only(),
-            )
-            .unwrap(),
-        );
-        let prompt_override = worker
-            .prompts()
-            .load_full()
-            .memory_consolidation_system("Japanese")
-            .unwrap();
-        worker.install_system_prompt_contribution(None, Some(prompt_override));
-        worker.ensure_system_prompt_materialized().await.unwrap();
-        let prompt = worker.engine().get_system_prompt().unwrap();
-        assert!(prompt.contains("`language`: `Japanese`"));
-        assert!(!prompt.contains("`language`: `English`"));
-    }
-
-    async fn render_system_prompt_with_summary(
-        summary_doc: Option<&str>,
-        memory_config: Option<manifest::ResolvedMemoryFeatureConfig>,
-        resident_injection: bool,
-    ) -> String {
-        render_system_prompt_with_resident_sections(
-            summary_doc,
-            memory_config,
-            ResidentInjectionGates::all(resident_injection),
-            false,
-        )
-        .await
-    }
-
-    async fn render_system_prompt_with_resident_sections(
-        summary_doc: Option<&str>,
-        memory_config: Option<manifest::ResolvedMemoryFeatureConfig>,
-        gates: ResidentInjectionGates,
-        _unused: bool,
-    ) -> String {
-        let dir = tempfile::tempdir().unwrap();
-        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
-        let cwd = dir.path().join("workspace");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let mut manifest = minimal_manifest();
-        manifest.feature.memory = memory_config.clone().unwrap_or_default();
-        if memory_config.is_some() {
-            manifest.feature.memory.profile.enabled = true;
-        }
-        let scope = Scope::writable(&cwd).unwrap();
-        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
-        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
-        let mut worker = Worker::new(
-            manifest,
-            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
-            store,
-            workspace_context,
-            authority,
-            scope,
-        )
-        .await
-        .unwrap();
-        worker.set_resident_memory_injection(gates.summary);
-        let resident_summary_source = if memory_config
-            .as_ref()
-            .is_some_and(|cfg| cfg.profile.resident.inject_summary)
-            && gates.summary
-        {
-            let summary = summary_doc.and_then(summary_content_for_backend);
-            Some(test_system_prompt_contribution_source(summary).0)
-        } else {
-            None
-        };
-        worker.install_system_prompt_contribution(resident_summary_source, None);
-        let template = SystemPromptTemplate::parse(
-            "default",
-            crate::prompt::source::PromptCatalogSource::builtins_only(),
-        )
-        .unwrap();
-        worker.set_system_prompt_template(template);
-        worker.ensure_system_prompt_materialized().await.unwrap();
-        worker.engine().get_system_prompt().unwrap().to_string()
-    }
-
-    fn summary_doc(body: &str) -> String {
-        format!("---\nupdated_at: 2026-01-01T00:00:00Z\n---\n{body}")
-    }
-
-    fn summary_content_for_backend(doc: &str) -> Option<String> {
-        if doc.contains("this is not yaml") {
-            return None;
-        }
-        if let Some(rest) = doc.strip_prefix("---\n") {
-            if let Some((_, body)) = rest.split_once("\n---\n") {
-                return Some(body.to_string());
-            }
-        }
-        Some(doc.to_string())
-    }
-
-    #[tokio::test]
-    async fn resident_summary_body_is_injected_without_frontmatter() {
-        let rendered = render_system_prompt_with_summary(
-            Some(&summary_doc("summary body for resident prompt\n")),
-            Some(manifest::ResolvedMemoryFeatureConfig::default()),
-            true,
-        )
-        .await;
-
-        assert!(rendered.contains("summary body for resident prompt"));
-        assert!(!rendered.contains("updated_at: 2026-01-01T00:00:00Z"));
-        assert!(!rendered.contains("---\nupdated_at"));
-    }
-
-    #[tokio::test]
-    async fn resident_summary_injection_can_be_disabled_by_memory_feature() {
-        let mut memory = manifest::ResolvedMemoryFeatureConfig::default();
-        memory.profile.resident.inject_summary = false;
-        let rendered = render_system_prompt_with_summary(
-            Some(&summary_doc("disabled summary body\n")),
-            Some(memory),
-            true,
-        )
-        .await;
-
-        assert!(!rendered.contains("disabled summary body"));
-    }
-
-    #[tokio::test]
-    async fn resident_summary_is_absent_when_memory_feature_is_disabled() {
-        let rendered = render_system_prompt_with_summary(
-            Some(&summary_doc("memory-disabled summary body\n")),
-            None,
-            true,
-        )
-        .await;
-
-        assert!(!rendered.contains("memory-disabled summary body"));
-    }
-
-    #[tokio::test]
-    async fn malformed_resident_summary_does_not_fail_render() {
-        let rendered = render_system_prompt_with_summary(
-            Some("---\nthis is not yaml: : :\n---\nbad summary body\n"),
-            Some(manifest::ResolvedMemoryFeatureConfig::default()),
-            true,
-        )
-        .await;
-
-        assert!(!rendered.trim().is_empty());
-        assert!(!rendered.contains("bad summary body"));
-    }
-
-    #[tokio::test]
-    async fn resident_summary_gate_false_omits_only_summary() {
-        let prompt = render_system_prompt_with_resident_sections(
-            Some(&summary_doc("resident summary marker")),
-            Some(manifest::ResolvedMemoryFeatureConfig::default()),
-            ResidentInjectionGates { summary: false },
-            true,
-        )
-        .await;
-
-        assert!(!prompt.contains("resident summary marker"));
     }
 
     #[test]
@@ -19860,7 +19227,7 @@ permission = "write"
         manifest
             .feature
             .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-test".into(),
 
                 language: "English".into(),
@@ -19895,7 +19262,7 @@ permission = "write"
                 &manifest,
                 Some(crate::subjektiv::test_connection(Arc::new(
                     RestoreSubjectResidentClient {
-                        availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
+                        availability: memory::subject::MemoryResidentSummaryAvailability::Ready,
                         content: Some("literal /prepare()".into()),
                         load_count: Arc::default(),
                         behavior_md: Some(behavior_md.clone()),
@@ -21285,9 +20652,9 @@ permission = "write"
                     Ok(server_api::SubjektivMemoryBackendResponse::ResidentContext(
                         server_api::SubjektivResidentContextOutput {
                             behavior_md: "Publication test behavior".into(),
-                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                            memory_surface: memory::subject::MemoryResidentSummaryOutput {
                                 availability:
-                                    memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                                    memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
                                 content: None,
                             },
                         },
@@ -21311,7 +20678,7 @@ permission = "write"
         fn stage_candidate(
             &self,
             _: &crate::subjektiv::SubjektivHostContext,
-            _: memory::backend::MemoryStageCandidateOperation,
+            _: memory::subject::MemoryStageCandidateOperation,
         ) -> Result<server_api::SubjektivStageCandidateResponse, crate::subjektiv::SubjektivHostError>
         {
             Err(crate::subjektiv::SubjektivHostError::Unavailable(
@@ -21321,8 +20688,8 @@ permission = "write"
         fn request_consolidation(
             &self,
             _: &crate::subjektiv::SubjektivHostContext,
-            _: memory::backend::MemoryConsolidateStagingOperation,
-        ) -> Result<memory::backend::MemoryConsolidationOutput, crate::subjektiv::SubjektivHostError>
+            _: memory::subject::MemoryConsolidateStagingOperation,
+        ) -> Result<memory::subject::MemoryConsolidationOutput, crate::subjektiv::SubjektivHostError>
         {
             Err(crate::subjektiv::SubjektivHostError::Unavailable(
                 "not used".into(),
@@ -21847,7 +21214,7 @@ permission = "write"
         include!("worker_composition_tests.rs");
     }
 
-    // Real initial-seed/replay/fork/compaction and Memory source wiring. Only the
+    // Real initial-seed/replay/fork/compaction and Subject Memory source wiring. Only the
     // Host HTTP boundary and provider transport are fixtures; Host policy evaluation
     // itself is covered by workspace-server authorization tests, not asserted here.
     mod subject_job_input_tests {
@@ -21904,33 +21271,33 @@ permission = "write"
                 &self,
                 request: WorkspaceRequest,
             ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-                if request.path.ends_with("/authorization/check") {
+                if request.path.ends_with("/authorization/bound-check") {
                     self.checks.fetch_add(1, Ordering::SeqCst);
-                    let input: server_api::authorization::OperationAuthorizationRequest =
+                    let input: server_api::authorization::BoundOperationAuthorizationRequest =
                         serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                     assert!(matches!(
                         input.operation.as_str(),
                         "memory.resident.read" | "memory.resident.supply"
                     ));
                     assert_eq!(
-                        input.resource,
-                        server_api::authorization::PermissionResource::Workspace {
-                            workspace_id: "workspace-test".into()
-                        }
+                        input.target,
+                        server_api::authorization::BoundAuthorizationTarget::Subject {}
                     );
                     return Ok(WorkspaceResponse {
                         content_type: None,
                         status: self.status.load(Ordering::SeqCst) as u16,
                         body: if self.status.load(Ordering::SeqCst) == 200 {
-                            serde_json::json!({"scope": input.resource}).to_string()
+                            serde_json::json!({"scope": {"kind":"subject", "workspace_id":"workspace-test", "subject_id":"subject-fixture"}}).to_string()
                         } else {
                             serde_json::json!({"message":"current permission revoked"}).to_string()
                         },
                     });
                 }
-                RestoreLegacyResidentClient {
-                    content: "RETAINED_PROTECTED_INPUT".into(),
+                RestoreSubjectResidentClient {
+                    availability: memory::subject::MemoryResidentSummaryAvailability::Ready,
+                    content: Some("RETAINED_PROTECTED_INPUT".into()),
                     load_count: self.reads.clone(),
+                    behavior_md: None,
                 }
                 .execute(request)
             }
@@ -21998,11 +21365,11 @@ permission = "write"
             let mut manifest = minimal_manifest();
             manifest.worker.name = format!("protected-input-{}", uuid::Uuid::now_v7());
             manifest.scope.allow.clear();
-            manifest.feature.memory.profile.enabled = true;
+            manifest.feature.subjektiv.profile.enabled = true;
             manifest
                 .feature
-                .memory
-                .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                .subjektiv
+                .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                     workspace_id: "workspace-test".into(),
                     language: "English".into(),
                 })
@@ -22014,20 +21381,15 @@ permission = "write"
             manifest: &WorkerManifest,
             host: Arc<Host>,
         ) {
-            let plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
-                manifest,
-                host,
-                worker.prompts().load_full(),
-            )
-            .unwrap()
-            .unwrap();
-            let source = plan.resident_summary_source;
-            assert!(
-                !worker
-                    .install_features(FeatureRegistryBuilder::new().with_module(plan.module))
-                    .has_errors()
-            );
-            worker.install_system_prompt_contribution(source, None);
+            let source =
+                crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
+                    manifest,
+                    Some(crate::subjektiv::test_connection(host)),
+                    worker.prompts(),
+                )
+                .unwrap()
+                .unwrap();
+            worker.install_system_prompt_contribution(Some(source), None);
         }
         async fn boot(
             manifest: WorkerManifest,
@@ -22075,14 +21437,14 @@ permission = "write"
         }
         fn assert_protected(store: &TestStore, session: SessionId, segment: SegmentId) {
             let log = store.read_all(session, segment).unwrap();
-            assert!(log.iter().any(|entry| matches!(entry, LogEntry::Extension { domain, payload, .. } if domain == PROTECTED_INPUTS_DOMAIN && payload["kinds"] == serde_json::json!(["workspace-memory"]))));
+            assert!(log.iter().any(|entry| matches!(entry, LogEntry::Extension { domain, payload, .. } if domain == PROTECTED_INPUTS_DOMAIN && payload["kinds"] == serde_json::json!(["subject-resident"]))));
         }
 
         struct WrongSource;
         #[async_trait]
         impl SystemPromptContributionSource for WrongSource {
             fn protected_input_kind(&self) -> Option<&'static str> {
-                Some("subject-resident")
+                Some("journal")
             }
             async fn load(&self) -> SystemPromptContribution {
                 panic!("restore must not reload")
@@ -22090,7 +21452,8 @@ permission = "write"
         }
 
         #[tokio::test]
-        async fn cached_memory_restore_requires_matching_source_and_current_supply_authority() {
+        async fn cached_subject_memory_restore_requires_matching_source_and_current_supply_authority()
+         {
             for mode in ["removed", "different-kind", "revoked", "allowed"] {
                 let _runtime_environment = worker_allocation::test_util::ENV_LOCK
                     .lock()
@@ -22113,7 +21476,7 @@ permission = "write"
                 assert_protected(&store, session, segment);
                 drop(original);
                 let mut replacement = manifest.clone();
-                replacement.feature.memory = Default::default();
+                replacement.feature.subjektiv = Default::default();
                 let provider = Provider::default();
                 let calls = provider.calls.clone();
                 let mut restored =
@@ -22182,7 +21545,7 @@ permission = "write"
                 let provider = Provider::default();
                 let calls = provider.calls.clone();
                 let mut local = manifest.clone();
-                local.feature.memory = Default::default();
+                local.feature.subjektiv = Default::default();
                 let mut restored = restore(local, store.clone(), session, segment, provider).await;
                 assert_supply_outcome(restored.run_text("must not leak").await, false);
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -22321,7 +21684,7 @@ permission = "write"
             assert_protected(&store, session, segment);
             drop(worker);
             let mut local = manifest;
-            local.feature.memory = Default::default();
+            local.feature.subjektiv = Default::default();
             let provider = Provider::default();
             let calls = provider.calls.clone();
             let mut restored = restore(local, store, session, segment, provider).await;
@@ -22370,9 +21733,68 @@ permission = "write"
             assert_eq!(host.checks.load(Ordering::SeqCst), 0);
         }
 
+        #[test]
+        fn removed_workspace_memory_provenance_is_rejected_in_retained_inputs() {
+            let payload = serde_json::json!({"version":1,"kinds":["workspace-memory"]});
+            let extension = SessionExtension::new(PROTECTED_INPUTS_DOMAIN, payload.clone());
+            for entry in [
+                LogEntry::Extension {
+                    ts: 1,
+                    domain: PROTECTED_INPUTS_DOMAIN.into(),
+                    payload,
+                },
+                LogEntry::AnnotatedSystemItem {
+                    ts: 1,
+                    entry: session_store::LoggedSystemHistoryEntry {
+                        item: SystemItem::Interrupt {
+                            body: "retained input".into(),
+                            prompt_provenance: None,
+                        },
+                        metadata: new_history_metadata(
+                            WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+                            None,
+                        ),
+                    },
+                    extensions: vec![extension.clone()],
+                },
+                LogEntry::AnnotatedUserInput {
+                    ts: 1,
+                    segments: vec![Segment::text("retained input")],
+                    extensions: vec![extension],
+                    history: vec![],
+                },
+            ] {
+                assert!(matches!(
+                    ProtectedInputProvenance::restore(&[entry], &[], None),
+                    Err(WorkerError::InvalidState(message)) if message.contains("workspace-memory")
+                ));
+            }
+            let mut provenance = ProtectedInputProvenance::default();
+            assert!(provenance.retain(Some("workspace-memory")).is_err());
+            assert!(provenance.kinds.is_empty());
+        }
+
+        #[test]
+        fn removed_workspace_memory_manifest_is_rejected_without_provenance() {
+            for enabled in [false, true] {
+                let mut snapshot =
+                    manifest::write_persisted_worker_manifest_snapshot(&minimal_manifest())
+                        .unwrap();
+                snapshot["manifest"]["feature"]["memory"] =
+                    serde_json::json!({"profile":{"enabled":enabled}});
+                let mut metadata = WorkerMetadata::new("removed-workspace-memory", None);
+                metadata.resolved_manifest_snapshot = Some(snapshot);
+                assert!(matches!(
+                    ProtectedInputProvenance::restore(&[], &[], Some(&metadata)),
+                    Err(WorkerError::InvalidState(message)) if message.contains("memory")
+                ));
+            }
+        }
+
         #[tokio::test]
         async fn malformed_retention_extension_is_rejected_before_provider() {
             for payload in [
+                serde_json::json!({"version":1,"kinds":["workspace-memory"]}),
                 serde_json::json!({"version":1,"kinds":["unknown-source"]}),
                 serde_json::json!({"version":2,"kinds":[]}),
                 serde_json::json!({"version":1,"kinds":[],"grant":true}),
@@ -22412,7 +21834,7 @@ permission = "write"
         }
 
         #[tokio::test]
-        async fn legacy_manifest_retention_is_persisted_before_replacement_config() {
+        async fn historical_subject_manifest_retention_is_persisted_before_replacement_config() {
             let _runtime_environment = worker_allocation::test_util::ENV_LOCK
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -22443,7 +21865,7 @@ permission = "write"
                 Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
             WorkerMetadataStore::write(&store, &metadata).unwrap();
             let mut replacement = manifest.clone();
-            replacement.feature.memory = Default::default();
+            replacement.feature.subjektiv = Default::default();
             let restored = restore(
                 replacement.clone(),
                 store.clone(),

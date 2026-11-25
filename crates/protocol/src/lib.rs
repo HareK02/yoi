@@ -2,6 +2,7 @@
 
 pub mod background_failure;
 pub mod control_failure;
+pub mod feature_initialization;
 pub mod identity;
 pub mod invocation;
 pub mod session_failure;

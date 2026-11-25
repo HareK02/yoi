@@ -197,7 +197,7 @@ pub(crate) fn original_session_presence(
     let worker: WorkerId = attribution.worker_id.parse().ok()?;
     let session: SessionId = session_id.parse().ok()?;
     let active = StandaloneWorkerStore::open_existing(state_root).ok()?;
-    let (workers, record) = match active.load(worker) {
+    let (workers, record) = match active.load_session_ownership(worker) {
         Ok(record) => (active, record),
         Err(StandaloneStoreError::WorkerNotFound(_)) => {
             let root = state_root.join("subjektiv").join("retained-workers");
@@ -207,7 +207,7 @@ pub(crate) fn original_session_presence(
                 Ok(_) => {}
             }
             let retained = StandaloneWorkerStore::open_existing(root).ok()?;
-            match retained.load(worker) {
+            match retained.load_session_ownership(worker) {
                 Ok(record) => (retained, record),
                 Err(StandaloneStoreError::WorkerNotFound(_)) => return Some(false),
                 Err(_) => return None,
@@ -302,7 +302,7 @@ impl Backend<'_> {
                 "Standalone Worker storage is inaccessible",
             )
         })?;
-        let record = match workers.load(id) {
+        let record = match workers.load_session_ownership(id) {
             Err(StandaloneStoreError::WorkerNotFound(_)) => {
                 workers = StandaloneWorkerStore::open_existing(
                     self.state_root.join("subjektiv").join("retained-workers"),
@@ -313,7 +313,7 @@ impl Backend<'_> {
                         "Original Session is not retained",
                     )
                 })?;
-                workers.load(id)
+                workers.load_session_ownership(id)
             }
             result => result,
         }
@@ -1306,6 +1306,81 @@ allow = []
         assert_eq!(
             backend.authorize(attribution).err().unwrap().code,
             SubjektivSessionDiagnosticCode::RetentionMissing
+        );
+    }
+
+    #[test]
+    fn retained_legacy_policy_remains_a_read_only_subject_session_source() {
+        let f = Fixture::new(&["retained historical experience"]);
+        let state_root = f.temp.path().join("workers");
+        let original = state_root.join(f.worker.to_string());
+        let path = original.join("record.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["schema_version"] = serde_json::json!(2);
+        record["status"] = serde_json::json!("stopped");
+        // Execution is intentionally unavailable, including old enabled Profiles.
+        record["manifest"]["manifest"]["feature"]["memory"] =
+            serde_json::json!({"profile":{"enabled":true}});
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let retained_root = state_root.join("subjektiv/retained-workers");
+        std::fs::create_dir_all(&retained_root).unwrap();
+        let retained = retained_root.join(f.worker.to_string());
+        std::fs::rename(original, &retained).unwrap();
+        let history = retained
+            .join("sessions")
+            .join(format!("{}.fixture", f.session));
+        let history_bytes = std::fs::read(&history).unwrap();
+        std::fs::create_dir(retained.join("sessions").join(f.session.to_string())).unwrap();
+        assert_eq!(
+            original_session_presence(
+                &state_root,
+                "local-scope-a",
+                &f.subject,
+                &f.store,
+                &f.session.to_string()
+            ),
+            Some(true)
+        );
+        assert!(matches!(
+            f.read(None),
+            SubjektivSessionBackendResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            f.search(None, 20),
+            SubjektivSessionBackendResponse::Ok { .. }
+        ));
+        assert!(
+            StandaloneWorkerStore::open_existing(&retained_root)
+                .unwrap()
+                .load(f.worker)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(retained.join("record.json")).unwrap(), bytes);
+        assert_eq!(std::fs::read(&history).unwrap(), history_bytes);
+        assert!(!retained.join("lease.json").exists());
+        assert!(!retained.join("commit.pending").exists());
+
+        record["subject"]["subject_id"] = serde_json::json!("foreign-subject");
+        std::fs::write(
+            retained.join("record.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        expect_error(
+            f.read(None),
+            SubjektivSessionDiagnosticCode::NotFoundOrNotAuthorized,
+        );
+        assert_eq!(
+            original_session_presence(
+                &state_root,
+                "local-scope-a",
+                &f.subject,
+                &f.store,
+                &f.session.to_string()
+            ),
+            None
         );
     }
 

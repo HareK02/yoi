@@ -648,6 +648,7 @@ struct LocalWorkdirSessionInner {
     commands: Mutex<HashMap<String, LocalCommand>>,
     command_telemetry: CommandTelemetry,
     command_environment: BTreeMap<String, String>,
+    command_host: Arc<crate::CommandHost>,
     resources: StdMutex<Vec<Arc<dyn WorkdirSessionResource>>>,
 }
 
@@ -1041,10 +1042,26 @@ impl LocalWorkdirSession {
                 commands: Mutex::new(HashMap::new()),
                 command_telemetry: CommandTelemetry::new(),
                 command_environment,
+                command_host: Arc::new(crate::CommandHost::default()),
                 resources: StdMutex::new(resources),
             }),
             operation_guard: None,
         }
+    }
+
+    /// Install the owning host's shared budget before the session is cloned.
+    /// Returns an error instead of mutating policy on an already-shared session.
+    pub fn with_command_host(
+        mut self,
+        host: Arc<crate::CommandHost>,
+    ) -> Result<Self, WorkdirError> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            WorkdirError::Conflict(
+                "command host must be configured before sharing a session".into(),
+            )
+        })?;
+        inner.command_host = host;
+        Ok(self)
     }
 
     pub fn root(&self) -> &Path {
@@ -1900,6 +1917,7 @@ impl WorkdirSession for LocalWorkdirSession {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
+        let permit = self.inner.command_host.admit()?;
         let command = command_transport::start(
             cwd,
             request,
@@ -1907,6 +1925,8 @@ impl WorkdirSession for LocalWorkdirSession {
             self.inner.command_telemetry.clone(),
             self.inner.command_environment.clone(),
             resources,
+            self.inner.command_host.clone(),
+            permit,
         );
         commands.insert(handle.0.clone(), command);
         Ok(handle)

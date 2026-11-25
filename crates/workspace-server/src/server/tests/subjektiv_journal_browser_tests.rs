@@ -594,8 +594,31 @@ async fn journal_browser_many_saved_links_page_without_reconciliation_and_use_im
 async fn journal_browser_read_post_has_memory_get_user_authority_but_no_mutation_authority() {
     let f = Fixture::new().await;
     let token = seed_test_api_token(f.api.store.as_ref(), "browser-reader-not-owner");
-    // Ordinary authenticated read authority is the same as Memory GET, even though browser
-    // selectors use POST. This exception is exact-route only; no mutations gain authority.
+    assert_eq!(
+        response(
+            build_router(f.api.clone()),
+            browser_request(&subject(&f), Some(&token), detail(&f))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let owner = seed_test_workspace_owner_token(f.api.store.as_ref(), "browser-reader-owner").await;
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/w/{TEST_WORKSPACE_ID}/members"))
+        .header(CONTENT_TYPE, "application/json")
+        .header("authorization", format!("Bearer {owner}"))
+        .body(Body::from(serde_json::json!({"operation_key":"add-browser-reader", "account_handle":"user-browser-reader-not-owner", "expected_membership_change_key":null}).to_string()))
+        .unwrap();
+    let (status, bytes) = response(build_router(f.api.clone()), request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    // A current member can read through the exact POST exception, but cannot mutate.
     assert_eq!(
         browser_call(&f, &token, detail(&f)).await["value"]["entry"]["id"],
         f.entry_id
@@ -605,7 +628,9 @@ async fn journal_browser_read_post_has_memory_get_user_authority_but_no_mutation
         .uri(format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"))
         .header(CONTENT_TYPE, "application/json")
         .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(r#"{"role":"not-allowed"}"#))
+        .body(Body::from(
+            r#"{"operation_id":"member-cannot-create-subject","role":"not-allowed"}"#,
+        ))
         .unwrap();
     assert_eq!(
         response(build_router(f.api.clone()), request).await.0,
@@ -736,6 +761,18 @@ async fn journal_browser_web_contract_serializes_saved_router_responses() {
 async fn journal_browser_cookie_read_post_retains_origin_check_for_non_owner_reader() {
     let f = Fixture::new().await;
     seed_test_api_token(f.api.store.as_ref(), "journal-cookie-reader");
+    let owner = f
+        .api
+        .store
+        .get_workspace(TEST_WORKSPACE_ID)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_account_id;
+    f.api.store.workspace_members_add(TEST_WORKSPACE_ID,&owner,&serde_json::from_value(json!({
+        "operation_key":"journal-cookie-membership", "account_handle":"user-journal-cookie-reader",
+        "expected_membership_change_key":null
+    })).unwrap()).unwrap();
     f.api
         .store
         .create_browser_session(&BrowserSessionRecord {

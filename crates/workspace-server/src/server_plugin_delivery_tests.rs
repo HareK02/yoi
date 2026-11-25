@@ -108,11 +108,11 @@ fn delivery_create_request(subject: Option<&str>, profile: &str) -> CreateWorksp
         profile: Some(profile.into()),
         initial_submit: vec![],
         workdir_attachments: vec![],
-        feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-            subjektiv: subject.map(|subject| server_api::SubjektivWorkerConnectionRequest {
-                subject_id: subject.into(),
-            }),
-        },
+        feature_connections: subject
+            .map(|subject| {
+                crate::server::subjektiv_worker_initialization::subject_connection(subject.into()).unwrap()
+            })
+            .unwrap_or_default(),
         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
         authorization: if subject.is_some() {
             server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None }
@@ -1055,7 +1055,7 @@ async fn subject_delegation_replacement_denies_child_warm_cache_and_preserves_sa
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
     let body = serde_json::to_vec(&json!({
         "runtime_id": f.worker.runtime_id, "display_name":"Artifact delegated consumer",
-        "profile":"builtin:coder", "initial_submit":[], "workdir_attachments":[], "feature_connections":{},
+        "profile":"builtin:coder", "initial_submit":[], "workdir_attachments":[], "feature_connections":[],
         "control_operation_id":"delivery-delegated-child",
         "authorization": authorization
     })).unwrap();

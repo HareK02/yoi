@@ -3,7 +3,7 @@
 //! Resolves the caller's registry Profile from the Workspace virtual config bundle and Prompt
 //! projection, using public catalog recipes separately from browser launch filtering. Raw sources
 //! and path selectors are rejected; instructions/features are not replaced with another default
-//! recipe. Recipes requiring Workspace mutation, Memory, child/peer, Workdir, Flow, or MCP authority
+//! recipe. Recipes requiring Workspace mutation, child/peer, Workdir, Flow, or MCP authority
 //! absent from the Job are rejected. subjektiv also checks explicit consolidation grants and feature
 //! requirements; Profile selection alone creates no domain authority.
 use super::*;
@@ -73,8 +73,7 @@ fn validate_backend_job_profile_requirements(
     // These tools require domain/parent/Workdir authority which a bounded Job
     // deliberately does not inherit. Reject, rather than disabling features or
     // substituting a different recipe under the caller's selector.
-    if f.memory.enabled()
-        || f.worker.enabled
+    if f.worker.enabled
         || f.sub_worker.enabled
         || f.flow.enabled
         || f.workspace_worker_discovery.enabled
@@ -86,7 +85,7 @@ fn validate_backend_job_profile_requirements(
         || f.orchestration.enabled
         || !manifest.mcp.stdio_servers.is_empty()
     {
-        return Err(Error::WorkspacePermissionDenied("Backend Job Profile requires authority not granted to this Job (Workspace mutation, Memory, child/peer, Workdir, Flow or MCP)".into()));
+        return Err(Error::WorkspacePermissionDenied("Backend Job Profile requires authority not granted to this Job (Workspace mutation, child/peer, Workdir, Flow or MCP)".into()));
     }
     let consolidation = request.grants.subjektiv_consolidation.is_some();
     if f.subjektiv.enabled() != consolidation

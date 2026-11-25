@@ -105,16 +105,21 @@ impl PendingRuntimeRestore {
 }
 
 pub(super) fn finalize_startup_binding<St>(
+    initializers: &worker::feature::initialization::FeatureInitializationRegistry<
+        Box<dyn agen::llm_client::LlmClient>,
+        St,
+    >,
     worker: &Worker<Box<dyn agen::llm_client::LlmClient>, St>,
-    attached: bool,
+    data: &protocol::feature_initialization::FeatureInitializations,
 ) -> Result<(), RuntimeRestoreFailure>
 where
     St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
 {
-    worker
-        .finalize_subjektiv_session_attribution_retaining_startup_failure(
-            attached,
-            SubjektivSessionAttributionLifecycle::NewSession,
+    initializers
+        .apply(
+            worker,
+            data,
+            worker::feature::initialization::InitializationPhase::New,
         )
         .map_err(|error| RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Binding, error))
 }
@@ -200,7 +205,7 @@ mod tests {
             workspace_api: None,
             memory_settings: None,
             plugin_execution: None,
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
         };
         #[cfg(feature = "ws-server")]
@@ -288,6 +293,7 @@ mod tests {
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
             deferred_workdir_sessions: BTreeMap::new(),
+            deferred_workdir_scope: Arc::new(std::sync::OnceLock::new()),
             config_bundle: None,
         };
         let result = backend.preflight_restore(&request).unwrap_err();

@@ -2039,3 +2039,26 @@ async fn exit_zero_with_incomplete_output_keeps_partial_bytes_and_safe_failure_i
         session.close().await.unwrap();
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "integration/systemd.rs"]
+mod systemd;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bare_sigkill_and_exit_137_never_claim_oom_in_bash_evidence() {
+    let (_root, _session, _view, bash) = output_fixture();
+    for (script, signal, code) in [
+        ("kill -KILL $$", Some(9), None),
+        ("exit 137", None, Some(137)),
+    ] {
+        let output = call(&bash, json!({"cwd":".","command":script})).await;
+        assert!(!output.summary.contains("OOM"));
+        let body: serde_json::Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+        let terminal = &body["output"]["terminal"];
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["signal"], json!(signal));
+        assert_eq!(terminal["exit_code"], json!(code));
+        assert_eq!(terminal["resource_outcome"], json!({"kind":"unconfined"}));
+    }
+}

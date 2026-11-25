@@ -259,6 +259,7 @@ pub struct WorkerE2eEnvironment {
     pub runtime_url: Option<String>,
     server: Option<ManagedProcess>,
     runtime: Option<ManagedProcess>,
+    command_host_environment: Option<(std::ffi::OsString, std::ffi::OsString)>,
     runtime_shutdown: WorkerProcessShutdownOutcome,
     server_shutdown: WorkerProcessShutdownOutcome,
     shutdown_error: Option<String>,
@@ -329,6 +330,7 @@ impl WorkerE2eEnvironment {
             runtime_url: None,
             server: None,
             runtime: None,
+            command_host_environment: None,
             runtime_shutdown: WorkerProcessShutdownOutcome::NotStarted,
             server_shutdown: WorkerProcessShutdownOutcome::NotStarted,
             shutdown_error: None,
@@ -1394,9 +1396,73 @@ impl WorkerE2eEnvironment {
         Ok(command)
     }
 
+    /// Configure only owned Runtime/share children, never the caller or user manager.
+    /// The small fixed limit belongs to the explicit command-isolation scenario.
+    pub fn use_systemd_command_host(
+        &mut self,
+        executable_path: std::ffi::OsString,
+        user_bus_address: std::ffi::OsString,
+    ) -> Result<()> {
+        if self.runtime.is_some() || self.server.is_some() {
+            return Err(HarnessError::Protocol(
+                "command host must be selected before startup".into(),
+            ));
+        }
+        self.command_host_environment = Some((executable_path, user_bus_address));
+        Ok(())
+    }
+
+    /// Exercise an authenticated product API; rejected bodies are never retained.
+    pub fn request_backend_json(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        if !path.starts_with("/api/") {
+            return Err(HarnessError::Protocol(
+                "expected an absolute Backend API path".into(),
+            ));
+        }
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| HarnessError::Protocol("invalid method".into()))?;
+        let mut request = self
+            .client
+            .request(method, format!("{}{path}", self.required_server_url()?))
+            .timeout(Duration::from_secs(20));
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        self.request_json(request, "command isolation product request")
+    }
+
+    /// A foreground product CLI shares the existing bounded capture and RAII owner.
+    pub fn start_product_cli(&self, name: &str, args: &[&str]) -> Result<ProductCliProcess> {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || name.is_empty() {
+            return Err(HarnessError::Protocol("invalid CLI artifact name".into()));
+        }
+        let binary = self.binaries.binary("yoi")?;
+        let mut command = self.runtime_command(&binary);
+        command.args(args).stdin(Stdio::null());
+        Ok(ProductCliProcess(ManagedProcess::spawn(
+            name,
+            command,
+            &self.artifacts_dir.join(format!("{name}.stdout.log")),
+            &self.artifacts_dir.join(format!("{name}.stderr.log")),
+        )?))
+    }
+
     fn runtime_command(&self, binary: &Path) -> Command {
         #[allow(unused_mut)]
         let mut command = self.isolated_command(binary);
+        if let Some((path, bus)) = &self.command_host_environment {
+            command
+                .env("PATH", path)
+                .env("DBUS_SESSION_BUS_ADDRESS", bus)
+                .env("YOI_WORKDIR_COMMAND_ISOLATION", "systemd")
+                .env("YOI_WORKDIR_COMMAND_MEMORY_MAX", "33554432")
+                .env("YOI_WORKDIR_COMMAND_PARALLEL", "2");
+        }
         #[cfg(feature = "fixture-support")]
         if let Some(home) = &self.acquisition_codex_home {
             command.env("CODEX_HOME", home);
@@ -1452,6 +1518,10 @@ impl WorkerE2eEnvironment {
                 "server_pid": self.server_pid(),
                 "runtime_pid": self.runtime_pid(),
                 "env_clear": true,
+                "command_isolation": self.command_host_environment.as_ref().map(|_| serde_json::json!({
+                    "mode": "systemd", "memory_max": 33554432_u64, "parallel": 2,
+                    "user_bus_explicit": true,
+                })),
                 "credentials_persisted_to_artifacts": false,
             }))?,
         )?;
@@ -1506,6 +1576,25 @@ fn shutdown_process(
         if !matches!(outcome, WorkerProcessShutdownOutcome::Failed { .. }) {
             *outcome = next;
         }
+    }
+}
+
+/// An owned foreground CLI, with the same drop/timeout cleanup as other products.
+#[derive(Debug)]
+pub struct ProductCliProcess(ManagedProcess);
+
+impl ProductCliProcess {
+    pub fn assert_running(&mut self) -> Result<()> {
+        if self.0.child.try_wait()?.is_some() {
+            return Err(HarnessError::Protocol(
+                "product CLI exited unexpectedly; see bounded CLI logs".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(mut self) -> Result<()> {
+        self.0.shutdown(EXIT_WAIT).map(|_| ())
     }
 }
 
@@ -1939,6 +2028,7 @@ mod startup_address_tests {
             runtime_url: None,
             server: None,
             runtime: None,
+            command_host_environment: None,
             runtime_shutdown: WorkerProcessShutdownOutcome::NotStarted,
             server_shutdown: WorkerProcessShutdownOutcome::NotStarted,
             shutdown_error: None,

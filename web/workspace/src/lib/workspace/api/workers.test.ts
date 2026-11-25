@@ -399,7 +399,7 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
       working_directory_id: "workdir-a",
       relative_cwd: null,
     }],
-    feature_connections: {},
+    feature_connections: [],
     authorization: { kind: "assignment", assignment: null },
     control_operation_id: "create-op",
   };
@@ -512,9 +512,28 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
   assertEquals(
     parseCreateWorkspaceWorkerRequest({
       ...request,
-      feature_connections: { subjektiv: { subject_id: "subject-42" } },
+      feature_connections: [{ feature_id: "builtin:subjektiv", version: 1, payload: { subject_id: "subject-42" } }],
     }).feature_connections,
+    [{ feature_id: "builtin:subjektiv", version: 1, payload: { subject_id: "subject-42" } }],
+  );
+  for (const feature_connections of [
+    {},
     { subjektiv: { subject_id: "subject-42" } },
+    [{ feature_id: "test:connection", version: 0, payload: {} }],
+    [{ feature_id: "test:connection", version: 1, payload: [] }],
+    [{ feature_id: "test:connection", version: 1, payload: {}, resolved: true }],
+    [
+      { feature_id: "test:connection", version: 1, payload: {} },
+      { feature_id: "test:connection", version: 1, payload: {} },
+    ],
+    [{ feature_id: "test:connection", version: 1, payload: { text: "x".repeat(16 * 1024) } }],
+  ]) {
+    assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, feature_connections }), Error, "");
+  }
+  assertThrows(
+    () => parseCreateWorkspaceWorkerRequest({ ...request, resolved_feature_initialization: [] }),
+    Error,
+    "unknown field resolved_feature_initialization",
   );
   assertThrows(
     () =>
@@ -560,6 +579,45 @@ Deno.test("Worker create request parser defaults authorization and preserves exp
   );
 });
 
+Deno.test("Worker create request validates Feature initialization bounds before canonicalizing", () => {
+  const request = {
+    runtime_id: "runtime-a",
+    display_name: "Worker A",
+    profile: null,
+    initial_submit: [],
+    workdir_attachments: [],
+    control_operation_id: "create-op",
+  };
+  const connections = Array.from({ length: 32 }, (_, index) => ({
+    feature_id: `test:${String(31 - index).padStart(3, "0")}`.padEnd(128, "x"),
+    version: 0xffff_ffff,
+    payload: {},
+  }));
+  assertEquals(
+    parseCreateWorkspaceWorkerRequest({ ...request, feature_connections: connections }).feature_connections,
+    [...connections].reverse(),
+  );
+  for (const feature_connections of [
+    [...connections, { feature_id: "test:extra", version: 1, payload: {} }],
+    [{ feature_id: "test:".padEnd(129, "x"), version: 1, payload: {} }],
+    [{ feature_id: "unqualified", version: 1, payload: {} }],
+    ...[0x1_0000_0000, -1, 1.5, NaN, Infinity, "1"].map((version) => [
+      { feature_id: "test:connection", version, payload: {} },
+    ]),
+    Array.from({ length: 9 }, (_, index) => ({
+      feature_id: `test:connection-${index}`,
+      version: 1,
+      payload: { text: "x".repeat(15_000) },
+    })),
+  ]) {
+    assertThrows(
+      () => parseCreateWorkspaceWorkerRequest({ ...request, feature_connections }),
+      Error,
+      "feature_connections",
+    );
+  }
+});
+
 Deno.test("Worker launch request preserves typed Feature invocations and rejects unsafe values", () => {
   const invocation = {
     invocation_id: "invoke-1",
@@ -577,7 +635,7 @@ Deno.test("Worker launch request preserves typed Feature invocations and rejects
     profile: "builtin:coder",
     initial_submit: [{ kind: "feature_invoke", invocation }],
     workdir_attachments: [],
-    feature_connections: {},
+    feature_connections: [],
     authorization: { kind: "assignment", assignment: null },
     control_operation_id: "create-op",
   };

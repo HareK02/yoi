@@ -106,25 +106,5 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
             description: "Supply frozen consolidation input only within its current Job capability.",
             sets: &["implementer", "companion", "conversation"],
         },
-        BuiltinPermissionOperation {
-            key: "memory.document.read",
-            description: "Read a legacy Workspace Memory document; not Subject Memory.",
-            sets: &["implementer", "companion"],
-        },
-        BuiltinPermissionOperation {
-            key: "memory.document.update",
-            description: "Update a legacy Workspace Memory document with existing storage constraints.",
-            sets: &["implementer", "companion"],
-        },
-        BuiltinPermissionOperation {
-            key: "memory.audit.append",
-            description: "Append a Workspace Memory audit event.",
-            sets: &["implementer", "companion"],
-        },
-        BuiltinPermissionOperation {
-            key: "memory.staging.close",
-            description: "Close a legacy Workspace staging candidate.",
-            sets: &["implementer", "companion"],
-        },
     ],
 };

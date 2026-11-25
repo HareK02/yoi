@@ -451,7 +451,6 @@ impl LaunchFixture {
                 public_key: runtime_identity.public_key.clone(),
                 public_key_fingerprint: String::new(),
                 binding_id: "binding-launch-test".to_string(),
-
                 authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
 
                 created_at: TEST_CREATED_AT.into(),
@@ -556,7 +555,7 @@ impl LaunchFixture {
         }
         json!({
             "runtime_id": self.runtime_id, "display_name": "Explicit Ticket Worker", "profile": profile,
-            "initial_submit": segments, "workdir_attachments": [], "feature_connections": {},
+            "initial_submit": segments, "workdir_attachments": [], "feature_connections": [],
             "authorization": { "kind": "assignment", "assignment": null },
             "control_operation_id": format!("launch-{operation_id}"),
         })

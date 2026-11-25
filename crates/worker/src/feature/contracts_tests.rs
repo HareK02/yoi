@@ -362,6 +362,7 @@ fn lifecycle_spawn_omitted_authorization_selects_common_default() {
         "initial_submit":[]
     }))
     .unwrap();
+    assert_eq!(request.feature_connections, Default::default());
     assert_eq!(
         serde_json::to_value(request.authorization).unwrap(),
         serde_json::json!({"kind":"assignment", "assignment":null})

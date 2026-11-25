@@ -121,11 +121,12 @@ impl WorkspaceApi {
                     return Err(Error::WorkspaceConfigConflict("Plugin Profile changed during launch".into()));
                 }
                 let saved = crate::plugin_plan::plugin_plan_create(tx, LAUNCH_ACTOR, &key, &plan)?;
-                let fingerprint = config_source::digest_bytes(&serde_json::to_vec(&(&reservation.create_fingerprint, &saved.fingerprint)).map_err(|_| Error::Config("Plugin launch encoding failed".into()))?);
+                let fingerprint = crate::plugin_plan::worker_launch_fingerprint(&reservation.create_fingerprint, &saved.fingerprint)?;
                 let updated = tx.execute("UPDATE worker_create_reservations SET create_fingerprint=?1 WHERE workspace_id=?2 AND runtime_id=?3 AND worker_id=?4 AND create_fingerprint=?5 AND state='reserved'",
                     params![fingerprint, self.workspace_id(), runtime, reservation.worker_id.to_string(), reservation.create_fingerprint])?;
                 if updated != 1 { return Err(Error::WorkspaceConfigConflict("Plugin launch reservation changed".into())); }
                 tx.execute("INSERT INTO worker_plugin_launches(workspace_id,runtime_id,worker_id,plan_id) VALUES(?1,?2,?3,?4)", params![self.workspace_id(), runtime, reservation.worker_id.to_string(), saved.plan_id])?;
+                crate::store::refresh_worker_create_evidence(tx, self.workspace_id(), &worker_runtime::identity::RuntimeWorkerRef::new(runtime, reservation.worker_id.to_string()))?;
                 runtime_api::PluginExecutionSnapshot { plan_id: saved.plan_id, fingerprint: saved.fingerprint, plan: saved.plan }
             };
             let fingerprint: String = tx.query_row("SELECT create_fingerprint FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='reserved'",

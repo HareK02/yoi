@@ -3025,15 +3025,9 @@ dependencies = [
 name = "memory"
 version = "0.1.0"
 dependencies = [
- "agen",
- "async-trait",
- "chrono",
- "lint-common",
  "schemars",
  "serde",
  "serde_json",
- "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -5662,6 +5656,7 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "async-trait",
+ "axum",
  "error-contract",
  "filetime",
  "fs-operation",
@@ -7400,6 +7395,7 @@ dependencies = [
  "session-store",
  "sha2 0.11.0",
  "subjektiv",
+ "subjektiv-api",
  "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.18",
@@ -7447,6 +7443,7 @@ dependencies = [
  "server-api",
  "session-store",
  "sha2 0.11.0",
+ "subjektiv-api",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -7582,9 +7579,12 @@ dependencies = [
  "session-store",
  "sha2 0.11.0",
  "tempfile",
+ "toml",
  "tungstenite 0.29.0",
+ "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs-proto",
+ "workdir",
  "worker-runtime",
  "yoi-workspace-server",
 ]
@@ -7669,6 +7669,7 @@ dependencies = [
  "sha2 0.11.0",
  "ssh-key",
  "subjektiv",
+ "subjektiv-api",
  "tempfile",
  "thiserror 2.0.18",
  "ticket",

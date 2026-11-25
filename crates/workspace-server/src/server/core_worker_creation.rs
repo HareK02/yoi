@@ -99,7 +99,7 @@ pub(super) fn resolve_creation_profile(
     runtime_id: &str,
     profile: Option<String>,
     resolved_control_operation: Option<&WorkerControlOperation>,
-    subject_connection: bool,
+    connection_authority: feature_initialization::CreationAuthority,
 ) -> ApiResult<(
     String,
     ProfileSelector,
@@ -125,6 +125,30 @@ pub(super) fn resolve_creation_profile(
             )
             .into());
         }
+    }
+    if let Some(operation) = resolved_control_operation
+        && let Some(saved) = api.config_store.saved_feature_worker_launch(
+            api.workspace_id(),
+            &operation.operation_id,
+            &operation.input_fingerprint,
+        )?
+    {
+        if connection_authority != feature_initialization::CreationAuthority::FeatureOwned {
+            return Err(Error::RepositoryConflict(
+                "creation operation is bound to a different Feature-owned authority".into(),
+            )
+            .into());
+        }
+        let selector = if saved.profile.starts_with("builtin:") {
+            ProfileSelector::Builtin(saved.profile.clone())
+        } else if saved.profile.starts_with("project:") {
+            ProfileSelector::Named(saved.profile.clone())
+        } else {
+            return Err(
+                Error::Config("saved Feature launch has noncanonical Profile".into()).into(),
+            );
+        };
+        return Ok((saved.profile, selector, Some(saved.bundle), None));
     }
     let saved = resolved_control_operation
         .as_ref()
@@ -207,7 +231,9 @@ pub(super) fn resolve_creation_profile(
                 .prompt_projection_cache
                 .resolve(&api.config.workspace_id, &config_state)?;
             let bundle = crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(&profile_projection, &config_state, &api.config.workspace_id, &api.config.workspace_created_at, &profile, prompt_catalog.as_ref())?.ok_or_else(|| Error::Config("resolved Worker Profile bundle is missing".into()))?;
-            let grant = if subject_connection {
+            let grant = if connection_authority
+                == feature_initialization::CreationAuthority::FeatureOwned
+            {
                 None
             } else {
                 Some(core_worker_creation::resolve_core_creation_grant(

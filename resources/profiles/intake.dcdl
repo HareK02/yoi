@@ -7,7 +7,6 @@ import "./base.dcdl" // {
     feature = {
         drive = { enabled = true; };
         task = { enabled = true; };
-        memory = { enabled = false; };
         subjektiv = { enabled = true; };
         web = { enabled = true; };
         sub_worker = { enabled = false; };

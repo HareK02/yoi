@@ -171,6 +171,7 @@ pub struct WorkingDirectoryBinding {
     pub cwd: PathBuf,
     working_directory_root: PathBuf,
     command_environment: BTreeMap<String, String>,
+    command_host: Arc<workdir::CommandHost>,
     session_resources: Vec<Arc<dyn WorkdirSessionResource>>,
     occupancy: occupancy::Occupancy,
     occupancy_id: String,
@@ -188,6 +189,10 @@ impl WorkingDirectoryBinding {
 
     pub fn working_directory_root(&self) -> &Path {
         &self.working_directory_root
+    }
+
+    pub fn command_host(&self) -> Arc<workdir::CommandHost> {
+        self.command_host.clone()
     }
 
     pub fn command_environment(&self) -> BTreeMap<String, String> {
@@ -681,6 +686,7 @@ fn repository_access_now_epoch_seconds() -> u64 {
 #[derive(Clone, Debug)]
 pub struct RuntimeGitMaterializer {
     runtime_root: PathBuf,
+    command_host: Arc<workdir::CommandHost>,
     repository_access: RepositoryAccessExpiryScheduler,
     occupancy: occupancy::Occupancy,
 }
@@ -689,9 +695,15 @@ impl RuntimeGitMaterializer {
     pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
         Self {
             runtime_root: runtime_root.into(),
+            command_host: Arc::new(workdir::CommandHost::default()),
             repository_access: RepositoryAccessExpiryScheduler::new(),
             occupancy: occupancy::Occupancy::default(),
         }
+    }
+
+    pub fn with_command_host(mut self, host: Arc<workdir::CommandHost>) -> Self {
+        self.command_host = host;
+        self
     }
 
     pub fn runtime_root(&self) -> &Path {
@@ -810,6 +822,7 @@ impl RuntimeGitMaterializer {
             cwd: record.root,
             working_directory_root,
             command_environment: BTreeMap::new(),
+            command_host: self.command_host.clone(),
             session_resources: Vec::new(),
             occupancy: self.occupancy.clone(),
             occupancy_id: working_directory_id.to_string(),
@@ -1173,6 +1186,7 @@ impl RuntimeGitMaterializer {
             cwd: checkout_root.clone(),
             working_directory_root: working_directory_root.clone(),
             command_environment: BTreeMap::new(),
+            command_host: self.command_host.clone(),
             session_resources: Vec::new(),
             occupancy: self.occupancy.clone(),
             occupancy_id: working_directory_id.to_string(),
@@ -3671,6 +3685,30 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(wildcard.code, "repository_ref_selector_invalid");
+    }
+
+    #[test]
+    fn reopening_workdirs_uses_the_current_host_budget_not_saved_repository_metadata() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let host = Arc::new(workdir::CommandHost::default());
+        let materializer =
+            RuntimeGitMaterializer::new(runtime_root.path()).with_command_host(host.clone());
+        let first = materializer
+            .materialize(&worker_ref(1), &request(repo.path()))
+            .unwrap();
+        let second = materializer
+            .bind_working_directory(&first.working_directory.id, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.command_host(), &host));
+        assert!(Arc::ptr_eq(&second.command_host(), &host));
+        let current = Arc::new(workdir::CommandHost::default());
+        let reopened = RuntimeGitMaterializer::new(runtime_root.path())
+            .with_command_host(current.clone())
+            .bind_working_directory(&first.working_directory.id, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(&reopened.command_host(), &current));
+        assert!(!Arc::ptr_eq(&reopened.command_host(), &host));
     }
 
     #[test]

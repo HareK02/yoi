@@ -293,7 +293,7 @@ mod restore_candidate {
                     manifest.feature.subjektiv =
                         manifest::ResolvedSubjektivFeatureConfig::default();
                     manifest.feature.task.enabled = true;
-                    create.subjektiv_attached = false;
+                    create.feature_initialization = Default::default();
                     create.workspace_api.as_mut().unwrap().base_url = base_url;
                     let aggregate = fixture_root
                         .join("workers")
@@ -1704,6 +1704,9 @@ mod restore_candidate {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 request.request.workspace_api.as_mut().unwrap().base_url = format!("http://{}", listener.local_addr().unwrap());
                 let app = axum::Router::new()
+                    .route("/api/w/workspace-saved-subjektiv/subjektiv/worker-connection", axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({ "workspace_id": "workspace-saved-subjektiv", "subject_id": "saved-subject", "kind": "subject_body" }))
+                    }))
                     .route("/api/w/workspace-saved-subjektiv/authorization/bound-check", axum::routing::post(
                         move |axum::Json(input): axum::Json<server_api::authorization::BoundOperationAuthorizationRequest>| {
                             let operations = operations.clone();

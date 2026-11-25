@@ -246,7 +246,7 @@ fn policy_create_request(
     policy: &server_api::launch_policy::WorkerLaunchPolicy,
 ) -> Value {
     json!({"runtime_id":runtime, "display_name":"Policy-bound editor", "profile":policy.allowed_profiles[0],
-        "initial_submit":[], "workdir_attachments":[], "feature_connections":{}, "control_operation_id":operation,
+        "initial_submit":[], "workdir_attachments":[], "feature_connections":[], "control_operation_id":operation,
         "authorization":{"kind":"policy", "policy_id":policy.policy_id, "policy_authorization_key":policy.authorization_key}})
 }
 
@@ -327,11 +327,11 @@ impl Fixture {
                 profile: Some("project:authority-source".into()),
                 initial_submit: vec![],
                 workdir_attachments: vec![],
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: subject.clone(),
-                    }),
-                },
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(
+                        subject.clone(),
+                    )
+                    .unwrap(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
@@ -612,7 +612,7 @@ impl Fixture {
             .map(|permission| permission.operation.as_str())
             .collect();
         json!({"runtime_id":self.source.runtime_id,"display_name":"Ordinary delegated editor",
-            "profile":"builtin:coder","initial_submit":[],"workdir_attachments":[],"feature_connections":{},
+            "profile":"builtin:coder","initial_submit":[],"workdir_attachments":[],"feature_connections":[],
             "control_operation_id":operation,
             "authorization":{"kind":"assignment","assignment":key_assignment(&keys)}})
     }
@@ -3057,7 +3057,8 @@ async fn delegated_creation_rejects_excess_permissions_and_body_identity_before_
     singleton["singleton_key"] = json!("model-chosen-singleton");
     let mut body_attachment =
         policy_create_request(&f.source.runtime_id, "subject-escalation", &reader);
-    body_attachment["feature_connections"] = json!({"subjektiv":{"subject_id":f.subject}});
+    body_attachment["feature_connections"] =
+        json!([{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":f.subject}}]);
     let mut spoof = policy_create_request(&f.source.runtime_id, "origin-escalation", &reader);
     spoof["authorization"]["subject_id"] = json!(f.subject);
     let records = creation_record_counts(&f);
@@ -4595,11 +4596,9 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
             profile: Some("project:authority-source".into()),
             initial_submit: vec![],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(subject.clone())
+                    .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
@@ -5120,7 +5119,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
             &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
             json!({"runtime_id":CONNECTED_RUNTIME, "display_name":format!("{label} read-only body"),
                 "profile":"project:authority-source", "initial_submit":[], "workdir_attachments":[],
-                "feature_connections":{"subjektiv":{"subject_id":subject}},
+                "feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject}}],
                 "control_operation_id":format!("parallel-{label}-body"),
                 "authorization":{"kind":"assignment", "assignment":null}})).await;
         assert_eq!(
@@ -5163,7 +5162,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
             "display_name":format!("{label} delegated Ticket editor"), "profile":"project:authority-editor",
             "initial_submit":[],
             "workdir_attachments":[{"alias":"workdir", "working_directory_id":workdir}],
-            "feature_connections":{}, "control_operation_id":format!("parallel-{label}-control"),
+            "feature_connections":[], "control_operation_id":format!("parallel-{label}-control"),
             "authorization":{"kind":"policy", "policy_id":launch.policy_id, "policy_authorization_key":launch.authorization_key}});
         cases.push(Case {
             subject,
@@ -5868,11 +5867,11 @@ async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_r
             profile: Some("project:authority-source".into()),
             initial_submit: vec![],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: f.subject.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(
+                    f.subject.clone(),
+                )
+                .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,

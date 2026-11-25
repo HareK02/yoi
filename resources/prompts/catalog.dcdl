@@ -27,7 +27,6 @@ internalFlowVerifierSystem = import "./internal/flow_verifier_system.md";
 internalBackendJobSystem = import "./internal/backend_job_system.md";
 internalJobSystem = import "./internal/job_system.md";
 internalTicketItemChecker = import "./internal/ticket_item_checker.md";
-internalMemoryConsolidationSystem = import "./internal/memory_consolidation_system.md";
 internalSubjektivMemoryConsolidationSystem = import "./internal/subjektiv_memory_consolidation_system.md";
 internalSubjektivJournalSystem = import "./internal/subjektiv_journal_system.md";
 internalSubjektivMemorySurfaceSystem = import "./internal/subjektiv_memory_surface_system.md";
@@ -76,7 +75,6 @@ in
         backend_job_system = internalBackendJobSystem.content;
         job_system = internalJobSystem.content;
         ticket_item_checker = internalTicketItemChecker.content;
-        memory_consolidation_system = internalMemoryConsolidationSystem.content;
         subjektiv_memory_consolidation_system = internalSubjektivMemoryConsolidationSystem.content;
         subjektiv_journal_system = internalSubjektivJournalSystem.content;
         subjektiv_memory_surface_system = internalSubjektivMemorySurfaceSystem.content;

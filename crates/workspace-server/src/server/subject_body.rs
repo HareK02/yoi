@@ -274,6 +274,12 @@ pub(super) async fn stop_outcome(
     let outcome = match result {
         runtime_api::WorkerStopOutcome::NotFound => server_api::SubjectBodyStopOutcome::NotFound,
         runtime_api::WorkerStopOutcome::Pending => server_api::SubjectBodyStopOutcome::Pending,
+        runtime_api::WorkerStopOutcome::Interrupted => {
+            server_api::SubjectBodyStopOutcome::Interrupted
+        }
+        runtime_api::WorkerStopOutcome::Failed { cause } => {
+            server_api::SubjectBodyStopOutcome::Failed { cause }
+        }
         runtime_api::WorkerStopOutcome::Stopped { .. } => {
             server_api::SubjectBodyStopOutcome::Stopped
         }
@@ -569,11 +575,10 @@ pub(super) async fn start(
                 profile: Some(server_api::authorization::SUBJECT_CONVERSATION_PROFILE.into()),
                 initial_submit: vec![],
                 workdir_attachments: vec![],
-                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: create_subject,
-                    }),
-                },
+                feature_connections:
+                    crate::server::subjektiv_worker_initialization::subject_connection(
+                        create_subject,
+                    )?,
                 control_operation_id: None,
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,

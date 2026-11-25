@@ -357,6 +357,26 @@ async fn public_mid_turn_compactions_preserve_originals_and_drain_after_cancel_a
             )
             .unwrap();
         let final_original = originals.descriptors().last().unwrap();
+        let accepted_terminal = catalog
+            .store
+            .read_journal_source(&context, &journal.id, final_original.canonical_order)
+            .expect("rolled-back cancellation must admit its committed terminal before RunEnd");
+        assert_eq!(
+            accepted_terminal.source.pointer.segment_id,
+            final_original.identity.segment_id
+        );
+        assert_eq!(
+            accepted_terminal.source.pointer.entry_ref,
+            final_original.identity.entry_ref
+        );
+        assert_eq!(accepted_terminal.source.content_sha256, final_original.sha256);
+        assert!(
+            accepted_terminal
+                .accepted
+                .iter()
+                .any(|range| range.start == 0 && range.end == final_original.total_bytes),
+            "the final terminal must be fully accepted before the gated Journal Job is released"
+        );
         let expected_cursor = (final_original.canonical_order + 1, 0);
         let canonical: Vec<_> = originals
             .descriptors()

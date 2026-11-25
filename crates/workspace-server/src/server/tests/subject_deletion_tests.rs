@@ -236,11 +236,11 @@ async fn unconfirmed_worker_shutdown_is_not_completion_and_exact_retry_converges
             profile: Some("builtin:companion".into()),
             initial_submit: vec![],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.id.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(
+                    subject.id.clone(),
+                )
+                .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
@@ -723,10 +723,6 @@ async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pendi
         } else {
             "unmaterialized-subject-body".into()
         };
-        let settings = api
-            .config_store
-            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-            .unwrap();
         let reserved = api
             .config_store
             .reserve_worker_create(
@@ -735,7 +731,6 @@ async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pendi
                 &allocation,
                 "unmaterialized-fingerprint",
                 singleton.as_deref(),
-                &settings,
             )
             .unwrap();
         let worker =
@@ -774,7 +769,6 @@ async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pendi
                     &allocation,
                     "unmaterialized-fingerprint",
                     singleton.as_deref(),
-                    &settings
                 )
                 .is_err()
         );
@@ -1458,11 +1452,11 @@ async fn body_archive_subject_deletion(completed_metadata_purge: bool, partial_r
             profile: Some("builtin:companion".into()),
             initial_submit: vec![],
             workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.id.clone(),
-                }),
-            },
+            feature_connections:
+                crate::server::subjektiv_worker_initialization::subject_connection(
+                    subject.id.clone(),
+                )
+                .unwrap(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
             authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,

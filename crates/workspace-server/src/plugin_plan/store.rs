@@ -10,6 +10,13 @@ pub(crate) fn worker_launch_key(runtime: &str, worker: &str) -> String {
     config_source::digest_bytes(&serde_json::to_vec(&(runtime, worker)).expect("identity encoding"))
 }
 
+pub(crate) fn worker_launch_fingerprint(base: &str, plan: &str) -> Result<String> {
+    Ok(config_source::digest_bytes(
+        &serde_json::to_vec(&(base, plan))
+            .map_err(|_| Error::Config("Plugin launch encoding failed".into()))?,
+    ))
+}
+
 /// An existing row with a NULL plan seals the empty selection. Absence is an
 /// unresolved reservation, not permission to reselect after Runtime dispatch.
 pub(crate) fn worker_launch_selection(

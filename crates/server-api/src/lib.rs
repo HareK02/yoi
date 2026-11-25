@@ -25,6 +25,7 @@ pub mod configuration_publication;
 pub use configuration_publication::*;
 pub mod feature_permissions;
 pub use configuration_adoption::*;
+pub use subjektiv_api::worker_initialization::ResolvedWorkerConnection;
 pub use subjektiv_api::*;
 mod subject_body;
 pub use subject_body::*;
@@ -98,11 +99,6 @@ pub struct SubjectPermissionInterruption {
     pub backend_command_sessions_closed: bool,
     pub diagnostics: Vec<String>,
 }
-
-#[allow(dead_code)]
-#[derive(JsonSchema)]
-struct ServerJsonSafeU64(#[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))] u64);
-type JsonSafeU64Pair = [ServerJsonSafeU64; 2];
 
 pub use runtime_api::control_failure;
 
@@ -563,8 +559,6 @@ impl_openapi_schema!(
     UpdateWorkspaceMetadataRequest,
     WorkspaceMetadataMutationResponse,
     WorkspaceSigningIdentityResponse,
-    WorkspaceMemorySettings,
-    UpdateWorkspaceMemorySettingsRequest,
     RepositoryAccessProjection,
     RepositorySshCredentialListResponse,
     RepositorySshCredential,
@@ -589,13 +583,6 @@ impl_openapi_schema!(
     PutFlowRequest,
     FlowSourceResolveRequest,
     ResolvedFlowSource,
-    MemoryDocumentResponse,
-    LegacyMemoryResetRequest,
-    LegacyMemoryResetResponse,
-    MemoryStagingQuery,
-    MemoryStagingListResponse,
-    MemoryBackendRequest,
-    MemoryBackendResponse,
     MemoryConsolidateStagingRequest,
     MemoryConsolidationResponse,
     SubjektivSubjectCreateRequest,
@@ -1310,33 +1297,6 @@ pub trait ServerApi {
     ) -> Result<WorkspaceSigningIdentityResponse, RepositoryApiError>;
 
     #[get(
-        "/api/w/{workspace_id}/settings/memory",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
-        bearer_auth = true,
-        browser_auth = true
-    )]
-    async fn workspace_memory_settings(
-        &self,
-        #[path] workspace_id: String,
-    ) -> Result<WorkspaceMemorySettings, RepositoryApiError>;
-
-    #[put(
-        "/api/w/{workspace_id}/settings/memory",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500],
-        bearer_auth = true,
-        browser_auth = true
-    )]
-    async fn workspace_memory_settings_update(
-        &self,
-        #[path] workspace_id: String,
-        #[body] request: UpdateWorkspaceMemorySettingsRequest,
-    ) -> Result<WorkspaceMemorySettings, RepositoryApiError>;
-
-    #[get(
         "/api/w/{workspace_id}/settings/repository-access",
         status = 200,
         error_status = 400,
@@ -1686,76 +1646,6 @@ pub trait ServerApi {
         #[path] flow_id: String,
     ) -> Result<FlowSourceRecord, RepositoryApiError>;
 
-    #[get(
-        "/api/w/{workspace_id}/memory",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
-        bearer_auth = true,
-        browser_auth = true
-    )]
-    async fn memory_document(
-        &self,
-        #[path] workspace_id: String,
-    ) -> Result<MemoryDocumentResponse, RepositoryApiError>;
-
-    #[post(
-        "/api/w/{workspace_id}/memory/reset",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
-        bearer_auth = true,
-        browser_auth = true
-    )]
-    async fn legacy_memory_reset(
-        &self,
-        #[extension] actor: RequestActor,
-        #[path] workspace_id: String,
-        #[body] request: LegacyMemoryResetRequest,
-    ) -> Result<LegacyMemoryResetResponse, RepositoryApiError>;
-
-    #[get(
-        "/api/w/{workspace_id}/memory/staging",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
-        bearer_auth = true,
-        browser_auth = true
-    )]
-    async fn memory_staging_list(
-        &self,
-        #[path] workspace_id: String,
-        #[query] query: MemoryStagingQuery,
-    ) -> Result<MemoryStagingListResponse, RepositoryApiError>;
-    #[post(
-        "/api/w/{workspace_id}/memory/backend",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
-        bearer_auth = true,
-        browser_auth = true,
-    )]
-    async fn memory_backend(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[body] request: MemoryBackendRequest,
-    ) -> Result<MemoryBackendResponse, RepositoryApiError>;
-    #[post(
-        "/api/w/{workspace_id}/memory/consolidation",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        bearer_auth = true,
-        browser_auth = true,
-    )]
-    async fn memory_consolidation(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[body] request: MemoryConsolidateStagingRequest,
-    ) -> Result<MemoryConsolidationResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/authorization/check",
         status = 200,
@@ -2075,6 +1965,14 @@ pub trait ServerApi {
         #[path] conversation_id: String,
         #[body] request: ChatUserMessageRequest,
     ) -> Result<ChatReceiveResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/subjektiv/worker-connection", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn subjektiv_worker_connection(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<ResolvedWorkerConnection, RepositoryApiError>;
 
     #[post("/api/w/{workspace_id}/subjektiv/chat/worker", status = 200, error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
@@ -6089,24 +5987,6 @@ pub struct ResolvedFlowSource {
     pub definition: CompiledFlowDefinition,
 }
 
-/// Query parameters for the bounded Memory staging list.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MemoryStagingQuery {
-    #[schemars(range(min = 0, max = 1000))]
-    pub limit: Option<u32>,
-}
-
-/// Public wrapper retaining the established tagged Memory backend wire shape.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-pub struct MemoryBackendRequest(pub memory::backend::MemoryBackendOperation);
-
-/// Public wrapper retaining the established tagged Memory backend response shape.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-pub struct MemoryBackendResponse(pub memory::backend::MemoryBackendHttpResponse);
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConsolidateStagingRequest {
@@ -6359,7 +6239,7 @@ pub struct SubjektivMemoryChangesQuery {
 pub struct SubjektivStageCandidateRequest {
     /// Committed parent Session identity captured by the Worker host.
     pub session_id: String,
-    pub operation: memory::backend::MemoryStageCandidateOperation,
+    pub operation: memory::subject::MemoryStageCandidateOperation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7028,14 +6908,14 @@ pub struct SubjektivResidentContextOutput {
     /// Exact user-managed document. Empty means explicitly unset.
     pub behavior_md: String,
     /// Independently-fresh generated Memory projection.
-    pub memory_surface: memory::backend::MemoryResidentSummaryOutput,
+    pub memory_surface: memory::subject::MemoryResidentSummaryOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendOperation {
-    ResidentSummary(memory::backend::MemoryResidentSummaryOperation),
-    ResidentContext(memory::backend::MemoryResidentSummaryOperation),
+    ResidentSummary(memory::subject::MemoryResidentSummaryOperation),
+    ResidentContext(memory::subject::MemoryResidentSummaryOperation),
     Query(SubjektivMemoryQueryRequest),
     Read(SubjektivMemoryReadRequest),
     ListChanges(SubjektivMemoryListChangesRequest),
@@ -7201,7 +7081,7 @@ pub struct SubjektivMemoryStageExplicitResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendResponse {
-    ResidentSummary(memory::backend::MemoryResidentSummaryOutput),
+    ResidentSummary(memory::subject::MemoryResidentSummaryOutput),
     ResidentContext(SubjektivResidentContextOutput),
     Query(SubjektivMemoryQueryResponse),
     Read(SubjektivMemoryReadResponse),
@@ -11772,21 +11652,10 @@ pub struct BrowserWorkerWorkingDirectorySelection {
     pub relative_cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceWorkerFeatureConnectionsRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub subjektiv: Option<SubjektivWorkerConnectionRequest>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct SubjektivWorkerConnectionRequest {
-    pub subject_id: String,
-}
+/// Caller-authored Feature initialization intent. Each registered Feature owns
+/// its payload codec and authorization; no resolved Host attachment is accepted here.
+pub type WorkspaceWorkerFeatureConnectionsRequest =
+    protocol::feature_initialization::FeatureInitializations;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -11909,57 +11778,7 @@ pub const MEMORY_API_MAX_COLLECTION_ITEMS: usize = 500;
 pub const MEMORY_API_MAX_STRING_BYTES: usize = 1024 * 1024;
 pub const MEMORY_API_MAX_IDENTIFIER_BYTES: usize = 512;
 
-/// Public Workspace Memory document projection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MemoryDocumentResponse {
-    pub body_md: String,
-    pub created_at: String,
-    pub updated_at: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub bytes: usize,
-    pub record_source: String,
-}
-
-pub const LEGACY_MEMORY_RESET_MAX_CONFIRMATION_BYTES: usize = 256;
-
-fn deserialize_legacy_memory_reset_confirmation<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    if value.len() > LEGACY_MEMORY_RESET_MAX_CONFIRMATION_BYTES {
-        return Err(serde::de::Error::custom(
-            "legacy Memory reset confirmation is too long",
-        ));
-    }
-    Ok(value)
-}
-
-/// Explicit destructive reset request. The confirmation must exactly equal
-/// `RESET LEGACY MEMORY <workspace_id>` for the Workspace named in the route.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyMemoryResetRequest {
-    #[serde(deserialize_with = "deserialize_legacy_memory_reset_confirmation")]
-    #[schemars(length(max = 256))]
-    pub confirmation: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyMemoryResetResponse {
-    pub workspace_id: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub documents_deleted: usize,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub staging_records_deleted: usize,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub staging_resolutions_deleted: usize,
-}
-
-/// Candidate kinds exposed by the Memory staging resource.
+/// Candidate kinds shared by Subject Memory projections.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -12015,108 +11834,6 @@ pub struct MemoryEvidenceOrigin {
     pub flow_definition_fingerprint: Option<String>,
 }
 
-/// Record-level source range for one Memory staging candidate.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MemorySourceRef {
-    pub segment_id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "[number, number]"))]
-    #[schemars(with = "JsonSafeU64Pair")]
-    pub range: [u64; 2],
-}
-
-/// Bounded evidence snippet included in one Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MemoryStagingEvidence {
-    pub id: String,
-    pub kind: String,
-    #[cfg_attr(feature = "typescript", ts(type = "[number, number] | null"))]
-    #[schemars(with = "Option<JsonSafeU64Pair>")]
-    pub entry_range: Option<[u64; 2]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(optional, type = "MemoryEvidenceOrigin | null")
-    )]
-    pub origin: Option<MemoryEvidenceOrigin>,
-    pub excerpt: Option<String>,
-    pub summary: Option<String>,
-}
-
-/// Bounded source anchor included in one Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MemorySourceEvidenceRef {
-    pub session_id: Option<String>,
-    pub segment_id: Option<String>,
-    #[cfg_attr(feature = "typescript", ts(type = "[number, number] | null"))]
-    #[schemars(with = "Option<JsonSafeU64Pair>")]
-    pub entry_range: Option<[u64; 2]>,
-    pub evidence_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(optional, type = "MemoryEvidenceOrigin | null")
-    )]
-    pub origin: Option<MemoryEvidenceOrigin>,
-    pub evidence_kind: Option<String>,
-    pub label: Option<String>,
-    pub summary: Option<String>,
-}
-
-/// Public projection of one valid Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MemoryStagingRecord {
-    pub schema_version: u32,
-    pub id: String,
-    pub extract_run_id: String,
-    pub source: MemorySourceRef,
-    pub kind: MemoryCandidateKind,
-    pub claim: String,
-    pub why_useful: String,
-    pub staleness: Option<String>,
-    pub evidence: Vec<MemoryStagingEvidence>,
-    pub source_refs: Vec<MemorySourceEvidenceRef>,
-}
-
-/// Public list entry for one valid Memory staging record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MemoryStagingEntry {
-    pub id: String,
-    #[cfg_attr(feature = "typescript", ts(type = "number"))]
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub byte_len: u64,
-    pub record: MemoryStagingRecord,
-}
-
-/// Public response returned by the Workspace Memory staging list resource.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct MemoryStagingListResponse {
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub limit: usize,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub returned_count: usize,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub total_valid_count: usize,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
-    pub invalid_count: usize,
-    pub truncated: bool,
-    pub order: String,
-    pub record_authority: String,
-    pub items: Vec<MemoryStagingEntry>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
 #[cfg(feature = "typescript")]
 pub fn memory_api_typescript() -> String {
     use ts_rs::TS;
@@ -12125,16 +11842,9 @@ pub fn memory_api_typescript() -> String {
     let declarations = [
         DiagnosticSeverity::decl(&config),
         Diagnostic::decl(&config),
-        MemoryDocumentResponse::decl(&config),
         MemoryCandidateKind::decl(&config),
         MemoryEvidenceOriginKind::decl(&config),
         MemoryEvidenceOrigin::decl(&config),
-        MemorySourceRef::decl(&config),
-        MemoryStagingEvidence::decl(&config),
-        MemorySourceEvidenceRef::decl(&config),
-        MemoryStagingRecord::decl(&config),
-        MemoryStagingEntry::decl(&config),
-        MemoryStagingListResponse::decl(&config),
         authorization::PermissionResource::decl(&config),
         authorization::ScopedPermission::decl(&config),
         authorization::SubjectPermissions::decl(&config),
@@ -12210,22 +11920,6 @@ export type SubjektivMemoryListChangesResponse = { memory_id: string, current_ch
             .collect::<Vec<_>>()
             .join("\n\n")
     )
-}
-
-/// Workspace-owned Memory settings returned by the shared Server API.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceMemorySettings {
-    pub workspace_id: String,
-    pub language: String,
-}
-
-/// Compare-and-swap update for Workspace-owned Memory settings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateWorkspaceMemorySettingsRequest {
-    pub expected_language: String,
-    pub language: String,
 }
 
 /// Public metadata for one Workspace-scoped Repository SSH credential.
@@ -13022,8 +12716,8 @@ pub fn worker_launch_api_typescript() -> String {
         WorkingDirectoryRepositoryOption::decl(&config),
         WorkerLaunchOptionsResponse::decl(&config),
         BrowserWorkerWorkingDirectorySelection::decl(&config),
-        SubjektivWorkerConnectionRequest::decl(&config),
-        WorkspaceWorkerFeatureConnectionsRequest::decl(&config),
+        protocol::feature_initialization::FeatureInitialization::decl(&config),
+        protocol::feature_initialization::FeatureInitializations::decl(&config),
         CreateWorkspaceWorkerRequest::decl(&config),
         BrowserCreateWorkerResponse::decl(&config),
         BrowserWorkspaceOrchestratorResponse::decl(&config),
@@ -13772,6 +13466,46 @@ mod tests {
     }
 
     #[test]
+    fn retired_workspace_memory_has_no_public_routes() {
+        assert!(ServerApiMetadata::OPERATIONS.iter().all(|operation| {
+            !operation.path.starts_with("/api/w/{workspace_id}/memory")
+                && operation.path != "/api/w/{workspace_id}/settings/memory"
+        }));
+    }
+
+    #[test]
+    fn memory_permissions_only_target_subjects() {
+        let catalog = authorization::subject_permission_operations();
+        for operation in catalog
+            .iter()
+            .filter(|item| item.operation.starts_with("memory."))
+        {
+            assert_eq!(
+                operation.resource_kinds,
+                vec![authorization::PermissionResourceKind::Subject],
+                "{} must only target Subject Memory",
+                operation.operation,
+            );
+        }
+        for removed in [
+            "memory.document.read",
+            "memory.document.update",
+            "memory.audit.append",
+            "memory.staging.close",
+        ] {
+            assert!(!catalog.iter().any(|item| item.operation == removed));
+        }
+        for retained in [
+            "memory.query",
+            "memory.staging.write",
+            "memory.resident.supply",
+            "memory.consolidation.request",
+        ] {
+            assert!(catalog.iter().any(|item| item.operation == retained));
+        }
+    }
+
+    #[test]
     fn auth_and_workspace_catalog_operations_are_in_server_api_metadata() {
         let operations = ServerApiMetadata::OPERATIONS;
         for (operation_id, method, path) in [
@@ -13964,16 +13698,6 @@ mod tests {
                 "/api/w/{workspace_id}/settings/signing-identity/provision",
             ),
             (
-                "workspace_memory_settings",
-                HttpMethod::Get,
-                "/api/w/{workspace_id}/settings/memory",
-            ),
-            (
-                "workspace_memory_settings_update",
-                HttpMethod::Put,
-                "/api/w/{workspace_id}/settings/memory",
-            ),
-            (
                 "repository_access_projection",
                 HttpMethod::Get,
                 "/api/w/{workspace_id}/settings/repository-access",
@@ -14079,26 +13803,6 @@ mod tests {
                 "flow_get",
                 HttpMethod::Get,
                 "/api/w/{workspace_id}/flows/{flow_id}",
-            ),
-            (
-                "memory_document",
-                HttpMethod::Get,
-                "/api/w/{workspace_id}/memory",
-            ),
-            (
-                "memory_staging_list",
-                HttpMethod::Get,
-                "/api/w/{workspace_id}/memory/staging",
-            ),
-            (
-                "memory_backend",
-                HttpMethod::Post,
-                "/api/w/{workspace_id}/memory/backend",
-            ),
-            (
-                "memory_consolidation",
-                HttpMethod::Post,
-                "/api/w/{workspace_id}/memory/consolidation",
             ),
             (
                 "skill_list",
@@ -14560,7 +14264,7 @@ mod tests {
                 "profile": null,
                 "initial_submit": [],
                 "workdir_attachments": [],
-                "feature_connections": {},
+                "feature_connections": [],
                 "control_operation_id": null,
                 "authorization": { "kind": "assignment", "assignment": null },
             })
@@ -14570,7 +14274,7 @@ mod tests {
     #[test]
     fn worker_creation_requests_default_omitted_authorization_and_reject_human_alias() {
         let mut workspace = serde_json::json!({
-            "runtime_id":"runtime-a", "display_name":"Worker", "feature_connections":{}
+            "runtime_id":"runtime-a", "display_name":"Worker", "feature_connections":[]
         });
         let mut runtime = serde_json::json!({
             "control_operation_id":"spawn-1", "intent":{"kind":"workspace_coding"},

@@ -176,7 +176,7 @@ fn saved_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
 
 // Explicit canonical tail: schema 132 has no registered migration. Keep this
 // expectation independent of published_plan and the production migration list.
-fn expected_published_tail() -> [(i64, &'static str); 19] {
+fn expected_published_tail() -> [(i64, &'static str); 23] {
     [
         (122, crate::config_adoption::MIGRATION_NAME),
         (123, super::super::backend_job_upgrade::MIGRATION_NAME),
@@ -224,6 +224,10 @@ fn expected_published_tail() -> [(i64, &'static str); 19] {
             super::super::backend_job_recording_input::MIGRATION_NAME,
         ),
         (141, super::super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME),
+        (142, super::super::feature_initialization::MIGRATION_NAME),
+        (143, super::super::feature_worker_launch::MIGRATION_NAME),
+        (144, super::super::memory_retirement::MIGRATION_NAME),
+        (145, super::super::branch_convergence::DEVELOP_NAME),
     ]
 }
 
@@ -304,7 +308,14 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
     for (name, _) in saved_rows(conn) {
         if name == "__yoi_schema_migrations"
             || super::super::backend_job_current::OBSOLETE_TABLES.contains(&name.as_str())
-            || ["backend_jobs", "backend_job_attempts"].contains(&name.as_str())
+            || [
+                "backend_jobs",
+                "backend_job_attempts",
+                "workspace_memory_documents",
+                "memory_staging_records",
+                "memory_staging_resolutions",
+            ]
+            .contains(&name.as_str())
         {
             continue;
         }
@@ -340,7 +351,8 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
                 name != "worker_removal_operations" || column != "journal_removal_json"
             })
             .filter(|column| {
-                name != "worker_create_reservations" || column != "startup_failure_json"
+                name != "worker_create_reservations"
+                    || !["startup_failure_json", "memory_language"].contains(&column.as_str())
             })
             .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
             .collect::<Vec<_>>();
@@ -364,7 +376,14 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
             .map(|row| format!("{:?}", row.unwrap()))
             .collect::<Vec<_>>();
         rows.sort();
-        result.push((name, rows));
+        // Settings change owner/name, not contents. Compare them under the
+        // destination name on both sides; deleted Workspace content is separate.
+        let retained_name = if name == "workspace_memory_settings" {
+            "subjektiv_memory_settings".into()
+        } else {
+            name
+        };
+        result.push((retained_name, rows));
     }
     result
 }
@@ -380,6 +399,7 @@ fn receipt_values_through(conn: &Connection, version: i64) -> Vec<(i64, String, 
 
 fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(Family, usize)>) {
     let source = fixture(stage, baseline, predecessor);
+    source.execute_batch("INSERT INTO workspace_memory_settings VALUES('workspace-a','日本語','settings-created','settings-updated'); INSERT INTO workspace_memory_documents VALUES('workspace-a','retire this document','1','1');").unwrap();
     let expected = immutable_rows(&source);
     let original_receipts = super::super::workspace_schema_migration_history(&source).unwrap();
     let original_version = original_receipts.last().unwrap().0;
@@ -411,6 +431,18 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             0
         );
         super::super::backend_job_current::verify(&conn).unwrap();
+        for table in [
+            "workspace_memory_settings",
+            "workspace_memory_documents",
+            "memory_staging_records",
+            "memory_staging_resolutions",
+        ] {
+            assert!(!super::super::table_exists(&conn, table).unwrap());
+        }
+        assert!(
+            !super::super::column_exists(&conn, "worker_create_reservations", "memory_language")
+                .unwrap()
+        );
         let actual = immutable_rows(&conn);
         for (table, rows) in &expected {
             assert_eq!(
@@ -448,30 +480,43 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
     }
 }
 
-#[test]
-fn published_database_runs_normal_store_preparation_and_reopens_without_downgrade() {
-    // Every physical stage still runs the real migrations and disk reopen. Only
-    // receipt/baseline permutations move to the pure matrix below: they select
-    // the same canonical tail and do not alter the fixture's schema or data.
-    for family in FAMILIES {
-        for count in 1..=family.names().len() {
-            // Baseline 114 leaves all three families possible. Exercise both
-            // non-first candidates through migration and reopen, where reference
-            // shapes also include later extensions, not just initial acceptance.
-            // Later stages retain named prefixes for these families.
-            let baseline = match (family, count) {
-                (Family::Removal | Family::Jobs, 1) => 114,
-                _ => 113,
-            };
-            exercise_published_runner(Stage::Published(family, count), baseline, None);
-        }
+fn exercise_published_family(family: Family) {
+    // Every physical stage still runs real migrations and disk reopen. Each
+    // family is a separate case so a bounded run identifies the reached stage.
+    for count in 1..=family.names().len() {
+        let baseline = match (family, count) {
+            (Family::Removal | Family::Jobs, 1) => 114,
+            _ => 113,
+        };
+        eprintln!("published runner: {family:?} stage {count}, baseline {baseline}");
+        exercise_published_runner(Stage::Published(family, count), baseline, None);
     }
+}
+
+#[test]
+fn published_permissions_run_normal_preparation_and_reopen() {
+    exercise_published_family(Family::Permissions);
+}
+
+#[test]
+fn published_removal_runs_normal_preparation_and_reopen() {
+    exercise_published_family(Family::Removal);
+}
+
+#[test]
+fn published_jobs_run_normal_preparation_and_reopen() {
+    exercise_published_family(Family::Jobs);
+}
+
+#[test]
+fn published_converged_runs_normal_preparation_and_reopen() {
     // Retain each family's named predecessor receipts through convergence, too.
     for (current, predecessor) in [
         (119, (Family::Permissions, 2)),
         (120, (Family::Removal, 4)),
         (121, (Family::Jobs, 5)),
     ] {
+        eprintln!("published runner: converged {current}, predecessor {predecessor:?}");
         exercise_published_runner(Stage::Converged(current), 113, Some(predecessor));
     }
 }
@@ -501,14 +546,32 @@ fn published_histories() -> Vec<(Stage, i64, Option<(Family, usize)>)> {
     histories
 }
 
-// Exercise the production receipt recognizers without constructing SQLite.
-// This composes receipt rules only; the runner/shape tests own their DB wiring.
+// A receipt-only SQLite fixture feeds late-family selection. It does not
+// claim a migrated physical shape; the runner/shape tests own that wiring.
+fn receipt_connection(rows: &[(i64, String)]) -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE __yoi_schema_migrations(version INTEGER,name TEXT NOT NULL)")
+        .unwrap();
+    for (version, name) in rows {
+        conn.execute(
+            "INSERT INTO __yoi_schema_migrations VALUES(?1,?2)",
+            params![version, name],
+        )
+        .unwrap();
+    }
+    conn
+}
 fn published_origin_stages(
     mut current: i64,
     mut rows: &[(i64, String)],
 ) -> Result<BTreeSet<Stage>> {
     if current >= 124 {
-        verify_failure_receipts(current, rows, FailureTail::Canonical)?;
+        verify_failure_receipts(
+            &receipt_connection(rows),
+            current,
+            rows,
+            FailureTail::Canonical,
+        )?;
         let end = rows
             .iter()
             .position(|row| row.0 >= 124)
@@ -561,7 +624,9 @@ fn published_receipt_matrix_preserves_prefixes_and_plans_only_the_missing_tail()
             published_origin_stages(current, &original).unwrap(),
             expected_stages
         );
-        let plan = FailureTail::Canonical.plan(current);
+        let plan = FailureTail::Canonical
+            .plan(&receipt_connection(&original), current)
+            .unwrap();
         assert_eq!(plan.current_schema_version, current);
         assert_eq!(
             plan.target_schema_version,
@@ -601,7 +666,9 @@ fn published_receipt_matrix_preserves_prefixes_and_plans_only_the_missing_tail()
                 "{stage:?}, baseline {baseline}, predecessor {predecessor:?}, at {}",
                 step.version
             );
-            let remaining = FailureTail::Canonical.plan(step.version);
+            let remaining = FailureTail::Canonical
+                .plan(&receipt_connection(&appended), step.version)
+                .unwrap();
             assert_eq!(
                 remaining
                     .migrations

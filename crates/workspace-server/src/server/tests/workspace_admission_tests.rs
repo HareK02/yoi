@@ -53,7 +53,7 @@ impl Fixture {
                 WorkdirlessFixtureRuntime::RUNTIME_ID,
                 Some("builtin:coder".into()),
                 Some(&operation),
-                false,
+                feature_initialization::CreationAuthority::Ordinary,
             )
             .unwrap();
             let mut grant = grant.unwrap();
@@ -957,7 +957,7 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
                 json!({
                     "runtime_id": WorkdirlessFixtureRuntime::RUNTIME_ID, "display_name": "callback parent",
                     "profile": "builtin:companion", "initial_submit": [],
-                    "feature_connections": {"subjektiv":{"subject_id":subject.id}},
+                    "feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject.id}}],
                 }),
             )
         } else {
@@ -1050,67 +1050,6 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
                 .unwrap(),
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn competing_memory_document_edits_are_atomic_without_workspace_exclusion() {
-    use crate::authority::MemoryAuthority;
-    let f = Fixture::new().await;
-    f.api.authority.update_memory_document("original").unwrap();
-    let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let mut edits = Vec::new();
-    for worker in ["1", "2"] {
-        let request = f.request(
-            Some(worker),
-            &format!("/api/w/{TEST_WORKSPACE_ID}/memory/backend"),
-            serde_json::to_vec(&MemoryBackendOperation::UpdateDocument(
-                memory::backend::MemoryDocumentUpdateOperation {
-                    old_string: "original".into(),
-                    new_string: format!("winner-{worker}"),
-                    replace_all: false,
-                },
-            ))
-            .unwrap(),
-            START,
-            worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
-        );
-        let app = f.app.clone();
-        let barrier = barrier.clone();
-        edits.push(tokio::spawn(async move {
-            barrier.wait().await;
-            app.oneshot(request).await.unwrap()
-        }));
-    }
-    barrier.wait().await;
-    let mut winners = 0;
-    let mut rejected = 0;
-    for edit in edits {
-        let body = assert_json(
-            tokio::time::timeout(BOUND, edit).await.unwrap().unwrap(),
-            StatusCode::OK,
-        )
-        .await;
-        match body["status"].as_str().unwrap() {
-            "ok" => winners += 1,
-            "error" => {
-                rejected += 1;
-                assert!(
-                    body["message"].as_str().unwrap().contains("not found"),
-                    "{body}"
-                );
-            }
-            _ => panic!("unexpected memory response {body}"),
-        }
-    }
-    assert_eq!((winners, rejected), (1, 1));
-    assert!(
-        f.api
-            .authority
-            .memory_document()
-            .unwrap()
-            .body_md
-            .starts_with("winner-")
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

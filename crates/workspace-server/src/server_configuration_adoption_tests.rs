@@ -121,17 +121,58 @@ mod configuration_adoption_http_integration {
     impl Fixture {
         async fn reopen(self) -> Self {
             let config = self.api.config.clone();
-            let Fixture { api, app, owner, foreign, owner_account, cookie, origin, subject, legacy, legacy_update, subject_policy, runtime_identity, _dir } = self;
+            let Fixture {
+                api,
+                app,
+                owner,
+                foreign,
+                owner_account,
+                cookie,
+                origin,
+                subject,
+                legacy,
+                legacy_update,
+                subject_policy,
+                runtime_identity,
+                _dir,
+            } = self;
             drop(app);
             drop(legacy);
             drop(api);
-            let mut api = WorkspaceApi::new_api_fixture(config, Arc::new(DeterministicExecutionBackend::default())).await.unwrap();
+            let mut api = WorkspaceApi::new_api_fixture(
+                config,
+                Arc::new(DeterministicExecutionBackend::default()),
+            )
+            .await
+            .unwrap();
             configure_runtime_request_auth(&mut api, &runtime_identity, "adoption-http-runtime");
             let legacy = open_subjektiv_store(&api).unwrap();
             let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
-            catalog.apis.lock().await.insert(TEST_WORKSPACE_ID.into(), api.clone());
-            catalog.routers.lock().await.insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
-            Fixture { api, app: workspace_server_router(catalog), owner, foreign, owner_account, cookie, origin, subject, legacy, legacy_update, subject_policy, runtime_identity, _dir }
+            catalog
+                .apis
+                .lock()
+                .await
+                .insert(TEST_WORKSPACE_ID.into(), api.clone());
+            catalog
+                .routers
+                .lock()
+                .await
+                .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+            Fixture {
+                api,
+                app: workspace_server_router(catalog),
+                owner,
+                foreign,
+                owner_account,
+                cookie,
+                origin,
+                subject,
+                legacy,
+                legacy_update,
+                subject_policy,
+                runtime_identity,
+                _dir,
+            }
         }
 
         async fn new() -> Self {
@@ -1730,22 +1771,49 @@ mod configuration_adoption_http_integration {
             contract,
             projection_digest: evaluation.projection_digest,
         };
-        f.api.config_store.with_immediate_transaction(|tx| {
-            tx.execute("DELETE FROM workspace_config_entries WHERE workspace_id=?1", [TEST_WORKSPACE_ID])?;
-            crate::config_source::insert_materialized_state(tx, TEST_WORKSPACE_ID, &state, "prior-evaluation")
-        }).unwrap();
+        f.api
+            .config_store
+            .with_immediate_transaction(|tx| {
+                tx.execute(
+                    "DELETE FROM workspace_config_entries WHERE workspace_id=?1",
+                    [TEST_WORKSPACE_ID],
+                )?;
+                crate::config_source::insert_materialized_state(
+                    tx,
+                    TEST_WORKSPACE_ID,
+                    &state,
+                    "prior-evaluation",
+                )
+            })
+            .unwrap();
         state
     }
 
     async fn runtime_prompt_bundle(f: &Fixture) -> (StatusCode, Value) {
-        let path = format!("/api/w/{TEST_WORKSPACE_ID}/runtime-config?profile=builtin%3Aasync-chat");
-        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&f.runtime_identity)
-            .issue("server-test", TEST_WORKSPACE_ID, None,
-                worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION, "GET", &path, b"",
-                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap(), 30).unwrap();
-        let request = Request::builder().uri(&path)
-            .header(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof)
-            .body(Body::empty()).unwrap();
+        let path =
+            format!("/api/w/{TEST_WORKSPACE_ID}/runtime-config?profile=builtin%3Aasync-chat");
+        let proof =
+            worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&f.runtime_identity)
+                .issue(
+                    "server-test",
+                    TEST_WORKSPACE_ID,
+                    None,
+                    worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION,
+                    "GET",
+                    &path,
+                    b"",
+                    i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap(),
+                    30,
+                )
+                .unwrap();
+        let request = Request::builder()
+            .uri(&path)
+            .header(
+                worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                proof,
+            )
+            .body(Body::empty())
+            .unwrap();
         f.call(request).await
     }
 
@@ -1753,25 +1821,52 @@ mod configuration_adoption_http_integration {
     async fn schema_default_refresh_reaches_new_worker_bundle_without_source_edit() {
         let f = Fixture::new().await;
         let current = f.api.current_workspace_config().unwrap();
-        let expected = crate::prompt_settings::project_prompts_from_workspace_config(&current).unwrap();
+        let expected =
+            crate::prompt_settings::project_prompts_from_workspace_config(&current).unwrap();
         let prior_default = "test-owned prior builtin language";
         let mut providers = current.contract.schema_bundle.contributions.clone();
-        let prompt = providers.iter_mut().find(|p| p.namespace == "prompts").unwrap();
+        let prompt = providers
+            .iter_mut()
+            .find(|p| p.namespace == "prompts")
+            .unwrap();
         let encoded = serde_json::to_string(&expected.templates["common.language"]).unwrap();
         assert!(prompt.source.contains(&encoded));
-        let source = prompt.source.replace(&encoded, &serde_json::to_string(prior_default).unwrap());
+        let source = prompt
+            .source
+            .replace(&encoded, &serde_json::to_string(prior_default).unwrap());
         let mut changed = config_source::ConfigSchemaContribution::new(
-            prompt.provider_id.clone(), prompt.namespace.clone(), prompt.version.clone(), source,
-        ).unwrap();
+            prompt.provider_id.clone(),
+            prompt.namespace.clone(),
+            prompt.version.clone(),
+            source,
+        )
+        .unwrap();
         changed.projection_validator = prompt.projection_validator.clone();
         *prompt = changed;
         let head = f.source().await.history_head;
-        let old = retain_test_evaluation(&f, current.snapshot.clone(), config_source::WorkspaceConfigSchemaBundle::compose(providers).unwrap());
+        let old = retain_test_evaluation(
+            &f,
+            current.snapshot.clone(),
+            config_source::WorkspaceConfigSchemaBundle::compose(providers).unwrap(),
+        );
         old.contract.validate().unwrap();
-        assert_eq!(old.contract.decodal_version, current.contract.decodal_version);
-        let held = f.api.prompt_projection_cache.resolve(TEST_WORKSPACE_ID, &old).unwrap();
+        assert_eq!(
+            old.contract.decodal_version,
+            current.contract.decodal_version
+        );
+        let held = f
+            .api
+            .prompt_projection_cache
+            .resolve(TEST_WORKSPACE_ID, &old)
+            .unwrap();
         assert_eq!(held.catalog().templates["common.language"], prior_default);
-        assert!(f.api.current_workspace_config().unwrap_err().configuration_update_required().is_some());
+        assert!(
+            f.api
+                .current_workspace_config()
+                .unwrap_err()
+                .configuration_update_required()
+                .is_some()
+        );
         let (status, body) = runtime_prompt_bundle(&f).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
@@ -1783,76 +1878,162 @@ mod configuration_adoption_http_integration {
         assert_eq!(held.catalog().templates["common.language"], prior_default);
         let (status, body) = runtime_prompt_bundle(&f).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["prompt_catalog"]["templates"]["common.language"], expected.templates["common.language"]);
+        assert_eq!(
+            body["prompt_catalog"]["templates"]["common.language"],
+            expected.templates["common.language"]
+        );
         let (_, _, bundle, _) = core_worker_creation::resolve_creation_profile(
-            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
-            Some("builtin:async-chat".into()), None, true,
-        ).unwrap();
-        assert_eq!(bundle.unwrap().prompt_catalog.unwrap().templates, expected.templates);
+            &f.api,
+            None,
+            Some(&f.owner_account),
+            &Default::default(),
+            "adoption-http-runtime",
+            Some("builtin:async-chat".into()),
+            None,
+            feature_initialization::CreationAuthority::FeatureOwned,
+        )
+        .unwrap();
+        assert_eq!(
+            bundle.unwrap().prompt_catalog.unwrap().templates,
+            expected.templates
+        );
         f.assert_subject_policy_unchanged();
         let before = f.durable();
         let f = f.reopen().await;
-        assert_eq!(f.durable(), before, "unchanged evaluation must not write again");
+        assert_eq!(
+            f.durable(),
+            before,
+            "unchanged evaluation must not write again"
+        );
     }
 
     #[tokio::test]
-    async fn same_version_schema_failure_blocks_new_bundles_but_keeps_saved_replay_and_owner_repair() {
+    async fn same_version_schema_failure_blocks_new_bundles_but_keeps_saved_replay_and_owner_repair()
+     {
         let f = Fixture::new().await;
         let operation = WorkerControlOperation {
             operation_id: "saved-before-schema-upgrade".into(),
             input_fingerprint: "saved-launch-input".into(),
         };
         let (_, _, bundle, grant) = core_worker_creation::resolve_creation_profile(
-            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
-            Some("builtin:async-chat".into()), Some(&operation), false,
-        ).unwrap();
+            &f.api,
+            None,
+            Some(&f.owner_account),
+            &Default::default(),
+            "adoption-http-runtime",
+            Some("builtin:async-chat".into()),
+            Some(&operation),
+            feature_initialization::CreationAuthority::Ordinary,
+        )
+        .unwrap();
         let bundle = bundle.unwrap();
-        let memory = f.api.config_store.get_workspace_memory_settings(TEST_WORKSPACE_ID).unwrap();
-        f.api.config_store.reserve_worker_create_with_core(
-            TEST_WORKSPACE_ID, "adoption-http-runtime", &operation.operation_id,
-            &operation.input_fingerprint, &operation.input_fingerprint, None,
-            &memory, &grant.unwrap(), &bundle,
-        ).unwrap();
-        let saved = f.api.config_store.saved_core_worker_launch(
-            TEST_WORKSPACE_ID, &operation.operation_id, &operation.input_fingerprint,
-        ).unwrap().unwrap();
+        f.api
+            .config_store
+            .reserve_worker_create_with_core(
+                TEST_WORKSPACE_ID,
+                "adoption-http-runtime",
+                &operation.operation_id,
+                &operation.input_fingerprint,
+                &operation.input_fingerprint,
+                None,
+                &grant.unwrap(),
+                &bundle,
+            )
+            .unwrap();
+        let saved = f
+            .api
+            .config_store
+            .saved_core_worker_launch(
+                TEST_WORKSPACE_ID,
+                &operation.operation_id,
+                &operation.input_fingerprint,
+            )
+            .unwrap()
+            .unwrap();
         let current = f.api.current_workspace_config().unwrap();
         let path = config_source::VirtualPath::parse("main.dcdl").unwrap();
         let main = current.snapshot.get(&path).unwrap();
         let original = main.content.clone();
-        let snapshot = current.snapshot.apply(&[config_source::ConfigTreeChange::Update {
-            path: path.clone(), expected_digest: main.content_digest.clone(),
-            content: original.replacen('{', "{ retired_test_setting = true;", 1),
-        }]).unwrap();
+        let snapshot = current
+            .snapshot
+            .apply(&[config_source::ConfigTreeChange::Update {
+                path: path.clone(),
+                expected_digest: main.content_digest.clone(),
+                content: original.replacen('{', "{ retired_test_setting = true;", 1),
+            }])
+            .unwrap();
         let mut providers = current.contract.schema_bundle.contributions.clone();
-        providers.push(config_source::ConfigSchemaContribution::new(
-            "builtin:retired-test", "retired_test_setting", "1", "{ retired_test_setting = Bool default false; }",
-        ).unwrap());
-        let old = retain_test_evaluation(&f, snapshot, config_source::WorkspaceConfigSchemaBundle::compose(providers).unwrap());
+        providers.push(
+            config_source::ConfigSchemaContribution::new(
+                "builtin:retired-test",
+                "retired_test_setting",
+                "1",
+                "{ retired_test_setting = Bool default false; }",
+            )
+            .unwrap(),
+        );
+        let old = retain_test_evaluation(
+            &f,
+            snapshot,
+            config_source::WorkspaceConfigSchemaBundle::compose(providers).unwrap(),
+        );
         old.contract.validate().unwrap();
         let before = f.durable();
         let f = f.reopen().await;
         assert_eq!(f.durable(), before, "failed refresh must roll back");
-        assert!(f.api.current_workspace_config().unwrap_err().configuration_update_required().is_some());
+        assert!(
+            f.api
+                .current_workspace_config()
+                .unwrap_err()
+                .configuration_update_required()
+                .is_some()
+        );
         let (_, _, replay_bundle, replay_grant) = core_worker_creation::resolve_creation_profile(
-            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
-            Some("builtin:async-chat".into()), Some(&operation), false,
-        ).unwrap();
-        assert_eq!(serde_json::to_value(replay_bundle.unwrap()).unwrap(), serde_json::to_value(&bundle).unwrap());
+            &f.api,
+            None,
+            Some(&f.owner_account),
+            &Default::default(),
+            "adoption-http-runtime",
+            Some("builtin:async-chat".into()),
+            Some(&operation),
+            feature_initialization::CreationAuthority::Ordinary,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(replay_bundle.unwrap()).unwrap(),
+            serde_json::to_value(&bundle).unwrap()
+        );
         assert_eq!(replay_grant.unwrap(), saved.0);
-        assert_eq!(f.durable(), before, "saved launch replay must not refresh configuration");
+        assert_eq!(
+            f.durable(),
+            before,
+            "saved launch replay must not refresh configuration"
+        );
         let fresh_operation = WorkerControlOperation {
             operation_id: "new-after-schema-upgrade".into(),
             input_fingerprint: "new-launch-input".into(),
         };
-        assert!(core_worker_creation::resolve_creation_profile(
-            &f.api, None, Some(&f.owner_account), &Default::default(), "adoption-http-runtime",
-            Some("builtin:async-chat".into()), Some(&fresh_operation), false,
-        ).is_err());
+        assert!(
+            core_worker_creation::resolve_creation_profile(
+                &f.api,
+                None,
+                Some(&f.owner_account),
+                &Default::default(),
+                "adoption-http-runtime",
+                Some("builtin:async-chat".into()),
+                Some(&fresh_operation),
+                feature_initialization::CreationAuthority::Ordinary,
+            )
+            .is_err()
+        );
         let (status, body) = runtime_prompt_bundle(&f).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         let source = f.source().await;
-        let repair = request(&source, "repair-same-version-schema", vec![update(&source, "main.dcdl", &original)]);
+        let repair = request(
+            &source,
+            "repair-same-version-schema",
+            vec![update(&source, "main.dcdl", &original)],
+        );
         f.owner_call("/preview", &repair, StatusCode::OK).await;
         assert_eq!(f.durable(), before);
         f.commit(&repair).await;
@@ -1865,10 +2046,25 @@ mod configuration_adoption_http_integration {
     #[tokio::test]
     async fn failed_startup_reevaluation_keeps_owner_http_repair_available() {
         let f = Fixture::new().await;
-        let mut state = f.api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
+        let mut state = f
+            .api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
         let path = config_source::VirtualPath::parse("main.dcdl").unwrap();
-        state.snapshot.entries.insert(path.clone(), config_source::ConfigEntry::new(path, config_source::ConfigContentType::Decodal, "{ prompts = ").unwrap());
-        state.snapshot = config_source::ConfigTreeSnapshot::from_entries(state.snapshot.entries.into_values()).unwrap();
+        state.snapshot.entries.insert(
+            path.clone(),
+            config_source::ConfigEntry::new(
+                path,
+                config_source::ConfigContentType::Decodal,
+                "{ prompts = ",
+            )
+            .unwrap(),
+        );
+        state.snapshot =
+            config_source::ConfigTreeSnapshot::from_entries(state.snapshot.entries.into_values())
+                .unwrap();
         f.api.config_store.with_immediate_transaction(|tx| {
             tx.execute("DELETE FROM workspace_config_entries WHERE workspace_id=?1", [TEST_WORKSPACE_ID])?;
             crate::config_source::insert_materialized_state(tx, TEST_WORKSPACE_ID, &state, "old-system")?;
@@ -1877,15 +2073,37 @@ mod configuration_adoption_http_integration {
         }).unwrap();
         let before = f.durable();
         let f = f.reopen().await;
-        assert_eq!(f.durable(), before, "failed reevaluation cannot alter saved authority");
+        assert_eq!(
+            f.durable(),
+            before,
+            "failed reevaluation cannot alter saved authority"
+        );
         let source = f.source().await;
         assert_eq!(source.state.contract.decodal_version, "0.4.0");
-        let repair = request(&source, "repair-after-system-update", vec![update(&source, "main.dcdl", "{} as WorkspaceConfigSchema\n")]);
-        let (denied, _) = f.call(f.bearer(&f.foreign, "POST", "/commit", Some(serde_json::to_value(&repair).unwrap()))).await;
+        let repair = request(
+            &source,
+            "repair-after-system-update",
+            vec![update(
+                &source,
+                "main.dcdl",
+                "{} as WorkspaceConfigSchema\n",
+            )],
+        );
+        let (denied, _) = f
+            .call(f.bearer(
+                &f.foreign,
+                "POST",
+                "/commit",
+                Some(serde_json::to_value(&repair).unwrap()),
+            ))
+            .await;
         assert_eq!(denied, StatusCode::FORBIDDEN);
         f.owner_call("/preview", &repair, StatusCode::OK).await;
         let receipt = f.commit(&repair).await;
-        assert_eq!(receipt.state.contract.decodal_version, config_source::DECODAL_VERSION);
+        assert_eq!(
+            receipt.state.contract.decodal_version,
+            config_source::DECODAL_VERSION
+        );
         f.assert_subject_policy_unchanged();
     }
 

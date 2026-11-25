@@ -8,6 +8,8 @@ mod backend_diagnostic;
 pub(crate) mod backend_job_input;
 pub mod backend_job_result;
 pub(crate) mod bash;
+pub(crate) mod subjektiv_composition;
+pub(crate) mod subjektiv_initialization;
 
 /// Host metadata participants are independent of model-facing Tool enablement.
 /// Disabling a Feature must not preserve stale Session-bound authority evidence.

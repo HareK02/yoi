@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agen::tool::ToolError;
-use memory::backend::{
+use memory::subject::{
     MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryStageCandidateOperation,
 };
 use server_api::*;
@@ -762,7 +762,7 @@ impl SubjektivHostConnection {
             || context.session_id.trim().is_empty()
             || context.worker_id.chars().any(char::is_control)
             || context.session_id.chars().any(char::is_control)
-            || !manifest::is_normalized_workspace_memory_language(&language)
+            || !manifest::is_normalized_subjektiv_memory_language(&language)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -857,7 +857,7 @@ pub(crate) fn test_connection(client: Arc<dyn WorkspaceClient>) -> SubjektivHost
     config.profile.enabled = true;
     config.profile.consolidation_tools = true;
     config
-        .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+        .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: client.workspace_id().unwrap().to_string(),
 
             language: "English".into(),
@@ -1025,9 +1025,9 @@ mod tests {
                     Ok(SubjektivMemoryBackendResponse::ResidentContext(
                         SubjektivResidentContextOutput {
                             behavior_md: "Explicit local subject behavior.".into(),
-                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                            memory_surface: memory::subject::MemoryResidentSummaryOutput {
                                 availability:
-                                    memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                                    memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
                                 content: None,
                             },
                         },

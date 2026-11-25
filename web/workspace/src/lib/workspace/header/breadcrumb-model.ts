@@ -25,9 +25,7 @@ export function buildWorkspaceBreadcrumbs(
     .filter(Boolean)
     .map(decodeURIComponent);
 
-  if (segments[0] === "memory" && segments[1] === "staging") {
-    return [{ label: "Memory" }, { label: "Staging" }];
-  }
+  if (segments[0] === "memory") return [];
 
   if (segments[0] === "subjektiv") {
     const crumbs: WorkspaceBreadcrumb[] = [{ label: "Subjects" }];

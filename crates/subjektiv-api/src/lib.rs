@@ -2,6 +2,7 @@
 mod chat;
 mod chat_transport;
 pub mod messaging;
+pub mod worker_initialization;
 pub use chat::*;
 pub use chat_transport::*;
 pub use messaging::*;

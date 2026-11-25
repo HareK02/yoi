@@ -123,17 +123,22 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
         }
         verify_history_records(conn, 123, &prefix)?;
     }
-    verify_failure_receipts(current, &rows, tail)
+    verify_failure_receipts(conn, current, &rows, tail)
 }
 
 // Receipt equality is independent of SQLite shape/data validation. The caller
 // still verifies the prefix and every physical extension before accepting a DB.
-fn verify_failure_receipts(current: i64, rows: &[(i64, String)], tail: FailureTail) -> Result<()> {
+fn verify_failure_receipts(
+    conn: &Connection,
+    current: i64,
+    rows: &[(i64, String)],
+    tail: FailureTail,
+) -> Result<()> {
     let baseline = rows
         .first()
         .ok_or_else(|| invalid("missing migration receipts"))?;
     let expected: Vec<_> = tail
-        .migrations()
+        .migrations_for(conn, current)?
         .into_iter()
         .filter(|(version, _)| *version >= 124 && *version > baseline.0 && *version <= current)
         .map(|(version, name)| (version, name.to_owned()))
@@ -359,7 +364,7 @@ pub(super) fn published_plan(
         current,
         &super::workspace_schema_migration_history(conn)?,
     )?;
-    Ok(Some(tail.plan(current)))
+    Ok(Some(tail.plan(conn, current)?))
 }
 
 // Receipt names come from the ordered owner, including the Service-126 hook.
@@ -381,12 +386,12 @@ enum FailureTail {
     Journal,
 }
 impl FailureTail {
-    fn plan(self, current: i64) -> super::WorkspaceSchemaMigrationPlan {
-        super::WorkspaceSchemaMigrationPlan {
+    fn plan(self, conn: &Connection, current: i64) -> Result<super::WorkspaceSchemaMigrationPlan> {
+        Ok(super::WorkspaceSchemaMigrationPlan {
             current_schema_version: current,
             target_schema_version: super::LATEST_SCHEMA_VERSION,
             migrations: self
-                .migrations()
+                .migrations_for(conn, current)?
                 .into_iter()
                 .filter(|(version, _)| *version > current)
                 .map(|(version, name)| super::WorkspaceSchemaMigrationStep {
@@ -394,7 +399,14 @@ impl FailureTail {
                     name: name.to_owned(),
                 })
                 .collect(),
-        }
+        })
+    }
+
+    fn migrations_for(self, conn: &Connection, current: i64) -> Result<Vec<(i64, &'static str)>> {
+        let mut steps = self.migrations();
+        steps.retain(|(v, _)| *v <= 141);
+        steps.extend(super::branch_convergence::tail(conn, current)?);
+        Ok(steps)
     }
 
     fn migrations(self) -> Vec<(i64, &'static str)> {
@@ -439,8 +451,9 @@ impl FailureTail {
         tail.push((139, super::backend_job_result_application::MIGRATION_NAME));
         tail.push((140, super::backend_job_recording_input::MIGRATION_NAME));
         tail.push((141, super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME));
-        tail.push((142, super::passkey_addition_code::MIGRATION_NAME));
-        tail.push((143, super::workspace_members::MIGRATION_NAME));
+        tail.push((142, super::feature_initialization::MIGRATION_NAME));
+        tail.push((143, super::feature_worker_launch::MIGRATION_NAME));
+        tail.push((144, super::memory_retirement::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -542,23 +555,38 @@ pub(super) fn verify_startup_shape(conn: &Connection) -> Result<()> {
 fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
     static WITH_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
     static WITHOUT_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static WITH_INITIALIZATION: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static INITIALIZATION_ONLY: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static RETIRED: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let retired =
+        super::column_exists(conn, "worker_create_reservations", "initialization_binding")?;
+    let initialized = super::column_exists(
+        conn,
+        "worker_create_reservations",
+        "feature_initialization_json",
+    )?;
     let select = |shape: Shape| -> Shape {
         shape
             .into_iter()
             .filter(|(_, object)| object.1 == "worker_create_reservations")
             .collect()
     };
-    let expected = if present {
-        &WITH_RESULT
-    } else {
-        &WITHOUT_RESULT
-    }
+    let expected = if retired { &RETIRED } else { match (present, initialized) {
+        (true, false) => &WITH_RESULT,
+        (false, false) => &WITHOUT_RESULT,
+        (true, true) => &WITH_INITIALIZATION,
+        (false, true) => &INITIALIZATION_ONLY,
+    }}
     .get_or_init(|| {
         (|| -> Result<Shape> {
             let reference = reference_base()?;
             if present {
                 reference.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
             }
+            if initialized {
+                reference.execute_batch(super::feature_initialization::COLUMN_SCHEMA)?;
+            }
+            if retired { reference.execute_batch("ALTER TABLE worker_create_reservations ADD COLUMN initialization_binding TEXT; ALTER TABLE worker_create_reservations ADD COLUMN subjektiv_memory_language TEXT; ALTER TABLE worker_create_reservations DROP COLUMN memory_language;")?; }
             Ok(select(snapshot(&reference)?))
         })()
         .map_err(|error| error.to_string())
@@ -612,8 +640,112 @@ fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
     )))
 }
 
+fn verify_memory_retirement_shape(conn: &Connection, current: i64) -> Result<()> {
+    let retired = current >= 145
+        || (current == 144 && !super::branch_convergence::hare_history(conn, current)?);
+    for column in ["initialization_binding", "subjektiv_memory_language"] {
+        if super::column_exists(conn, "worker_create_reservations", column)? != retired {
+            return Err(invalid(
+                "Memory retirement reservation receipt/shape mismatch",
+            ));
+        }
+    }
+    if super::table_exists(conn, "subjektiv_memory_settings")? != retired {
+        return Err(invalid("Subjektiv settings receipt/shape mismatch"));
+    }
+    if !retired {
+        if current >= 141 {
+            let reference = reference_base()?;
+            let select = |shape: Shape| -> Shape {
+                shape
+                    .into_iter()
+                    .filter(|(_, object)| {
+                        matches!(
+                            object.1.as_str(),
+                            "workspace_memory_settings"
+                                | "workspace_memory_documents"
+                                | "memory_staging_records"
+                                | "memory_staging_resolutions"
+                        )
+                    })
+                    .collect()
+            };
+            if select(snapshot(conn)?) != select(snapshot(&reference)?) {
+                return Err(invalid(
+                    "retiring Workspace Memory input physical schema mismatch",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    for table in [
+        "workspace_memory_settings",
+        "workspace_memory_documents",
+        "memory_staging_records",
+        "memory_staging_resolutions",
+    ] {
+        if super::table_exists(conn, table)? {
+            return Err(invalid(
+                "retired Workspace Memory content table still exists",
+            ));
+        }
+    }
+    if super::column_exists(conn, "worker_create_reservations", "memory_language")? {
+        return Err(invalid(
+            "retired Workspace Memory reservation settings still exist",
+        ));
+    }
+    let reference = reference_base()?;
+    reference.execute_batch(
+        "ALTER TABLE workspace_memory_settings RENAME TO subjektiv_memory_settings;",
+    )?;
+    let settings = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(_, object)| object.1 == "subjektiv_memory_settings")
+            .collect()
+    };
+    if settings(snapshot(conn)?) != settings(snapshot(&reference)?) {
+        return Err(invalid("Subjektiv settings physical schema mismatch"));
+    }
+    Ok(())
+}
+
 // Run only for the saved version, not recursively against historical prefixes.
 fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> Result<()> {
+    verify_memory_retirement_shape(conn, current)?;
+    let initialized = super::column_exists(
+        conn,
+        "worker_create_reservations",
+        "feature_initialization_json",
+    )?;
+    let feature = current >= 145
+        || (current >= 142 && !super::branch_convergence::hare_history(conn, current)?);
+    let binding = current >= 145
+        || (current >= 143 && !super::branch_convergence::hare_history(conn, current)?);
+    if initialized != feature {
+        return Err(invalid("Feature initialization receipt/shape mismatch"));
+    }
+
+    if super::table_exists(conn, "worker_create_operation_bindings")? != binding {
+        return Err(invalid(
+            "Worker create operation binding receipt/shape mismatch",
+        ));
+    }
+    if binding {
+        let reference = Connection::open_in_memory()?;
+        reference.execute_batch(super::feature_worker_launch::SCHEMA)?;
+        let expected = snapshot(&reference)?;
+        let actual: Shape = snapshot(conn)?
+            .into_iter()
+            .filter(|(_, object)| object.1 == "worker_create_operation_bindings")
+            .collect();
+        if actual != expected {
+            return Err(invalid(
+                "Worker create operation binding physical schema mismatch",
+            ));
+        }
+    }
     let startup = super::column_exists(conn, "worker_create_reservations", "startup_failure_json")?;
     if startup != tail.startup(current) {
         return Err(invalid("startup failure receipt/shape mismatch"));
@@ -662,7 +794,9 @@ fn verify_membership_shape(conn: &Connection, current: i64) -> Result<()> {
         .into_iter()
         .filter(|(_, object)| tables.contains(&object.1))
         .collect();
-    if (current >= 143 && actual != expected) || (current < 143 && !actual.is_empty()) {
+    let present = current >= 145
+        || (current >= 143 && super::branch_convergence::hare_history(conn, current)?);
+    if (present && actual != expected) || (!present && !actual.is_empty()) {
         return Err(invalid("Workspace membership receipt/shape mismatch"));
     }
     Ok(())
@@ -676,7 +810,9 @@ fn verify_addition_code_shape(conn: &Connection, current: i64) -> Result<()> {
         .into_iter()
         .filter(|(_, object)| object.1 == "passkey_addition_codes")
         .collect();
-    if (current >= 142 && actual != expected) || (current < 142 && !actual.is_empty()) {
+    let present = current >= 145
+        || (current >= 142 && super::branch_convergence::hare_history(conn, current)?);
+    if (present && actual != expected) || (!present && !actual.is_empty()) {
         return Err(invalid("Passkey addition code receipt/shape mismatch"));
     }
     Ok(())
@@ -1631,7 +1767,7 @@ mod failure_format_tests {
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
         124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
-        143,
+        143, 144, 145,
     ];
 
     #[test]
@@ -2088,6 +2224,8 @@ mod failure_format_tests {
             VALUES('owner','user','owner','Owner','1','1');
             INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
             VALUES('workspace-a','owner','Saved workspace','active','1','1');
+            INSERT INTO workspace_memory_settings VALUES('workspace-a','日本語','settings-created','settings-updated');
+            INSERT INTO workspace_memory_documents VALUES('workspace-a','retire this document','1','1');
             INSERT INTO backend_jobs(workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,state,current_attempt,result_json,result_digest,created_at,updated_at,input_disposition)
             VALUES('workspace-a','saved-job','journal','digest','input',json_object('job_id','saved-job','purpose','journal','input_ref','input','input',NULL,'instruction','fixture','profile','builtin:backend-job'),'fingerprint','completed',1,'{\"saved\":true}','result-digest','1','1','erased');
             INSERT INTO backend_job_attempts(workspace_id,job_id,attempt_id,attempt,input_digest,state,deadline_at,result_json,result_digest,created_at,updated_at)
@@ -2145,6 +2283,25 @@ mod failure_format_tests {
             .unwrap()
             .retain(|column| column != "state");
         let retained = values(&conn, &old_columns);
+        // Before 144 all old content remains immutable. After retirement retain
+        // every other old column and compare settings under their new owner name.
+        let mut retired_columns = old_columns.clone();
+        for table in [
+            "workspace_memory_documents",
+            "memory_staging_records",
+            "memory_staging_resolutions",
+        ] {
+            retired_columns.remove(table);
+        }
+        retired_columns
+            .get_mut("worker_create_reservations")
+            .unwrap()
+            .retain(|column| column != "memory_language");
+        let mut retired_values = values(&conn, &retired_columns);
+        let settings_columns = retired_columns.remove("workspace_memory_settings").unwrap();
+        retired_columns.insert("subjektiv_memory_settings".into(), settings_columns);
+        let settings_values = retired_values.remove("workspace_memory_settings").unwrap();
+        retired_values.insert("subjektiv_memory_settings".into(), settings_values);
         let mut previous = 123;
         for &version in CURRENT_TAIL {
             conn.execute_batch(&format!("CREATE TRIGGER inject_failure_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version={version} BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")).unwrap();
@@ -2160,7 +2317,23 @@ mod failure_format_tests {
                 .unwrap();
             apply(&conn, version).unwrap();
             verify_history(&conn, version).unwrap();
-            assert_eq!(values(&conn, &old_columns), retained);
+            if version >= 144 {
+                assert_eq!(values(&conn, &retired_columns), retired_values);
+                for table in [
+                    "workspace_memory_settings",
+                    "workspace_memory_documents",
+                    "memory_staging_records",
+                    "memory_staging_resolutions",
+                ] {
+                    assert!(!store::table_exists(&conn, table).unwrap());
+                }
+                assert!(
+                    !store::column_exists(&conn, "worker_create_reservations", "memory_language")
+                        .unwrap()
+                );
+            } else {
+                assert_eq!(values(&conn, &old_columns), retained);
+            }
             let state: String = conn
                 .query_row(
                     "SELECT state FROM backend_jobs WHERE job_id='saved-job'",
@@ -2220,7 +2393,7 @@ mod failure_format_tests {
             )
             .unwrap();
         }
-        assert_eq!(values(&conn, &old_columns), retained);
+        assert_eq!(values(&conn, &retired_columns), retired_values);
     }
 
     #[test]
@@ -2929,4 +3102,11 @@ fn verify_launch_policy_shape(conn: &Connection, current: i64) -> Result<()> {
         return Err(invalid("launch policy physical schema mismatch"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn convergence_schema_signature(
+    conn: &Connection,
+) -> Result<BTreeMap<String, (String, String, Vec<String>)>> {
+    snapshot(conn)
 }

@@ -43,7 +43,15 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 19;
+pub(crate) const SCHEMA_VERSION: u32 = 21;
+const STOP_HISTORY_SCHEMA_VERSION: u32 = 20;
+
+#[path = "fs_store_memory_retirement.rs"]
+mod memory_retirement;
+#[cfg(test)]
+#[path = "fs_store_memory_retirement_tests.rs"]
+mod memory_retirement_tests;
+const RECEIPT_SEQUENCE_SCHEMA_VERSION: u32 = 19;
 const LIFECYCLE_SCHEMA_VERSION: u32 = 18;
 const ATTACHMENT_AUTHORITY_SCHEMA_VERSION: u32 = 17;
 const ATTACHMENT_SET_SCHEMA_VERSION: u32 = 16;
@@ -751,28 +759,10 @@ pub(crate) struct PersistedWorkerRestoreOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PersistedWorkerStopOperation {
-    pub(crate) operation_id: WorkerLifecycleOperationId,
-    /// Restore resources remain operation-owned until stop confirms cleanup.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) pending_restore: Option<PersistedWorkerRestoreOperation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) restore_finalization: Option<PersistedWorkerRestoreFinalization>,
-    /// Stop can reconcile an identity whose execution metadata is unavailable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) request: Option<CreateWorkerRequest>,
-    pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
-    pub(crate) last_settled_status: WorkerStatus,
-    pub(crate) progress: PersistedWorkerStopProgress,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "intent", rename_all = "snake_case")]
 pub(crate) enum PersistedWorkerLifecycleOperation {
     Create(PersistedWorkerCreateOperation),
     Restore(PersistedWorkerRestoreOperation),
-    Stop(PersistedWorkerStopOperation),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,13 +772,6 @@ pub(crate) struct PersistedWorkerCreateOperation {
     pub(crate) operation_id: Option<WorkerLifecycleOperationId>,
     pub(crate) request: Option<CreateWorkerRequest>,
     pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "phase", content = "termination", rename_all = "snake_case")]
-pub(crate) enum PersistedWorkerStopProgress {
-    AwaitingTermination,
-    ScopeTerminated(crate::execution::WorkerExecutionTermination),
 }
 
 // A saved admission precedes execution ownership. Legacy aggregates could store
@@ -827,6 +810,8 @@ pub(crate) enum PersistedWorkerExecutionState {
     RestoreAdmitted(PersistedWorkerRestoreAdmission),
     RestoreFinalization(PersistedWorkerRestoreFinalization),
     Stopped(Option<PersistedWorkerExecution>),
+    /// Explicit no-auto-restore intent; neither termination proof nor a pending Stop.
+    Suspended(Option<PersistedWorkerExecution>),
     ReconciliationRequired(PersistedWorkerLifecycleOperation),
 }
 
@@ -979,11 +964,13 @@ fn plan_runtime_store_migration(
             | ATTACHMENT_SET_SCHEMA_VERSION
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
             | LIFECYCLE_SCHEMA_VERSION
+            | RECEIPT_SEQUENCE_SCHEMA_VERSION
+            | STOP_HISTORY_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, {LIFECYCLE_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, {LIFECYCLE_SCHEMA_VERSION}, {RECEIPT_SEQUENCE_SCHEMA_VERSION}, {STOP_HISTORY_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1325,6 +1312,8 @@ fn migrate_worker_record(
             | ATTACHMENT_SET_SCHEMA_VERSION
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
             | LIFECYCLE_SCHEMA_VERSION
+            | RECEIPT_SEQUENCE_SCHEMA_VERSION
+            | STOP_HISTORY_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -1350,6 +1339,9 @@ fn migrate_worker_record(
         if source_schema_version < LIFECYCLE_SCHEMA_VERSION {
             migrate_v18_lifecycle(&mut identity_document, identity_path)?;
         }
+        if source_schema_version < STOP_HISTORY_SCHEMA_VERSION {
+            migrate_v20_stop_history(&mut identity_document, identity_path)?;
+        }
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let mut aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| runtime_store_corrupt(identity_path, error.to_string()))?;
@@ -1372,6 +1364,7 @@ fn migrate_worker_record(
         if source_schema_version < LIFECYCLE_SCHEMA_VERSION {
             migrate_v18_lifecycle(&mut identity_document, identity_path)?;
         }
+        migrate_v20_stop_history(&mut identity_document, identity_path)?;
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let mut aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| {
@@ -1439,6 +1432,199 @@ fn migrate_worker_record(
     identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
     execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
     Ok(WorkerAggregateRecord::from_v8(identity, execution))
+}
+
+// The only reader of persisted Stop operations/owners is this versioned JSON
+// migration. A missing receipt is terminal Interrupted history, not recovery
+// authority. Preserve independent Restore authority and actual termination facts.
+fn migrate_v20_stop_history(
+    document: &mut serde_json::Value,
+    path: &Path,
+) -> Result<(), RuntimeError> {
+    let decode_error = |error: serde_json::Error| runtime_store_corrupt(path, error.to_string());
+    let pending_stop = document["execution_state"]["state"] == "reconciliation_required"
+        && document["execution_state"]["execution"]["operation"] == "stop";
+    let stop = document["execution_state"]["execution"]["intent"].clone();
+    let guard = document["restore_guard"].as_object_mut().ok_or_else(|| {
+        runtime_store_corrupt(path, "legacy Restore guard must be an object".into())
+    })?;
+    if let Some(owners) = guard.remove("stop_owners") {
+        let owners = owners.as_object().ok_or_else(|| {
+            runtime_store_corrupt(path, "legacy Stop owners must be an object".into())
+        })?;
+        let mut results = serde_json::Map::new();
+        for (id, owner) in owners {
+            if owner["request"]["stop_intent"]["request_id"] != id.as_str() {
+                return Err(runtime_store_corrupt(
+                    path,
+                    "legacy Stop request identity differs from history key".into(),
+                ));
+            }
+            // Drop the old operation ID even for successful receipts. It owned
+            // an in-process wait, not an operation that can survive reopening.
+            results.insert(
+                id.clone(),
+                serde_json::json!({"request": owner["request"], "receipt": owner["receipt"]}),
+            );
+        }
+        if guard.contains_key("stop_results") {
+            return Err(runtime_store_corrupt(
+                path,
+                "legacy Stop history contains both owners and results".into(),
+            ));
+        }
+        if !results.is_empty() {
+            guard.insert("stop_results".into(), serde_json::Value::Object(results));
+        }
+    }
+    guard
+        .entry("automatic_restore_suppressed")
+        .or_insert_with(|| serde_json::json!(false));
+    if !pending_stop {
+        return Ok(());
+    }
+    guard.insert(
+        "automatic_restore_suppressed".into(),
+        serde_json::json!(true),
+    );
+    let operation_id: WorkerLifecycleOperationId =
+        serde_json::from_value(stop["operation_id"].clone()).map_err(decode_error)?;
+    if stop["last_settled_status"] != document["status"] {
+        return Err(runtime_store_corrupt(
+            path,
+            "legacy Stop status differs from settled identity".into(),
+        ));
+    }
+    match stop["progress"]["phase"].as_str() {
+        Some("awaiting_termination") => {}
+        Some("scope_terminated") => {
+            let termination: crate::execution::WorkerExecutionTermination =
+                serde_json::from_value(stop["progress"]["termination"].clone())
+                    .map_err(decode_error)?;
+            let worker_ref: WorkerRef =
+                serde_json::from_value(document["worker_ref"].clone()).map_err(decode_error)?;
+            if !termination.confirms_scope_shutdown(&worker_ref, operation_id)
+                || (!document["restore_guard"]["execution_termination"].is_null()
+                    && document["restore_guard"]["execution_termination"]
+                        != stop["progress"]["termination"])
+            {
+                return Err(runtime_store_corrupt(
+                    path,
+                    "legacy Stop termination conflicts with execution history".into(),
+                ));
+            }
+            document["restore_guard"]["execution_termination"] =
+                stop["progress"]["termination"].clone();
+        }
+        _ => {
+            return Err(runtime_store_corrupt(
+                path,
+                "invalid legacy Stop progress".into(),
+            ));
+        }
+    }
+    let execution = if stop["request"].is_null() {
+        if !stop["binding"].is_null() {
+            return Err(runtime_store_corrupt(
+                path,
+                "metadata-free legacy Stop cannot carry a binding".into(),
+            ));
+        }
+        None
+    } else {
+        Some(PersistedWorkerExecution {
+            request: serde_json::from_value(stop["request"].clone()).map_err(decode_error)?,
+            binding: serde_json::from_value(stop["binding"].clone()).map_err(decode_error)?,
+        })
+    };
+    let pending_restore = !stop["pending_restore"].is_null();
+    let finalization = !stop["restore_finalization"].is_null();
+    if pending_restore && finalization {
+        return Err(runtime_store_corrupt(
+            path,
+            "legacy Stop has competing Restore authorities".into(),
+        ));
+    }
+    let mut state = if pending_restore {
+        // Even uncommitted Restore can own preparation/source-repair effects.
+        // Never discard it merely because the enclosing Stop was interrupted.
+        let restore =
+            serde_json::from_value(stop["pending_restore"].clone()).map_err(decode_error)?;
+        PersistedWorkerExecutionState::ReconciliationRequired(
+            PersistedWorkerLifecycleOperation::Restore(restore),
+        )
+    } else if finalization {
+        let finalization: PersistedWorkerRestoreFinalization =
+            serde_json::from_value(stop["restore_finalization"].clone()).map_err(decode_error)?;
+        if finalization.execution != execution {
+            return Err(runtime_store_corrupt(
+                path,
+                "legacy Stop and Restore finalization specifications differ".into(),
+            ));
+        }
+        PersistedWorkerExecutionState::RestoreFinalization(finalization)
+    } else {
+        PersistedWorkerExecutionState::Suspended(execution.clone())
+    };
+    if !pending_restore
+        && !finalization
+        && let Some(id) = document["restore_guard"]["active_request_id"]
+            .as_str()
+            .map(str::to_owned)
+    {
+        let owner = &document["restore_guard"]["owners"][&id];
+        if owner["request"]["request_id"] != id {
+            return Err(runtime_store_corrupt(
+                path,
+                "invalid legacy active Restore owner under Stop".into(),
+            ));
+        }
+        if !owner["receipt"].is_null() {
+            // The existing terminal receipt remains authoritative and replayable.
+            document["restore_guard"]["active_request_id"] = serde_json::Value::Null;
+        } else if owner["preparation_applied"] == true
+            || owner["execution_started"] == true
+            || !owner["request"]["preparation"].is_null()
+        {
+            let operation_id =
+                serde_json::from_value(owner["operation_id"].clone()).map_err(decode_error)?;
+            // Without a nested decision, preparation may already have had
+            // irreversible effects. Do not downgrade it to an uncommitted
+            // admission just because the enclosing Stop cannot be resumed.
+            let execution = execution.ok_or_else(|| {
+                runtime_store_corrupt(
+                    path,
+                    "legacy Stop lost the specification for unresolved Restore effects".into(),
+                )
+            })?;
+            state = PersistedWorkerExecutionState::ReconciliationRequired(
+                PersistedWorkerLifecycleOperation::Restore(PersistedWorkerRestoreOperation {
+                    operation_id,
+                    mode: PersistedWorkerRestoreMode::Explicit,
+                    commit: crate::runtime::RestoreCommitFact::LegacyUnknown,
+                    source_repair_possible: true,
+                    request: execution.request,
+                    binding: execution.binding,
+                    last_settled_status: serde_json::from_value(document["status"].clone())
+                        .map_err(decode_error)?,
+                }),
+            );
+        } else {
+            let receipt = crate::runtime::RuntimeWorkerRestoreResult {
+                state: server_api::WorkerRestoreState::Superseded,
+                worker: None,
+                reason_code: Some("worker_restore_superseded_by_stop_intent".into()),
+                message: Some("Restore admission was superseded by explicit stop intent; execution termination is unknown".into()),
+                control: None,
+                startup: None,
+            };
+            document["restore_guard"]["owners"][&id]["receipt"] =
+                serde_json::to_value(receipt).map_err(decode_error)?;
+            document["restore_guard"]["active_request_id"] = serde_json::Value::Null;
+        }
+    }
+    document["execution_state"] = serde_json::to_value(state).map_err(decode_error)?;
+    Ok(())
 }
 
 // Historical receipt snapshots have no live execution ordering to recover.
@@ -1560,22 +1746,9 @@ fn migrate_v18_lifecycle(
         restore_intent: LegacyWorkerRestoreIntent,
     }
     #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct LegacyStop {
-        operation_id: WorkerLifecycleOperationId,
-        #[serde(default)]
-        pending_restore: Option<PersistedWorkerRestoreOperation>,
-        #[serde(default)]
-        request: Option<CreateWorkerRequest>,
-        binding: Option<PersistedWorkerExecutionBinding>,
-        restore_intent: LegacyWorkerRestoreIntent,
-        last_settled_status: WorkerStatus,
-    }
-    #[derive(Deserialize)]
     #[serde(tag = "operation", content = "intent", rename_all = "snake_case")]
     enum LegacyOperation {
         Restore(PersistedWorkerRestoreOperation),
-        Stop(LegacyStop),
     }
     #[derive(Deserialize)]
     #[serde(tag = "state", content = "execution", rename_all = "snake_case")]
@@ -1587,6 +1760,37 @@ fn migrate_v18_lifecycle(
     let decode_error = |error: serde_json::Error| runtime_store_corrupt(path, error.to_string());
     let status: WorkerStatus =
         serde_json::from_value(document["status"].clone()).map_err(decode_error)?;
+    // Stop is decoded only at the versioned JSON boundary. The next migration
+    // removes it entirely; never route it through a current lifecycle variant.
+    if document["execution_state"]["execution"]["operation"] == "stop" {
+        let stop = &document["execution_state"]["execution"]["intent"];
+        if !stop["request"].is_null() {
+            let intent: LegacyWorkerRestoreIntent =
+                serde_json::from_value(stop["restore_intent"].clone()).map_err(decode_error)?;
+            match (status, intent) {
+                (status, LegacyWorkerRestoreIntent::Automatic)
+                    if status.is_active() && !stop["binding"].is_null() => {}
+                (WorkerStatus::Stopped, LegacyWorkerRestoreIntent::Explicit) => {}
+                _ => {
+                    return Err(runtime_store_corrupt(
+                        path,
+                        "legacy Stop status conflicts with restore intent or binding".into(),
+                    ));
+                }
+            }
+        }
+        let intent = document["execution_state"]["execution"]["intent"]
+            .as_object_mut()
+            .ok_or_else(|| runtime_store_corrupt(path, "legacy Stop must be an object".into()))?;
+        intent.remove("restore_intent");
+        let termination = document["restore_guard"]["execution_termination"].clone();
+        document["execution_state"]["execution"]["intent"]["progress"] = if termination.is_null() {
+            serde_json::json!({"phase": "awaiting_termination"})
+        } else {
+            serde_json::json!({"phase": "scope_terminated", "termination": termination})
+        };
+        return Ok(());
+    }
     let legacy: LegacyState =
         serde_json::from_value(document["execution_state"].clone()).map_err(decode_error)?;
     let validate_intent =
@@ -1633,40 +1837,6 @@ fn migrate_v18_lifecycle(
         LegacyState::ReconciliationRequired(LegacyOperation::Restore(restore)) => {
             PersistedWorkerExecutionState::ReconciliationRequired(
                 PersistedWorkerLifecycleOperation::Restore(restore),
-            )
-        }
-        LegacyState::ReconciliationRequired(LegacyOperation::Stop(stop)) => {
-            if stop.request.is_some() {
-                validate_intent(status, stop.restore_intent, stop.binding.is_some())?;
-            }
-            let progress = if document["restore_guard"]["execution_termination"].is_null() {
-                PersistedWorkerStopProgress::AwaitingTermination
-            } else {
-                let termination: crate::execution::WorkerExecutionTermination =
-                    serde_json::from_value(
-                        document["restore_guard"]["execution_termination"].clone(),
-                    )
-                    .map_err(decode_error)?;
-                let worker_ref: WorkerRef =
-                    serde_json::from_value(document["worker_ref"].clone()).map_err(decode_error)?;
-                if !termination.confirms_scope_shutdown(&worker_ref, stop.operation_id) {
-                    return Err(runtime_store_corrupt(
-                        path,
-                        "legacy Stop termination belongs to a different execution operation".into(),
-                    ));
-                }
-                PersistedWorkerStopProgress::ScopeTerminated(termination)
-            };
-            PersistedWorkerExecutionState::ReconciliationRequired(
-                PersistedWorkerLifecycleOperation::Stop(PersistedWorkerStopOperation {
-                    operation_id: stop.operation_id,
-                    pending_restore: stop.pending_restore,
-                    restore_finalization: None,
-                    request: stop.request,
-                    binding: stop.binding,
-                    last_settled_status: stop.last_settled_status,
-                    progress,
-                }),
             )
         }
     };
@@ -1982,7 +2152,7 @@ fn migrate_worker_aggregate_document(
             )
         })?
         .to_string();
-    let migrated = actual_name != expected_name;
+    let mut migrated = actual_name != expected_name;
     if migrated {
         let legacy_worker_id = actual_name
             .strip_prefix("worker-runtime-")
@@ -2017,6 +2187,27 @@ fn migrate_worker_aggregate_document(
         .get_mut("resolved_manifest_snapshot")
         .filter(|snapshot| !snapshot.is_null())
     {
+        match memory_retirement::retire_disabled_memory(snapshot) {
+            memory_retirement::Retirement::Disabled => migrated = true,
+            memory_retirement::Retirement::Unavailable(_) => {
+                // Keep unavailable policy intact. It is never converted to an executable
+                // current Manifest; the normal reader rejects it and Runtime records a
+                // specific diagnostic without changing lifecycle/request history.
+                let saved_name = snapshot
+                    .get("manifest")
+                    .unwrap_or(snapshot)
+                    .pointer("/worker/name")
+                    .and_then(serde_json::Value::as_str);
+                if saved_name != Some(actual_name.as_str()) {
+                    return Err(runtime_store_corrupt(
+                        metadata_path,
+                        "retired Worker manifest identity does not match metadata".into(),
+                    ));
+                }
+                return Ok((document, migrated));
+            }
+            memory_retirement::Retirement::Unchanged => {}
+        }
         let mut manifest = manifest::read_persisted_worker_manifest_snapshot(snapshot.clone())
             .map_err(|error| {
                 runtime_store_corrupt(
@@ -2172,6 +2363,8 @@ fn migrate_runtime_document(
             | ATTACHMENT_SET_SCHEMA_VERSION
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
             | LIFECYCLE_SCHEMA_VERSION
+            | RECEIPT_SEQUENCE_SCHEMA_VERSION
+            | STOP_HISTORY_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2640,6 +2833,7 @@ fn migrate_runtime_store_in_place(
         )
     })?;
 
+    let mut retired_workers = Vec::new();
     for planned_worker in &planned_workers {
         let source_dir = &planned_worker.source_dir;
         let source_snapshot_path = source_dir.join(WORKER_FILE);
@@ -2674,16 +2868,24 @@ fn migrate_runtime_store_in_place(
         let metadata = if metadata_path.is_file() {
             let metadata: serde_json::Value =
                 read_json(&metadata_path, "read Worker aggregate metadata")?;
-            Some(
-                migrate_worker_aggregate_document(
-                    metadata,
-                    planned_worker,
-                    runtime_id,
-                    &metadata_path,
-                )?
-                .0,
-            )
+            if let Some(reason) =
+                memory_retirement::unavailable_reason(&metadata, &aggregate.profile)
+            {
+                retired_workers.push((aggregate.worker_ref.clone(), reason));
+            }
+            Some(migrate_worker_aggregate_document(
+                metadata,
+                planned_worker,
+                runtime_id,
+                &metadata_path,
+            )?)
         } else {
+            if memory_retirement::legacy_profile(&aggregate.profile) {
+                retired_workers.push((
+                    aggregate.worker_ref.clone(),
+                    "removed Workspace Memory profile",
+                ));
+            }
             None
         };
 
@@ -2712,18 +2914,21 @@ fn migrate_runtime_store_in_place(
             }
         }
         // Schema 11/12 metadata was validated above but needs no conversion.
-        if let Some(metadata) = metadata
-            && !matches!(
-                plan.current_schema_version,
-                SOURCE_SCHEMA_VERSION
-                    | RESTORE_ADMISSION_SCHEMA_VERSION
-                    | RESTORE_DECISION_SCHEMA_VERSION
-                    | RESTORE_REPAIR_SCHEMA_VERSION
-                    | SESSION_ARCHIVE_SCHEMA_VERSION
-                    | ATTACHMENT_SET_SCHEMA_VERSION
-                    | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
-                    | LIFECYCLE_SCHEMA_VERSION
-            )
+        if let Some((metadata, changed)) = metadata
+            && (changed
+                || !matches!(
+                    plan.current_schema_version,
+                    SOURCE_SCHEMA_VERSION
+                        | RESTORE_ADMISSION_SCHEMA_VERSION
+                        | RESTORE_DECISION_SCHEMA_VERSION
+                        | RESTORE_REPAIR_SCHEMA_VERSION
+                        | SESSION_ARCHIVE_SCHEMA_VERSION
+                        | ATTACHMENT_SET_SCHEMA_VERSION
+                        | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
+                        | LIFECYCLE_SCHEMA_VERSION
+                        | RECEIPT_SEQUENCE_SCHEMA_VERSION
+                        | STOP_HISTORY_SCHEMA_VERSION
+                ))
         {
             atomic_write_json(
                 &migrated_dir.join(WORKER_METADATA_FILE),
@@ -2746,12 +2951,13 @@ fn migrate_runtime_store_in_place(
     // A Runtime schema bump says nothing about the retained Session schema.
     // Session Store owns versioned conversion, including v4 -> generic v5.
     crate::retention::migrate_staged_sessions(root)?;
-    let (document, _) = migrate_runtime_document(
+    let (mut document, _) = migrate_runtime_document(
         document,
         plan.current_schema_version,
         &plan.mappings,
         &runtime_path,
     )?;
+    memory_retirement::record_unavailable_workers(&mut document, retired_workers, &runtime_path)?;
     atomic_write_json(
         &runtime_path,
         &document,
@@ -2954,13 +3160,13 @@ impl WorkerAggregateRecord {
                 admission.execution.as_ref().map(|e| &e.request)
             }
             PersistedWorkerExecutionState::NotStarted(execution)
-            | PersistedWorkerExecutionState::Stopped(execution) => {
+            | PersistedWorkerExecutionState::Stopped(execution)
+            | PersistedWorkerExecutionState::Suspended(execution) => {
                 execution.as_ref().map(|e| &e.request)
             }
             PersistedWorkerExecutionState::ReconciliationRequired(operation) => match operation {
                 PersistedWorkerLifecycleOperation::Create(create) => create.request.as_ref(),
                 PersistedWorkerLifecycleOperation::Restore(restore) => Some(&restore.request),
-                PersistedWorkerLifecycleOperation::Stop(stop) => stop.request.as_ref(),
             },
         };
         let claims = request
@@ -3051,17 +3257,6 @@ impl WorkerAggregateRecord {
             PersistedWorkerExecutionState::ReconciliationRequired(
                 PersistedWorkerLifecycleOperation::Restore(restore),
             ) => Some(restore.operation_id),
-            PersistedWorkerExecutionState::ReconciliationRequired(
-                PersistedWorkerLifecycleOperation::Stop(stop),
-            ) => stop
-                .pending_restore
-                .as_ref()
-                .map(|restore| restore.operation_id)
-                .or_else(|| {
-                    stop.restore_finalization
-                        .as_ref()
-                        .map(|finalization| finalization.operation_id)
-                }),
             _ => None,
         };
         if active_owner.is_some() && active_owner != operation_id {
@@ -3075,9 +3270,6 @@ impl WorkerAggregateRecord {
             .is_some_and(|owner| owner.receipt_stored);
         let finalization = match &execution_state {
             PersistedWorkerExecutionState::RestoreFinalization(finalization) => Some(finalization),
-            PersistedWorkerExecutionState::ReconciliationRequired(
-                PersistedWorkerLifecycleOperation::Stop(stop),
-            ) => stop.restore_finalization.as_ref(),
             _ => None,
         };
         if active_receipt
@@ -3193,6 +3385,19 @@ impl WorkerAggregateRecord {
                     validate_request(&execution.request)?;
                 }
             }
+            PersistedWorkerExecutionState::Suspended(execution) => {
+                // Status is the last settled observation, not evidence of shutdown.
+                if !restore_guard.automatic_restore_suppressed() {
+                    return Err(runtime_store_corrupt(
+                        path,
+                        "Suspended execution requires explicit automatic-restore suppression"
+                            .into(),
+                    ));
+                }
+                if let Some(execution) = execution {
+                    validate_request(&execution.request)?;
+                }
+            }
             PersistedWorkerExecutionState::RestoreAdmitted(admission) => {
                 if active_owner != Some(admission.operation_id) {
                     return Err(runtime_store_corrupt(
@@ -3221,71 +3426,6 @@ impl WorkerAggregateRecord {
                         return Err(mismatch());
                     }
                     validate_restore(restore)?;
-                }
-                PersistedWorkerLifecycleOperation::Stop(stop) => {
-                    if identity.status != stop.last_settled_status
-                        || (!stop.last_settled_status.is_active()
-                            && stop.pending_restore.is_none()
-                            && stop.restore_finalization.is_none())
-                        || (stop.pending_restore.is_some() && stop.restore_finalization.is_some())
-                    {
-                        return Err(mismatch());
-                    }
-                    if let Some(finalization) = &stop.restore_finalization
-                        && (finalization.execution.as_ref().map(|spec| &spec.request)
-                            != stop.request.as_ref()
-                            || finalization
-                                .execution
-                                .as_ref()
-                                .and_then(|spec| spec.binding.as_ref())
-                                != stop.binding.as_ref())
-                    {
-                        return Err(runtime_store_corrupt(
-                            path,
-                            "Stop and finalization specifications differ".into(),
-                        ));
-                    }
-                    if stop.request.is_none()
-                        && (stop.binding.is_some() || stop.pending_restore.is_some())
-                    {
-                        return Err(runtime_store_corrupt(
-                            path,
-                            "metadata-free Stop cannot carry Restore authority".into(),
-                        ));
-                    }
-                    if let Some(request) = &stop.request {
-                        validate_request(request)?;
-                        if stop.last_settled_status.is_active() && stop.binding.is_none() {
-                            return Err(runtime_store_corrupt(
-                                path,
-                                "runnable Stop requires a binding".into(),
-                            ));
-                        }
-                    }
-                    if let Some(restore) = &stop.pending_restore {
-                        validate_restore(restore)?;
-                    }
-                    if let PersistedWorkerStopProgress::ScopeTerminated(termination) =
-                        &stop.progress
-                        && !termination
-                            .confirms_scope_shutdown(&identity.worker_ref, stop.operation_id)
-                    {
-                        return Err(runtime_store_corrupt(
-                            path,
-                            "Stop termination target or operation differs".into(),
-                        ));
-                    }
-                    if let PersistedWorkerStopProgress::ScopeTerminated(termination) =
-                        &stop.progress
-                        && restore_guard
-                            .historical_termination()
-                            .is_some_and(|historical| historical != termination)
-                    {
-                        return Err(runtime_store_corrupt(
-                            path,
-                            "Stop progress conflicts with historical termination".into(),
-                        ));
-                    }
                 }
             },
         }
@@ -3797,7 +3937,7 @@ fn sync_directory(path: &Path, operation: &'static str) -> Result<(), RuntimeErr
 mod tests {
     use super::*;
 
-    fn write_empty_schema_v8_store(root: &Path) {
+    pub(super) fn write_empty_schema_v8_store(root: &Path) {
         fs::create_dir_all(root.join(WORKERS_DIR)).unwrap();
         fs::write(
             root.join(RUNTIME_FILE),
@@ -3931,6 +4071,8 @@ mod tests {
             let persisted_worker = state.workers.get(&worker_id).unwrap();
             expected_worker["schema_version"] = serde_json::json!(SCHEMA_VERSION);
             migrate_v18_lifecycle(&mut expected_worker, &worker_path).unwrap();
+            expected_worker["restore_guard"]["automatic_restore_suppressed"] =
+                serde_json::json!(false);
             expected_worker["workdir_attachments_guard"] =
                 serde_json::to_value(&persisted_worker.workdir_attachments_guard).unwrap();
             assert_eq!(
@@ -5027,7 +5169,7 @@ mod tests {
         document
     }
 
-    fn canonical_worker_store() -> (
+    pub(super) fn canonical_worker_store() -> (
         tempfile::TempDir,
         FsRuntimeStore,
         PersistedWorkerRecord,
@@ -5051,6 +5193,34 @@ mod tests {
         worker.created_at_ms = Some(1);
         opened.store.write_worker_record(&worker).unwrap();
         (temp, opened.store, worker, path)
+    }
+
+    #[test]
+    fn legacy_attached_execution_metadata_is_rejected_without_dropping_its_connection_or_history() {
+        let (_temp, store, worker, path) = canonical_worker_store();
+        let history_path = path.parent().unwrap().join("session/history.json");
+        fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        let history = b"[{\"role\":\"user\",\"content\":\"retained history\"}]\n";
+        fs::write(&history_path, history).unwrap();
+        let mut document: serde_json::Value =
+            read_json(&path, "read initialization fixture").unwrap();
+        let request = document["execution_state"]["execution"]["request"]
+            .as_object_mut()
+            .unwrap();
+        request.remove("feature_initialization");
+        request.insert("subjektiv_attached".into(), serde_json::json!(true));
+        let bytes = serde_json::to_vec(&document).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        // This fixture owns an aggregate, not a complete Runtime snapshot. Read
+        // through the real aggregate decoder without an unrelated root preflight.
+        let error = store.read_worker_record(&worker.worker_ref).unwrap_err();
+        assert!(error.to_string().contains("subjektiv_attached"), "{error}");
+        assert_eq!(fs::read(&history_path).unwrap(), history);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "failed legacy decode must not rewrite saved connection metadata"
+        );
     }
 
     #[test]
@@ -5154,13 +5324,15 @@ mod tests {
         restore["commit"] = serde_json::json!("legacy_unknown");
         restore["source_repair_possible"] = serde_json::json!(true);
         migrate_v18_lifecycle(&mut expected, &path).unwrap();
+        migrate_v20_stop_history(&mut expected, &path).unwrap();
 
         let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
         let persisted = opened.store.read_worker_record(&worker.worker_ref).unwrap();
         expected["workdir_attachments_guard"] =
             serde_json::to_value(&persisted.workdir_attachments_guard).unwrap();
-        // Compare the persisted aggregate, including both operation IDs, full
+        // Compare the aggregate, including the retained Restore operation ID,
         // request/source references, token, pending owner and terminal receipt.
+        // The enclosing legacy Stop operation ID is deliberately not retained.
         assert_eq!(
             read_json::<serde_json::Value>(&path, "read migrated Worker").unwrap(),
             expected
@@ -5192,7 +5364,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pending_restore_migrates_as_unknown_and_preserves_stop_ownership() {
+    fn legacy_pending_restore_migrates_as_unknown_without_enclosing_stop_ownership() {
         use crate::runtime::RestoreCommitFact;
         for (source_schema, under_stop) in [
             RESTORE_ADMISSION_SCHEMA_VERSION,
@@ -5216,24 +5388,25 @@ mod tests {
                 binding: execution.binding.clone(),
                 last_settled_status: worker.status,
             };
-            let operation = if under_stop {
-                PersistedWorkerLifecycleOperation::Stop(PersistedWorkerStopOperation {
-                    operation_id: WorkerLifecycleOperationId::new(),
-                    pending_restore: Some(restore),
-                    restore_finalization: None,
-                    request: Some(execution.request),
-                    binding: execution.binding,
-                    progress: PersistedWorkerStopProgress::AwaitingTermination,
-                    last_settled_status: worker.status,
-                })
-            } else {
-                PersistedWorkerLifecycleOperation::Restore(restore)
-            };
-            worker.execution_state =
-                PersistedWorkerExecutionState::ReconciliationRequired(operation);
+            worker.execution_state = PersistedWorkerExecutionState::ReconciliationRequired(
+                PersistedWorkerLifecycleOperation::Restore(restore),
+            );
             let mut legacy = legacy_lifecycle_document(
                 serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap(),
             );
+            if under_stop {
+                let restore = legacy["execution_state"]["execution"]["intent"].clone();
+                legacy["execution_state"]["execution"] = serde_json::json!({
+                    "operation": "stop", "intent": {
+                        "operation_id": WorkerLifecycleOperationId::new(),
+                        "pending_restore": restore,
+                        "request": execution.request,
+                        "binding": execution.binding,
+                        "restore_intent": "automatic",
+                        "last_settled_status": worker.status
+                    }
+                });
+            }
             legacy["schema_version"] = serde_json::json!(source_schema);
             legacy
                 .as_object_mut()
@@ -5253,7 +5426,8 @@ mod tests {
                 .unwrap()
                 .remove("source_repair_possible");
             let expected_request = restore["request"].clone();
-            let before_guard = legacy["restore_guard"].clone();
+            let mut before_guard = legacy["restore_guard"].clone();
+            before_guard["automatic_restore_suppressed"] = serde_json::json!(under_stop);
             fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
             write_empty_schema_v8_store(&root);
             let runtime_path = root.join(RUNTIME_FILE);
@@ -5271,7 +5445,6 @@ mod tests {
             };
             let restored = match operation {
                 PersistedWorkerLifecycleOperation::Restore(restore) => restore,
-                PersistedWorkerLifecycleOperation::Stop(stop) => stop.pending_restore.unwrap(),
                 PersistedWorkerLifecycleOperation::Create(_) => {
                     panic!("Restore changed operation kind")
                 }
@@ -5297,15 +5470,14 @@ mod tests {
             assert_eq!(disk["worker_ref"], legacy["worker_ref"]);
             let settled = disk["execution_state"]["execution"]["intent"].clone();
             let legacy_intent = &legacy["execution_state"]["execution"]["intent"];
-            if under_stop {
-                assert_eq!(settled["operation_id"], legacy_intent["operation_id"]);
-                assert_eq!(
-                    settled["pending_restore"]["operation_id"],
-                    legacy_intent["pending_restore"]["operation_id"]
-                );
+            let legacy_restore = if under_stop {
+                &legacy_intent["pending_restore"]
             } else {
-                assert_eq!(settled["operation_id"], legacy_intent["operation_id"]);
-            }
+                legacy_intent
+            };
+            assert_eq!(settled["operation_id"], legacy_restore["operation_id"]);
+            assert_eq!(disk["execution_state"]["execution"]["operation"], "restore");
+            assert!(disk.to_string().find("stop_owners").is_none());
             drop(opened);
             let reopened = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
             assert!(
@@ -5315,6 +5487,336 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    // Frozen legacy Stop documents exercise the real migration/writer/open path,
+    // not a current enum capable of serializing the removed operation.
+    fn pre20_stop_document(
+        worker: &PersistedWorkerRecord,
+        schema: u32,
+        with_spec: bool,
+        terminated: bool,
+    ) -> serde_json::Value {
+        let mut document =
+            serde_json::to_value(WorkerAggregateRecord::from_persisted(worker)).unwrap();
+        let execution = document["execution_state"]["execution"].clone();
+        let stop_id = WorkerLifecycleOperationId::new();
+        document["schema_version"] = serde_json::json!(schema);
+        document["last_finished_submission_request_id"] = serde_json::json!("retained-input-fence");
+        document["restore_guard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("automatic_restore_suppressed");
+        let token = document["restore_guard"]["observation_token"].clone();
+        let request = |id: &str| {
+            serde_json::json!({
+                "reason": "retained explicit stop",
+                "stop_intent": {"request_id": id, "expected_observation_token": token}
+            })
+        };
+        let mut ack = serde_json::json!({
+            "command": null, "replayed": false, "worker_ref": worker.worker_ref,
+            "status": "stopped", "worker_state": null
+        });
+        if schema >= LIFECYCLE_SCHEMA_VERSION {
+            ack["lifecycle"] = serde_json::json!("stopped");
+        }
+        document["restore_guard"]["stop_owners"] = serde_json::json!({
+            "interrupted": {"operation_id": stop_id, "request": request("interrupted"), "receipt": null},
+            "finished": {"operation_id": WorkerLifecycleOperationId::new(), "request": request("finished"), "receipt": ack}
+        });
+        let mut stop = serde_json::json!({
+            "operation_id": stop_id,
+            "request": if with_spec { execution["request"].clone() } else { serde_json::Value::Null },
+            "binding": if with_spec { execution["binding"].clone() } else { serde_json::Value::Null },
+            "last_settled_status": document["status"]
+        });
+        let termination = terminated.then(|| {
+            crate::execution::WorkerExecutionTermination::joined_startup_candidate(
+                worker.worker_ref.clone(),
+                stop_id,
+                uuid::Uuid::now_v7(),
+            )
+        });
+        if schema < LIFECYCLE_SCHEMA_VERSION {
+            stop["restore_intent"] = serde_json::json!("automatic");
+            if let Some(termination) = &termination {
+                document["restore_guard"]["execution_termination"] =
+                    serde_json::to_value(termination).unwrap();
+            }
+        } else {
+            stop["progress"] = if let Some(termination) = termination {
+                serde_json::json!({"phase": "scope_terminated", "termination": termination})
+            } else {
+                serde_json::json!({"phase": "awaiting_termination"})
+            };
+        }
+        document["execution_state"] = serde_json::json!({
+            "state": "reconciliation_required", "execution": {"operation": "stop", "intent": stop}
+        });
+        document
+    }
+
+    fn install_pre20_document(store: &FsRuntimeStore, path: &Path, document: &serde_json::Value) {
+        fs::write(path, serde_json::to_vec(document).unwrap()).unwrap();
+        write_empty_schema_v8_store(&store.root);
+        let runtime_path = store.root.join(RUNTIME_FILE);
+        let mut runtime: serde_json::Value = read_json(&runtime_path, "read fixture").unwrap();
+        runtime["schema_version"] = document["schema_version"].clone();
+        fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn schema17_and19_interrupted_stop_becomes_suspended_history_and_survives_reopen() {
+        for schema in [
+            ATTACHMENT_AUTHORITY_SCHEMA_VERSION,
+            RECEIPT_SEQUENCE_SCHEMA_VERSION,
+        ] {
+            for with_spec in [false, true] {
+                for terminated in [false, true] {
+                    let (_temp, store, worker, path) = canonical_worker_store();
+                    let root = store.root.clone();
+                    let legacy = pre20_stop_document(&worker, schema, with_spec, terminated);
+                    install_pre20_document(&store, &path, &legacy);
+                    let session = path.parent().unwrap().join("session/history.json");
+                    fs::create_dir_all(session.parent().unwrap()).unwrap();
+                    let history =
+                        b"[{\"role\":\"user\",\"content\":\"accepted input retained\"}]\n";
+                    fs::write(&session, history).unwrap();
+                    drop(store);
+                    let opened =
+                        FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+                    let saved = opened.store.read_worker_record(&worker.worker_ref).unwrap();
+                    assert!(
+                        matches!(&saved.execution_state, PersistedWorkerExecutionState::Suspended(spec) if spec.is_some() == with_spec)
+                    );
+                    assert_eq!(saved.status, worker.status); // Never claim Stopped.
+                    assert!(saved.restore_guard.automatic_restore_suppressed());
+                    let disk: serde_json::Value =
+                        read_json(&path, "read migrated Stop history").unwrap();
+                    assert_eq!(disk["schema_version"], SCHEMA_VERSION);
+                    for key in [
+                        "worker_ref",
+                        "worker_id",
+                        "profile",
+                        "profile_source",
+                        "config_bundle",
+                        "workspace_id",
+                        "workdir_attachments",
+                        "logical_workdir_attachments",
+                        "workdir_attachments_guard",
+                        "last_finished_submission_request_id",
+                    ] {
+                        assert_eq!(disk[key], legacy[key], "preserve {key}");
+                    }
+                    assert_eq!(
+                        disk["restore_guard"]["observation_token"],
+                        legacy["restore_guard"]["observation_token"]
+                    );
+                    let results = &disk["restore_guard"]["stop_results"];
+                    for id in ["interrupted", "finished"] {
+                        assert_eq!(
+                            results[id]["request"],
+                            legacy["restore_guard"]["stop_owners"][id]["request"]
+                        );
+                        assert_eq!(results[id].as_object().unwrap().len(), 2);
+                        assert!(results[id].get("operation_id").is_none());
+                    }
+                    assert!(results["interrupted"]["receipt"].is_null());
+                    assert_eq!(results["finished"]["receipt"]["lifecycle"], "stopped");
+                    assert_eq!(
+                        disk["restore_guard"]["execution_termination"].is_null(),
+                        !terminated
+                    );
+                    if with_spec {
+                        assert_eq!(
+                            disk["execution_state"]["execution"]["request"],
+                            legacy["execution_state"]["execution"]["intent"]["request"]
+                        );
+                        assert_eq!(
+                            disk["execution_state"]["execution"]["binding"],
+                            legacy["execution_state"]["execution"]["intent"]["binding"]
+                        );
+                    }
+                    let serialized = serde_json::to_string(&disk).unwrap();
+                    for removed in [
+                        "stop_owners",
+                        "pending_restore",
+                        "restore_intent",
+                        "awaiting_termination",
+                        "scope_terminated",
+                        "\"operation\":\"stop\"",
+                    ] {
+                        assert!(!serialized.contains(removed), "removed {removed}");
+                    }
+                    opened.store.write_worker_record(&saved).unwrap();
+                    assert_eq!(
+                        read_json::<serde_json::Value>(&path, "read reserialized").unwrap(),
+                        disk
+                    );
+                    let committed = fs::read(&path).unwrap();
+                    drop(opened);
+                    let reopened = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
+                    let saved = reopened
+                        .store
+                        .read_worker_record(&worker.worker_ref)
+                        .unwrap();
+                    assert!(matches!(
+                        saved.execution_state,
+                        PersistedWorkerExecutionState::Suspended(_)
+                    ));
+                    assert_eq!(fs::read(&path).unwrap(), committed);
+                    assert_eq!(fs::read(&session).unwrap(), history);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schema19_stop_preserves_unresolved_restore_and_finalization_authority() {
+        for kind in [
+            "restore",
+            "finalization",
+            "published_finalization",
+            "admission",
+            "safe_admission",
+            "terminal_receipt",
+        ] {
+            let (_temp, store, worker, path) = canonical_worker_store();
+            let root = store.root.clone();
+            let mut legacy =
+                pre20_stop_document(&worker, RECEIPT_SEQUENCE_SCHEMA_VERSION, true, false);
+            let spec = legacy["execution_state"]["execution"]["intent"].clone();
+            let restore_id = WorkerLifecycleOperationId::new();
+            let token = legacy["restore_guard"]["observation_token"].clone();
+            let receipt = serde_json::json!({"state": "superseded", "worker": null,
+                "reason_code": "retained-terminal", "message": "original terminal result"});
+            legacy["restore_guard"]["active_request_id"] = serde_json::json!("restore-owner");
+            legacy["restore_guard"]["owners"]["restore-owner"] = serde_json::json!({
+                "fingerprint": "retained-restore-intent",
+                "operation_id": restore_id,
+                "request": {"request_id": "restore-owner", "expected_observation_token": token},
+                "preparation_applied": kind != "safe_admission",
+                "execution_started": kind == "published_finalization",
+                "receipt": if kind == "finalization" || kind == "terminal_receipt" { receipt.clone() } else { serde_json::Value::Null }
+            });
+            if kind == "restore" {
+                legacy["execution_state"]["execution"]["intent"]["pending_restore"] = serde_json::json!({
+                    "operation_id": restore_id, "mode": "explicit", "commit": "legacy_unknown",
+                    "source_repair_possible": true, "request": spec["request"],
+                    "binding": spec["binding"], "last_settled_status": worker.status
+                });
+            } else if matches!(kind, "finalization" | "published_finalization") {
+                legacy["execution_state"]["execution"]["intent"]["restore_finalization"] = serde_json::json!({
+                    "operation_id": restore_id, "evidence": if kind == "finalization" { "receipt_stored" } else { "legacy_aggregate_published" },
+                    "execution": {"request": spec["request"], "binding": spec["binding"]}
+                });
+            }
+            install_pre20_document(&store, &path, &legacy);
+            drop(store);
+            let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+            let saved = opened.store.read_worker_record(&worker.worker_ref).unwrap();
+            let disk: serde_json::Value =
+                read_json(&path, "read retained Restore authority").unwrap();
+            let state = &disk["execution_state"];
+            match kind {
+                "restore" => {
+                    assert_eq!(state["execution"]["operation"], "restore");
+                    assert_eq!(
+                        state["execution"]["intent"],
+                        legacy["execution_state"]["execution"]["intent"]["pending_restore"]
+                    );
+                }
+                "finalization" | "published_finalization" => {
+                    assert_eq!(state["state"], "restore_finalization");
+                    assert_eq!(
+                        state["execution"],
+                        legacy["execution_state"]["execution"]["intent"]["restore_finalization"]
+                    );
+                }
+                "admission" => {
+                    assert_eq!(state["execution"]["operation"], "restore");
+                    assert_eq!(state["execution"]["intent"]["commit"], "legacy_unknown");
+                    assert_eq!(state["execution"]["intent"]["source_repair_possible"], true);
+                }
+                "safe_admission" | "terminal_receipt" => {
+                    assert_eq!(state["state"], "suspended");
+                    assert!(disk["restore_guard"]["active_request_id"].is_null());
+                    let stored = &disk["restore_guard"]["owners"]["restore-owner"]["receipt"];
+                    assert_eq!(stored["state"], "superseded");
+                    if kind == "terminal_receipt" {
+                        assert_eq!(stored, &receipt);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            if matches!(
+                kind,
+                "restore" | "finalization" | "published_finalization" | "admission"
+            ) {
+                assert_eq!(
+                    disk["restore_guard"]["owners"],
+                    legacy["restore_guard"]["owners"]
+                );
+                assert_eq!(
+                    state["execution"]["operation_id"]
+                        .as_str()
+                        .unwrap_or_else(|| state["execution"]["intent"]["operation_id"]
+                            .as_str()
+                            .unwrap()),
+                    restore_id.to_string()
+                );
+            }
+            opened.store.write_worker_record(&saved).unwrap();
+            let committed = fs::read(&path).unwrap();
+            drop(opened);
+            let reopened = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
+            reopened
+                .store
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            assert_eq!(fs::read(path).unwrap(), committed);
+        }
+    }
+
+    #[test]
+    fn current_suspended_requires_suppression_and_valid_identity_but_not_shutdown() {
+        let (_temp, store, mut worker, path) = canonical_worker_store();
+        let PersistedWorkerExecutionState::Runnable(execution) = worker.execution_state.clone()
+        else {
+            panic!("fixture")
+        };
+        worker.execution_state = PersistedWorkerExecutionState::Suspended(Some(execution));
+        assert!(
+            WorkerAggregateRecord::from_persisted(&worker)
+                .validate(&path)
+                .is_err()
+        );
+        let mut document =
+            serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
+        document["restore_guard"]["automatic_restore_suppressed"] = serde_json::json!(true);
+        let aggregate: WorkerAggregateRecord = serde_json::from_value(document.clone()).unwrap();
+        let saved = aggregate.validate(&path).unwrap();
+        store.write_worker_record(&saved).unwrap();
+        assert_eq!(
+            store.read_worker_record(&worker.worker_ref).unwrap().status,
+            worker.status
+        );
+        assert!(document["restore_guard"]["execution_termination"].is_null());
+        document["execution_state"]["execution"]["request"]["worker_id"] =
+            serde_json::json!(WorkerId::now_v7());
+        assert!(
+            serde_json::from_value::<WorkerAggregateRecord>(document)
+                .unwrap()
+                .validate(&path)
+                .is_err()
+        );
+        let mut old = pre20_stop_document(&worker, SCHEMA_VERSION, true, false);
+        old["restore_guard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stop_owners");
+        assert!(serde_json::from_value::<WorkerAggregateRecord>(old).is_err());
     }
 
     #[test]

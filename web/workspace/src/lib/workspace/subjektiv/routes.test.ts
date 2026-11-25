@@ -89,9 +89,7 @@ Deno.test("Subject sidebar ownership and breadcrumbs never lead to legacy or non
   ) {
     assertEquals(ownsRoutePath(root, path), false);
   }
-  assertEquals(buildWorkspaceBreadcrumbs("/w/w/memory/staging", "w"), [{
-    label: "Memory",
-  }, { label: "Staging" }]);
+  assertEquals(buildWorkspaceBreadcrumbs("/w/w/memory/staging", "w"), []);
   assertEquals(buildWorkspaceBreadcrumbs(root, "w"), [{ label: "Subjects" }]);
   assertEquals(
     buildWorkspaceBreadcrumbs("/w/w/subjektiv/a%2Fb/memories/permissions", "w"),

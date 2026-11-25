@@ -156,24 +156,12 @@ where
         if let Some(workdir_session) = self.workdir_session {
             worker.bind_single_workdir_session(Some(workdir_session));
         }
-        let explicit_subjektiv_host = self.subjektiv_host.is_some();
-        worker.bind_subjektiv_host(self.subjektiv_host);
-        if explicit_subjektiv_host
-            && worker.manifest().feature.subjektiv.profile.enabled
-            && !worker
-                .manifest()
-                .feature
-                .subjektiv
-                .profile
-                .consolidation_tools
-        {
-            worker
-                .finalize_subjektiv_session_attribution(
-                    true,
-                    crate::SubjektivSessionAttributionLifecycle::NewSession,
-                )
-                .map_err(WorkerBootstrapError::Worker)?;
-        }
+        crate::feature::builtin::subjektiv_initialization::bind_explicit_host(
+            &mut worker,
+            self.subjektiv_host,
+            crate::feature::initialization::InitializationPhase::New,
+        )
+        .map_err(WorkerBootstrapError::Worker)?;
         Ok(PreparedWorker::new(worker, self.layout))
     }
 
@@ -229,24 +217,12 @@ where
         if let Some(workdir_session) = self.workdir_session {
             worker.bind_single_workdir_session(Some(workdir_session));
         }
-        let explicit_subjektiv_host = self.subjektiv_host.is_some();
-        worker.bind_subjektiv_host(self.subjektiv_host);
-        if explicit_subjektiv_host
-            && worker.manifest().feature.subjektiv.profile.enabled
-            && !worker
-                .manifest()
-                .feature
-                .subjektiv
-                .profile
-                .consolidation_tools
-        {
-            worker
-                .finalize_subjektiv_session_attribution(
-                    true,
-                    crate::SubjektivSessionAttributionLifecycle::RestoredSession,
-                )
-                .map_err(WorkerBootstrapError::Worker)?;
-        }
+        crate::feature::builtin::subjektiv_initialization::bind_explicit_host(
+            &mut worker,
+            self.subjektiv_host,
+            crate::feature::initialization::InitializationPhase::Restored,
+        )
+        .map_err(WorkerBootstrapError::Worker)?;
         Ok(PreparedWorker::new(worker, self.layout))
     }
 
@@ -322,21 +298,33 @@ where
 
 /// Host bindings for one unpublished restored Controller. These do not expose
 /// Worker execution or permit arbitrary mutation during preparation.
-pub struct RestoredControllerBindings {
+pub struct RestoredControllerBindings<St>
+where
+    St: Store + WorkerMetadataStore + Clone + 'static,
+{
+    pub initialization_registry: std::sync::Arc<
+        crate::feature::initialization::FeatureInitializationRegistry<Box<dyn LlmClient>, St>,
+    >,
     pub backend_job: Option<crate::BackendJobExecutionBinding>,
     pub workdir_sessions: std::sync::Arc<workdir::WorkdirSessionRouter>,
     pub observation_provider:
         Option<std::sync::Arc<dyn crate::feature::contracts::WorkerObservationProvider>>,
-    pub subjektiv_attached: bool,
+    pub feature_initialization: protocol::feature_initialization::FeatureInitializations,
 }
 
 /// The same real receiver, snapshot sources and paired subscription retained
 /// privately across the Runtime's durable restore decision.
-pub struct UnpublishedRestoredController<St: Store> {
+pub struct UnpublishedRestoredController<St>
+where
+    St: Store + WorkerMetadataStore + Clone + 'static,
+{
     initialized: Option<crate::controller::InitializedWorkerController<Box<dyn LlmClient>, St>>,
+    initialization_registry: std::sync::Arc<
+        crate::feature::initialization::FeatureInitializationRegistry<Box<dyn LlmClient>, St>,
+    >,
     activation: Option<crate::worker::RestoredWorkerActivation>,
     streams: Option<crate::ipc::protocol_session::WorkerProtocolSessionStreams>,
-    subjektiv_attached: bool,
+    feature_initialization: protocol::feature_initialization::FeatureInitializations,
     effects_applied: bool,
     activation_failed: bool,
     closing: bool,
@@ -357,6 +345,13 @@ where
         Ok(self.worker_mut()?.workspace_client_handle())
     }
 
+    /// Retain saved local policy even before a deferred provider is opened.
+    pub fn local_workdir_scope(&mut self) -> Result<Option<manifest::SharedScope>, WorkerError> {
+        let worker = self.worker_mut()?;
+        let has_policy = worker.scope().load().readable_paths().next().is_some();
+        Ok(has_policy.then(|| worker.scope().clone()))
+    }
+
     pub fn retain_startup_feature_cleanup(
         &mut self,
     ) -> Result<crate::WorkerStartupFeatureCleanup, WorkerError> {
@@ -369,7 +364,7 @@ where
     pub async fn prepare_runtime_controller(
         mut self,
         run_dir: &std::path::Path,
-        bindings: RestoredControllerBindings,
+        bindings: RestoredControllerBindings<St>,
     ) -> Result<UnpublishedRestoredController<St>, WorkerBootstrapError> {
         let worker = self.worker_mut().map_err(WorkerBootstrapError::Worker)?;
         if let Some(binding) = bindings.backend_job {
@@ -386,6 +381,10 @@ where
             })?;
         worker.bind_workdir_sessions(bindings.workdir_sessions);
         worker.bind_worker_observation_provider(bindings.observation_provider);
+        bindings
+            .initialization_registry
+            .prepare_host(worker, &bindings.feature_initialization)
+            .map_err(WorkerBootstrapError::Worker)?;
         let flow_enabled = worker.manifest().feature.flow.enabled;
         if flow_enabled {
             let report = worker
@@ -414,9 +413,10 @@ where
         };
         Ok(UnpublishedRestoredController {
             initialized: Some(initialized),
+            initialization_registry: bindings.initialization_registry,
             activation: Some(activation),
             streams: Some(streams),
-            subjektiv_attached: bindings.subjektiv_attached,
+            feature_initialization: bindings.feature_initialization,
             effects_applied: false,
             activation_failed: false,
             closing: false,
@@ -460,9 +460,8 @@ where
         // Recheck local attribution consistency before applying saved state.
         // Controller restoration does not register or authorize the Session again;
         // current authority remains an operation-time concern.
-        initialized
-            .worker
-            .validate_saved_subjektiv_attribution()
+        self.initialization_registry
+            .validate_saved_state(&initialized.worker)
             .map_err(WorkerBootstrapError::Worker)?;
         if !self.effects_applied {
             self.activation_failed = true;
@@ -472,11 +471,11 @@ where
                 .activate(&mut initialized.worker)
                 .await
                 .map_err(WorkerBootstrapError::Worker)?;
-            initialized
-                .worker
-                .finalize_subjektiv_session_attribution(
-                    self.subjektiv_attached,
-                    crate::SubjektivSessionAttributionLifecycle::RestoredSession,
+            self.initialization_registry
+                .apply(
+                    &initialized.worker,
+                    &self.feature_initialization,
+                    crate::feature::initialization::InitializationPhase::Restored,
                 )
                 .map_err(WorkerBootstrapError::Worker)?;
             self.effects_applied = true;

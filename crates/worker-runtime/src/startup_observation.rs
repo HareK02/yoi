@@ -131,7 +131,7 @@ mod tests {
             workspace_api: None,
             memory_settings: None,
             plugin_execution: None,
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
         }
     }

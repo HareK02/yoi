@@ -468,6 +468,7 @@ fn exercise_failure_histories(tail: Tail) {
             old_columns.remove("typed_ticket_orchestration_plans");
             old_columns.remove("ticket_schema_migrations");
             exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
+            exclude_retired_memory_objects(&mut old_columns);
             // Result-only completion is intentionally reopened by schema134;
             // every other retained value stays byte-for-byte identical.
             old_columns
@@ -816,6 +817,7 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("published-journal.sqlite");
         let conn = published_journal(&path, sql);
+        conn.execute_batch("INSERT INTO workspace_memory_settings VALUES('w','日本語','settings-created','settings-updated'); INSERT INTO workspace_memory_documents VALUES('w','retire this document','1','1');").unwrap();
         let before_schema = schema(&conn);
         let mut old_columns = all_columns(&conn);
         let before = values(&conn, &old_columns);
@@ -845,6 +847,13 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
         );
         old_columns.remove("merge_request_schema");
         exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
+        let settings = rows(
+            &conn,
+            "SELECT workspace_id,language,created_at,updated_at FROM workspace_memory_settings ORDER BY workspace_id",
+        );
+        // 144 deletes legacy Workspace content but renames, rather than discards,
+        // the settings now owned by Subjektiv. Rollback above still checks every table.
+        exclude_retired_memory_objects(&mut old_columns);
         let retained = values(&conn, &old_columns);
         drop(conn);
         let applied = SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -856,7 +865,12 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
                 assert_appended_receipts(conn, &old_receipts, &plan);
                 assert_obsolete_job_tables_removed(conn);
                 assert_eq!(rows(conn, "SELECT singleton,version FROM merge_request_schema"), vec![vec![Value::Integer(1),Value::Integer(17)]]);
-                assert_eq!(values(conn, &old_columns), retained, "all old columns and values must remain exact");
+                assert_eq!(values(conn, &old_columns), retained, "all retained old columns and values must remain exact");
+                assert_eq!(rows(conn, "SELECT workspace_id,language,created_at,updated_at FROM subjektiv_memory_settings ORDER BY workspace_id"), settings, "Subjektiv settings survive the ownership rename exactly");
+                for table in ["workspace_memory_settings", "workspace_memory_documents", "memory_staging_records", "memory_staging_resolutions"] {
+                    assert!(!table_exists(conn, table)?);
+                }
+                assert!(!column_exists(conn, "worker_create_reservations", "memory_language")?);
                 assert_eq!(failure_signature(conn), expected, "all changed tables, keys and programs match fresh composition");
                 storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
                 assert_eq!(rows(conn, "SELECT j.state,a.state,j.failure_cause FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id) WHERE j.job_id='after-retirement'"),
@@ -985,6 +999,7 @@ fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_
             let mut retained_columns = columns.clone();
             retained_columns.remove("__yoi_schema_migrations");
             exclude_empty_obsolete_job_tables(&conn, &mut retained_columns);
+            exclude_retired_memory_objects(&mut retained_columns);
             retained_columns
                 .get_mut("backend_jobs")
                 .unwrap()
@@ -1039,4 +1054,22 @@ fn assert_result_only_job_finalizing(conn: &Connection) {
         vec![vec![Value::Text("finalizing".into()), Value::Null]],
         "the old result is retained but completion waits for cleanup proof"
     );
+}
+
+// Limit the generic preservation oracle to non-target data. The retirement
+// contract suite separately asserts removal, settings transfer and frozen
+// creation/Subject preservation; do not weaken any other retained table.
+fn exclude_retired_memory_objects(columns: &mut Columns) {
+    for table in [
+        "workspace_memory_settings",
+        "workspace_memory_documents",
+        "memory_staging_records",
+        "memory_staging_resolutions",
+    ] {
+        columns.remove(table);
+    }
+    columns
+        .get_mut("worker_create_reservations")
+        .unwrap()
+        .retain(|column| column != "memory_language");
 }

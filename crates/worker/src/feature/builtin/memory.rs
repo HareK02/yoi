@@ -1,14 +1,4 @@
-//! Memory tools through Workspace HTTP and a Host-provided resident prompt source.
-//!
-//! Workspace authority does not imply filesystem authority, so model-visible Memory operations
-//! delegate to typed Backend operations. They do not discover/import `.yoi/memory` from cwd or
-//! ancestors. The legacy Workspace single document and subject-scoped Subjektiv retain separate
-//! authorities/operations. Enabling the Feature neither migrates/dual-writes legacy data nor
-//! replaces existing tool semantics with subject Memory.
-//!
-//! Resident context is supporting context, not current authority or grounds to update confirmed
-//! Memory. User-managed behavior and generated Memory surfaces remain distinct; fetch/render
-//! failures do not mean "unset".
+//! Subject-scoped resident context and delegated Memory consolidation tools.
 
 pub(crate) mod permission_declaration;
 
@@ -20,15 +10,8 @@ use std::time::Duration;
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use memory::backend::{
-    MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
-    MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryDocumentReadOperation,
-    MemoryDocumentUpdateOperation, MemoryQueryOperation, MemoryStagingCloseOperation,
-    MemoryStagingListOperation, MemoryStagingReadOperation, MemoryToolOutput,
-};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
-use serde_json::json;
 
 use crate::feature::{
     FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -42,7 +25,6 @@ use crate::hook::{
 use crate::prompt::catalog::{PromptCatalog, WorkerPrompt};
 use crate::worker::{
     ResidentContextRefresh, SystemPromptContribution, SystemPromptContributionSource,
-    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -119,128 +101,6 @@ pub(crate) fn resident_summary_input(
     )
 }
 
-#[derive(Clone, Debug)]
-pub struct WorkspaceHttpMemoryBackend {
-    client: Arc<dyn WorkspaceClient>,
-}
-
-impl WorkspaceHttpMemoryBackend {
-    pub fn new(client: Arc<dyn WorkspaceClient>) -> Self {
-        Self { client }
-    }
-
-    pub async fn execute_operation(
-        &self,
-        operation: MemoryBackendOperation,
-    ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
-        execute_memory_backend(self.client.as_ref(), operation).await
-    }
-
-    async fn execute(&self, operation: MemoryBackendOperation) -> Result<ToolOutput, ToolError> {
-        match self.execute_operation(operation).await {
-            Ok(MemoryBackendOperationResult::ToolOutput(output)) => Ok(tool_output(output)),
-            Ok(result) => Err(ToolError::ExecutionFailed(format!(
-                "unexpected memory backend result for model-visible tool: {result:?}"
-            ))),
-            Err(error) => Err(ToolError::ExecutionFailed(error.to_string())),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum WorkspaceMemoryBackendError {
-    #[error("workspace memory backend is unavailable: {reason}")]
-    Unavailable { reason: String },
-    #[error("workspace memory backend request failed: {0}")]
-    Request(#[from] WorkspaceClientError),
-    #[error("workspace memory backend returned HTTP {status}: {body}")]
-    Http {
-        status: reqwest::StatusCode,
-        body: String,
-    },
-    #[error("decode memory backend response: {0}")]
-    Decode(#[from] serde_json::Error),
-    #[error("workspace memory backend rejected operation: {0}")]
-    Backend(String),
-    #[error("workspace memory backend returned an invalid response: {0}")]
-    InvalidResponse(String),
-}
-
-impl dyn WorkspaceClient + '_ {
-    pub async fn execute_memory_backend_operation(
-        &self,
-        operation: MemoryBackendOperation,
-    ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
-        execute_memory_backend(self, operation).await
-    }
-
-    pub async fn request_memory_staging_consolidation(
-        &self,
-        operation: MemoryConsolidateStagingOperation,
-    ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
-        execute_memory_consolidation(self, operation, false).await
-    }
-
-    pub async fn request_subjektiv_memory_staging_consolidation(
-        &self,
-        operation: MemoryConsolidateStagingOperation,
-    ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
-        execute_memory_consolidation(self, operation, true).await
-    }
-
-    pub async fn prepare_subjektiv_memory_surface(
-        &self,
-    ) -> Result<server_api::SubjektivSurfacePrepareResponse, WorkspaceMemoryBackendError> {
-        match execute_subjektiv_memory_operation(
-            self,
-            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
-                server_api::SubjektivSurfacePrepareRequest {},
-            ),
-        )
-        .await?
-        {
-            server_api::SubjektivMemoryBackendResponse::SurfacePrepared(output) => Ok(output),
-            other => Err(WorkspaceMemoryBackendError::Backend(format!(
-                "unexpected surface preparation response: {other:?}"
-            ))),
-        }
-    }
-
-    pub async fn publish_subjektiv_memory_surface(
-        &self,
-        input: server_api::SubjektivSurfacePublishRequest,
-    ) -> Result<server_api::SubjektivSurfacePublishResponse, WorkspaceMemoryBackendError> {
-        match execute_subjektiv_memory_operation(
-            self,
-            server_api::SubjektivMemoryBackendOperation::PublishSurface(input),
-        )
-        .await?
-        {
-            server_api::SubjektivMemoryBackendResponse::SurfacePublished(output) => Ok(output),
-            other => Err(WorkspaceMemoryBackendError::Backend(format!(
-                "unexpected surface publication response: {other:?}"
-            ))),
-        }
-    }
-
-    pub async fn fail_subjektiv_memory_surface(
-        &self,
-        input: server_api::SubjektivSurfaceFailureRequest,
-    ) -> Result<server_api::SubjektivSurfaceFailureResponse, WorkspaceMemoryBackendError> {
-        match execute_subjektiv_memory_operation(
-            self,
-            server_api::SubjektivMemoryBackendOperation::FailSurface(input),
-        )
-        .await?
-        {
-            server_api::SubjektivMemoryBackendResponse::SurfaceFailed(output) => Ok(output),
-            other => Err(WorkspaceMemoryBackendError::Backend(format!(
-                "unexpected surface failure response: {other:?}"
-            ))),
-        }
-    }
-}
-
 #[cfg(test)]
 const RESIDENT_SUMMARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -263,214 +123,6 @@ pub(crate) fn subject_memory_operation_name(
         Operation::PublishSurface(_) => "memory.surface.publish",
         Operation::FailSurface(_) => "memory.surface.fail",
     }
-}
-
-async fn execute_subjektiv_memory_operation(
-    client: &dyn WorkspaceClient,
-    operation: server_api::SubjektivMemoryBackendOperation,
-) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
-    execute_subjektiv_memory_operation_with(client, operation, |client, request| {
-        client.execute(request)
-    })
-}
-
-fn execute_subjektiv_memory_operation_with(
-    client: &dyn WorkspaceClient,
-    operation: server_api::SubjektivMemoryBackendOperation,
-    execute: impl FnOnce(
-        &dyn WorkspaceClient,
-        WorkspaceRequest,
-    ) -> Result<crate::worker::WorkspaceResponse, WorkspaceClientError>,
-) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
-    let workspace_id =
-        client
-            .workspace_id()
-            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
-                reason: format!(
-                    "workspace client kind `{}` has no workspace id",
-                    client.kind()
-                ),
-            })?;
-    client.authorize_subject_operation(subject_memory_operation_name(&operation))?;
-    let response = execute(
-        client,
-        WorkspaceRequest::json(
-            WorkspaceRequestMethod::Post,
-            format!("/api/w/{workspace_id}/subjektiv/memory"),
-            serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })?,
-        ),
-    )?;
-    let status = reqwest::StatusCode::from_u16(response.status)
-        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-    if !response.is_success() {
-        return Err(WorkspaceMemoryBackendError::Http {
-            status,
-            body: response.body,
-        });
-    }
-    Ok(serde_json::from_str(&response.body)?)
-}
-
-pub(super) fn authorize_workspace_memory_operation(
-    client: &dyn WorkspaceClient,
-    operation: &str,
-) -> Result<(), WorkspaceMemoryBackendError> {
-    let workspace_id =
-        client
-            .workspace_id()
-            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
-                reason: "Memory operation requires a Host-bound Workspace identity".into(),
-            })?;
-    client.authorize_operation(
-        operation,
-        &server_api::authorization::PermissionResource::Workspace {
-            workspace_id: workspace_id.to_owned(),
-        },
-    )?;
-    Ok(())
-}
-
-fn memory_operation_name(operation: &MemoryBackendOperation) -> &'static str {
-    match operation {
-        MemoryBackendOperation::Query(_) => "memory.query",
-        MemoryBackendOperation::ReadDocument(_) => "memory.document.read",
-        MemoryBackendOperation::UpdateDocument(_) => "memory.document.update",
-        MemoryBackendOperation::ResidentSummary(_) => "memory.resident.read",
-        MemoryBackendOperation::AppendAudit(_) => "memory.audit.append",
-        MemoryBackendOperation::StageCandidate(_) => "memory.staging.write",
-        MemoryBackendOperation::StageExtracted(_) => "memory.staging.write",
-        MemoryBackendOperation::StagingList(_) => "memory.staging.list",
-        MemoryBackendOperation::StagingRead(_) => "memory.staging.read",
-        MemoryBackendOperation::StagingClose(_) => "memory.staging.close",
-    }
-}
-
-async fn execute_memory_backend(
-    client: &dyn WorkspaceClient,
-    operation: MemoryBackendOperation,
-) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
-    let workspace_id =
-        client
-            .workspace_id()
-            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
-                reason: format!(
-                    "workspace client kind `{}` has no workspace id",
-                    client.kind()
-                ),
-            })?;
-    authorize_workspace_memory_operation(client, memory_operation_name(&operation))?;
-    let response = client.execute(WorkspaceRequest::json(
-        WorkspaceRequestMethod::Post,
-        format!("/api/w/{workspace_id}/memory/backend"),
-        serde_json::to_string(&server_api::MemoryBackendRequest(operation))?,
-    ))?;
-    let status = reqwest::StatusCode::from_u16(response.status)
-        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-    if !response.is_success() {
-        return Err(WorkspaceMemoryBackendError::Http {
-            status,
-            body: response.body,
-        });
-    }
-    match serde_json::from_str::<server_api::MemoryBackendResponse>(&response.body)?.0 {
-        MemoryBackendHttpResponse::Ok { result } => Ok(result),
-        MemoryBackendHttpResponse::Error { message } => {
-            Err(WorkspaceMemoryBackendError::Backend(message))
-        }
-    }
-}
-
-async fn execute_memory_consolidation(
-    client: &dyn WorkspaceClient,
-    operation: MemoryConsolidateStagingOperation,
-    subjektiv: bool,
-) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
-    let workspace_id =
-        client
-            .workspace_id()
-            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
-                reason: format!(
-                    "workspace client kind `{}` has no workspace id",
-                    client.kind()
-                ),
-            })?;
-    if subjektiv {
-        client.authorize_subject_operation("memory.consolidation.request")?;
-    } else {
-        authorize_workspace_memory_operation(client, "memory.consolidation.request")?;
-    }
-    let response = client.execute(WorkspaceRequest::json(
-        WorkspaceRequestMethod::Post,
-        format!(
-            "/api/w/{workspace_id}/{}",
-            if subjektiv {
-                "subjektiv/consolidation"
-            } else {
-                "memory/consolidation"
-            }
-        ),
-        serde_json::to_string(&server_api::MemoryConsolidateStagingRequest {
-            force: operation.force,
-        })?,
-    ))?;
-    let status = reqwest::StatusCode::from_u16(response.status)
-        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-    if !response.is_success() {
-        return Err(WorkspaceMemoryBackendError::Http {
-            status,
-            body: response.body,
-        });
-    }
-    let response = serde_json::from_str::<server_api::MemoryConsolidationResponse>(&response.body)?;
-    Ok(MemoryConsolidationOutput {
-        status: response.status,
-        summary: response.summary,
-        candidate_count: response.candidate_count,
-        total_bytes: response.total_bytes,
-    })
-}
-
-pub fn workspace_http_memory_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
-    let backend = WorkspaceHttpMemoryBackend::new(client);
-    vec![
-        memory_tool(
-            "MemoryReadDocument",
-            READ_DOCUMENT_DESCRIPTION,
-            document_read_schema(),
-            backend.clone(),
-            |input| {
-                Ok(MemoryBackendOperation::ReadDocument(parse_input::<
-                    MemoryDocumentReadOperation,
-                >(
-                    input
-                )?))
-            },
-        ),
-        memory_tool(
-            "MemoryUpdateDocument",
-            UPDATE_DOCUMENT_DESCRIPTION,
-            document_update_schema(),
-            backend.clone(),
-            |input| {
-                Ok(MemoryBackendOperation::UpdateDocument(parse_input::<
-                    MemoryDocumentUpdateOperation,
-                >(
-                    input
-                )?))
-            },
-        ),
-        memory_tool(
-            "MemoryQuery",
-            QUERY_DESCRIPTION,
-            query_schema(),
-            backend,
-            |input| {
-                Ok(MemoryBackendOperation::Query(parse_input::<
-                    MemoryQueryOperation,
-                >(input)?))
-            },
-        ),
-    ]
 }
 
 fn subjektiv_consolidation_tools(host: SubjektivHostConnection) -> Vec<ToolDefinition> {
@@ -630,181 +282,12 @@ impl Tool for SubjectConsolidationTool {
     }
 }
 
-pub fn workspace_http_memory_consolidation_tools(
-    client: Arc<dyn WorkspaceClient>,
-) -> Vec<ToolDefinition> {
-    let mut tools = workspace_http_memory_tools(client.clone());
-    let backend = WorkspaceHttpMemoryBackend::new(client);
-    tools.extend([
-        memory_tool(
-            "MemoryStagingList",
-            STAGING_LIST_DESCRIPTION,
-            schema_for::<MemoryStagingListOperation>(),
-            backend.clone(),
-            |input| {
-                Ok(MemoryBackendOperation::StagingList(parse_input::<
-                    MemoryStagingListOperation,
-                >(
-                    input
-                )?))
-            },
-        ),
-        memory_tool(
-            "MemoryStagingRead",
-            STAGING_READ_DESCRIPTION,
-            schema_for::<MemoryStagingReadOperation>(),
-            backend.clone(),
-            |input| {
-                Ok(MemoryBackendOperation::StagingRead(parse_input::<
-                    MemoryStagingReadOperation,
-                >(
-                    input
-                )?))
-            },
-        ),
-        memory_tool(
-            "MemoryStagingClose",
-            STAGING_CLOSE_DESCRIPTION,
-            schema_for::<MemoryStagingCloseOperation>(),
-            backend,
-            |input| {
-                Ok(MemoryBackendOperation::StagingClose(parse_input::<
-                    MemoryStagingCloseOperation,
-                >(
-                    input
-                )?))
-            },
-        ),
-    ]);
-    tools
-}
-
-type OperationBuilder = fn(&str) -> Result<MemoryBackendOperation, ToolError>;
-
-fn memory_tool(
-    name: &'static str,
-    description: &'static str,
-    schema: serde_json::Value,
-    backend: WorkspaceHttpMemoryBackend,
-    build: OperationBuilder,
-) -> ToolDefinition {
-    Arc::new(move || {
-        (
-            ToolMeta::new(name)
-                .description(description)
-                .input_schema(schema.clone()),
-            Arc::new(WorkspaceHttpMemoryTool {
-                backend: backend.clone(),
-                build,
-            }) as Arc<dyn Tool>,
-        )
-    })
-}
-
-#[derive(Clone)]
-struct WorkspaceHttpMemoryTool {
-    backend: WorkspaceHttpMemoryBackend,
-    build: OperationBuilder,
-}
-
-#[async_trait]
-impl Tool for WorkspaceHttpMemoryTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _ctx: ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let operation = (self.build)(input_json)?;
-        self.backend.execute(operation).await
-    }
-}
-
 fn parse_input<T: DeserializeOwned>(input: &str) -> Result<T, ToolError> {
     serde_json::from_str(input).map_err(|error| ToolError::InvalidArgument(error.to_string()))
 }
 
 fn schema_for<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).expect("memory tool schema should serialize")
-}
-
-fn tool_output(output: MemoryToolOutput) -> ToolOutput {
-    ToolOutput {
-        summary: output.summary,
-        content: output.content,
-        attachments: Vec::new(),
-    }
-}
-
-const READ_DOCUMENT_DESCRIPTION: &str =
-    "Read the Workspace memory Markdown document through Workspace authority.";
-const UPDATE_DOCUMENT_DESCRIPTION: &str =
-    "Edit the Workspace memory Markdown document by replacing an exact old_string with new_string.";
-const QUERY_DESCRIPTION: &str = "Query the Workspace memory document through Workspace authority.";
-const STAGING_LIST_DESCRIPTION: &str =
-    "List pending Memory staging candidates without loading full record payloads.";
-const STAGING_READ_DESCRIPTION: &str = "Read one pending Memory staging candidate by candidate_id.";
-const STAGING_CLOSE_DESCRIPTION: &str = "Close one staging candidate with a required reason; records disposition and deletes the staging record.";
-
-fn document_read_schema() -> serde_json::Value {
-    json!({
-        "type":"object",
-        "additionalProperties": false,
-        "properties":{
-            "offset":{"type":["integer","null"],"minimum":0},
-            "limit":{"type":["integer","null"],"minimum":0}
-        }
-    })
-}
-
-fn document_update_schema() -> serde_json::Value {
-    json!({
-        "type":"object",
-        "additionalProperties": false,
-        "required":["old_string", "new_string"],
-        "properties":{
-            "old_string":{"type":"string", "minLength": 1},
-            "new_string":{"type":"string"},
-            "replace_all":{"type":"boolean", "default": false}
-        }
-    })
-}
-
-fn query_schema() -> serde_json::Value {
-    json!({
-        "type":"object",
-        "additionalProperties": false,
-        "properties":{
-            "query":{"type":["string","null"]}
-        }
-    })
-}
-
-#[derive(Default, PartialEq, Eq)]
-enum ResidentRepresentation {
-    #[default]
-    Unknown,
-    NotStarted,
-    Supplied,
-}
-
-struct WorkspaceResidentSummarySource {
-    client: Arc<dyn WorkspaceClient>,
-    // Unknown/restored prompts must be checked. Only an explicitly unstarted
-    // initial contribution can omit checks when no protected content was supplied.
-    representation: Mutex<ResidentRepresentation>,
-}
-
-impl WorkspaceResidentSummarySource {
-    fn not_started(&self) -> SystemPromptContribution {
-        let mut representation = self
-            .representation
-            .lock()
-            .expect("resident representation poisoned");
-        if *representation == ResidentRepresentation::Unknown {
-            *representation = ResidentRepresentation::NotStarted;
-        }
-        SystemPromptContribution::Unavailable
-    }
 }
 
 #[derive(Default)]
@@ -816,91 +299,6 @@ struct WorkspaceSubjektivResidentSummarySource {
     host: SubjektivHostConnection,
     prompts: Arc<ArcSwap<PromptCatalog>>,
     behavior_state: Arc<Mutex<SubjectBehaviorRefreshState>>,
-}
-
-fn resident_summary_contribution(
-    output: memory::backend::MemoryResidentSummaryOutput,
-) -> SystemPromptContribution {
-    if output.availability != memory::backend::MemoryResidentSummaryAvailability::Ready {
-        return SystemPromptContribution::Unavailable;
-    }
-    SystemPromptContribution::Ready(output.content.unwrap_or_default())
-}
-
-#[async_trait]
-impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
-    fn protected_input_kind(&self) -> Option<&'static str> {
-        match *self
-            .representation
-            .lock()
-            .expect("resident representation poisoned")
-        {
-            ResidentRepresentation::NotStarted => None,
-            ResidentRepresentation::Unknown | ResidentRepresentation::Supplied => {
-                Some("workspace-memory")
-            }
-        }
-    }
-
-    async fn authorize_supply(&self) -> Result<(), String> {
-        if *self
-            .representation
-            .lock()
-            .expect("resident representation poisoned")
-            == ResidentRepresentation::NotStarted
-        {
-            return Ok(());
-        }
-        authorize_workspace_memory_operation(self.client.as_ref(), "memory.resident.supply")
-            .map_err(|error| error.to_string())
-    }
-
-    async fn load(&self) -> SystemPromptContribution {
-        if let Err(error) =
-            authorize_workspace_memory_operation(self.client.as_ref(), "memory.resident.supply")
-        {
-            tracing::warn!(%error, operation = "memory.resident.supply", "optional resident Memory not started; no protected read or prompt contribution");
-            return self.not_started();
-        }
-        match self
-            .client
-            .execute_memory_backend_operation(
-                memory::backend::MemoryBackendOperation::ResidentSummary(
-                    memory::backend::MemoryResidentSummaryOperation::default(),
-                ),
-            )
-            .await
-        {
-            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(output)) => {
-                if let Err(error) = authorize_workspace_memory_operation(
-                    self.client.as_ref(),
-                    "memory.resident.supply",
-                ) {
-                    tracing::warn!(%error, operation = "memory.resident.supply", "optional resident Memory prompt contribution not supplied");
-                    return self.not_started();
-                }
-                let contribution = resident_summary_contribution(output);
-                if matches!(contribution, SystemPromptContribution::Ready(_)) {
-                    *self
-                        .representation
-                        .lock()
-                        .expect("resident representation poisoned") =
-                        ResidentRepresentation::Supplied;
-                } else {
-                    self.not_started();
-                }
-                contribution
-            }
-            Ok(other) => {
-                tracing::debug!(?other, "unexpected resident Memory Backend result");
-                self.not_started()
-            }
-            Err(error) => {
-                tracing::warn!(%error, operation = "memory.resident.read", "optional resident Memory not started; protected read failed and no prompt contribution supplied");
-                self.not_started()
-            }
-        }
-    }
 }
 
 impl WorkspaceSubjektivResidentSummarySource {
@@ -929,7 +327,7 @@ impl WorkspaceSubjektivResidentSummarySource {
         &self,
         output: &server_api::SubjektivResidentContextOutput,
     ) -> Result<(String, session_store::PromptRenderProvenance), String> {
-        use memory::backend::MemoryResidentSummaryAvailability as Availability;
+        use memory::subject::MemoryResidentSummaryAvailability as Availability;
         let availability = match output.memory_surface.availability {
             Availability::Ready => "ready",
             Availability::Ungenerated => "ungenerated",
@@ -1268,94 +666,6 @@ impl Hook<WorkerRestored> for SubjektivResidentRestoreRefreshHook {
     }
 }
 
-pub(crate) struct MemoryFeatureInstallPlan {
-    pub(crate) module: MemoryToolsFeature,
-    pub(crate) resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
-    pub(crate) system_prompt_override: Option<String>,
-}
-
-impl MemoryFeatureInstallPlan {
-    pub fn prepare(
-        manifest: &manifest::WorkerManifest,
-        client: Arc<dyn WorkspaceClient>,
-        prompts: Arc<crate::prompt::catalog::PromptCatalog>,
-    ) -> std::io::Result<Option<Self>> {
-        Self::prepare_resolved(
-            manifest.feature.memory.clone(),
-            client,
-            prompts,
-            manifest.profile.clone(),
-        )
-    }
-
-    fn prepare_resolved(
-        config: manifest::ResolvedMemoryFeatureConfig,
-        client: Arc<dyn WorkspaceClient>,
-        prompts: Arc<crate::prompt::catalog::PromptCatalog>,
-        profile: Option<manifest::ProfileManifestSnapshot>,
-    ) -> std::io::Result<Option<Self>> {
-        let profile_name = profile
-            .as_ref()
-            .and_then(|snapshot| match &snapshot.source {
-                manifest::ProfileSource::Registry {
-                    source: manifest::ProfileRegistrySource::Builtin,
-                    name,
-                    ..
-                } => Some(name.as_str()),
-                _ => None,
-            });
-        let memory_consolidation_worker = profile_name == Some("memory-consolidation");
-        config
-            .validate_execution()
-            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !config.profile.enabled {
-            return Ok(None);
-        }
-        let workspace_id = client.workspace_id().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Memory tools require Backend Workspace API authority",
-            )
-        })?;
-        let settings = config
-            .workspace_settings()
-            .expect("validated enabled Memory config has Workspace settings");
-        if settings.workspace_id != workspace_id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Memory settings belong to {} instead of {}",
-                    settings.workspace_id, workspace_id
-                ),
-            ));
-        }
-
-        let resident_summary_source = config.profile.resident.inject_summary.then(|| {
-            Arc::new(WorkspaceResidentSummarySource {
-                representation: Mutex::new(ResidentRepresentation::Unknown),
-                client: Arc::clone(&client),
-            }) as Arc<dyn SystemPromptContributionSource>
-        });
-        let system_prompt_override = if memory_consolidation_worker {
-            let language = settings.language;
-            Some(
-                prompts
-                    .memory_consolidation_system(&language)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?,
-            )
-        } else {
-            None
-        };
-
-        let module = MemoryToolsFeature::new(client, config.profile.staging_tools);
-        Ok(Some(Self {
-            module,
-            resident_summary_source,
-            system_prompt_override,
-        }))
-    }
-}
-
 pub(crate) fn is_builtin_subjektiv_consolidation_profile(
     manifest: &manifest::WorkerManifest,
 ) -> bool {
@@ -1474,55 +784,10 @@ impl FeatureModule for SubjektivConsolidationToolsFeature {
     }
 }
 
-#[derive(Clone)]
-pub struct MemoryToolsFeature {
-    tools: Vec<ToolDefinition>,
-}
-
-impl MemoryToolsFeature {
-    pub fn new(client: Arc<dyn WorkspaceClient>, staging_tools: bool) -> Self {
-        let tools = if staging_tools {
-            workspace_http_memory_consolidation_tools(client)
-        } else {
-            workspace_http_memory_tools(client)
-        };
-        Self { tools }
-    }
-}
-
-impl FeatureModule for MemoryToolsFeature {
-    fn declare_permissions(
-        &self,
-        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
-    ) -> Result<(), FeatureInstallError> {
-        permission_declaration::DECLARATION.declare(registrar)
-    }
-
-    fn descriptor(&self) -> FeatureDescriptor {
-        let mut descriptor = FeatureDescriptor::builtin("memory", "Memory")
-            .with_description("Workspace Memory document, query, and staging tools.");
-        for tool in &self.tools {
-            let (meta, _) = tool();
-            descriptor = descriptor.with_tool(ToolDeclaration::new(meta.name, meta.description));
-        }
-        descriptor
-    }
-
-    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        for tool in &self.tools {
-            let (meta, _) = tool();
-            context
-                .tools()
-                .register(ToolContribution::new(meta.name, tool.clone()))?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WorkspaceResponse;
+    use crate::{WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
     use agen::tool::ToolDefinition;
     use std::sync::Mutex;
 
@@ -1562,7 +827,7 @@ mod tests {
 
     #[derive(Debug)]
     struct SubjectResidentClient {
-        availability: memory::backend::MemoryResidentSummaryAvailability,
+        availability: memory::subject::MemoryResidentSummaryAvailability,
         content: Option<String>,
         scope_allowed: std::sync::atomic::AtomicBool,
         behavior: Mutex<String>,
@@ -1572,7 +837,7 @@ mod tests {
 
     impl SubjectResidentClient {
         fn new(
-            availability: memory::backend::MemoryResidentSummaryAvailability,
+            availability: memory::subject::MemoryResidentSummaryAvailability,
             content: Option<&str>,
         ) -> Self {
             Self {
@@ -1587,7 +852,7 @@ mod tests {
 
         fn denied() -> Self {
             Self {
-                availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
+                availability: memory::subject::MemoryResidentSummaryAvailability::Ready,
                 content: Some("must not be injected".into()),
                 scope_allowed: std::sync::atomic::AtomicBool::new(false),
                 behavior: Mutex::new("must not be injected".to_string()),
@@ -1654,7 +919,7 @@ mod tests {
                     &server_api::SubjektivMemoryBackendResponse::ResidentContext(
                         server_api::SubjektivResidentContextOutput {
                             behavior_md,
-                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                            memory_surface: memory::subject::MemoryResidentSummaryOutput {
                                 availability: self.availability,
                                 content: self.content.clone(),
                             },
@@ -1675,45 +940,6 @@ mod tests {
             }
             self.execute(request)
         }
-    }
-
-    fn resident_client(content: &str) -> Arc<dyn WorkspaceClient> {
-        resident_client_state(
-            memory::backend::MemoryResidentSummaryAvailability::Ready,
-            Some(content),
-        )
-    }
-
-    fn resident_client_state(
-        availability: memory::backend::MemoryResidentSummaryAvailability,
-        content: Option<&str>,
-    ) -> Arc<dyn WorkspaceClient> {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let content = content.map(str::to_string);
-        std::thread::spawn(move || {
-            for _ in 0..4 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 4096];
-                let size = stream.read(&mut request).unwrap();
-                let body = if String::from_utf8_lossy(&request[..size]).contains("/authorization/check") {
-                    serde_json::json!({"scope":{"kind":"workspace","workspace_id":"workspace"}})
-                } else {
-                    serde_json::json!({
-                        "status": "ok",
-                        "result": { "kind": "resident_summary", "availability": availability, "content": content }
-                    })
-                }.to_string();
-                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
-        });
-        Arc::new(crate::worker::TestWorkspaceHttpClient::new(
-            "workspace",
-            format!("http://{addr}"),
-        ))
     }
 
     fn repository_error_client(status: u16, code: &str) -> Arc<dyn WorkspaceClient> {
@@ -1774,74 +1000,6 @@ mod tests {
             .input_schema
     }
 
-    #[tokio::test]
-    async fn memory_install_plan_is_the_fail_closed_config_boundary() {
-        let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
-        let disabled = MemoryFeatureInstallPlan::prepare_resolved(
-            manifest::ResolvedMemoryFeatureConfig::default(),
-            test_client(),
-            prompts.clone(),
-            None,
-        )
-        .unwrap();
-        assert!(disabled.is_none());
-
-        let mut enabled = manifest::ResolvedMemoryFeatureConfig::default();
-        enabled.profile.enabled = true;
-        enabled.profile.resident.inject_summary = false;
-        assert!(
-            MemoryFeatureInstallPlan::prepare_resolved(
-                enabled.clone(),
-                test_client(),
-                prompts.clone(),
-                None,
-            )
-            .is_err()
-        );
-        enabled
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace".to_string(),
-
-                language: "English".to_string(),
-            })
-            .unwrap();
-        let mut foreign = enabled.clone();
-        foreign.workspace_settings.as_mut().unwrap().workspace_id = "other-workspace".to_string();
-        assert!(
-            MemoryFeatureInstallPlan::prepare_resolved(
-                foreign,
-                test_client(),
-                prompts.clone(),
-                None,
-            )
-            .is_err()
-        );
-        let plan = MemoryFeatureInstallPlan::prepare_resolved(
-            enabled.clone(),
-            test_client(),
-            prompts.clone(),
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(plan.resident_summary_source.is_none());
-        assert!(plan.system_prompt_override.is_none());
-
-        enabled.profile.resident.inject_summary = true;
-        let plan = MemoryFeatureInstallPlan::prepare_resolved(
-            enabled,
-            resident_client("# Durable Memory"),
-            prompts,
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            plan.resident_summary_source.unwrap().load().await,
-            SystemPromptContribution::Ready("# Durable Memory".into())
-        );
-    }
-
     #[test]
     fn dedicated_subjektiv_consolidator_uses_subject_settings_and_only_consolidation_tools() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1859,24 +1017,14 @@ mod tests {
         manifest
             .feature
             .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace".into(),
 
                 language: "English".into(),
             })
             .unwrap();
 
-        assert!(!manifest.feature.memory.profile.enabled);
         assert!(!ordinary_subjektiv_features_enabled(&manifest));
-        assert!(
-            MemoryFeatureInstallPlan::prepare(
-                &manifest,
-                test_client(),
-                crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
-            )
-            .unwrap()
-            .is_none()
-        );
 
         let plan = SubjektivConsolidationFeatureInstallPlan::prepare(
             &manifest,
@@ -1894,46 +1042,6 @@ mod tests {
         assert!(names.contains(&"MemoryApplyCandidate".to_string()));
         assert!(!names.contains(&"MemoryQuery".to_string()));
         assert!(!names.contains(&"SubjektivRemember".to_string()));
-    }
-
-    #[tokio::test]
-    async fn memory_prompt_contribution_defers_resident_summary_until_loaded() {
-        let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
-        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
-        config.profile.enabled = true;
-        config
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace".to_string(),
-
-                language: "English".to_string(),
-            })
-            .unwrap();
-
-        let first = MemoryFeatureInstallPlan::prepare_resolved(
-            config.clone(),
-            resident_client("first resident summary"),
-            prompts.clone(),
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        let restored = MemoryFeatureInstallPlan::prepare_resolved(
-            config,
-            resident_client("updated resident summary"),
-            prompts,
-            None,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            first.resident_summary_source.unwrap().load().await,
-            SystemPromptContribution::Ready("first resident summary".into())
-        );
-        assert_eq!(
-            restored.resident_summary_source.unwrap().load().await,
-            SystemPromptContribution::Ready("updated resident summary".into())
-        );
     }
 
     fn subject_manifest(workspace_id: &str) -> manifest::WorkerManifest {
@@ -1959,7 +1067,7 @@ permission = "write"
         manifest
             .feature
             .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: workspace_id.to_string(),
 
                 language: "English".to_string(),
@@ -1972,7 +1080,7 @@ permission = "write"
     async fn subject_resident_source_preserves_only_current_ready_surface() {
         let manifest = subject_manifest("workspace");
         let ready_client = Arc::new(SubjectResidentClient::new(
-            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            memory::subject::MemoryResidentSummaryAvailability::Ready,
             Some("current subject surface"),
         ));
         let ready = backend_resident_source(&manifest, ready_client.clone(), test_prompts())
@@ -1994,7 +1102,7 @@ permission = "write"
         );
 
         let ready_empty_client = Arc::new(SubjectResidentClient::new(
-            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            memory::subject::MemoryResidentSummaryAvailability::Ready,
             None,
         ));
         let ready_empty = backend_resident_source(&manifest, ready_empty_client, test_prompts())
@@ -2007,9 +1115,9 @@ permission = "write"
         assert!(ready_empty.contains("intentionally empty"));
 
         for availability in [
-            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
-            memory::backend::MemoryResidentSummaryAvailability::Stale,
-            memory::backend::MemoryResidentSummaryAvailability::Failed,
+            memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
+            memory::subject::MemoryResidentSummaryAvailability::Stale,
+            memory::subject::MemoryResidentSummaryAvailability::Failed,
         ] {
             let source = backend_resident_source(
                 &manifest,
@@ -2033,7 +1141,7 @@ permission = "write"
     async fn subject_resident_source_emits_only_changed_behavior() {
         let manifest = subject_manifest("workspace");
         let client = Arc::new(SubjectResidentClient::new(
-            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
             None,
         ));
         let source = backend_resident_source(&manifest, client.clone(), test_prompts())
@@ -2128,7 +1236,7 @@ permission = "write"
     async fn resident_behavior_ack_tracks_exact_committed_content_not_latest_fetch() {
         let manifest = subject_manifest("workspace");
         let client = Arc::new(SubjectResidentClient::new(
-            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
             None,
         ));
         let source = backend_resident_source(&manifest, client.clone(), test_prompts())
@@ -2238,7 +1346,7 @@ permission = "write"
         let mut policy_only = disabled.clone();
         policy_only.feature.subjektiv.profile.enabled = true;
         let unattached_client = Arc::new(SubjectResidentClient::new(
-            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            memory::subject::MemoryResidentSummaryAvailability::Ready,
             Some("policy-only surface must not load"),
         ));
         assert!(
@@ -2293,141 +1401,11 @@ permission = "write"
         );
     }
 
-    #[derive(Debug)]
-    struct MemoryAuthorizationFixture {
-        status: std::sync::atomic::AtomicU16,
-        effects: std::sync::atomic::AtomicUsize,
-        checks: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
-    }
-
-    impl MemoryAuthorizationFixture {
-        fn new(status: u16) -> Self {
-            Self {
-                status: std::sync::atomic::AtomicU16::new(status),
-                effects: std::sync::atomic::AtomicUsize::new(0),
-                checks: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    // Exercise the production authorization request adapter and Memory dispatcher;
-    // only the Host transport/provider effect is replaced.
-    impl WorkspaceClient for MemoryAuthorizationFixture {
-        fn workspace_id(&self) -> Option<&str> {
-            Some("workspace")
-        }
-        fn kind(&self) -> &str {
-            "memory-authorization-fixture"
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn execute(
-            &self,
-            request: WorkspaceRequest,
-        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-            use std::sync::atomic::Ordering;
-            if request.path.ends_with("/authorization/check") {
-                let check = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
-                self.checks.lock().unwrap().push(check);
-                let status = self.status.load(Ordering::SeqCst);
-                if status == 0 {
-                    return Err(WorkspaceClientError::Unavailable(
-                        "authorization transport offline".into(),
-                    ));
-                }
-                return Ok(WorkspaceResponse {
-                    content_type: None,
-                    status,
-                    body: if status == 200 {
-                        r#"{"scope":{"kind":"workspace","workspace_id":"workspace"}}"#.into()
-                    } else {
-                        r#"{"message":"operation not granted"}"#.into()
-                    },
-                });
-            }
-            assert!(request.path.ends_with("/memory/backend"));
-            let operation: server_api::MemoryBackendRequest =
-                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
-            self.effects.fetch_add(1, Ordering::SeqCst);
-            let result = if matches!(operation.0, MemoryBackendOperation::ResidentSummary(_)) {
-                MemoryBackendOperationResult::ResidentSummary(
-                    memory::backend::MemoryResidentSummaryOutput {
-                        availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
-                        content: Some("protected summary".into()),
-                    },
-                )
-            } else {
-                MemoryBackendOperationResult::ToolOutput(MemoryToolOutput {
-                    summary: "effect completed".into(),
-                    content: None,
-                })
-            };
-            Ok(WorkspaceResponse {
-                content_type: None,
-                status: 200,
-                body: serde_json::to_string(&MemoryBackendHttpResponse::Ok { result }).unwrap(),
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn resident_read_denied_before_provider_access_and_prompt_supply() {
-        use std::sync::atomic::Ordering;
-        let client = Arc::new(MemoryAuthorizationFixture::new(403));
-        let source = WorkspaceResidentSummarySource {
-            representation: Mutex::new(ResidentRepresentation::Unknown),
-            client: client.clone(),
-        };
-        assert_eq!(source.load().await, SystemPromptContribution::Unavailable);
-        assert_eq!(client.effects.load(Ordering::SeqCst), 0);
-        let checks = client.checks.lock().unwrap();
-        assert_eq!(checks[0].operation, "memory.resident.supply");
-        assert_eq!(
-            checks[0].resource,
-            server_api::authorization::PermissionResource::Workspace {
-                workspace_id: "workspace".into()
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn resident_cached_supply_rechecks_authority_but_unstarted_optional_source_supplies_nothing()
-     {
-        use std::sync::atomic::Ordering;
-        let client = Arc::new(MemoryAuthorizationFixture::new(200));
-        let source = WorkspaceResidentSummarySource {
-            representation: Mutex::new(ResidentRepresentation::Unknown),
-            client: client.clone(),
-        };
-        assert!(matches!(
-            source.load().await,
-            SystemPromptContribution::Ready(_)
-        ));
-        client.status.store(403, Ordering::SeqCst);
-        assert!(source.authorize_supply().await.unwrap_err().contains("403"));
-        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
-
-        let never_started = WorkspaceResidentSummarySource {
-            representation: Mutex::new(ResidentRepresentation::Unknown),
-            client: client.clone(),
-        };
-        // Unknown includes restore: saved protected content must not bypass checks.
-        assert!(never_started.authorize_supply().await.is_err());
-        assert_eq!(
-            never_started.load().await,
-            SystemPromptContribution::Unavailable
-        );
-        // Optional initial refusal left no protected content to supply.
-        never_started.authorize_supply().await.unwrap();
-        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
-    }
-
     #[tokio::test]
     async fn subject_cached_and_changed_resident_supply_reject_revocation_without_new_reads() {
         let manifest = subject_manifest("workspace");
         let client = Arc::new(SubjectResidentClient::new(
-            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            memory::subject::MemoryResidentSummaryAvailability::Ready,
             Some("private surface"),
         ));
         let source = backend_resident_source(&manifest, client.clone(), test_prompts())
@@ -2449,137 +1427,6 @@ permission = "write"
         );
         assert!(source.load_changed_resident_context().await.is_err());
         assert_eq!(client.paths.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn memory_tool_rechecks_current_authority_before_each_effect() {
-        use std::sync::atomic::Ordering;
-        let client = Arc::new(MemoryAuthorizationFixture::new(200));
-        let (_, tool) = workspace_http_memory_tools(client.clone())
-            .into_iter()
-            .map(|definition| definition())
-            .find(|(meta, _)| meta.name == "MemoryReadDocument")
-            .unwrap();
-        tool.execute("{}", ToolExecutionContext::direct())
-            .await
-            .unwrap();
-        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
-        client.status.store(403, Ordering::SeqCst);
-        let error = tool
-            .execute("{}", ToolExecutionContext::direct())
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("403"));
-        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
-        assert_eq!(client.checks.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn memory_authorization_transport_failure_is_not_permission_denial() {
-        use std::sync::atomic::Ordering;
-        let client = MemoryAuthorizationFixture::new(0);
-        let error = execute_memory_backend(
-            &client,
-            MemoryBackendOperation::ReadDocument(MemoryDocumentReadOperation {
-                offset: None,
-                limit: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            WorkspaceMemoryBackendError::Request(WorkspaceClientError::Unavailable(_))
-        ));
-        assert_eq!(client.effects.load(Ordering::SeqCst), 0);
-        client.status.store(403, Ordering::SeqCst);
-        let error = execute_memory_backend(
-            &client,
-            MemoryBackendOperation::ReadDocument(MemoryDocumentReadOperation {
-                offset: None,
-                limit: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            WorkspaceMemoryBackendError::Request(WorkspaceClientError::AuthorizationRejected {
-                status: 403
-            })
-        ));
-        assert!(error.to_string().contains("authorization denied"));
-        assert_eq!(client.effects.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn memory_feature_owns_normal_and_staging_tool_surfaces() {
-        let normal = MemoryToolsFeature::new(test_client(), false);
-        let normal_names = tool_names(normal.tools);
-        assert!(normal_names.contains(&"MemoryQuery".to_string()));
-        assert!(!normal_names.contains(&"MemoryStagingList".to_string()));
-
-        let staging = MemoryToolsFeature::new(test_client(), true);
-        assert_eq!(staging.descriptor().id.as_str(), "builtin:memory");
-        let staging_names = tool_names(staging.tools);
-        assert!(staging_names.contains(&"MemoryQuery".to_string()));
-        assert!(staging_names.contains(&"MemoryStagingList".to_string()));
-    }
-
-    #[test]
-    fn normal_workspace_memory_tools_do_not_include_staging_tools() {
-        let names = tool_names(workspace_http_memory_tools(test_client()));
-
-        assert!(names.contains(&"MemoryQuery".to_string()));
-        assert!(names.contains(&"MemoryReadDocument".to_string()));
-        assert!(names.contains(&"MemoryUpdateDocument".to_string()));
-        assert!(!names.contains(&"MemoryRead".to_string()));
-        assert!(!names.contains(&"MemoryWrite".to_string()));
-        assert!(!names.contains(&"MemoryEdit".to_string()));
-        assert!(!names.contains(&"MemoryDelete".to_string()));
-        assert!(!names.contains(&"MemoryStagingList".to_string()));
-        assert!(!names.contains(&"MemoryStagingRead".to_string()));
-        assert!(!names.contains(&"MemoryStagingClose".to_string()));
-    }
-
-    #[test]
-    fn document_update_schema_is_edit_like_and_staging_close_has_no_legacy_kinds() {
-        let update_schema = tool_meta(
-            workspace_http_memory_tools(test_client()),
-            "MemoryUpdateDocument",
-        );
-        assert_eq!(
-            update_schema["required"],
-            serde_json::json!(["old_string", "new_string"])
-        );
-        assert!(update_schema["properties"].get("old_string").is_some());
-        assert!(update_schema["properties"].get("new_string").is_some());
-        assert!(update_schema["properties"].get("replace_all").is_some());
-        assert!(update_schema["properties"].get("body_md").is_none());
-
-        let close_schema_text = tool_meta(
-            workspace_http_memory_consolidation_tools(test_client()),
-            "MemoryStagingClose",
-        )
-        .to_string();
-        assert!(close_schema_text.contains("affected_memory"));
-        assert!(close_schema_text.contains("edit"));
-        assert!(!close_schema_text.contains("summary"));
-        assert!(!close_schema_text.contains("decision"));
-        assert!(!close_schema_text.contains("request"));
-        assert!(!close_schema_text.contains("slug"));
-    }
-
-    #[test]
-    fn consolidation_workspace_memory_tools_include_staging_tools() {
-        let names = tool_names(workspace_http_memory_consolidation_tools(test_client()));
-
-        assert!(names.contains(&"MemoryQuery".to_string()));
-        assert!(names.contains(&"MemoryReadDocument".to_string()));
-        assert!(names.contains(&"MemoryUpdateDocument".to_string()));
-        assert!(names.contains(&"MemoryStagingList".to_string()));
-        assert!(names.contains(&"MemoryStagingRead".to_string()));
-        assert!(names.contains(&"MemoryStagingClose".to_string()));
     }
 
     #[tokio::test]

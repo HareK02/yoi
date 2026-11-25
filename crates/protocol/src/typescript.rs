@@ -65,6 +65,15 @@ pub fn generated_protocol_types() -> String {
     );
 
     output.push_str("import type { MessagingRequest, MessagingResponse, MessagingEvent } from './chat-api.ts';\n\n");
+    push_decl::<crate::feature_initialization::FeatureInitialization>(&cfg, &mut output);
+    push_decl::<crate::feature_initialization::FeatureInitializations>(&cfg, &mut output);
+    output.push_str(&format!(
+        "export const MAX_FEATURE_INITIALIZATIONS = {};\nexport const MAX_FEATURE_INITIALIZATION_PAYLOAD_BYTES = {};\nexport const MAX_FEATURE_INITIALIZATION_BYTES = {};\nexport const MAX_FEATURE_INITIALIZATION_ID_BYTES = {};\n\n",
+        crate::feature_initialization::MAX_INITIALIZATIONS,
+        crate::feature_initialization::MAX_PAYLOAD_BYTES,
+        crate::feature_initialization::MAX_INITIALIZATION_BYTES,
+        crate::feature_initialization::MAX_FEATURE_ID_BYTES,
+    ));
     push_decl::<crate::control_failure::RuntimeControlCause>(&cfg, &mut output);
     push_decl::<crate::startup_failure::StartupFailureAttachment>(&cfg, &mut output);
     push_decl::<crate::startup_failure::StoredStartupFailureAttachment>(&cfg, &mut output);

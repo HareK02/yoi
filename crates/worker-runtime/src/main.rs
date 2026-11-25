@@ -225,6 +225,8 @@ fn run_migration_command(mut args: Vec<String>) -> Result<(), ProcessError> {
 }
 
 fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
+    let command_host =
+        workdir::CommandHost::from_environment().map_err(ProcessError::WorkerAdapter)?;
     let fs_paths = config.resolved_fs_paths();
     let runtime_store_dir = match &config.http.store {
         RuntimeHttpStoreSelection::Memory => fs_paths.runtime_dir.clone(),
@@ -349,9 +351,10 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
             .map_err(ProcessError::WorkerAdapter)?
-            .with_working_directory_materializer(RuntimeGitMaterializer::new(
-                fs_paths.workdir_target.clone(),
-            )),
+            .with_working_directory_materializer(
+                RuntimeGitMaterializer::new(fs_paths.workdir_target.clone())
+                    .with_command_host(command_host),
+            ),
     );
 
     let runtime = match &config.http.store {

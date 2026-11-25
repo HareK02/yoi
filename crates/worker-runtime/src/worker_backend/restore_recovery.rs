@@ -25,11 +25,10 @@ impl ProfileRuntimeWorkerFactory {
             .as_ref()
             .ok_or_else(|| cause("restore recovery Session missing"))?;
         let pending = active.segment_id.is_none();
-        let incomplete = request.request.subjektiv_attached
-            && !matches!(
-                metadata.subjektiv_session_attribution,
-                Some(session_store::SubjektivSessionAttributionState::Confirmed { .. })
-            );
+        let incomplete = self
+            .initialization_registry
+            .requires_source_repair(&metadata, &request.request.feature_initialization)
+            .map_err(|_| cause("saved Feature initialization cannot be recovered"))?;
         if !pending && !incomplete {
             return Ok(false);
         }
@@ -46,7 +45,8 @@ impl ProfileRuntimeWorkerFactory {
                 .map_err(|_| cause("restore recovery retention unavailable"))?,
         )
         .map_err(|_| cause("restore recovery Session open failed"))?;
-        let (manifest, mut loader) = Self::manifest_for_restore(&metadata, &request.request)
+        let (manifest, mut loader) = self
+            .restore_manifest(&metadata, &request.request)
             .map_err(|_| cause("restore recovery saved manifest invalid"))?;
         let workspace = RuntimeWorkspaceBackendRef::from_worker_request(
             &request.request,
@@ -140,10 +140,11 @@ impl ProfileRuntimeWorkerFactory {
                     .bind_backend_job(binding.clone())
                     .map_err(|_| cause("recovery Backend Job binding failed"))?;
             }
-            worker
-                .finalize_subjektiv_session_attribution_retaining_startup_failure(
-                    request.request.subjektiv_attached,
-                    SubjektivSessionAttributionLifecycle::RestoredSession,
+            self.initialization_registry
+                .apply(
+                    &worker,
+                    &request.request.feature_initialization,
+                    worker::feature::initialization::InitializationPhase::Recovery,
                 )
                 .map_err(|error| {
                     RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Recovery, error)

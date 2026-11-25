@@ -1407,7 +1407,7 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         .await;
     let c = conversation["id"].as_str().unwrap();
     *conversation_id.lock().unwrap() = c.into();
-    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Connected async chat","profile":"builtin:async-chat","authorization":{"kind":"assignment","assignment":null},"control_operation_id":Uuid::now_v7().to_string(),"initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Connected async chat","profile":"builtin:async-chat","authorization":{"kind":"assignment","assignment":null},"control_operation_id":Uuid::now_v7().to_string(),"initial_submit":[],"workdir_attachments":[],"feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject}}]})).await;
     let worker = created["worker_id"].as_str().unwrap();
     let mut events = f.runtime.subscribe_worker_observation().unwrap();
     let first_wire = json!({"operation_id":"connected-first","text":"CHAT_FIRST_USER_CONTENT"});
@@ -1807,7 +1807,7 @@ async fn browser_notify_preserves_ack_id_limits_retry_and_console_next_draft() {
         )
         .await;
     let c = conversation["id"].as_str().unwrap();
-    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Notify Console","profile":"builtin:async-chat","authorization":{"kind":"assignment","assignment":null},"control_operation_id":Uuid::now_v7().to_string(),"initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Notify Console","profile":"builtin:async-chat","authorization":{"kind":"assignment","assignment":null},"control_operation_id":Uuid::now_v7().to_string(),"initial_submit":[],"workdir_attachments":[],"feature_connections": [{"feature_id":"builtin:subjektiv","version":1,"payload":{"subject_id":subject}}]})).await;
     let worker = created["worker_id"].as_str().unwrap();
     let chat = f
         .post(

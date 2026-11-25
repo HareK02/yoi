@@ -8,7 +8,6 @@
   import { ownsRoutePath } from './route-ownership';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import SubjectsNavSection from './SubjectsNavSection.svelte';
-  import MemoryNavSection from './MemoryNavSection.svelte';
   import MergeRequestsNavSection from './MergeRequestsNavSection.svelte';
   import TicketsNavSection from './TicketsNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
@@ -87,7 +86,6 @@
       <MergeRequestsNavSection {currentPath} {workspaceId} />
       <DriveNavSection {currentPath} {workspaceId} />
       <SubjectsNavSection {currentPath} {workspaceId} />
-      <MemoryNavSection {currentPath} {workspaceId} />
       <WorkersNavSection {currentPath} {workspaceId} />
     </nav>
   {/if}

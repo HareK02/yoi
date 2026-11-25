@@ -136,7 +136,6 @@ impl fmt::Display for ProfileExecutionTarget {
 pub enum WorkspaceAuthorityRequirement {
     Flow,
     ManageWorkdir,
-    Memory,
     Subjektiv,
     MergeRequest,
     Objective,
@@ -150,7 +149,6 @@ impl fmt::Display for WorkspaceAuthorityRequirement {
         match self {
             Self::Flow => formatter.write_str("feature.flow"),
             Self::ManageWorkdir => formatter.write_str("feature.manage_workdir"),
-            Self::Memory => formatter.write_str("feature.memory"),
             Self::Subjektiv => formatter.write_str("feature.subjektiv"),
             Self::MergeRequest => formatter.write_str("feature.merge_request"),
             Self::Objective => formatter.write_str("feature.objective"),
@@ -178,9 +176,6 @@ pub fn validate_profile_execution_target(
     // or normal Tools. It must not prevent standalone Tools-mode launches.
     if feature.manage_workdir.enabled {
         requirements.insert(WorkspaceAuthorityRequirement::ManageWorkdir);
-    }
-    if feature.memory.profile.enabled || feature.memory.profile.staging_tools {
-        requirements.insert(WorkspaceAuthorityRequirement::Memory);
     }
     // Subject policy is Host-neutral. Only an already bound Backend snapshot
     // requires Workspace authority; a local Host supplies its own live capability.
@@ -1421,12 +1416,11 @@ mod tests {
         assert!(!worker.feature.flow.enabled);
         assert!(!worker.feature.manage_workdir.enabled);
         assert!(!worker.feature.worker.enabled);
-        assert!(!worker.feature.memory.profile.enabled);
         assert!(!worker.feature.subjektiv.profile.enabled);
     }
 
     #[test]
-    fn builtin_workspace_profiles_cut_over_to_subjektiv_without_legacy_memory() {
+    fn builtin_workspace_profiles_enable_subjektiv_for_subject_work() {
         let tmp = TempDir::new().unwrap();
         let resolve = |name: &str| {
             ProfileResolver::new()
@@ -1449,38 +1443,12 @@ mod tests {
                 manifest.feature.subjektiv.profile.extraction.enabled,
                 "{name} must enable subject extraction"
             );
-            assert!(
-                !manifest.feature.memory.profile.enabled,
-                "{name} must not enable legacy Workspace Memory"
-            );
         }
 
         for name in ["default", "standalone", "backend-job"] {
             let manifest = resolve(name);
-            assert!(!manifest.feature.memory.profile.enabled, "{name}");
             assert!(!manifest.feature.subjektiv.profile.enabled, "{name}");
         }
-
-        let legacy_consolidator = resolve("memory-consolidation");
-        assert!(legacy_consolidator.feature.memory.profile.enabled);
-        assert!(legacy_consolidator.feature.memory.profile.staging_tools);
-        assert!(
-            legacy_consolidator
-                .feature
-                .memory
-                .profile
-                .extraction
-                .enabled
-        );
-        assert!(
-            legacy_consolidator
-                .feature
-                .memory
-                .profile
-                .consolidation
-                .request_enabled
-        );
-        assert!(!legacy_consolidator.feature.subjektiv.profile.enabled);
     }
 
     #[test]
@@ -1499,8 +1467,6 @@ mod tests {
         let manifest = resolved.manifest;
         let feature = &manifest.feature;
 
-        assert!(!feature.memory.profile.enabled);
-        assert!(!feature.memory.profile.staging_tools);
         assert!(feature.subjektiv.profile.enabled);
         assert!(!feature.subjektiv.profile.extraction.enabled);
         assert!(!feature.task.enabled);
@@ -1529,14 +1495,43 @@ mod tests {
     }
 
     #[test]
-    fn profile_rejects_workspace_memory_snapshot_authority_fields() {
+    fn profile_rejects_removed_workspace_memory() {
+        let tmp = TempDir::new().unwrap();
+        for memory in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": false}),
+            serde_json::json!({"enabled": true, "staging_tools": true}),
+            serde_json::json!({"profile": {"enabled": false}}),
+            serde_json::Value::Null,
+        ] {
+            let error = resolve_profile_artifact_value(
+                serde_json::json!({"feature": {"memory": memory}}),
+                ProfileSource::Registry {
+                    source: ProfileRegistrySource::Builtin,
+                    name: "test".to_string(),
+                    path: None,
+                    provenance: None,
+                },
+                tmp.path(),
+                "test-worker",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field `memory`"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_rejects_subjektiv_snapshot_authority_fields() {
         let tmp = TempDir::new().unwrap();
         for (field, value) in [
             ("workspace_id", serde_json::json!("workspace-a")),
             ("language", serde_json::json!("Japanese")),
         ] {
             let artifact = serde_json::json!({
-                "feature": { "memory": { (field): value } }
+                "feature": { "subjektiv": { (field): value } }
             });
             let error = resolve_profile_artifact_value(
                 artifact,
@@ -1638,7 +1633,6 @@ mod tests {
                 && rule.target == tmp.path()
                 && rule.symlink_policy == protocol::SymlinkPolicy::Logical
         }));
-        assert!(!resolved.manifest.feature.memory.profile.enabled);
         assert!(!resolved.manifest.feature.ticket.enabled);
         assert!(!resolved.manifest.feature.objective.enabled);
         assert!(!resolved.manifest.feature.flow.enabled);
@@ -1747,7 +1741,6 @@ mod tests {
             !requirements.contains(&WorkspaceAuthorityRequirement::Subjektiv),
             "subject policy alone is no longer Backend authority"
         );
-        assert!(!requirements.contains(&WorkspaceAuthorityRequirement::Memory));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::MergeRequest));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::Ticket));
         assert!(!diagnostic.contains(tmp.path().to_string_lossy().as_ref()));
@@ -1810,12 +1803,7 @@ mod tests {
     #[test]
     fn builtin_read_only_profiles_keep_inspection_without_write_supply() {
         let tmp = TempDir::new().unwrap();
-        for name in [
-            "reviewer",
-            "backend-job",
-            "memory-consolidation",
-            "subjektiv-memory-consolidation",
-        ] {
+        for name in ["reviewer", "backend-job", "subjektiv-memory-consolidation"] {
             let resolved = ProfileResolver::new()
                 .with_workspace_base(tmp.path())
                 .resolve(
@@ -1875,8 +1863,6 @@ mod tests {
         assert!(feature.subjektiv.profile.extraction.enabled);
         assert!(feature.subjektiv.workspace_settings.is_none());
         assert!(!feature.subjektiv.execution_enabled());
-        assert!(!feature.memory.profile.enabled);
-        assert!(!feature.memory.profile.staging_tools);
         assert!(!feature.task.enabled);
         assert!(!feature.sub_worker.enabled);
         assert!(!feature.flow.enabled);
@@ -2113,9 +2099,6 @@ model_id = "claude-sonnet-4-20250514"
 [feature.task]
 enabled = true
 
-[feature.memory]
-enabled = false
-
 [feature.web]
 enabled = true
 
@@ -2148,7 +2131,6 @@ enabled = false
             .unwrap();
         assert_eq!(resolved.manifest.worker.name, "runtime-worker");
         assert!(resolved.manifest.feature.task.enabled);
-        assert!(!resolved.manifest.feature.memory.profile.enabled);
         assert!(resolved.manifest.feature.web.enabled);
         assert!(resolved.manifest.feature.sub_worker.enabled);
         assert!(resolved.manifest.feature.ticket.enabled);

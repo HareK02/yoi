@@ -524,7 +524,7 @@ fn workspace_worker_create_request(
                 relative_cwd: attachment.relative_cwd,
             })
             .collect(),
-        feature_connections: Default::default(),
+        feature_connections: request.feature_connections,
         control_operation_id: Some(control_operation_id),
         authorization: request.authorization,
     })
@@ -986,6 +986,7 @@ impl Tool for WorkspaceWorkerTool {
                         runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
                         workdir_attachments,
                         authorization: input.authorization,
+                        feature_connections: Default::default(),
                         profile: canonical_launch_profile(input.profile)?,
                         singleton_key: input.singleton_key,
                         operation_id,
@@ -2410,6 +2411,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_spawn_forwards_feature_connections_unchanged_to_workspace_api() {
+        use protocol::feature_initialization::{FeatureInitialization, FeatureInitializations};
+        let connections = FeatureInitializations::new(vec![
+            FeatureInitialization::encode(
+                "test:spawn-connection",
+                1,
+                &serde_json::json!({"resource":"requested-resource"}),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let input = serde_json::json!({
+            "runtime_id":"runtime-1",
+            "workdir_attachments":[],
+            "profile":"builtin:coder",
+            "operation_id":"feature-spawn-intent",
+            "display_name":"Worker",
+            "initial_submit":[],
+            "feature_connections":connections
+        });
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        test_control(client.clone())
+            .spawn_worker(serde_json::from_value(input).unwrap())
+            .await
+            .unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, crate::WorkspaceRequestMethod::Post);
+        assert_eq!(
+            requests[0].path,
+            "/api/w/workspace%2Ftest/worker-control/workers"
+        );
+        let actual: CreateWorkspaceWorkerRequest =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(actual.feature_connections, connections);
+        assert_eq!(
+            actual.control_operation_id.as_deref(),
+            Some("feature-spawn-intent")
+        );
+    }
+
+    #[tokio::test]
     async fn worker_and_sub_worker_providers_are_ambiguous_before_install() {
         let runtime_base = tempfile::tempdir().unwrap();
         let runtime_dir = Arc::new(
@@ -3023,6 +3066,7 @@ mod tests {
                 singleton_key: None,
                 operation_id,
                 authorization: Default::default(),
+                feature_connections: Default::default(),
                 display_name: "Worker".into(),
                 initial_submit: Vec::new(),
             });
@@ -3129,6 +3173,7 @@ mod tests {
                 .contains(&serde_json::json!("authorization"))
         );
         assert!(schema["properties"].get("authorization").is_some());
+        assert!(schema["properties"].get("feature_connections").is_none());
         assert!(schema["properties"].get("policy_id").is_none());
         assert!(schema["properties"].get("policy_revision").is_none());
         assert!(text.contains("policy_authorization_key"));
@@ -3173,6 +3218,7 @@ mod tests {
             singleton_key: Some("subjektiv:subject-1".to_string()),
             operation_id: Some("ordinary-spawn-intent-1".into()),
             authorization: Default::default(),
+            feature_connections: Default::default(),
             display_name: "Coder".to_string(),
             initial_submit: vec![
                 Segment::Flow {
@@ -3221,6 +3267,7 @@ mod tests {
             singleton_key: None,
             operation_id: Some("spawn-ticket-worker:T-719:call-1".to_string()),
             authorization: Default::default(),
+            feature_connections: Default::default(),
             display_name: "Worker · T-719".to_string(),
             initial_submit: vec![Segment::text("Investigate Ticket T-719.")],
         })
@@ -3637,6 +3684,7 @@ mod tests {
                             singleton_key: None,
                             operation_id: Some("spawn-intent".into()),
                             authorization: Default::default(),
+                            feature_connections: Default::default(),
                             display_name: "child".into(),
                             initial_submit: vec![Segment::text("work")],
                         })

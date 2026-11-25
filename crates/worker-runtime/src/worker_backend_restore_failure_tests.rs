@@ -781,7 +781,12 @@ fn profile_restore_v4_readiness_check_preserves_saved_restrictions_and_history()
             .clone();
         assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
         let restored_history = serde_json::to_value(handle.committed_entries()).unwrap();
-        assert!(restored_history.as_array().unwrap().starts_with(history_before));
+        assert!(
+            restored_history
+                .as_array()
+                .unwrap()
+                .starts_with(history_before)
+        );
         fixture.runtime.stop_worker(worker_ref, None).unwrap();
 
         let restored_metadata = WorkerAggregateStore::open_read_only(&aggregate, &name)
@@ -799,14 +804,20 @@ fn profile_restore_v4_readiness_check_preserves_saved_restrictions_and_history()
             serde_json::to_value(&restored_manifest.scope).unwrap(),
             serde_json::to_value(&expected.scope).unwrap()
         );
-        let restored_sessions = WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+        let restored_sessions =
+            WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
         let retained_history = serde_json::to_value(
             restored_sessions
                 .read_all_read_only(session_id, segment_id)
                 .unwrap(),
         )
         .unwrap();
-        assert!(retained_history.as_array().unwrap().starts_with(history_before));
+        assert!(
+            retained_history
+                .as_array()
+                .unwrap()
+                .starts_with(history_before)
+        );
         assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
     }
 }
@@ -1015,6 +1026,281 @@ fn profile_restore_prior_effects_from_pending_head_repair_survive_read_only_repr
         );
     }
     fixture.resume_same_operation(request, pending.request.operation_id);
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn profile_restore_repaired_source_reprepares_fresh_deferred_scope_after_binding_failure() {
+    let mut fixture = ProfileFailureFixture::with_pending_head(Duration::from_secs(5));
+    let worker_ref = fixture.worker.worker_ref.clone();
+    // Give the never-published pending head a real local attachment, without
+    // creating a Controller or rewinding an already-materialized Session.
+    let binding = fixture
+        .backend
+        .working_directory_materializer
+        .as_ref()
+        .unwrap()
+        .create(&working_directory_request(&fixture.root.path().join("g")))
+        .unwrap();
+    let checkout = binding.root().to_path_buf();
+    fs::write(checkout.join("outside.txt"), "outside narrowed policy\n").unwrap();
+    let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+    let store = fixture.runtime.test_runtime_store();
+    let mut record = store.read_worker_record(&worker_ref).unwrap();
+    record.workdir_attachments = vec![WorkingDirectoryAttachmentStatus {
+        alias: alias.clone(),
+        working_directory: binding.status(),
+    }];
+    assert!(record.logical_workdir_attachments.is_empty());
+    store.write_worker_record(&record).unwrap();
+    drop(store);
+    drop(fixture.runtime);
+    fixture.runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+        crate::fs_store::FsRuntimeStoreOptions::new(fixture.root.path().join("s"))
+            .with_runtime_id("r"),
+        fixture.backend.clone(),
+    )
+    .unwrap();
+    let _pause = fixture.runtime.test_pause_restore_continuation();
+    let aggregate = fixture
+        .backend
+        .factory
+        .worker_aggregate_dir(&worker_ref)
+        .unwrap();
+    let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
+    let metadata = WorkerAggregateStore::new(&aggregate, &name).unwrap();
+    let mut initial = metadata.read_by_name(&name).unwrap().unwrap();
+    let pending_session = initial.active.as_ref().unwrap().session_id;
+    assert!(initial.active.as_ref().unwrap().segment_id.is_none());
+    let mut manifest = manifest::read_persisted_worker_manifest_snapshot(
+        initial.resolved_manifest_snapshot.clone().unwrap(),
+    )
+    .unwrap();
+    manifest.scope = serde_json::from_value(serde_json::json!({
+        "allow": [{ "target": checkout, "permission": "read" }]
+    }))
+    .unwrap();
+    initial.resolved_manifest_snapshot =
+        Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+    metadata.write(&initial).unwrap();
+
+    // Feature is after prepare_unpublished_restore binds the scope cell and
+    // deferred router. Repair must already have committed the first real head.
+    fixture.fail(RuntimeRestoreStage::Feature);
+    let request = fixture.runtime.test_restore_request(&worker_ref);
+    let first = fixture
+        .runtime
+        .restore_worker_operation(&worker_ref, request.clone())
+        .unwrap();
+    assert_eq!(
+        first.state,
+        server_api::WorkerRestoreState::ReconciliationRequired,
+        "{first:?}"
+    );
+    let pending = fixture
+        .backend
+        .pending_restore(&worker_ref)
+        .unwrap()
+        .unwrap();
+    fixture.assert_retained_restore_effects(&request, &pending, RuntimeRestoreStage::Feature);
+    assert!(!pending.activation_started.load(Ordering::SeqCst));
+    assert!(pending.request.workdir_attachments.is_empty());
+    assert!(pending.request.logical_workdir_attachments.is_empty());
+    assert_eq!(pending.request.deferred_workdir_sessions.len(), 1);
+    let old_session = pending.request.deferred_workdir_sessions[&alias].clone();
+    let old_scope = pending
+        .request
+        .deferred_workdir_scope
+        .get()
+        .expect("post-binding failure must leave the first scope cell bound")
+        .as_ref()
+        .expect("saved policy must bind the reconstructed Worker's live scope")
+        .clone();
+    assert!(old_scope.load().is_readable(&checkout.join("outside.txt")));
+    let mut repaired = metadata.read_by_name(&name).unwrap().unwrap();
+    let active = repaired.active.as_ref().unwrap().clone();
+    assert_eq!(active.session_id, pending_session);
+    let segment = active
+        .segment_id
+        .expect("production repair must publish a head");
+    let sessions = WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+    assert_eq!(
+        sessions.list_segments(pending_session).unwrap(),
+        vec![segment]
+    );
+    assert!(
+        session_store::collect_state(
+            &sessions
+                .read_all_read_only(pending_session, segment)
+                .unwrap()
+        )
+        .system_prompt
+        .is_some()
+    );
+    let repaired_session = persisted_files(&aggregate.join("session"));
+
+    // The next genuine reconstruction gets a narrower Worker policy. Keeping
+    // the old scope (even if its OnceLock error were ignored) must not pass.
+    manifest.scope = serde_json::from_value(serde_json::json!({
+        "allow": [{ "target": checkout.join("README.md"), "permission": "read" }]
+    }))
+    .unwrap();
+    repaired.resolved_manifest_snapshot =
+        Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+    metadata.write(&repaired).unwrap();
+    *fixture
+        .backend
+        .factory
+        .restore_faults
+        .fail_at
+        .lock()
+        .unwrap() = None;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (entered_tx, entered) = mpsc::channel();
+    *fixture
+        .backend
+        .factory
+        .restore_faults
+        .prepared_gate
+        .lock()
+        .unwrap() = Some(release.clone());
+    *fixture
+        .backend
+        .factory
+        .restore_faults
+        .prepared_entered
+        .lock()
+        .unwrap() = Some(entered_tx);
+    fixture
+        .backend
+        .wait_pending_restore(&pending, Duration::from_secs(5))
+        .unwrap();
+    fixture
+        .backend
+        .retry_pending_restore_cleanup(&pending, true)
+        .unwrap();
+    let reached = entered.recv_timeout(Duration::from_secs(5));
+    // Always release the existing hook, including on a regression, so failure
+    // cannot strand an adapter task while unwinding the fixture.
+    let new_router = reached.as_ref().ok().map(|_| {
+        fixture
+            .backend
+            .factory
+            .failed_restore_resources
+            .lock()
+            .unwrap()[&worker_ref]
+            .sessions
+            .last()
+            .expect("new production candidate must own its deferred router")
+            .clone()
+    });
+    release.notify_one();
+    fixture
+        .backend
+        .wait_pending_restore(&pending, Duration::from_secs(5))
+        .unwrap();
+    reached.expect("same-operation reconstruction must bind a fresh scope cell");
+    let new_session = new_router.unwrap().session(&alias).unwrap();
+    assert!(!Arc::ptr_eq(&old_session, &new_session));
+    assert!(Arc::ptr_eq(
+        &pending,
+        &fixture
+            .backend
+            .pending_restore(&worker_ref)
+            .unwrap()
+            .unwrap()
+    ));
+    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+    assert_eq!(metadata.read_by_name(&name).unwrap().unwrap(), repaired);
+    assert_eq!(
+        persisted_files(&aggregate.join("session")),
+        repaired_session
+    );
+    let accepted = fixture
+        .runtime
+        .restore_worker_operation(&worker_ref, request.clone())
+        .unwrap();
+    assert_eq!(
+        accepted.state,
+        server_api::WorkerRestoreState::Accepted,
+        "{accepted:?}"
+    );
+    assert_eq!(
+        fixture.backend.workers.lock().unwrap()[&worker_ref].restore_operation_id,
+        Some(pending.request.operation_id)
+    );
+    let executions = || {
+        fixture
+            .backend
+            .factory
+            .restore_faults
+            .executions
+            .load(Ordering::SeqCst)
+    };
+    assert_eq!(executions(), 2);
+    let checked = new_session.clone();
+    fixture
+        .backend
+        .run_on_adapter_runtime(async move {
+            let read = |path: &str| workdir::ReadRequest {
+                path: workdir::WorkdirPath::new(path).unwrap(),
+                offset: 0,
+                limit: 10,
+                max_bytes: 1024,
+            };
+            assert!(matches!(
+                old_session.read(read("README.md")).await,
+                Err(workdir::WorkdirError::SessionClosed)
+            ));
+            checked
+                .read(read("README.md"))
+                .await
+                .expect("fresh deferred session must open successfully");
+            let denied = checked.read(read("outside.txt")).await.unwrap_err();
+            assert_eq!(
+                denied.denial_reason(),
+                Some(workdir::WorkdirDenialReason::PathOutOfScope),
+                "new session must use the reconstructed Worker's narrowed scope: {denied:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 1);
+    assert!(old_scope.load().is_readable(&checkout.join("outside.txt")));
+    let replay = fixture
+        .runtime
+        .restore_worker_operation(&worker_ref, request)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(replay).unwrap(),
+        serde_json::to_value(accepted).unwrap()
+    );
+    assert_eq!(executions(), 2);
+    let raw_replacement = pending.current_request().deferred_workdir_sessions[&alias].clone();
+    fixture.runtime.stop_worker(&worker_ref, None).unwrap();
+    fixture
+        .backend
+        .run_on_adapter_runtime(async move {
+            let read = || workdir::ReadRequest {
+                path: workdir::WorkdirPath::new("README.md").unwrap(), offset: 0, limit: 10, max_bytes: 1024,
+            };
+            assert!(matches!(raw_replacement.read(read()).await, Err(workdir::WorkdirError::SessionClosed)));
+            let fenced = new_session.read(read()).await.unwrap_err();
+            assert!(matches!(&fenced, workdir::WorkdirError::Unavailable(message) if message == "Workdir attachment is detached"), "{fenced:?}");
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        metadata.read_by_name(&name).unwrap().unwrap().active,
+        Some(active)
+    );
+    let sessions = WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+    assert_eq!(
+        sessions.list_segments(pending_session).unwrap(),
+        vec![segment]
+    );
+    assert!(fixture.backend.pending_restores.lock().unwrap().is_empty());
+    assert!(fixture.backend.workers.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2273,8 +2559,6 @@ fn profile_restore_missing_committed_system_prompt_rolls_back_and_replays_classi
         [engine]
         instruction = "default"
         max_tokens = 100
-        [feature.memory.profile]
-        enabled = false
         "#,
     )
     .unwrap();

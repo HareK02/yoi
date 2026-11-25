@@ -88,7 +88,6 @@ impl EffectivePromptCatalog {
 pub enum WorkerPrompt {
     CompactSystem,
     MemoryExtractSystem,
-    MemoryConsolidationSystem,
     SubjektivMemoryConsolidationSystem,
     SubjektivMemorySurfaceSystem,
     FlowVerifierSystem,
@@ -113,7 +112,6 @@ impl WorkerPrompt {
         match self {
             Self::CompactSystem => "internal.compact_system",
             Self::MemoryExtractSystem => "internal.memory_extract_system",
-            Self::MemoryConsolidationSystem => "internal.memory_consolidation_system",
             Self::SubjektivMemoryConsolidationSystem => {
                 "internal.subjektiv_memory_consolidation_system"
             }
@@ -141,7 +139,6 @@ impl WorkerPrompt {
     pub const ALL: &'static [WorkerPrompt] = &[
         WorkerPrompt::CompactSystem,
         WorkerPrompt::MemoryExtractSystem,
-        WorkerPrompt::MemoryConsolidationSystem,
         WorkerPrompt::SubjektivMemoryConsolidationSystem,
         WorkerPrompt::SubjektivMemorySurfaceSystem,
         WorkerPrompt::FlowVerifierSystem,
@@ -479,12 +476,6 @@ impl PromptCatalog {
     pub fn memory_extract_system(&self, language: &str) -> Result<String, CatalogError> {
         self.render(
             WorkerPrompt::MemoryExtractSystem,
-            single("language", language),
-        )
-    }
-    pub fn memory_consolidation_system(&self, language: &str) -> Result<String, CatalogError> {
-        self.render(
-            WorkerPrompt::MemoryConsolidationSystem,
             single("language", language),
         )
     }

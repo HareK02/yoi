@@ -549,8 +549,7 @@ impl Tool for SubWorkerSpawnTool {
             WorkerManifestConfig::resolution_defaults().merge(child_config),
         )
         .map_err(|error| ToolError::ExecutionFailed(format!("resolve child manifest: {error}")))?;
-        bind_child_memory_settings(&self.spawner_manifest, &mut child_manifest)
-            .map_err(ToolError::ExecutionFailed)?;
+        prepare_child_subjektiv_policy(&mut child_manifest).map_err(ToolError::ExecutionFailed)?;
         // Delegated children stay bound to their scoped session and cannot use
         // Workspace attachment tools to replace it with parent-level authority.
         child_manifest.feature.manage_workdir.enabled = false;
@@ -1018,27 +1017,7 @@ fn profile_error_with_available(error: ProfileError, available: &AvailableProfil
     )
 }
 
-fn bind_child_memory_settings(
-    parent: &manifest::WorkerManifest,
-    child: &mut manifest::WorkerManifest,
-) -> Result<(), String> {
-    if child.feature.memory.profile.enabled {
-        let workspace_settings = parent.feature.memory.workspace_settings().ok_or_else(|| {
-            "enabled child Memory feature requires the parent's trusted Workspace settings snapshot"
-                .to_string()
-        })?;
-        child
-            .feature
-            .memory
-            .bind_workspace_settings(workspace_settings)
-            .map_err(str::to_string)?;
-    }
-    child
-        .feature
-        .memory
-        .validate_execution()
-        .map_err(str::to_string)?;
-
+fn prepare_child_subjektiv_policy(child: &mut manifest::WorkerManifest) -> Result<(), String> {
     // An Internal SubWorker has no Backend keyed-singleton lease of its own.
     // Preserve reusable subjektiv profile policy but never copy the parent's
     // trusted activation snapshot into the child.
@@ -1341,8 +1320,6 @@ max_tokens = 3333
 enabled = true
 thread = true
 
-[feature.memory]
-enabled = false
 "#;
 
     #[tokio::test]
@@ -1562,7 +1539,7 @@ enabled = false
         manifest
             .feature
             .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-test".to_string(),
 
                 language: "English".to_string(),
@@ -2344,47 +2321,24 @@ enabled = false
     }
 
     #[test]
-    fn child_memory_inherits_only_the_parents_trusted_settings_snapshot() {
+    fn internal_child_does_not_inherit_subject_activation() {
         let temp = tempfile::tempdir().unwrap();
         let mut parent = parent_manifest(temp.path(), None);
-        parent.feature.memory.profile.enabled = true;
-        let settings = manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-1".to_string(),
-
-            language: "日本語".to_string(),
-        };
-        parent
-            .feature
-            .memory
-            .bind_workspace_settings(settings.clone())
-            .unwrap();
         parent.feature.subjektiv.profile.enabled = true;
         parent.feature.subjektiv.profile.extraction.enabled = true;
         parent
             .feature
             .subjektiv
-            .bind_workspace_settings(settings)
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
+                workspace_id: "workspace-1".into(),
+                language: "日本語".into(),
+            })
             .unwrap();
         let mut child = parent.clone();
-        child.feature.memory.workspace_settings = None;
-
-        bind_child_memory_settings(&parent, &mut child).unwrap();
-        assert_eq!(
-            child.feature.memory.workspace_settings(),
-            parent.feature.memory.workspace_settings()
-        );
+        prepare_child_subjektiv_policy(&mut child).unwrap();
         assert!(child.feature.subjektiv.profile.enabled);
         assert!(!child.feature.subjektiv.execution_enabled());
-
-        let mut ordinary_parent = parent.clone();
-        ordinary_parent.feature.subjektiv.workspace_settings = None;
-        let mut ordinary_child = child.clone();
-        ordinary_child.feature.memory.workspace_settings = None;
-        bind_child_memory_settings(&ordinary_parent, &mut ordinary_child).unwrap();
-        assert!(!ordinary_child.feature.subjektiv.execution_enabled());
-
-        child.feature.memory.profile.enabled = false;
-        assert!(bind_child_memory_settings(&parent, &mut child).is_err());
+        assert!(parent.feature.subjektiv.execution_enabled());
     }
 
     fn write_project_profile_registry(

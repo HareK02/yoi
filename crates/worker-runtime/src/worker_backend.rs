@@ -171,9 +171,9 @@ use worker::feature::contracts::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{WorkerProtocolSessionStreams, live_log_entry_event};
 use worker::{
-    PromptCatalogSource, SegmentLogSink, SubjektivSessionAttributionLifecycle, WorkerBootstrap,
-    WorkerBootstrapError, WorkerBootstrapLayout, WorkerError, WorkerFilesystemAuthority,
-    WorkerHandle, WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    PromptCatalogSource, SegmentLogSink, WorkerBootstrap, WorkerBootstrapError,
+    WorkerBootstrapLayout, WorkerError, WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState,
+    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 #[cfg(feature = "ws-server")]
@@ -1000,6 +1000,7 @@ type SpawnModelClientFactory =
 pub struct ProfileRuntimeWorkerFactory {
     spawn_model_client_factory: Option<SpawnModelClientFactory>,
     plugin_runtime: Option<Arc<dyn crate::plugin::PluginToolRuntime>>,
+    initialization_registry: Arc<ProfileFeatureInitializationRegistry>,
     observation_hub: Arc<RuntimeWorkerObservationHub>,
     profile_base_dir: PathBuf,
     worker_aggregate_root: Option<PathBuf>,
@@ -1171,6 +1172,7 @@ impl ProfileRuntimeWorkerFactory {
         Self {
             spawn_model_client_factory: None,
             plugin_runtime: None,
+            initialization_registry: Arc::new(feature_initializers()),
             observation_hub: Arc::new(RuntimeWorkerObservationHub::default()),
             profile_base_dir,
             worker_aggregate_root: None,
@@ -1197,6 +1199,15 @@ impl ProfileRuntimeWorkerFactory {
         factory: impl Fn() -> Box<dyn agen::llm_client::client::LlmClient> + Send + Sync + 'static,
     ) -> Self {
         self.spawn_model_client_factory = Some(Arc::new(factory));
+        self
+    }
+
+    /// Trusted Feature composition; durable requests carry envelopes, not adapters.
+    pub fn with_feature_initialization_registry(
+        mut self,
+        registry: Arc<ProfileFeatureInitializationRegistry>,
+    ) -> Self {
+        self.initialization_registry = registry;
         self
     }
 
@@ -1424,6 +1435,56 @@ impl ProfileRuntimeWorkerFactory {
         Self::runtime_profile_for_request(&request.request)
     }
 
+    fn reject_retired_memory_profile(request: &CreateWorkerRequest) -> Result<(), String> {
+        if matches!(
+            Self::runtime_profile_for_request(request).as_ref(),
+            "builtin:memory-consolidation" | "memory-consolidation"
+        ) {
+            return Err("The retired Workspace memory-consolidation Profile cannot execute; create a replacement Worker with a supported Profile".into());
+        }
+        Ok(())
+    }
+
+    fn reject_retired_memory_snapshot(snapshot: &serde_json::Value) -> Result<(), String> {
+        let saved = if snapshot.get("schema_version").is_some() {
+            snapshot.get("manifest")
+        } else {
+            Some(snapshot)
+        };
+        if saved
+            .and_then(|saved| saved.pointer("/profile/source/name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "memory-consolidation" | "builtin:memory-consolidation"
+                )
+            })
+        {
+            // The immutable request selector need not describe the saved
+            // resolved Profile. Reject its retired provenance independently,
+            // matching Runtime storage migration's unavailable classification.
+            return Err("Saved Worker has retired Workspace memory-consolidation Profile provenance that cannot execute; create a replacement Worker with a supported Profile".into());
+        }
+        if let Some(memory) = saved
+            .and_then(|saved| saved.get("feature"))
+            .and_then(|features| features.get("memory"))
+        {
+            // Only the owner-locked Runtime storage migration may remove an
+            // explicitly disabled policy. Never repair execution authority in
+            // the decoder/restore path, including for malformed legacy values.
+            if memory
+                .pointer("/profile/enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                return Err("Saved Worker contains retired feature.memory; disabled legacy snapshots require Runtime storage migration before restore".into());
+            }
+            return Err("Saved Worker contains retired feature.memory that cannot execute; create a replacement Worker with a supported Profile".into());
+        }
+        Ok(())
+    }
+
     fn restore_fallback_manifest(
         worker_name: &str,
     ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
@@ -1433,23 +1494,47 @@ impl ProfileRuntimeWorkerFactory {
             .map_err(|err| format!("failed to build restore fallback manifest: {err}"))?;
         Ok((manifest, PromptCatalogSource::builtins_only()))
     }
-    fn manifest_for_restore(
+    fn manifest_for_restore_using(
+        initializers: &ProfileFeatureInitializationRegistry,
         metadata: &session_store::WorkerMetadata,
         request: &CreateWorkerRequest,
     ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
+        Self::reject_retired_memory_profile(request)?;
         let (fallback, loader) = Self::restore_fallback_manifest(&metadata.worker_name)?;
         let manifest = match metadata.resolved_manifest_snapshot.clone() {
-            Some(snapshot) => manifest::read_persisted_worker_manifest_snapshot(snapshot)
-                .map_err(|error| format!("failed to read saved Worker Manifest: {error}"))?,
-            None if request.workspace_api.is_some() || request.subjektiv_attached => {
+            Some(snapshot) => {
+                Self::reject_retired_memory_snapshot(&snapshot)?;
+                manifest::read_persisted_worker_manifest_snapshot(snapshot)
+                    .map_err(|error| format!("failed to read saved Worker Manifest: {error}"))?
+            }
+            None if request.workspace_api.is_some()
+                || !request.feature_initialization.is_empty() =>
+            {
                 return Err("Workspace Worker metadata has no saved Manifest; replacement Worker is required".to_string());
             }
             None => fallback,
         };
         // Saved policy is execution authority. Rebinding current settings here
         // would hide content and attachment mismatches.
-        validate_worker_memory_settings(&manifest, request)?;
+        initializers
+            .validate_manifest(&manifest, &restore_feature_initialization_context(request))?;
         Ok((manifest, loader))
+    }
+
+    fn restore_manifest(
+        &self,
+        metadata: &session_store::WorkerMetadata,
+        request: &CreateWorkerRequest,
+    ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
+        Self::manifest_for_restore_using(&self.initialization_registry, metadata, request)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn manifest_for_restore(
+        metadata: &session_store::WorkerMetadata,
+        request: &CreateWorkerRequest,
+    ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
+        Self::manifest_for_restore_using(&feature_initializers(), metadata, request)
     }
 
     fn observe_bundle_prompt_projection(
@@ -1753,24 +1838,30 @@ fn runtime_local_workdir_session(
     cwd: &Path,
     scope: manifest::SharedScope,
     capabilities: WorkdirSessionCapabilities,
+    command_host: Arc<workdir::CommandHost>,
     command_environment: std::collections::BTreeMap<String, String>,
     resources: Vec<Arc<dyn workdir::WorkdirSessionResource>>,
 ) -> WorkdirSessionHandle {
-    Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
-        Workdir::new(workdir_id),
-        root.to_path_buf(),
-        cwd.to_path_buf(),
-        scope,
-        capabilities,
-        command_environment,
-        resources,
-    ))
+    Arc::new(
+        LocalWorkdirSession::materialized_bound_with_environment(
+            Workdir::new(workdir_id),
+            root.to_path_buf(),
+            cwd.to_path_buf(),
+            scope,
+            capabilities,
+            command_environment,
+            resources,
+        )
+        .with_command_host(command_host)
+        .expect("new provider session is not shared"),
+    )
 }
 
 fn runtime_local_workdir_router(
     attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     capabilities: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionCapabilities>,
     authorization_client: Option<Arc<dyn WorkspaceClient>>,
+    worker_scope: Option<manifest::SharedScope>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let router = Arc::new(WorkdirSessionRouter::new());
     for (alias, binding) in attachments {
@@ -1778,13 +1869,19 @@ fn runtime_local_workdir_router(
             .get(alias)
             .copied()
             .unwrap_or(WorkdirSessionCapabilities::READ_ONLY);
-        let scope = runtime_attachment_scope(binding.root(), capabilities)?;
+        // Capabilities and Host authorization remain independent ceilings. Retain
+        // the filesystem Worker's live policy, including its deny rules.
+        let scope = match &worker_scope {
+            Some(scope) => scope.clone(),
+            None => runtime_attachment_scope(binding.root(), capabilities)?,
+        };
         let source = runtime_local_workdir_session(
             &binding.working_directory.id,
             binding.root(),
             binding.cwd(),
             scope,
             capabilities,
+            binding.command_host(),
             binding.command_environment(),
             binding
                 .session_resources()
@@ -1820,6 +1917,7 @@ fn restored_workdir_router(
     deferred_sessions: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionHandle>,
     claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
     workspace_client: Arc<dyn WorkspaceClient>,
+    worker_scope: Option<manifest::SharedScope>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let mut local_capabilities = local_attachments
         .keys()
@@ -1839,6 +1937,7 @@ fn restored_workdir_router(
         local_attachments,
         &local_capabilities,
         Some(workspace_client.clone()),
+        worker_scope,
     )?;
     for (alias, session) in deferred_sessions {
         if let Some(attachment) = logical_attachments.iter().find(|item| &item.alias == alias) {
@@ -1857,8 +1956,14 @@ fn restored_workdir_router(
             workspace_client.clone(),
             session.workdir().id().to_string(),
         );
+        let cwd = claims
+            .iter()
+            .find(|claim| &claim.alias == alias)
+            .and_then(|claim| claim.relative_cwd.as_deref())
+            .unwrap_or("");
+        let cwd = workdir::WorkdirPath::new(cwd).map_err(|error| error.to_string())?;
         router
-            .attach(alias.clone(), source)
+            .attach_at_cwd(alias.clone(), source, cwd)
             .map_err(|error| error.to_string())?;
     }
     for attachment in logical_attachments {
@@ -1971,24 +2076,34 @@ fn deferred_restore_workdir_sessions(
                 .find(|claim| claim.alias == alias)
                 .and_then(|claim| claim.relative_cwd.clone());
             let materializer = materializer.clone();
+            let worker_scope = request.deferred_workdir_scope.clone();
             let id = workdir_id.clone();
             let session = deferred_workdir::DeferredWorkdirSession::handle(
                 &workdir_id,
                 capabilities,
                 move || {
+                    // Do not open a provider until the reconstructed Worker has
+                    // bound its live policy (including an explicit no-policy case).
+                    let worker_scope = worker_scope
+                        .get()
+                        .ok_or_else(|| "restored Worker scope is not bound".to_string())?;
                     let materializer = materializer
                         .as_ref()
                         .ok_or_else(|| "Workdir provider is not configured".to_string())?;
                     let binding = materializer
                         .bind_working_directory(&id, relative_cwd.as_deref())
                         .map_err(|error| error.to_string())?;
-                    let scope = runtime_attachment_scope(binding.root(), capabilities)?;
+                    let scope = match worker_scope {
+                        Some(scope) => scope.clone(),
+                        None => runtime_attachment_scope(binding.root(), capabilities)?,
+                    };
                     Ok(runtime_local_workdir_session(
                         &id,
                         binding.root(),
                         binding.cwd(),
                         scope,
                         capabilities,
+                        binding.command_host(),
                         binding.command_environment(),
                         binding
                             .session_resources()
@@ -2001,153 +2116,73 @@ fn deferred_restore_workdir_sessions(
         .collect()
 }
 
-fn validate_backend_job_profile(
-    manifest: &manifest::WorkerManifest,
-    request: &CreateWorkerRequest,
-) -> Result<(), String> {
-    if let Some(binding) = &request.backend_job {
-        let policy = &manifest.feature.subjektiv.profile;
-        if policy.consolidation_tools != binding.subjektiv_consolidation
-            || ((binding.subjektiv_consolidation || binding.subjektiv_journal)
-                && policy.extraction.enabled)
-        {
-            return Err("Backend Job tools must match their independent trusted grants and extraction must be disabled".into());
-        }
-    }
-    Ok(())
+pub type ProfileFeatureInitializationRegistry =
+    worker::feature::initialization::FeatureInitializationRegistry<
+        Box<dyn agen::llm_client::LlmClient>,
+        CombinedStore<WorkerSessionStore, WorkerAggregateStore>,
+    >;
+
+fn feature_initializers() -> ProfileFeatureInitializationRegistry {
+    worker::feature::initialization::builtin_registry()
 }
 
-fn bind_workspace_memory_settings(
+pub(crate) fn feature_initialization_context(
+    request: &CreateWorkerRequest,
+) -> worker::feature::initialization::InitializationContext<'_> {
+    worker::feature::initialization::InitializationContext {
+        data: &request.feature_initialization,
+        workspace_id: request
+            .workspace_api
+            .as_ref()
+            .map(|api| api.workspace_id.as_str()),
+        memory_settings: request.memory_settings.as_ref(),
+        backend_job: request.backend_job.as_ref(),
+    }
+}
+
+// CreateWorkerRequest is an immutable receipt. Before Workspace Memory was
+// retired, ordinary Workers also saved memory_settings. Restore must not turn
+// that historical metadata into a new Subjektiv attachment or rewrite the
+// receipt. Explicit Subjektiv initialization (including invalid data) retains
+// the exact settings checks; normal creation uses the strict context above.
+fn restore_feature_initialization_context(
+    request: &CreateWorkerRequest,
+) -> worker::feature::initialization::InitializationContext<'_> {
+    let mut context = feature_initialization_context(request);
+    if request
+        .feature_initialization
+        .get(subjektiv_api::worker_initialization::FEATURE_ID)
+        .is_none()
+    {
+        context.memory_settings = None;
+    }
+    context
+}
+
+#[cfg(test)]
+fn bind_worker_initialization(
     manifest: &mut manifest::WorkerManifest,
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
-    validate_backend_job_profile(manifest, request)?;
-    let Some(snapshot) = request.memory_settings.as_ref() else {
-        if request.workspace_api.is_some() || request.subjektiv_attached {
-            return Err(
-                "Workspace Worker request is missing its bound Memory settings snapshot"
-                    .to_string(),
-            );
-        }
-        return Ok(());
-    };
-    if let Some(workspace_api) = request.workspace_api.as_ref()
-        && snapshot.workspace_id != workspace_api.workspace_id
-    {
-        return Err(format!(
-            "Memory settings workspace {} does not match Workspace API scope {}",
-            snapshot.workspace_id, workspace_api.workspace_id
-        ));
-    }
-    if manifest.feature.memory.profile.enabled {
-        manifest
-            .feature
-            .memory
-            .bind_workspace_settings(snapshot.clone())
-            .map_err(str::to_string)?;
-    }
-    if request.subjektiv_attached {
-        if !manifest.feature.subjektiv.profile.enabled {
-            return Err(
-                "subject-attached Worker profile does not enable subjektiv policy".to_string(),
-            );
-        }
-        manifest
-            .feature
-            .subjektiv
-            .bind_workspace_settings(snapshot.clone())
-            .map_err(str::to_string)?;
-    }
-    manifest
-        .feature
-        .memory
-        .validate_execution()
-        .map_err(str::to_string)?;
-    manifest
-        .feature
-        .subjektiv
-        .validate_execution()
-        .map_err(str::to_string)?;
-    Ok(())
+    feature_initializers().bind_manifest(manifest, &feature_initialization_context(request))
 }
 
-/// Read-only validation shared with the offline, feature-gated fixture installer.
-#[cfg(feature = "test-support")]
+#[cfg(test)]
+fn validate_worker_initialization(
+    manifest: &manifest::WorkerManifest,
+    request: &CreateWorkerRequest,
+) -> Result<(), String> {
+    feature_initializers().validate_manifest(manifest, &feature_initialization_context(request))
+}
+
+/// Read-only validation shared with storage migration tests and the offline,
+/// feature-gated fixture installer. Neither entrypoint repairs saved authority.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn validate_fixture_restore_metadata(
     metadata: &session_store::WorkerMetadata,
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
     ProfileRuntimeWorkerFactory::manifest_for_restore(metadata, request).map(|_| ())
-}
-
-fn validate_worker_memory_settings(
-    manifest: &manifest::WorkerManifest,
-    request: &CreateWorkerRequest,
-) -> Result<(), String> {
-    validate_backend_job_profile(manifest, request)?;
-    let Some(expected) = request.memory_settings.as_ref() else {
-        if request.subjektiv_attached || request.workspace_api.is_some() {
-            return Err(
-                "Workspace Worker restore is missing its trusted settings snapshot".to_string(),
-            );
-        }
-        return Ok(());
-    };
-    if let Some(workspace_api) = request.workspace_api.as_ref()
-        && expected.workspace_id != workspace_api.workspace_id
-    {
-        return Err("trusted Memory settings do not match Workspace API scope".to_string());
-    }
-    manifest
-        .feature
-        .memory
-        .validate_execution()
-        .map_err(str::to_string)?;
-    manifest
-        .feature
-        .subjektiv
-        .validate_execution()
-        .map_err(str::to_string)?;
-    if manifest.feature.memory.profile.enabled
-        && manifest.feature.memory.workspace_settings().as_ref() != Some(expected)
-    {
-        let actual = manifest
-            .feature
-            .memory
-            .workspace_settings()
-            .ok_or_else(|| {
-                "Workspace Worker restored without its bound Memory settings snapshot".to_string()
-            })?;
-        return Err(format!(
-            "Workspace Worker Memory settings snapshot mismatch: expected {} language {}, restored {} language {}",
-            expected.workspace_id, expected.language, actual.workspace_id, actual.language
-        ));
-    }
-    let subjektiv_settings = manifest.feature.subjektiv.workspace_settings();
-    if request.subjektiv_attached {
-        if !manifest.feature.subjektiv.profile.enabled {
-            return Err(
-                "subject-attached Worker restored with a Profile that disables subjektiv policy"
-                    .to_string(),
-            );
-        }
-        if subjektiv_settings.as_ref() != Some(expected) {
-            let actual = subjektiv_settings.ok_or_else(|| {
-                "subject-attached Worker restored without its bound subjektiv settings snapshot"
-                    .to_string()
-            })?;
-            return Err(format!(
-                "Workspace Worker subjektiv settings snapshot mismatch: expected {} language {}, restored {} language {}",
-                expected.workspace_id, expected.language, actual.workspace_id, actual.language
-            ));
-        }
-    } else if subjektiv_settings.is_some() {
-        return Err(
-            "ordinary Workspace Worker restored with an unauthorized subjektiv attachment"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -2280,6 +2315,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         &self,
         request: WorkerExecutionSpawnRequest,
     ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+        Self::reject_retired_memory_profile(&request.request)?;
         let worker_name = Self::runtime_worker_name(&request);
         let profile = Self::runtime_profile(&request);
         let logical_attachments = request.request.workspace_workdir_attachments();
@@ -2356,7 +2392,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )?
             }
         };
-        bind_workspace_memory_settings(&mut manifest, &request.request)?;
+        self.initialization_registry.bind_manifest(
+            &mut manifest,
+            &feature_initialization_context(&request.request),
+        )?;
         if let Some(bundle) = request.config_bundle.as_ref()
             && let Some(resolution) =
                 self.observe_bundle_prompt_projection(bundle, observation_workspace_id.as_deref())?
@@ -2488,14 +2527,22 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .bind_backend_job(binding.clone())
                 .map_err(str::to_string)?;
         }
-        validate_worker_memory_settings(worker.manifest(), &request.request)?;
-        startup_failure::finalize_startup_binding(worker, request.request.subjektiv_attached)?;
+        self.initialization_registry.validate_manifest(
+            worker.manifest(),
+            &feature_initialization_context(&request.request),
+        )?;
+        startup_failure::finalize_startup_binding(
+            &self.initialization_registry,
+            worker,
+            &request.request.feature_initialization,
+        )?;
         let sessions = restored_workdir_router(
             &request.workdir_attachments,
             &logical_attachments,
             &BTreeMap::new(),
             &request.request.workdir_attachments,
             worker.workspace_client_handle(),
+            has_local_filesystem.then(|| worker.scope().clone()),
         )?;
         self.failed_spawn_resources
             .lock()
@@ -2585,7 +2632,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .read_by_name(&worker_name)
                 .map_err(|error| format!("failed to read Worker metadata: {error}"))?
                 .ok_or_else(|| "Persisted Worker metadata is unavailable".to_string())?;
-            let (manifest, loader) = Self::manifest_for_restore(&metadata, &request.request)?;
+            let (manifest, loader) = self.restore_manifest(&metadata, &request.request)?;
             if let Some(active) = metadata.active.as_ref()
                 && let Some(segment_id) = active.segment_id
             {
@@ -2765,7 +2812,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .read_by_name(&worker_name)
                 .map_err(|_| "Worker metadata read failed")?
                 .ok_or("saved Worker metadata unavailable")?;
-            let (manifest, loader) = Self::manifest_for_restore(&metadata, &request.request)
+            let (manifest, loader) = self
+                .restore_manifest(&metadata, &request.request)
                 .map_err(|_| "saved manifest resolution failed")?;
             let store = CombinedStore::new(session_store, worker_metadata_store);
 
@@ -2841,8 +2889,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             #[cfg(test)]
             self.restore_checkpoint(stage)
                 .map_err(|_| "injected restore boundary failure")?;
-            validate_worker_memory_settings(candidate.manifest(), &request.request)
-                .map_err(|_| "saved memory settings mismatch")?;
+            self.initialization_registry
+                .validate_manifest(
+                    candidate.manifest(),
+                    &restore_feature_initialization_context(&request.request),
+                )
+                .map_err(|_| "saved feature initialization mismatch")?;
             self.prepare_unpublished_restore(candidate, &request)
                 .await
                 .map(|candidate| Box::new(candidate) as Box<dyn RuntimeRestoreCandidate>)
@@ -3247,12 +3299,20 @@ impl ProfileRuntimeWorkerFactory {
             let workspace_client = candidate
                 .workspace_client_handle()
                 .map_err(|_| "restore Workspace binding unavailable")?;
+            let worker_scope = candidate
+                .local_workdir_scope()
+                .map_err(|_| "restore Worker scope unavailable")?;
+            request
+                .deferred_workdir_scope
+                .set(worker_scope.clone())
+                .map_err(|_| "restore Worker scope is already bound")?;
             let workdir_sessions = restored_workdir_router(
                 &request.workdir_attachments,
                 &request.logical_workdir_attachments,
                 &request.deferred_workdir_sessions,
                 &request.request.workdir_attachments,
                 workspace_client.clone(),
+                worker_scope,
             )
             .map_err(|_| "restored Workdir binding failed")?;
             self.failed_restore_resources
@@ -3351,10 +3411,11 @@ impl ProfileRuntimeWorkerFactory {
                 .prepare_runtime_controller(
                     &run_dir,
                     worker::bootstrap::RestoredControllerBindings {
+                        initialization_registry: self.initialization_registry.clone(),
                         backend_job: request.request.backend_job.clone(),
                         workdir_sessions,
                         observation_provider,
-                        subjektiv_attached: request.request.subjektiv_attached,
+                        feature_initialization: request.request.feature_initialization.clone(),
                     },
                 )
                 .await
@@ -3921,6 +3982,9 @@ struct PendingRuntimeSpawn {
 struct PendingRuntimeRestore {
     execution_id: uuid::Uuid,
     request: WorkerExecutionRestoreRequest,
+    // Authority stays in the admitted request; reconstruction replaces only
+    // process-owned scope and sessions. Publication retries retain the attempt.
+    attempt_request: Mutex<Option<WorkerExecutionRestoreRequest>>,
     // Transient ownership mode, not a durable phase. Cold restart reclamation
     // must never enter preparation, canonical repair, or activation.
     cleanup_only: bool,
@@ -3950,6 +4014,14 @@ impl Drop for RestoreTaskCompletion {
 }
 
 impl PendingRuntimeRestore {
+    fn current_request(&self) -> WorkerExecutionRestoreRequest {
+        self.attempt_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| self.request.clone())
+    }
+
     fn stop_failure_result(&self, message: String) -> WorkerExecutionResult {
         let mut result = self.failure_result(message);
         result.operation = WorkerExecutionOperation::Stop;
@@ -4581,6 +4653,7 @@ where
         if let Some(failure) = failure {
             let owner = Arc::clone(pending);
             let factory = Arc::clone(&self.factory);
+            let materializer = self.working_directory_materializer.clone();
             let mut task = pending
                 .task
                 .try_lock()
@@ -4598,24 +4671,41 @@ where
                 {
                     let prior_effects = failure.durable_effects_possible
                         || owner.activation_started.load(Ordering::Acquire);
-                    let result =
-                        match prepare_restore_operation(factory.as_ref(), owner.request.clone())
-                            .await
-                        {
-                            Ok(candidate) => {
-                                Ok(Box::new(EffectRetainingRestoreCandidate { candidate })
-                                    as Box<dyn RuntimeRestoreCandidate>)
-                            }
-                            Err(mut failure) => {
-                                failure.durable_effects_possible |= prior_effects;
-                                Err(finish_restore_failure(
-                                    factory.as_ref(),
-                                    &owner.request,
-                                    failure,
-                                )
-                                .await)
-                            }
-                        };
+                    let mut request = owner.current_request();
+                    request.deferred_workdir_scope = Arc::new(std::sync::OnceLock::new());
+                    let prepared = async {
+                        request.deferred_workdir_sessions =
+                            deferred_restore_workdir_sessions(&request, materializer).map_err(
+                                |_| {
+                                    RuntimeRestoreFailure::unproven(
+                                        RuntimeRestoreStage::Binding,
+                                        "restore Workdir session reconstruction failed",
+                                    )
+                                },
+                            )?;
+                        *owner
+                            .attempt_request
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(request.clone());
+                        prepare_restore_operation(factory.as_ref(), request.clone()).await
+                    }
+                    .await;
+                    let result = match prepared {
+                        Ok(candidate) => {
+                            Ok(Box::new(EffectRetainingRestoreCandidate { candidate })
+                                as Box<dyn RuntimeRestoreCandidate>)
+                        }
+                        Err(mut failure) => {
+                            failure.durable_effects_possible |= prior_effects;
+                            Err(finish_restore_failure(
+                                factory.as_ref(),
+                                &owner.current_request(),
+                                failure,
+                            )
+                            .await)
+                        }
+                    };
                     // A completed reprepare replaces attempt resources, never
                     // the operation's effect history. Only a ready candidate
                     // may clear the old activation completion for a new attempt.
@@ -4637,7 +4727,8 @@ where
                     return;
                 }
                 let failure =
-                    finish_restore_failure(factory.as_ref(), &owner.request, failure).await;
+                    finish_restore_failure(factory.as_ref(), &owner.current_request(), failure)
+                        .await;
                 if owner.activation_started.load(Ordering::Acquire) {
                     *owner
                         .activated
@@ -6077,7 +6168,18 @@ where
             return result;
         };
 
-        if let Err(message) = self.cleanup_execution_resources(&execution) {
+        let cleanup = if operation_id
+            .is_some_and(|id| execution.tasks.termination(worker_ref, id).is_some())
+        {
+            execution
+                .handle
+                .delete_uncommitted_uploaded_files()
+                .map(|_| ())
+                .map_err(|error| format!("uploaded_file_cleanup_failed: {error}"))
+        } else {
+            self.cleanup_execution_resources(&execution)
+        };
+        if let Err(message) = cleanup {
             let mut result = startup_stop_result.clone().unwrap_or_else(|| {
                 WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message.clone())
             });
@@ -6935,6 +7037,7 @@ where
             binding.cwd(),
             scope,
             WorkdirSessionCapabilities::ALL,
+            binding.command_host(),
             binding.command_environment(),
             binding.session_resources()?,
         ))
@@ -7220,7 +7323,7 @@ where
         if let Some(existing) = workers.get(&request.worker_ref) {
             let result = WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Restore,
-                "Worker is already connected to execution backend",
+                "Worker execution resources are still owned; if shutdown was requested, issue a fresh Stop to reclaim that owner before Restore",
             );
             if existing.shutdown_requested.load(Ordering::Acquire)
                 || existing.tasks.has_cleanup_candidates().map_err(|message| {
@@ -7417,6 +7520,9 @@ where
                 return WorkerExecutionSpawnResult::Rejected(result);
             }
 
+            // Fresh preparation owns a fresh slot; pending retries above retain
+            // the original request, slot and candidate together.
+            request.deferred_workdir_scope = Arc::new(std::sync::OnceLock::new());
             request.deferred_workdir_sessions = match deferred_restore_workdir_sessions(
                 &request,
                 self.working_directory_materializer.clone(),
@@ -7457,6 +7563,7 @@ where
                 let pending = Arc::new(PendingRuntimeRestore {
                     execution_id: uuid::Uuid::now_v7(),
                     request: request.clone(),
+                    attempt_request: Mutex::new(None),
                     cleanup_only: false,
                     task: tokio::sync::Mutex::new(None),
                     task_in_flight: AtomicBool::new(false),
@@ -7795,6 +7902,7 @@ where
                     let pending = Arc::new(PendingRuntimeRestore {
                         execution_id: uuid::Uuid::now_v7(),
                         request: request.clone(),
+                        attempt_request: Mutex::new(None),
                         cleanup_only: true,
                         task: tokio::sync::Mutex::new(None),
                         task_in_flight: AtomicBool::new(false),
@@ -8052,7 +8160,7 @@ where
                                             }
                                             let failure = finish_restore_failure(
                                                 factory.as_ref(),
-                                                &owner.request,
+                                                &owner.current_request(),
                                                 failure,
                                             )
                                             .await;
@@ -8541,6 +8649,55 @@ where
         self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method)
     }
 
+    fn cleanup_stopped_worker(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> Result<(), String> {
+        let lock = self.worker_lock(worker_ref)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| "worker operation lock is poisoned")?;
+        if self.pending_spawn_exists(worker_ref)? || self.pending_restore(worker_ref)?.is_some() {
+            return Err("Worker startup resources still have a current owner; stop that owner before retrying cleanup".into());
+        }
+        let execution = self
+            .workers
+            .lock()
+            .map_err(|_| "worker registry poisoned")?
+            .get(worker_ref)
+            .cloned();
+        if let Some(execution) = execution {
+            let saved = saved
+                .ok_or("a current execution still owns resources; explicit Stop is required")?;
+            if execution
+                .tasks
+                .termination(worker_ref, saved.stop_operation_id)
+                .as_ref()
+                != Some(saved)
+            {
+                return Err("current execution differs from the terminated resource owner".into());
+            }
+            // Actual join is already confirmed by this original scope. Only the
+            // remaining resource effects are retried, never Shutdown or join.
+            execution
+                .handle
+                .delete_uncommitted_uploaded_files()
+                .map_err(|error| format!("uploaded_file_cleanup_failed: {error}"))?;
+            self.factory
+                .deactivate_stopped_controller(worker_ref, &execution.handle)?;
+            self.workers
+                .lock()
+                .map_err(|_| "worker registry poisoned")?
+                .remove(worker_ref);
+        }
+        let factory = self.factory.clone();
+        let stopped = worker_ref.clone();
+        self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
+            factory.reconcile_stopped_worker(&stopped).await
+        })
+    }
+
     fn reconcile_stop_worker_operation(
         &self,
         request: WorkerExecutionStopRequest,
@@ -8603,7 +8760,9 @@ where
                 );
             }
         };
-        self.stop_worker_operation_under_lock(request)
+        let worker = request.worker_ref.clone();
+        let result = self.stop_worker_operation_under_lock(request);
+        self.reconcile_stop_cleanup_under_lock(&worker, result)
     }
 
     fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
@@ -8898,6 +9057,11 @@ mod tests {
 
     include!("subject_delete_backend_tests.rs");
     include!("worker_backend/startup_binding_tests.rs");
+    include!("worker_backend/memory_retirement_tests.rs");
+    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
+    include!("worker_backend/initialization_tests.rs");
+    #[cfg(all(feature = "fs-store", feature = "ws-server", feature = "http-server"))]
+    include!("worker_backend/subjektiv_initialization_tests.rs");
     include!("worker_backend/spawn_tool_startup_tests.rs");
     include!("worker_backend/termination_persistence_tests.rs");
     include!("worker_backend/submission_termination_tests.rs");
@@ -9193,8 +9357,6 @@ mod tests {
             permission = "read"
             recursive = true
             symlink_policy = "resolved"
-            [feature.memory.profile]
-            enabled = false
             [feature.subjektiv.profile]
             enabled = true
             [feature.subjektiv.profile.extraction]
@@ -9211,12 +9373,15 @@ mod tests {
             workspace_id: "workspace-saved-subjektiv".to_string(),
             base_url: "http://workspace.invalid".to_string(),
         });
-        request.subjektiv_attached = true;
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        request.feature_initialization = crate::catalog::test_subject_initialization(
+            "workspace-saved-subjektiv",
+            "saved-subject",
+        );
+        request.memory_settings = Some(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-saved-subjektiv".to_string(),
             language: "English".to_string(),
         });
-        bind_workspace_memory_settings(&mut saved, &request).unwrap();
+        bind_worker_initialization(&mut saved, &request).unwrap();
         (saved, request)
     }
 
@@ -9306,7 +9471,7 @@ mod tests {
             Some("workspace-saved-subjektiv")
         );
         // Transport for incomplete initial-head repair and subsequent operations.
-        // A normal materialized restore must use the saved attribution instead.
+        // A materialized restore rechecks Host identity but must use saved attribution.
         #[cfg(feature = "http-server")]
         {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9329,6 +9494,12 @@ mod tests {
                         })
                     },
                 ),
+            );
+            let app = app.route(
+                "/api/w/workspace-saved-subjektiv/subjektiv/worker-connection",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({
+                    "workspace_id":"workspace-saved-subjektiv", "subject_id":"saved-subject", "kind":"subject_body"
+                })) }),
             );
             let app = app.route(
                 "/api/w/workspace-saved-subjektiv/subjektiv/journal/startup",
@@ -9419,6 +9590,7 @@ mod tests {
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
             deferred_workdir_sessions: BTreeMap::new(),
+            deferred_workdir_scope: Arc::new(std::sync::OnceLock::new()),
             config_bundle: None,
         }
     }
@@ -10345,6 +10517,7 @@ mod tests {
             Arc::new(PendingRuntimeRestore {
                 execution_id: uuid::Uuid::now_v7(),
                 request: direct_restore_request(worker_ref.clone()),
+                attempt_request: Mutex::new(None),
                 cleanup_only: false,
                 task: tokio::sync::Mutex::new(None),
                 task_in_flight: AtomicBool::new(false),
@@ -10391,6 +10564,7 @@ mod tests {
         let pending = Arc::new(PendingRuntimeRestore {
             execution_id: uuid::Uuid::now_v7(),
             request: request.clone(),
+            attempt_request: Mutex::new(None),
             cleanup_only: false,
             task: tokio::sync::Mutex::new(Some(failed)),
             task_in_flight: AtomicBool::new(false),
@@ -10596,18 +10770,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(worker_allocation)]
     #[cfg(feature = "http-server")]
-    async fn profile_factory_saved_subjektiv_restores_without_server_communication() {
+    async fn profile_factory_saved_subjektiv_rechecks_host_without_replaying_registration() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store = root.path().join("runtime");
         let mut request = saved_subjektiv_restore_fixture(&runtime_store, true).await;
-        // Replace only the external Server with an unavailable endpoint. Every
-        // request is counted, so ignored errors cannot masquerade as offline restore.
+        // Permit only the owner connection check. Any registration or protected
+        // startup data request is counted and refused, never silently ignored.
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_calls = calls.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         request.request.workspace_api.as_mut().unwrap().base_url =
             format!("http://{}", listener.local_addr().unwrap());
-        let app = axum::Router::new().fallback(move || {
+        let app = axum::Router::new().route(
+            "/api/w/workspace-saved-subjektiv/subjektiv/worker-connection",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({
+                "workspace_id":"workspace-saved-subjektiv", "subject_id":"saved-subject", "kind":"subject_body"
+            })) }),
+        ).fallback(move || {
             let calls = observed_calls.clone();
             async move {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -10632,6 +10811,7 @@ mod tests {
         let saved_active = saved_metadata.active.as_ref().unwrap();
         let session_store = WorkerSessionStore::new(aggregate_dir.join("session")).unwrap();
         for _ in 0..2 {
+            request.deferred_workdir_scope = Arc::new(std::sync::OnceLock::new());
             // Fresh factory: exercise the same saved authority after both a
             // restart and another explicit restore, not a mock Controller path.
             let factory =
@@ -10686,7 +10866,7 @@ mod tests {
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "normal restore must not contact the Server"
+            "normal restore must not replay registration or fetch startup data"
         );
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
@@ -10950,7 +11130,7 @@ mod tests {
         let mut wrong_settings = request.clone();
         wrong_settings.memory_settings.as_mut().unwrap().language = "different language".into();
         let mut detached = request.clone();
-        detached.subjektiv_attached = false;
+        detached.feature_initialization = Default::default();
         let mut missing_settings = request.clone();
         missing_settings.memory_settings = None;
         for (invalid, expected) in [
@@ -11175,6 +11355,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             client,
+            None,
         )
         .unwrap();
 
@@ -11229,6 +11410,7 @@ mod tests {
             &BTreeMap::from([(alias.clone(), deferred)]),
             &[],
             client.clone(),
+            None,
         )
         .unwrap();
         assert!(client.0.lock().unwrap().is_empty());
@@ -11301,7 +11483,8 @@ mod tests {
         let client = WorkerWorkspaceContext::no_workspace().client_handle();
 
         let router =
-            restored_workdir_router(&attachments, &logical, &BTreeMap::new(), &[], client).unwrap();
+            restored_workdir_router(&attachments, &logical, &BTreeMap::new(), &[], client, None)
+                .unwrap();
 
         let session = router.session(&alias).unwrap();
         assert_eq!(
@@ -13064,7 +13247,7 @@ mod tests {
                 && workspace_context.workspace_id().is_some()
             {
                 assert!(
-                    !request.request.subjektiv_attached,
+                    request.request.feature_initialization.is_empty(),
                     "generic legacy fixture must never authorize a Subject Worker"
                 );
                 WorkerWorkspaceContext::with_client(
@@ -13158,6 +13341,91 @@ mod tests {
                 )
             })
         }
+    }
+
+    struct FailLiveStopCleanupFactory {
+        inner: MockFactory,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeWorkerFactory for FailLiveStopCleanupFactory {
+        async fn spawn_controller(
+            &self,
+            request: WorkerExecutionSpawnRequest,
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+            self.inner.spawn_controller(request).await
+        }
+        async fn prepare_restore(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
+            self.inner.prepare_restore(request).await
+        }
+        async fn reconcile_stopped_worker(&self, _: &WorkerRef) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("factory cleanup failed after live join".into())
+        }
+    }
+
+    #[test]
+    fn public_runtime_live_stop_reports_factory_cleanup_failure_after_real_join() {
+        require_restore_test_environment();
+        let root = tempfile::tempdir_in(".").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(FailLiveStopCleanupFactory {
+                inner: MockFactory {
+                    client: MockClient::new(vec![]),
+                    runtime_base: PathBuf::from(root.path().file_name().unwrap())
+                        .join("controllers"),
+                    cwd: fs::canonicalize(root.path()).unwrap(),
+                    store_dir: root.path().join("sessions"),
+                    worker_metadata_dir: root.path().join("metadata"),
+                    observed_cwds: Arc::default(),
+                    observed_workspace_clients: Arc::default(),
+                },
+                calls: calls.clone(),
+            })
+            .unwrap(),
+        );
+        let runtime = EmbeddedRuntime::with_execution_backend(
+            crate::RuntimeOptions::default(),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(create_request("live cleanup failure"))
+            .unwrap();
+        let execution = backend.workers.lock().unwrap()[&worker.worker_ref].clone();
+        let error = runtime.stop_worker(&worker.worker_ref, None).unwrap_err();
+        assert_eq!(
+            error.control_cause(),
+            protocol::control_failure::RuntimeControlCause::StopTerminatedCleanupFailed
+        );
+        let termination = error
+            .execution_result()
+            .unwrap()
+            .termination
+            .as_ref()
+            .unwrap();
+        assert_eq!(termination.execution_id, execution.tasks.execution_id);
+        assert!(
+            termination.confirms_scope_shutdown(&worker.worker_ref, termination.stop_operation_id)
+        );
+        assert!(execution.handle.protocol_is_closed());
+        assert!(execution.tasks.tasks.lock().unwrap().is_empty());
+        assert!(backend.workers.lock().unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().lifecycle,
+            crate::catalog::WorkerLifecycleState::Stopped
+        );
+        assert_eq!(
+            runtime.execution_termination(&worker.worker_ref).unwrap(),
+            Some(termination.clone())
+        );
     }
 
     fn core_filesystem_tool_names() -> BTreeSet<&'static str> {
@@ -13324,60 +13592,8 @@ mod tests {
             worker_observation_grants: Vec::new(),
             workspace_api: None,
             memory_settings: None,
-            subjektiv_attached: false,
+            feature_initialization: Default::default(),
             backend_job: None,
-        }
-    }
-
-    #[test]
-    fn backend_job_profile_policy_matches_trusted_grant_without_implicit_changes() {
-        let mut manifest = WorkerManifest::from_toml(
-            r#"
-            [worker]
-            name = "job-policy-test"
-            pwd = "./"
-            [model]
-            scheme = "anthropic"
-            model_id = "chosen-model"
-            auth = { kind = "none" }
-            [engine]
-            instruction = "default"
-            [[scope.allow]]
-            target = "./"
-            permission = "read"
-        "#,
-        )
-        .unwrap();
-        let mut request = create_request("policy");
-        for (granted, journal) in [(false, false), (true, false), (false, true)] {
-            request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
-                job_id: "job-1".into(),
-                attempt_id: "attempt-1".into(),
-                input_digest: None,
-                subjektiv_consolidation: granted,
-                subjektiv_journal: journal,
-            });
-            for tools in [false, true] {
-                for extraction in [false, true] {
-                    manifest.feature.subjektiv.profile.consolidation_tools = tools;
-                    manifest.feature.subjektiv.profile.extraction.enabled = extraction;
-                    let expected = tools == granted && (!(granted || journal) || !extraction);
-                    let before = serde_json::to_value(&manifest).unwrap();
-                    assert_eq!(
-                        validate_backend_job_profile(&manifest, &request).is_ok(),
-                        expected
-                    );
-                    assert_eq!(
-                        bind_workspace_memory_settings(&mut manifest, &request).is_ok(),
-                        expected
-                    );
-                    assert_eq!(
-                        validate_worker_memory_settings(&manifest, &request).is_ok(),
-                        expected
-                    );
-                    assert_eq!(serde_json::to_value(&manifest).unwrap(), before);
-                }
-            }
         }
     }
 
@@ -13408,7 +13624,7 @@ mod tests {
             manifest.feature.subjektiv.profile.extraction.enabled = true;
             manifest
         };
-        let settings = manifest::WorkspaceMemorySettingsSnapshot {
+        let settings = manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-subject".to_string(),
             language: "English".to_string(),
         };
@@ -13417,27 +13633,28 @@ mod tests {
             workspace_id: settings.workspace_id.clone(),
             base_url: "http://workspace.invalid".to_string(),
         });
-        ordinary_request.memory_settings = Some(settings.clone());
         let mut ordinary = manifest();
-        bind_workspace_memory_settings(&mut ordinary, &ordinary_request).unwrap();
+        bind_worker_initialization(&mut ordinary, &ordinary_request).unwrap();
         assert!(ordinary.feature.subjektiv.profile.enabled);
         assert!(!ordinary.feature.subjektiv.execution_enabled());
-        validate_worker_memory_settings(&ordinary, &ordinary_request).unwrap();
+        validate_worker_initialization(&ordinary, &ordinary_request).unwrap();
 
         let mut attached_request = ordinary_request.clone();
-        attached_request.subjektiv_attached = true;
+        attached_request.feature_initialization =
+            crate::catalog::test_subject_initialization("workspace-subject", "subject-test");
+        attached_request.memory_settings = Some(settings.clone());
         let mut attached = manifest();
-        bind_workspace_memory_settings(&mut attached, &attached_request).unwrap();
+        bind_worker_initialization(&mut attached, &attached_request).unwrap();
         assert!(attached.feature.subjektiv.execution_enabled());
         assert_eq!(
             attached.feature.subjektiv.workspace_settings(),
             Some(settings.clone())
         );
-        validate_worker_memory_settings(&attached, &attached_request).unwrap();
-        assert!(validate_worker_memory_settings(&attached, &ordinary_request).is_err());
+        validate_worker_initialization(&attached, &attached_request).unwrap();
+        assert!(validate_worker_initialization(&attached, &ordinary_request).is_err());
 
         attached_request.memory_settings = None;
-        assert!(bind_workspace_memory_settings(&mut manifest(), &attached_request).is_err());
+        assert!(bind_worker_initialization(&mut manifest(), &attached_request).is_err());
     }
 
     fn git(path: &std::path::Path, args: &[&str]) {
@@ -13598,10 +13815,17 @@ mod tests {
         let journal_path = aggregate.join("worker.json");
         let journal_before = fs::read(&journal_path).unwrap();
         let journal: serde_json::Value = serde_json::from_slice(&journal_before).unwrap();
-        assert_eq!(journal["execution_state"]["execution"]["operation"], "stop");
         assert_eq!(
-            journal["execution_state"]["execution"]["intent"]["pending_restore"]["operation_id"],
+            journal["execution_state"]["execution"]["operation"],
+            "restore"
+        );
+        assert_eq!(
+            journal["execution_state"]["execution"]["intent"]["operation_id"],
             prior_restore_id.to_string()
+        );
+        assert_eq!(
+            journal["restore_guard"]["automatic_restore_suppressed"],
+            true
         );
         let artifact = aggregate
             .join("runs")
@@ -13655,12 +13879,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // A fresh Stop rotates only the observation fence. It must retain the
+        // independent Restore identity and all other canonical material.
+        let assert_retained_restore = || {
+            let mut observed: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+            observed["restore_guard"]["observation_token"] =
+                journal["restore_guard"]["observation_token"].clone();
+            assert_eq!(observed, journal);
+        };
         let failed = restarted.stop_worker(&worker.worker_ref, None).unwrap_err();
         assert!(
             failed.to_string().contains("unsafe restore artifact"),
             "{failed}"
         );
-        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_retained_restore();
         assert!(artifact.is_file());
         assert!(!profile_base.exists());
 
@@ -13674,7 +13907,7 @@ mod tests {
                 .contains("map absence is not shutdown proof")
         );
         assert!(!artifact.exists());
-        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_retained_restore();
         assert_eq!(
             fs::read_to_string(aggregate.join("session").join("keep-authority")).unwrap(),
             "saved Session authority"
@@ -13865,6 +14098,7 @@ mod tests {
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
             deferred_workdir_sessions: BTreeMap::new(),
+            deferred_workdir_scope: Arc::new(std::sync::OnceLock::new()),
             config_bundle: None,
         }
     }
@@ -14147,6 +14381,7 @@ mod tests {
         let owner = Arc::new(PendingRuntimeRestore {
             execution_id: uuid::Uuid::now_v7(),
             request: request.clone(),
+            attempt_request: Mutex::new(None),
             cleanup_only: false,
             task: tokio::sync::Mutex::new(None),
             task_in_flight: AtomicBool::new(false),
@@ -14847,6 +15082,7 @@ mod tests {
             root.path(),
             spawned_scope,
             WorkdirSessionCapabilities::READ_ONLY,
+            Arc::new(workdir::CommandHost::default()),
             Default::default(),
             Vec::new(),
         );
@@ -14857,6 +15093,7 @@ mod tests {
             root.path(),
             restored_scope,
             WorkdirSessionCapabilities::READ_ONLY,
+            Arc::new(workdir::CommandHost::default()),
             Default::default(),
             Vec::new(),
         );
@@ -14950,10 +15187,6 @@ mod tests {
             workspace_id: "workspace-restore".to_string(),
             base_url: "http://workspace.invalid".to_string(),
         });
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-restore".to_string(),
-            language: "English".to_string(),
-        });
         let identity = RuntimeIdentityMaterial::generate("runtime-restore").unwrap();
         let error = match ProfileRuntimeWorkerFactory::new(root.path())
             .with_runtime_store_dir(&runtime_store_dir)
@@ -14972,6 +15205,7 @@ mod tests {
                 logical_workdir_attachments: Vec::new(),
                 workdir_attachments: BTreeMap::new(),
                 deferred_workdir_sessions: BTreeMap::new(),
+                deferred_workdir_scope: Arc::new(std::sync::OnceLock::new()),
                 config_bundle: None,
             })
             .await
@@ -15055,6 +15289,7 @@ mod tests {
                 logical_workdir_attachments: Vec::new(),
                 workdir_attachments: BTreeMap::new(),
                 deferred_workdir_sessions: BTreeMap::new(),
+                deferred_workdir_scope: Arc::new(std::sync::OnceLock::new()),
                 config_bundle: None,
             })
             .await
@@ -15220,6 +15455,7 @@ mod tests {
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
             deferred_workdir_sessions: BTreeMap::new(),
+            deferred_workdir_scope: Arc::new(std::sync::OnceLock::new()),
             config_bundle: None,
         };
 
@@ -15615,6 +15851,7 @@ mod tests {
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
             deferred_workdir_sessions: BTreeMap::new(),
+            deferred_workdir_scope: Arc::new(std::sync::OnceLock::new()),
             config_bundle: None,
         };
         drop(runtime);
@@ -15690,6 +15927,7 @@ mod tests {
             }
             let before = persisted_files(&root.path().join("workdirs"));
             backend.preflight_restore(&request).unwrap();
+            request.deferred_workdir_scope.set(None).unwrap();
             let sessions = deferred_restore_workdir_sessions(
                 &request,
                 backend.working_directory_materializer.clone(),
@@ -16152,10 +16390,6 @@ mod tests {
             workspace_id: "ws-test".into(),
             base_url: "http://127.0.0.1:3999".into(),
         });
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "ws-test".into(),
-            language: "English".into(),
-        });
         let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "embedded-backend");
         let detail = runtime.create_worker_scoped(&scope, create).unwrap();
         let mut release = runtime_api::SubjectReleaseRequest {
@@ -16336,6 +16570,7 @@ mod tests {
     }
 
     include!("worker_backend/publication_tests.rs");
+    include!("worker_backend/routing_scope_tests.rs");
 
     #[test]
     fn stopping_and_deleting_worker_preserves_bound_working_directory() {
@@ -16408,7 +16643,8 @@ mod tests {
 
         let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
         let attachments = BTreeMap::from([(alias, binding.clone())]);
-        let router = runtime_local_workdir_router(&attachments, &BTreeMap::new(), None).unwrap();
+        let router =
+            runtime_local_workdir_router(&attachments, &BTreeMap::new(), None, None).unwrap();
         session_clone.close().await.unwrap();
         assert_eq!(
             materializer.cleanup_working_directory(id).unwrap_err().code,
@@ -16444,7 +16680,7 @@ mod tests {
             (root_alias, WorkdirSessionCapabilities::ALL),
             (nested_alias, WorkdirSessionCapabilities::READ_ONLY),
         ]);
-        let router = runtime_local_workdir_router(&attachments, &ceilings, None).unwrap();
+        let router = runtime_local_workdir_router(&attachments, &ceilings, None, None).unwrap();
         assert!(router.resolve(None).is_err());
         for (alias, cwd, content, command) in [
             ("root", "", "root", true),

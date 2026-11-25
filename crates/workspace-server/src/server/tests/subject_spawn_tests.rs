@@ -15,10 +15,6 @@ async fn subject_current_worker_lookup_failure_is_not_reported_as_no_body() {
             .is_none()
     );
     let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
-    let memory = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     // Real reservation SQL owns the body, but no Runtime Worker exists yet.
     // This is an unavailable observation, not evidence that another launch is safe.
     api.config_store
@@ -28,7 +24,6 @@ async fn subject_current_worker_lookup_failure_is_not_reported_as_no_body() {
             "subject-start",
             &"f".repeat(64),
             Some(&singleton_key),
-            &memory,
         )
         .unwrap();
     assert!(
@@ -61,10 +56,6 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
     let identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
     configure_runtime_request_auth(&mut api, &identity, "runtime-test");
     let subjektiv = open_subjektiv_store(&api).unwrap();
-    let memory = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let mut callbacks = Vec::new();
     for index in 0..2 {
         let subject = subjektiv
@@ -94,7 +85,6 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
                 &format!("subject-start-{index}"),
                 &"f".repeat(64),
                 Some(&singleton_key),
-                &memory,
             )
             .unwrap();
         callbacks.push((
@@ -257,10 +247,6 @@ async fn consolidation_subject_callbacks_are_denied_without_runtime_lookup() {
         .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
         .unwrap();
     let key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id);
-    let memory = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reservation = api
         .config_store
         .reserve_worker_create(
@@ -269,7 +255,6 @@ async fn consolidation_subject_callbacks_are_denied_without_runtime_lookup() {
             "consolidation-start",
             &"f".repeat(64),
             Some(&key),
-            &memory,
         )
         .unwrap();
     // runtime-test has no Worker adapter: authority denial must not try to look
@@ -393,10 +378,6 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
         .create_subject(crate::subjektiv::SubjectRole::new("rejected-create").unwrap())
         .unwrap();
     let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
-    let memory = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reserved = api
         .config_store
         .reserve_worker_create(
@@ -405,7 +386,6 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
             "manual:rejected-create",
             &"f".repeat(64),
             Some(&key),
-            &memory,
         )
         .unwrap();
     let worker = RuntimeWorkerRef::new(EMBEDDED_RUNTIME_ID, reserved.worker_id.to_string());
@@ -463,7 +443,6 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
             "manual:retry-rejected-create",
             &"f".repeat(64),
             Some(&key),
-            &memory,
         );
         assert!(
             matches!(retry, Err(Error::RepositoryConflict(ref message))
@@ -487,10 +466,6 @@ async fn unpublished_recovery_fixture(
         .create_subject(crate::subjektiv::SubjectRole::new("recovery-test").unwrap())
         .unwrap();
     let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
-    let memory = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let old = api
         .config_store
         .reserve_worker_create(
@@ -499,7 +474,6 @@ async fn unpublished_recovery_fixture(
             "manual:failed-subject",
             &"f".repeat(64),
             Some(&key),
-            &memory,
         )
         .unwrap();
     api.config_store
@@ -532,7 +506,14 @@ fn recovery_spawn_request(api: &WorkspaceApi, subject: &str) -> WorkerSpawnReque
     }))
     .unwrap();
     request.resolved_config_bundle = Some(bundle);
-    request.resolved_subjektiv_attached = true;
+    request.feature_connections =
+        subjektiv_worker_initialization::subject_connection(subject.into()).unwrap();
+    request.resolved_feature_initialization =
+        subjektiv_worker_initialization::fixture_subject_initialization(
+            api.workspace_id(),
+            subject,
+        )
+        .unwrap();
     request
 }
 

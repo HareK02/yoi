@@ -148,26 +148,6 @@ CREATE TABLE flow_sources (
     UNIQUE (workspace_id, source_kind, name),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
-CREATE TABLE memory_staging_records (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    candidate_id TEXT NOT NULL,
-    raw_json TEXT NOT NULL,
-    source_path TEXT,
-    imported_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, candidate_id)
-);
-CREATE TABLE memory_staging_resolutions (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    candidate_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    affected_refs_json TEXT NOT NULL,
-    staging_raw_json TEXT NOT NULL,
-    source_path TEXT,
-    imported_at TEXT NOT NULL,
-    resolved_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, candidate_id, resolved_at)
-);
 CREATE TABLE "objective_events" (
     workspace_id TEXT NOT NULL,
     objective_id TEXT NOT NULL,
@@ -675,11 +655,14 @@ CREATE TABLE worker_create_reservations (
             create_fingerprint TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('reserved', 'created', 'removed')),
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL, request_fingerprint TEXT, memory_language TEXT,
+            updated_at TEXT NOT NULL, request_fingerprint TEXT, initialization_binding TEXT, subjektiv_memory_language TEXT,
             singleton_key TEXT,
             singleton_generation INTEGER CHECK (singleton_generation IS NULL OR singleton_generation > 0),
             startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR
                 (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),
+            feature_initialization_json TEXT CHECK (feature_initialization_json IS NULL OR
+                (typeof(feature_initialization_json) = 'text' AND length(CAST(feature_initialization_json AS BLOB)) <= 131072
+                 AND json_valid(feature_initialization_json) AND json_type(feature_initialization_json) = 'array')),
             PRIMARY KEY (workspace_id, allocation_key),
             UNIQUE (workspace_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
@@ -1013,19 +996,13 @@ CREATE TABLE workspace_signing_identity_audit (
         );
 CREATE INDEX workspace_signing_identity_audit_workspace_idx
             ON workspace_signing_identity_audit(workspace_id, created_at DESC);
-CREATE TABLE workspace_memory_documents (
-    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    body_md TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+CREATE TABLE subjektiv_memory_settings (
+ workspace_id TEXT PRIMARY KEY NOT NULL,
+ language TEXT NOT NULL CHECK(length(trim(language)) > 0),
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL,
+ FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
-CREATE TABLE workspace_memory_settings (
-            workspace_id TEXT PRIMARY KEY NOT NULL,
-            language TEXT NOT NULL CHECK(length(trim(language)) > 0),
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
-        );
 CREATE TABLE "workspace_resource_key_counters" (
     workspace_id TEXT NOT NULL,
     resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),

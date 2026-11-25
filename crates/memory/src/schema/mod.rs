@@ -1,18 +1,9 @@
-//! Typed frontmatter schemas for Memory documents.
+//! Bounded evidence and source references shared by Subject Memory.
 //!
-//! These structures and pure parsing helpers are shared by Workspace-backed
-//! validation. They do not select or traverse a repository-local Memory tree.
+//! These snapshots provide traceability, not authority to read Session content
+//! or mutate Memory. Hosts validate access separately from stored attribution.
 
 mod common;
-mod decision;
-mod request;
-mod summary;
 
 pub(crate) use common::JsonSafeU64Pair;
-pub use common::{
-    EvidenceKind, EvidenceOrigin, EvidenceOriginKind, Frontmatter, SourceEvidenceRef, SourceRef,
-    split_frontmatter,
-};
-pub use decision::{DecisionFrontmatter, DecisionStatus};
-pub use request::RequestFrontmatter;
-pub use summary::SummaryFrontmatter;
+pub use common::{EvidenceKind, EvidenceOrigin, EvidenceOriginKind, SourceEvidenceRef, SourceRef};

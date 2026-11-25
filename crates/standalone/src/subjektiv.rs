@@ -144,7 +144,7 @@ impl StandaloneSubjects {
             }
             Err(error) => return Err(error.into()),
         };
-        if !manifest::is_normalized_workspace_memory_language(&memory_language) {
+        if !manifest::is_normalized_subjektiv_memory_language(&memory_language) {
             return Err(SubjectError::InvalidScope(
                 "invalid local Memory language setting".into(),
             ));
@@ -1590,7 +1590,7 @@ impl SubjektivHost for LocalSubjectHost {
     fn stage_candidate(
         &self,
         context: &SubjektivHostContext,
-        mut operation: memory::backend::MemoryStageCandidateOperation,
+        mut operation: memory::subject::MemoryStageCandidateOperation,
     ) -> Result<SubjektivStageCandidateResponse, SubjektivHostError> {
         self.authorize_operation(context, "memory.extract.commit")?;
         let attribution = self.attribution(context, false)?;
@@ -1646,8 +1646,8 @@ impl SubjektivHost for LocalSubjectHost {
     fn request_consolidation(
         &self,
         context: &SubjektivHostContext,
-        operation: memory::backend::MemoryConsolidateStagingOperation,
-    ) -> Result<memory::backend::MemoryConsolidationOutput, SubjektivHostError> {
+        operation: memory::subject::MemoryConsolidateStagingOperation,
+    ) -> Result<memory::subject::MemoryConsolidationOutput, SubjektivHostError> {
         self.authorize_operation(context, "memory.consolidation.request")?;
         let jobs = self.jobs()?;
         if let Some(pending) = jobs
@@ -1667,7 +1667,7 @@ impl SubjektivHost for LocalSubjectHost {
                 .store
                 .pending_staging_backlog(&self.binding.subject_id)
                 .map_err(domain_error)?;
-            return Ok(memory::backend::MemoryConsolidationOutput { status:"resumed_pending".into(),summary:"Resumed the existing immutable reserved Subject Job; prior execution receipts remain independently fenced".into(),candidate_count:count,total_bytes:bytes });
+            return Ok(memory::subject::MemoryConsolidationOutput { status:"resumed_pending".into(),summary:"Resumed the existing immutable reserved Subject Job; prior execution receipts remain independently fenced".into(),candidate_count:count,total_bytes:bytes });
         }
         let (count, bytes) = self
             .catalog
@@ -1681,7 +1681,7 @@ impl SubjektivHost for LocalSubjectHost {
             .map_err(domain_error)?
             .availability;
         if !subjektiv::job::consolidation_required(count, bytes, operation.force, surface) {
-            return Ok(memory::backend::MemoryConsolidationOutput {
+            return Ok(memory::subject::MemoryConsolidationOutput {
                 status: "skipped_below_threshold".into(),
                 summary: "Subject backlog/surface is below the common consolidation threshold"
                     .into(),
@@ -1726,7 +1726,7 @@ impl SubjektivHost for LocalSubjectHost {
             )
             .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))?;
         schedule_job(jobs, snapshot, self.self_weak.clone(), None);
-        Ok(memory::backend::MemoryConsolidationOutput { status:"started".into(),summary:"Requested a durable generic standalone consolidation Job; processing stops on Host shutdown".into(),candidate_count:count,total_bytes:bytes })
+        Ok(memory::subject::MemoryConsolidationOutput { status:"started".into(),summary:"Requested a durable generic standalone consolidation Job; processing stops on Host shutdown".into(),candidate_count:count,total_bytes:bytes })
     }
 }
 
@@ -1922,7 +1922,7 @@ impl SubjektivHost for LocalConsolidationHost {
     fn stage_candidate(
         &self,
         _: &SubjektivHostContext,
-        _: memory::backend::MemoryStageCandidateOperation,
+        _: memory::subject::MemoryStageCandidateOperation,
     ) -> Result<SubjektivStageCandidateResponse, SubjektivHostError> {
         self.denied()
     }
@@ -1936,8 +1936,8 @@ impl SubjektivHost for LocalConsolidationHost {
     fn request_consolidation(
         &self,
         _: &SubjektivHostContext,
-        _: memory::backend::MemoryConsolidateStagingOperation,
-    ) -> Result<memory::backend::MemoryConsolidationOutput, SubjektivHostError> {
+        _: memory::subject::MemoryConsolidateStagingOperation,
+    ) -> Result<memory::subject::MemoryConsolidationOutput, SubjektivHostError> {
         self.denied()
     }
 }

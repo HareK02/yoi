@@ -862,7 +862,47 @@ Deno.test("failed create has a recovery-only control and a frozen token-free res
     ) === JSON.stringify(attempt),
   );
   assert(!("expected_observation_token" in attempt.request));
-  rejects(() => createSubjectBodyAttempt("account", body, "start", "no-replacement"));
+  rejects(() =>
+    createSubjectBodyAttempt("account", body, "start", "no-replacement")
+  );
   rejects(() => parse({ ...absent(), observation: { kind: "failed_create" } }));
   assert(!subjectBodyControls({ ...body, can_start: false }).recover);
+});
+
+Deno.test("stop outcome accepts terminal failures strictly without treating them as stopped", () => {
+  for (
+    const outcome of [
+      "interrupted",
+      { failed: { cause: "stop_terminated_persistence_failed" } },
+      { failed: { cause: "stop_terminated_persistence_outcome_unknown" } },
+      { failed: { cause: "stop_terminated_cleanup_failed" } },
+    ]
+  ) {
+    const result = parseSubjectBodyStopOutcomeResponse(
+      { request_id: "request", outcome, body: null },
+      "workspace",
+      "subject",
+      "request",
+    );
+    assert(JSON.stringify(result.outcome) === JSON.stringify(outcome));
+  }
+  for (
+    const outcome of [
+      "failed",
+      { failed: {} },
+      { failed: { cause: "invented" } },
+      { failed: { cause: "execution_failed", extra: true } },
+      { failed: { cause: "execution_failed" }, extra: true },
+      null,
+    ]
+  ) {
+    rejects(() =>
+      parseSubjectBodyStopOutcomeResponse(
+        { request_id: "request", outcome, body: null },
+        "workspace",
+        "subject",
+        "request",
+      )
+    );
+  }
 });
