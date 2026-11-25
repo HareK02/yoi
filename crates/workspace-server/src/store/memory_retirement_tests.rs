@@ -83,6 +83,7 @@ mod memory_retirement_contract {
                 ),
             )
             .unwrap();
+        let subject = subjects.subject(&subject.id).unwrap().unwrap();
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
         let (subject_hash, ordinary_hash) = populate(&conn, &subject.id);

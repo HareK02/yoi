@@ -1003,6 +1003,13 @@ CREATE TABLE subjektiv_memory_settings (
  updated_at TEXT NOT NULL,
  FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
+CREATE TABLE "workspace_resource_key_counters" (
+    workspace_id TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),
+    next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
+    PRIMARY KEY (workspace_id, resource_kind),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
 CREATE TABLE "workspace_resource_keys" (
     workspace_id TEXT NOT NULL,
     resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),

@@ -5,9 +5,9 @@
 
 use super::*;
 use memory::{
-    backend::MemoryStageCandidateOperation,
     extract::{CandidateKind, ExtractedCandidate, StagingEvidence},
     schema::{EvidenceKind, EvidenceOriginKind, SourceEvidenceRef, SourceRef},
+    subject::MemoryStageCandidateOperation,
 };
 use subjektiv::{
     CandidateDecision, CandidateDecisionRequest, MemoryChangeTarget, MemoryDraft, MemoryRecord,

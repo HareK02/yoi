@@ -237,6 +237,7 @@ mod memory_retirement_tests {
         let (mut saved, mut request) = saved_subjektiv_policy(root, &worker_ref);
         saved.feature.subjektiv.workspace_settings = None;
         request.feature_initialization = Default::default();
+        let snapshot = manifest::write_persisted_worker_manifest_snapshot(&saved).unwrap();
         let mut engine =
             Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
                 MockClient::new(Vec::new()),
@@ -245,7 +246,7 @@ mod memory_retirement_tests {
         let mut worker = Worker::new(
             saved,
             engine,
-            CombinedStore::new(session, store),
+            CombinedStore::new(session, store.clone()),
             WorkerWorkspaceContext::unavailable(
                 Some(WorkspaceId::new("workspace-saved-subjektiv").unwrap()),
                 "ordinary historical receipt must not inject Memory",
@@ -258,6 +259,14 @@ mod memory_retirement_tests {
         worker.enable_worker_metadata_write_through().unwrap();
         worker.materialize_durable_session_head().await.unwrap();
         drop(worker);
+        // Current ordinary Workers need no Subject snapshot. This fixture instead
+        // represents an old Worker whose storage migration retained its resolved
+        // execution snapshot alongside the unchanged historical create receipt.
+        store
+            .update_by_name(&name, |metadata| {
+                metadata.resolved_manifest_snapshot = Some(snapshot);
+            })
+            .unwrap();
         let mut restore = direct_restore_request(worker_ref);
         restore.request = request;
         restore.workspace_scope = Some(crate::runtime::RuntimeWorkspaceScope::new(
