@@ -226,6 +226,27 @@ where
             return Ok(());
         }
         if phase == InitializationPhase::Restored {
+            if let Some(resolved) = connection(data).map_err(WorkerError::FeatureLifecycle)?
+                && resolved.kind == WorkerConnectionKind::SubjectBody
+            {
+                // A confirmed body reconstructs saved state, not current Host
+                // authority. Recheck local identity at effects; a changed or
+                // unconfirmed attribution must not become implicit repair.
+                // Recovery and Jobs retain live verification, and protected
+                // reads and supplies authorize against the Host per call.
+                worker.validate_saved_subjektiv_attribution()?;
+                let metadata = worker
+                    .store()
+                    .read_by_name(&worker.manifest().worker.name)?;
+                return match metadata.and_then(|metadata| metadata.subjektiv_session_attribution) {
+                    Some(SubjektivSessionAttributionState::Confirmed { subject_id, .. })
+                        if resolved.subject_id.as_deref() == Some(subject_id.as_str()) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(binding_mismatch(&resolved)),
+                };
+            }
             return self.prepare_host(worker, data);
         }
         // Observe the same Worker/Session before the Host boundary. Never adopt a

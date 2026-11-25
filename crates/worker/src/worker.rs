@@ -6917,6 +6917,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     ts: segment_log::now_millis(),
                     entry_id: None,
                 })?;
+                self.dispatch_run_committed(
+                    uuid::Uuid::now_v7().to_string(),
+                    RunCommittedExit::Interrupted,
+                )
+                .await;
             }
             return Ok(WorkerRunResult::RolledBack);
         }
@@ -7829,6 +7834,37 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
+    /// Dispatch only after persistence succeeds, using the current committed
+    /// history so an empty-turn rollback cannot expose its removed input.
+    async fn dispatch_run_committed(&mut self, run_id: String, exit: RunCommittedExit) {
+        let committed_invocation = self.hook_invocation_context(Some(run_id));
+        if let Some(hooks) = self.hook_registry.clone() {
+            let context = RunCommittedContext {
+                invocation: committed_invocation.clone(),
+                exit,
+                committed_history: self.hook_history_range(),
+            };
+            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_committed(&context))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "run-committed hook requires attention");
+                }
+                Err(_) => {
+                    hooks.record_chain_timeout("run-committed");
+                    tracing::warn!("run-committed hook chain exceeded its host deadline");
+                }
+            }
+        }
+        if let Err(error) = self
+            .feature_background_tasks
+            .start_run_committed(committed_invocation)
+        {
+            tracing::warn!(error = %error, "run-committed background task start failed");
+        }
+    }
+
     /// Handle one Engine execution boundary: persist its turn and transition,
     /// then compact and resume when Engine yielded for compaction.
     ///
@@ -7884,32 +7920,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         });
         self.persist_turn(history_before, &result, request_block_message.as_deref())
             .await?;
-        let committed_invocation = self.hook_invocation_context(Some(run_id));
-        if let Some(hooks) = self.hook_registry.clone() {
-            let context = RunCommittedContext {
-                invocation: committed_invocation.clone(),
-                exit: hook_exit,
-                committed_history: self.hook_history_range(),
-            };
-            match tokio::time::timeout(FEATURE_HOOK_CHAIN_TIMEOUT, hooks.on_run_committed(&context))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "run-committed hook requires attention");
-                }
-                Err(_) => {
-                    hooks.record_chain_timeout("run-committed");
-                    tracing::warn!("run-committed hook chain exceeded its host deadline");
-                }
-            }
-        }
-        if let Err(error) = self
-            .feature_background_tasks
-            .start_run_committed(committed_invocation)
-        {
-            tracing::warn!(error = %error, "run-committed background task start failed");
-        }
+        self.dispatch_run_committed(run_id, hook_exit).await;
 
         if let Some(block) = request_block {
             let error = automatic_compact_block_error(block);
@@ -13063,6 +13074,54 @@ status: 200,
 
     #[tokio::test]
     async fn empty_turn_direct_cancel_and_pause_still_remove_only_unmaterialized_input() {
+        struct CommittedCancellationHook {
+            store: session_store::FsStore,
+            location: SegmentLocation,
+            expected_history: HookHistoryRange,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Hook<crate::hook::RunCommitted> for CommittedCancellationHook {
+            async fn call(
+                &self,
+                context: &RunCommittedContext,
+            ) -> Result<(), crate::hook::HookError> {
+                assert_eq!(context.exit, RunCommittedExit::Interrupted);
+                assert_eq!(context.committed_history, self.expected_history);
+                assert!(context.invocation.run_id.is_some());
+                let entries = self
+                    .store
+                    .read_all(self.location.session_id, self.location.segment_id)
+                    .unwrap();
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry,
+                                LogEntry::RunCancelled {
+                                    entry_id: Some(_),
+                                    ..
+                                }
+                            )
+                        })
+                        .count(),
+                    1,
+                    "the cancellation must already be durable when the hook runs"
+                );
+                assert!(
+                    !entries.iter().any(|entry| matches!(
+                        entry,
+                        LogEntry::Invoke { .. } | LogEntry::AnnotatedUserInput { .. }
+                    )),
+                    "the hook must not see rolled-back speculative input"
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
         for pause in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let store = session_store::FsStore::new(dir.path()).unwrap();
@@ -13078,8 +13137,18 @@ status: 200,
             .await
             .unwrap();
             worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
-            worker.materialize_durable_session_head().await.unwrap();
             let loc = worker.segment_state.location();
+            let committed_calls = Arc::new(AtomicUsize::new(0));
+            let expected_history = worker.hook_history_range();
+            worker
+                .hook_builder
+                .add_run_committed(CommittedCancellationHook {
+                    store: store.clone(),
+                    location: loc,
+                    expected_history,
+                    calls: committed_calls.clone(),
+                });
+            worker.materialize_durable_session_head().await.unwrap();
             let before = store.read_all(loc.session_id, loc.segment_id).unwrap();
             let signal = if pause {
                 worker.engine().pause_sender()
@@ -13095,6 +13164,11 @@ status: 200,
             .await
             .unwrap();
             assert_eq!(result.unwrap(), WorkerRunResult::RolledBack);
+            assert_eq!(
+                committed_calls.load(Ordering::SeqCst),
+                usize::from(!pause),
+                "only persisted cancellation, not empty-turn pause, dispatches committed hooks"
+            );
             let after = store.read_all(loc.session_id, loc.segment_id).unwrap();
             let cancelled = after
                 .iter()

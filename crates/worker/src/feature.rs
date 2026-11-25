@@ -2582,7 +2582,6 @@ mod tests {
         // Enabling each config key independently also detects default-on flags.
         for name in [
             "task",
-            "memory",
             "subjektiv",
             "web",
             "image",
@@ -2600,7 +2599,7 @@ mod tests {
             "orchestration",
         ] {
             let mut value = serde_json::to_value(&config).unwrap();
-            if name == "memory" || name == "subjektiv" {
+            if name == "subjektiv" {
                 value[name]["profile"]["enabled"] = json!(true);
             } else if name == "merge_request" {
                 value[name]["show"] = json!(true);

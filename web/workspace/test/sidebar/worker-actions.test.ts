@@ -648,6 +648,76 @@ Deno.test("sidebar Delete accepts HTTP 202 but retains the Worker and saved oper
   );
 });
 
+Deno.test("Stop interruption and post-termination failures preserve owner evidence without retrying", async () => {
+  for (
+    const [reason, category, status] of [
+      ["stop_request_interrupted", "conflict", 409],
+      ["stop_terminated_persistence_failed", "internal", 500],
+      ["stop_terminated_persistence_outcome_unknown", "unknown", 500],
+      ["stop_terminated_cleanup_failed", "dependency", 500],
+    ] as const
+  ) {
+    const explanation =
+      `Owner explanation for ${reason}; inspect before recovery.`;
+    const problem = controlProblem(reason, explanation, status);
+    problem.yoi_failure.category = category;
+    for (const validCategory of [true, false]) {
+      let calls = 0;
+      try {
+        await stopSidebarWorker(
+          "team",
+          worker,
+          (() => {
+            calls++;
+            return Promise.resolve(controlProblemResponse({
+              ...problem,
+              yoi_failure: {
+                ...problem.yoi_failure,
+                category: validCategory ? category : "authorization",
+              },
+            }));
+          }) as typeof fetch,
+        );
+        throw new Error("must reject");
+      } catch (error) {
+        assert(error instanceof RuntimeControlHttpError);
+        assertEquals(error.receipt.kind, validCategory ? "problem" : "invalid");
+        if (error.receipt.kind === "problem") {
+          assertEquals(error.receipt.problem.yoi_failure.details, reason);
+          assertEquals(error.receipt.problem.yoi_failure.category, category);
+          assertEquals(error.message, explanation);
+        } else {
+          assert(!error.message.includes(explanation));
+        }
+      }
+      assertEquals(calls, 1);
+    }
+    {
+      let calls = 0;
+      await assertRejects(
+        () =>
+          stopSidebarWorker(
+            "team",
+            worker,
+            (() => {
+              calls++;
+              return Promise.resolve(jsonResponse({
+                state: "rejected",
+                runtime_id: worker.runtime_id,
+                worker_id: worker.worker_id,
+                control: reason,
+                control_explanation: explanation,
+                diagnostics: [],
+              }));
+            }) as typeof fetch,
+          ),
+        explanation,
+      );
+      assertEquals(calls, 1);
+    }
+  }
+});
+
 Deno.test("Restore and Stop HTTP failures display the typed primary cause, not legacy bodies or supplemental order", async () => {
   for (
     const explanation of [

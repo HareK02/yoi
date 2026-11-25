@@ -2303,6 +2303,144 @@ async fn confirmed_restore_preserves_attribution_with_revoked_host_trust_but_pro
     shutdown_workspace_feature_storage(api).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn confirmed_restore_rejects_changed_saved_identity_before_effects_without_implicit_repair() {
+    use session_store::{Store as _, WorkerMetadataStore as _};
+    use std::sync::atomic::Ordering::SeqCst;
+    use worker_runtime::execution::WorkerExecutionBackend as _;
+
+    for change in ["subject", "session", "unconfirmed"] {
+        let fixture = connected_restore_fixture().await;
+        let api = &fixture.api;
+        let worker = &fixture.worker;
+        let probe = &fixture.probe;
+        let aggregate = api
+            .config
+            .embedded_runtime_store_root
+            .join("workers")
+            .join(&worker.worker_id);
+        let name = format!("worker-runtime-{}", worker.worker_id);
+        let metadata = session_store::WorkerAggregateStore::new(&aggregate, &name).unwrap();
+        let saved = metadata.read_by_name(&name).unwrap().unwrap();
+        let active = saved.active.as_ref().unwrap();
+        let sessions =
+            session_store::WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+        let before = serde_json::to_value(
+            sessions
+                .read_all_read_only(active.session_id, active.segment_id.unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let store = open_subjektiv_store(api).unwrap();
+        let attributions = store
+            .subject_session_attributions(&fixture.subject_id)
+            .unwrap();
+        let model_before = fixture.model.calls.load(SeqCst);
+        let request = runtime_api::WorkerRestoreRequest {
+            expected_observation_token: api
+                .runtime
+                .worker(worker)
+                .unwrap()
+                .restore_observation_token
+                .unwrap(),
+            request_id: format!("restore-changed-{change}"),
+            preparation: Some(runtime_api::WorkerRestorePreparation::default()),
+        };
+        fixture.requests.lock().unwrap().clear();
+        fixture.callbacks.lock().unwrap().clear();
+        let runtime = api.runtime.clone();
+        let target = worker.clone();
+        let restoring =
+            tokio::task::spawn_blocking(move || runtime.restore_worker(&target, request));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            probe.prepared.notified(),
+        )
+        .await
+        .unwrap();
+        // Inject a competing saved-state change only after the real read-only
+        // candidate exists. Do not alter its frozen connection or trust grants.
+        metadata
+            .update_by_name(&name, |metadata| {
+                metadata.subjektiv_session_attribution = Some(match change {
+                    "subject" => session_store::SubjektivSessionAttributionState::Confirmed {
+                        session_id: active.session_id,
+                        subject_id: "different-subject".into(),
+                    },
+                    "session" => session_store::SubjektivSessionAttributionState::Confirmed {
+                        session_id: session_store::new_session_id(),
+                        subject_id: fixture.subject_id.clone(),
+                    },
+                    _ => session_store::SubjektivSessionAttributionState::OutcomeUnknown {
+                        session_id: active.session_id,
+                        diagnostic: "concurrent attribution acknowledgement loss".into(),
+                    },
+                });
+            })
+            .unwrap();
+        let changed = metadata.read_by_name(&name).unwrap().unwrap();
+        probe.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), restoring)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.state,
+            server_api::WorkerRestoreState::ReconciliationRequired,
+            "{change}: {result:?}"
+        );
+        assert_eq!(probe.prepares.load(SeqCst), 1);
+        assert_eq!(probe.publications.load(SeqCst), 0);
+        assert_eq!(fixture.model.calls.load(SeqCst), model_before);
+        assert!(
+            fixture.callbacks.lock().unwrap().is_empty(),
+            "{change}: ordinary restore must not repair a changed attribution"
+        );
+        assert_eq!(
+            metadata
+                .read_by_name(&name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution,
+            changed.subjektiv_session_attribution
+        );
+        assert_eq!(
+            serde_json::to_value(
+                sessions
+                    .read_all_read_only(active.session_id, active.segment_id.unwrap())
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .subject_session_attributions(&fixture.subject_id)
+                .unwrap(),
+            attributions
+        );
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(aggregate.join("worker.json")).unwrap()).unwrap();
+        assert!(
+            record["restore_guard"]["owners"][format!("restore-changed-{change}")]["receipt"]
+                .is_null()
+        );
+        let worker_ref = worker_runtime::identity::WorkerRef::try_from(worker).unwrap();
+        assert!(fixture.execution.worker_snapshot(&worker_ref).is_none());
+        let stop = worker_runtime::execution::WorkerExecutionStopRequest {
+            worker_ref: worker_ref.clone(),
+            operation_id: worker_runtime::execution::WorkerLifecycleOperationId::new(),
+        };
+        let cleanup = fixture.execution.stop_worker_operation(stop.clone());
+        assert!(cleanup.is_accepted(), "{change}: {cleanup:?}");
+        assert!(cleanup.termination.as_ref().is_some_and(|receipt| {
+            receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)
+        }));
+        shutdown_workspace_feature_storage(api).await.unwrap();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ConnectedRepair {
     IncompleteAttribution,
@@ -2626,15 +2764,28 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
             server_api::WorkerRestoreState::ReconciliationRequired,
             "{replay:?}"
         );
-        assert!(
-            fixture
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(path, status)| path.ends_with("/subjektiv/sessions")
-                    && *status == StatusCode::UNAUTHORIZED)
-        );
+        {
+            let requests = fixture.requests.lock().unwrap();
+            assert!(requests.iter().any(|(path, status)| {
+                path.ends_with("/subjektiv/worker-connection")
+                    && *status == StatusCode::UNAUTHORIZED
+            }));
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(path, _)| path.ends_with("/subjektiv/sessions"))
+                    .count(),
+                1,
+                "current Host verification must refuse the replay before a second Session registration"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|(path, status)| path.ends_with("/subjektiv/sessions")
+                        && *status == StatusCode::OK),
+                "the first registration committed before its response was lost"
+            );
+        }
         assert_eq!(probe.prepares.load(SeqCst), 0);
         assert_eq!(probe.activations.load(SeqCst), 0);
         assert_eq!(probe.publications.load(SeqCst), 0);
@@ -2797,8 +2948,8 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
         );
         assert_eq!(
             callbacks.len(),
-            2,
-            "only the initial registration recovery and its same-operation retry contact the Host"
+            if revoked { 1 } else { 2 },
+            "revoked replay must stop at connection verification; otherwise only the initial registration and same-operation retry reach Session registration"
         );
         assert!(
             callbacks
