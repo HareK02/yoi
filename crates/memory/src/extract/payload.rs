@@ -1,10 +1,7 @@
-//! extract staging schema.
+//! Candidate records for Subject Memory extraction.
 //!
-//! Extract produces memory-candidate records, not activity-log batches. During
-//! the transitional `write_extracted` path the model submits an
-//! [`ExtractedPayload`] containing `candidates[]`; the host expands each
-//! candidate into one [`StagingRecord`] and attaches record ids, extract-run ids,
-//! record-level source, evidence snippets, and source anchors mechanically.
+//! The Host attaches record ids, extract-run ids, bounded evidence, and source
+//! anchors before storing each candidate as one consolidation decision unit.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,24 +49,9 @@ pub struct ExtractedCandidate {
     /// Optional invalidation / staleness hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staleness: Option<String>,
-    /// Evidence ids selected by the extract worker. The transitional
-    /// `write_extracted` path may leave this empty until `session-explore`
-    /// provides host-issued evidence ids.
+    /// Host-issued evidence ids selected by the extraction Worker.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_ids: Vec<String>,
-}
-
-/// Transitional extract output: zero or more flat candidates.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct ExtractedPayload {
-    #[serde(default)]
-    pub candidates: Vec<ExtractedCandidate>,
-}
-
-impl ExtractedPayload {
-    pub fn is_empty(&self) -> bool {
-        self.candidates.is_empty()
-    }
 }
 
 /// Bounded evidence snippet copied into a flat staging record.
@@ -141,21 +123,6 @@ mod tests {
             segment_id: "segment-record".into(),
             range: [0, 20],
         }
-    }
-
-    #[test]
-    fn extracted_payload_empty_when_no_candidates() {
-        assert!(ExtractedPayload::default().is_empty());
-        let payload = ExtractedPayload {
-            candidates: vec![ExtractedCandidate {
-                kind: CandidateKind::Decision,
-                claim: "Use flat staging records".into(),
-                why_useful: "Consolidation can resolve candidates independently".into(),
-                staleness: None,
-                evidence_ids: Vec::new(),
-            }],
-        };
-        assert!(!payload.is_empty());
     }
 
     #[test]

@@ -688,11 +688,6 @@ fn profiles_with_unavailable_requirements_are_rejected_without_name_allowlist_or
             json!({"subjektiv":{"consolidation_tools":true}}),
             "feature.subjektiv",
         ),
-        (
-            "feature",
-            json!({"memory":{"staging_tools":true}}),
-            "feature.memory",
-        ),
         ("scope", json!("workspace_read"), "scope"),
         (
             "delegation_scope",

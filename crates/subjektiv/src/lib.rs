@@ -689,7 +689,6 @@ pub const REGISTRATION: FeatureRegistration =
 /// and connection lifecycle to [`feature_storage`]. Synchronous API; async Hosts use a blocking executor.
 ///
 /// Scope and subject IDs select storage boundaries; the Host authenticates before calls.
-/// Independent of the legacy Workspace Memory DB, with no implicit import or dual writes.
 /// This store saves no current Worker links; the Host manages execution ownership.
 #[derive(Clone)]
 pub struct SubjektivStore {

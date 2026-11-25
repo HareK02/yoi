@@ -41,7 +41,7 @@ pub struct FixedWorkerSeed<'a> {
 
 /// Insert catalog, completed reservation, owner grant and frozen launch bundle atomically.
 ///
-/// Uses the normal reservation validators, authoritative Memory snapshot, fingerprint
+/// Uses the normal reservation validators, Feature initialization fingerprint
 /// binding, resource-key allocator and immediate transaction. Even an exact repeat is
 /// rejected: this is not an upsert/import/recovery API. Existing allocations, Worker
 /// identities and residual lifecycle/attachment records are never adopted or repaired.
@@ -68,7 +68,7 @@ pub fn seed_fixed_worker(
         || !request.resolved_workdir_attachments.is_empty()
         || request.resolved_config_bundle.is_some()
         || request.resolved_workspace_api.is_some()
-        || request.resolved_memory_settings.is_some()
+        || request.resolved_subjektiv_memory_settings.is_some()
         || request.resolved_worker_observation_enabled
         || !request.resolved_worker_observation_grants.is_empty()
         || request.resolved_control_operation.is_some()
@@ -147,14 +147,12 @@ pub fn seed_fixed_worker(
         .unwrap_or(&worker_id);
     validate_non_empty("fixture Worker display name", display_name)?;
     let fingerprint = worker_spawn_create_fingerprint(request).map_err(Error::InvalidInput)?;
-    let memory = store.get_workspace_memory_settings(seed.workspace_id)?;
     store.reserve_worker_create_with(
         seed.workspace_id,
         seed.runtime_id,
         seed.allocation_key,
         &fingerprint,
         None,
-        &memory,
         &Default::default(),
         |tx| {
             require_seed_target(tx, &seed)?;
@@ -384,7 +382,7 @@ mod tests {
             resolved_workdir_attachments: Vec::new(),
             resolved_config_bundle: None,
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_worker_observation_enabled: false,
@@ -431,8 +429,6 @@ mod tests {
         let second = seed_fixed_worker(&b, seed(&b, &request)).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.worker_id.to_string(), WORKER);
-        assert_eq!(first.memory_settings.workspace_id, WORKSPACE);
-        assert_eq!(first.memory_settings.language, "English");
         assert!(first.singleton.is_none());
         assert_ne!(
             a.get_workspace_signing_identity(WORKSPACE)
@@ -645,9 +641,8 @@ mod tests {
     fn reserved_and_orphaned_resource_identities_are_not_adopted() {
         let store = bootstrap();
         let request = request();
-        let memory = store.get_workspace_memory_settings(WORKSPACE).unwrap();
         let ordinary = store
-            .reserve_worker_create(WORKSPACE, RUNTIME, "ordinary", "fingerprint", None, &memory)
+            .reserve_worker_create(WORKSPACE, RUNTIME, "ordinary", "fingerprint", None)
             .unwrap();
         let mut collision = seed(&store, &request);
         collision.worker_id = ordinary.worker_id;
@@ -861,10 +856,9 @@ mod tests {
     #[test]
     fn ordinary_creation_still_allocates_and_replays_without_catalog_insertion() {
         let store = bootstrap();
-        let memory = store.get_workspace_memory_settings(WORKSPACE).unwrap();
         let reserve = |key| {
             store
-                .reserve_worker_create(WORKSPACE, RUNTIME, key, "fingerprint", None, &memory)
+                .reserve_worker_create(WORKSPACE, RUNTIME, key, "fingerprint", None)
                 .unwrap()
         };
         let first = reserve("ordinary-one");
@@ -890,7 +884,7 @@ mod tests {
         );
         assert!(
             store
-                .reserve_worker_create(WORKSPACE, RUNTIME, "ordinary-one", "changed", None, &memory)
+                .reserve_worker_create(WORKSPACE, RUNTIME, "ordinary-one", "changed", None)
                 .is_err()
         );
     }

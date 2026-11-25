@@ -1426,7 +1426,7 @@ async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy
     manifest
         .feature
         .subjektiv
-        .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+        .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-1".into(),
             language: "English".into(),
         })
@@ -1510,7 +1510,7 @@ async fn denied_subject_job_input_supply_stops_before_model_dispatch() {
             manifest
                 .feature
                 .subjektiv
-                .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                     workspace_id: "workspace-1".into(),
                     language: "English".into(),
                 })
@@ -1620,7 +1620,7 @@ permission = "write"
     assert!(names.iter().any(|name| name == "WebSearch"));
     assert!(names.iter().any(|name| name == "WebFetch"));
     assert!(!names.iter().any(|name| name == "SubWorkerSpawn"));
-    assert!(!names.iter().any(|name| name == "MemoryRead"));
+    assert!(!names.iter().any(|name| name == "SubjektivMemoryRead"));
 }
 
 #[tokio::test]

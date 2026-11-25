@@ -1247,10 +1247,6 @@ async fn session_runtime_subject(
     } else {
         crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap()
     };
-    let memory = fixture
-        .store
-        .get_workspace_memory_settings(WORKSPACE)
-        .unwrap();
     let reservation = fixture
         .store
         .reserve_worker_create(
@@ -1259,7 +1255,6 @@ async fn session_runtime_subject(
             "network-fixture",
             "network-fixture-fingerprint",
             Some(&singleton),
-            &memory,
         )
         .unwrap();
     let worker = RuntimeWorkerRef::new("subject-runtime", reservation.worker_id.to_string());
@@ -1409,7 +1404,7 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
         observed(
             fixture
                 .executor
-                .run(move || read_store.get_workspace_memory_settings(WORKSPACE)),
+                .run(move || read_store.list_workspace_runtime_bindings(WORKSPACE, false)),
         )
         .await
         .unwrap();
@@ -1466,7 +1461,7 @@ async fn runtime_registration_scan_keeps_sql_and_tokio_free_and_retains_cancelle
     observed(
         fixture
             .executor
-            .run(move || store.get_workspace_memory_settings(WORKSPACE)),
+            .run(move || store.list_workspace_runtime_bindings(WORKSPACE, false)),
     )
     .await
     .unwrap();
@@ -1981,7 +1976,7 @@ async fn runtime_metadata_reads_wait_off_tokio_and_db_and_retain_cancelled_host_
         observed(
             fixture
                 .executor
-                .run(move || read_store.get_workspace_memory_settings(WORKSPACE)),
+                .run(move || read_store.list_workspace_runtime_bindings(WORKSPACE, false)),
         )
         .await
         .unwrap();

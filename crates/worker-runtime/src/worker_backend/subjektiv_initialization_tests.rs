@@ -142,7 +142,7 @@ mod subjektiv_initialization_tests {
             "profile-source-archive:subject-initialization".into(), "builtin:companion".into(),
             serde_json::json!({"slug":"subject-initialization","description":"Subject initialization test","scope":"workspace_read",
                 "model":{"scheme":"anthropic","model_id":"unused","auth":{"kind":"none"}},
-                "engine":{"max_tokens":100},"feature":{"memory":{"enabled":false},"subjektiv":{"enabled":true,"extraction":{"enabled":false}}}})
+                "engine":{"max_tokens":100},"feature":{"subjektiv":{"enabled":true,"extraction":{"enabled":false}}}})
         ).unwrap();
         let mut bundle = test_bundle();
         bundle.metadata.workspace_id = WORKSPACE.into();
@@ -164,7 +164,7 @@ mod subjektiv_initialization_tests {
             workspace_id: WORKSPACE.into(),
             base_url: host.base_url.clone(),
         });
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        request.memory_settings = Some(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: WORKSPACE.into(),
             language: "English".into(),
         });

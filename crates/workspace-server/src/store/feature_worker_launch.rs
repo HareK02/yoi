@@ -79,7 +79,6 @@ impl SqliteWorkspaceStore {
         caller_fingerprint: &str,
         request_fingerprint: &str,
         singleton: Option<&str>,
-        memory: &WorkspaceMemorySettingsRecord,
         profile: &str,
         bundle: &ConfigBundle,
         initialization: &FeatureInitializations,
@@ -98,7 +97,7 @@ impl SqliteWorkspaceStore {
         let bundle_json = serde_json::to_string(bundle)
             .map_err(|e| Error::Store(format!("Feature Worker Profile bundle: {e}")))?;
         self.reserve_worker_create_with_binding(
-            workspace, runtime, &allocation, request_fingerprint, singleton, memory, initialization,
+            workspace, runtime, &allocation, request_fingerprint, singleton, initialization,
             |tx| {
                 // Double-check under the same IMMEDIATE transaction as reserve.
                 // A prior public read cannot fence competing Server processes.

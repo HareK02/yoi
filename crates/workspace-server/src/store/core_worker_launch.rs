@@ -43,7 +43,6 @@ impl SqliteWorkspaceStore {
         request_fingerprint: &str,
         caller_fingerprint: &str,
         singleton: Option<&str>,
-        memory: &WorkspaceMemorySettingsRecord,
         draft: &CoreWorkerExecutionGrant,
         bundle: &worker_runtime::config_bundle::ConfigBundle,
     ) -> Result<WorkerCreateReservation> {
@@ -54,7 +53,6 @@ impl SqliteWorkspaceStore {
             request_fingerprint,
             caller_fingerprint,
             singleton,
-            memory,
             draft,
             bundle,
             &FeatureInitializations::default(),
@@ -70,7 +68,6 @@ impl SqliteWorkspaceStore {
         request_fingerprint: &str,
         caller_fingerprint: &str,
         singleton: Option<&str>,
-        memory: &WorkspaceMemorySettingsRecord,
         draft: &CoreWorkerExecutionGrant,
         bundle: &worker_runtime::config_bundle::ConfigBundle,
         feature_initialization: &FeatureInitializations,
@@ -85,7 +82,7 @@ impl SqliteWorkspaceStore {
                 "resolved launch identity or Profile bundle mismatch".into(),
             ));
         }
-        self.reserve_worker_create_with(workspace, runtime, operation, request_fingerprint, singleton, memory, feature_initialization,
+        self.reserve_worker_create_with(workspace, runtime, operation, request_fingerprint, singleton, feature_initialization,
             |tx| {
                 let existing: Option<(Option<String>, Option<String>, String)> = tx.query_row(
                     "SELECT b.caller_fingerprint,b.config_bundle_json,r.worker_id FROM worker_create_reservations r LEFT JOIN core_worker_launch_bindings b ON b.workspace_id=r.workspace_id AND b.operation_id=r.allocation_key WHERE r.workspace_id=?1 AND r.allocation_key=?2",

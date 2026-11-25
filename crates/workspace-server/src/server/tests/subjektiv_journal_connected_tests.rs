@@ -857,10 +857,6 @@ async fn signed_compaction_read_does_not_contact_runtime_or_wait_for_active_gene
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("snapshot").unwrap())
         .unwrap();
-    let settings = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reserve = |key: String, operation: &str| {
         api.config_store
             .reserve_worker_create(
@@ -869,7 +865,6 @@ async fn signed_compaction_read_does_not_contact_runtime_or_wait_for_active_gene
                 operation,
                 &"f".repeat(64),
                 Some(&key),
-                &settings,
             )
             .unwrap()
             .worker_id
@@ -991,12 +986,19 @@ fn connected_host_reader(
         &worker.worker_id,
     )
     .with_runtime_request_source(&EMBEDDED_RUNTIME_REQUEST_IDENTITY, audience);
+    let language = api.config_store.with_conn(|conn| {
+        Ok(conn.query_row(
+            "SELECT subjektiv_memory_language FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+            rusqlite::params![TEST_WORKSPACE_ID, worker.runtime_id, worker.worker_id],
+            |row| row.get::<_, String>(0),
+        )?)
+    }).unwrap();
     let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
     config.profile.enabled = true;
     config
-        .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+        .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: TEST_WORKSPACE_ID.into(),
-            language: "English".into(),
+            language,
         })
         .unwrap();
     worker::subjektiv::SubjektivHostConnection::new(
@@ -1528,10 +1530,6 @@ async fn seed_unstarted_pending_head(
     .unwrap()
     .unwrap();
     let archive = bundle.profile_source_archive.clone().unwrap();
-    let settings = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let singleton = crate::subjektiv::subject_worker_singleton_key(subject_id).unwrap();
     // Reserve only: this supplies the real Host's Worker/Subject binding, but is
     // deliberately not completed as an accepted create operation.
@@ -1548,7 +1546,6 @@ async fn seed_unstarted_pending_head(
             "pending-head-fixture-reservation",
             &"f".repeat(64),
             Some(&singleton),
-            &settings,
             &initialization,
         )
         .unwrap();
@@ -1592,7 +1589,7 @@ async fn seed_unstarted_pending_head(
         worker_observation_enabled: false,
         worker_observation_grants: Vec::new(),
         workspace_api: Some(api.workspace_api_ref(EMBEDDED_WORKER_RUNTIME_ID)),
-        memory_settings: Some(reservation.memory_settings.clone()),
+        memory_settings: reservation.subjektiv_memory_settings.clone(),
         feature_initialization: initialization,
         backend_job: None,
     };
@@ -1647,7 +1644,7 @@ enabled = false
     manifest
         .feature
         .subjektiv
-        .bind_workspace_settings(reservation.memory_settings)
+        .bind_workspace_settings(reservation.subjektiv_memory_settings.unwrap())
         .unwrap();
     let sessions = session_store::WorkerSessionStore::new(aggregate.join("session")).unwrap();
     let metadata = session_store::WorkerAggregateStore::new(&aggregate, &name).unwrap();

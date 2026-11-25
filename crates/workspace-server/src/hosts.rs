@@ -822,7 +822,6 @@ pub struct WorkerTicketAssignmentRequest {
     /// Observed delegation required for Orchestrator Ticket starts; manual starts omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_assignment_id: Option<String>,
-
     pub ticket_id: String,
     pub operation_id: String,
 }
@@ -900,9 +899,9 @@ pub struct WorkerSpawnRequest {
     pub resolved_config_bundle: Option<ConfigBundle>,
     #[serde(skip, default)]
     pub resolved_workspace_api: Option<WorkspaceApiRef>,
-    /// Backend-authored immutable Workspace Memory settings snapshot.
+    /// Frozen Subjektiv execution settings from the Worker create reservation.
     #[serde(skip, default)]
-    pub resolved_memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    pub resolved_subjektiv_memory_settings: Option<manifest::SubjektivMemorySettingsSnapshot>,
     /// Caller intent is fingerprinted independently of Host-resolved connection data.
     #[serde(default)]
     pub feature_connections: protocol::feature_initialization::FeatureInitializations,
@@ -8075,7 +8074,7 @@ fn runtime_create_worker_request(
         worker_observation_enabled: request.resolved_worker_observation_enabled,
         worker_observation_grants: request.resolved_worker_observation_grants.clone(),
         workspace_api: Some(workspace_api),
-        memory_settings: request.resolved_memory_settings.clone(),
+        memory_settings: request.resolved_subjektiv_memory_settings.clone(),
         plugin_execution: binding.plugin_execution,
         feature_initialization: request.resolved_feature_initialization.clone(),
         backend_job: match &request.intent {
@@ -8205,9 +8204,7 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
     Some(match profile {
         ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => {
             let builtin_name = name.strip_prefix("builtin:").unwrap_or(name);
-            if builtin_name == MEMORY_CONSOLIDATION_PROFILE {
-                MEMORY_CONSOLIDATION_PROFILE.to_string()
-            } else if builtin_name == WORKSPACE_ORCHESTRATOR_PROFILE {
+            if builtin_name == WORKSPACE_ORCHESTRATOR_PROFILE {
                 WORKSPACE_ORCHESTRATOR_PROFILE.to_string()
             } else {
                 safe_display_hint(name)
@@ -8216,17 +8213,13 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
     })
 }
 
-const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
-pub(crate) const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
 pub(crate) const SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX: &str = "subjektiv-consolidation:";
 const WORKSPACE_ORCHESTRATOR_PROFILE: &str = "orchestrator";
 pub(crate) const WORKSPACE_ORCHESTRATOR_SINGLETON_KEY: &str = "workspace-orchestrator";
 
 pub(crate) fn is_reserved_internal_worker_singleton_key(key: &str) -> bool {
-    matches!(
-        key,
-        MEMORY_CONSOLIDATION_SINGLETON_KEY | WORKSPACE_ORCHESTRATOR_SINGLETON_KEY
-    ) || key.starts_with(SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX)
+    matches!(key, WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+        || key.starts_with(SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX)
 }
 
 struct WorkerDisplayMetadata {
@@ -8241,21 +8234,6 @@ fn worker_display_metadata(
     requested_display_name: Option<&str>,
     internal: bool,
 ) -> WorkerDisplayMetadata {
-    if profile_label == Some(MEMORY_CONSOLIDATION_PROFILE) {
-        let mut tags = vec![
-            "memory".to_string(),
-            "consolidation".to_string(),
-            "singleton".to_string(),
-        ];
-        if internal {
-            tags.insert(0, "internal".to_string());
-        }
-        return WorkerDisplayMetadata {
-            display_name: "Memory Consolidation".to_string(),
-            singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
-            tags,
-        };
-    }
     if profile_label == Some(WORKSPACE_ORCHESTRATOR_PROFILE)
         && requested_display_name == Some(WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
     {
@@ -10377,13 +10355,6 @@ mod tests {
         }
     }
 
-    fn test_memory_settings() -> manifest::WorkspaceMemorySettingsSnapshot {
-        manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-test".to_string(),
-            language: "English".to_string(),
-        }
-    }
-
     #[test]
     fn worker_summary_keeps_flat_wire_identity_while_using_structured_internal_identity() {
         let summary = placeholder_worker("placeholder");
@@ -11255,7 +11226,7 @@ mod tests {
             authorization: None,
             resolved_core_execution_grant: None,
             resolved_workspace_api: Some(test_workspace_api()),
-            resolved_memory_settings: Some(test_memory_settings()),
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
         }
@@ -11294,6 +11265,26 @@ mod tests {
     #[test]
     fn runtime_create_request_serializes_only_canonical_workdir_attachments() {
         let mut request = embedded_spawn_request();
+        let original_fingerprint = worker_spawn_create_fingerprint(&request).unwrap();
+        let frozen_settings = manifest::SubjektivMemorySettingsSnapshot {
+            workspace_id: "workspace-test".into(),
+            language: "日本語".into(),
+        };
+        request.resolved_subjektiv_memory_settings = Some(frozen_settings.clone());
+        assert_eq!(
+            worker_spawn_create_fingerprint(&request).unwrap(),
+            original_fingerprint
+        );
+        let spawn_json = serde_json::to_value(&request).unwrap();
+        assert!(
+            spawn_json
+                .get("resolved_subjektiv_memory_settings")
+                .is_none()
+        );
+        let mut forged = spawn_json;
+        forged["resolved_subjektiv_memory_settings"] =
+            serde_json::to_value(&frozen_settings).unwrap();
+        assert!(serde_json::from_value::<WorkerSpawnRequest>(forged).is_err());
         request.resolved_workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
             alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: "workdir-1".to_string(),
@@ -11311,6 +11302,10 @@ mod tests {
         );
 
         let value = serde_json::to_value(create).unwrap();
+        assert_eq!(
+            value["memory_settings"],
+            serde_json::to_value(&frozen_settings).unwrap()
+        );
         assert!(value.get("working_directory").is_none());
         assert!(value.get("working_directory_request").is_none());
         assert_eq!(value["workdir_attachments"].as_array().unwrap().len(), 1);
@@ -11667,7 +11662,7 @@ mod tests {
                     authorization: None,
                     resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
-                    resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_memory_settings: None,
                     feature_connections: Default::default(),
                     resolved_feature_initialization: Default::default(),
                 },
@@ -11782,7 +11777,7 @@ mod tests {
                     authorization: None,
                     resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
-                    resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_memory_settings: None,
                     feature_connections: Default::default(),
                     resolved_feature_initialization: Default::default(),
                 },
@@ -11826,7 +11821,7 @@ mod tests {
                     authorization: None,
                     resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
-                    resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_memory_settings: None,
                     feature_connections: Default::default(),
                     resolved_feature_initialization: Default::default(),
                 },

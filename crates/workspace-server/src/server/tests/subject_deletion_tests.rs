@@ -723,10 +723,6 @@ async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pendi
         } else {
             "unmaterialized-subject-body".into()
         };
-        let settings = api
-            .config_store
-            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-            .unwrap();
         let reserved = api
             .config_store
             .reserve_worker_create(
@@ -735,7 +731,6 @@ async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pendi
                 &allocation,
                 "unmaterialized-fingerprint",
                 singleton.as_deref(),
-                &settings,
             )
             .unwrap();
         let worker =
@@ -774,7 +769,6 @@ async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pendi
                     &allocation,
                     "unmaterialized-fingerprint",
                     singleton.as_deref(),
-                    &settings
                 )
                 .is_err()
         );

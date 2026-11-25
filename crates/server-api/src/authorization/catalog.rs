@@ -802,31 +802,6 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
         ],
     );
     add(
-        K::Workspace,
-        &[
-            (
-                "memory.document.read",
-                "Read Workspace Memory document",
-                "Read a legacy Workspace Memory document; not Subject Memory.",
-            ),
-            (
-                "memory.document.update",
-                "Update Workspace Memory document",
-                "Update a legacy Workspace Memory document with existing storage constraints.",
-            ),
-            (
-                "memory.audit.append",
-                "Append Workspace Memory audit",
-                "Append a Workspace Memory audit event.",
-            ),
-            (
-                "memory.staging.close",
-                "Close Workspace Memory candidate",
-                "Close a legacy Workspace staging candidate.",
-            ),
-        ],
-    );
-    add(
         K::Subject,
         &[
             (
@@ -841,26 +816,6 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
             ),
         ],
     );
-    // The same exact operation may target either independent Memory domain. This
-    // adds accepted kinds, never cross-kind containment or a second descriptor.
-    for descriptor in &mut catalog {
-        if matches!(
-            descriptor.operation.as_str(),
-            "memory.query"
-                | "memory.resident.read"
-                | "memory.resident.supply"
-                | "memory.staging.write"
-                | "memory.staging.list"
-                | "memory.staging.read"
-                | "memory.extract.read"
-                | "memory.extract.supply"
-                | "memory.extract.commit"
-                | "memory.consolidation.request"
-        ) {
-            descriptor.resource_kinds.push(K::Workspace);
-            descriptor.description.push_str(" The Workspace kind selects the separate legacy Workspace Memory domain, never all Subjects.");
-        }
-    }
     catalog.push(PermissionOperationDescriptor {
         operation: "notification.diagnostics.read".into(), label: "Read notification diagnostics".into(),
         description: "Read bounded saved delivery evidence for the exact source resource; Runtime acceptance does not prove processing.".into(),

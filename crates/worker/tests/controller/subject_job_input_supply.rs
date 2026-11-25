@@ -81,7 +81,7 @@ async fn job_worker(
         manifest
             .feature
             .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-test".into(),
                 language: "English".into(),
             })

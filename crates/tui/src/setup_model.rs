@@ -227,9 +227,6 @@ worker_context_max_tokens = 100000
 [feature.task]
 enabled = true
 
-[feature.memory]
-enabled = false
-
 [feature.web]
 enabled = true
 

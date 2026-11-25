@@ -103,13 +103,11 @@
     "profile": {
       "engine": { "reasoning": -1 },
       "feature": {
-        "memory": { "extraction": { "enabled": true, "reasoning": 4096 } },
         "subjektiv": { "extraction": { "enabled": true, "reasoning": 4096 } }
       }
     },
     "manifest_expect": {
       "/engine/reasoning": -1,
-      "/feature/memory/profile/extraction/reasoning": 4096,
       "/feature/subjektiv/profile/extraction/reasoning": 4096
     }
   },
@@ -117,14 +115,12 @@
     "name": "string_extraction_reasoning",
     "profile": {
       "feature": {
-        "memory": { "extraction": { "enabled": true, "reasoning": "high" } },
         "subjektiv": {
           "extraction": { "enabled": true, "reasoning": "medium" }
         }
       }
     },
     "manifest_expect": {
-      "/feature/memory/profile/extraction/reasoning": "high",
       "/feature/subjektiv/profile/extraction/reasoning": "medium"
     }
   },

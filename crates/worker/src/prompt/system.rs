@@ -115,7 +115,7 @@ pub struct SystemPromptContext<'a> {
     /// Not visible from the template; consumed by the trailing-section
     /// formatter in [`SystemPromptTemplate::render`].
     pub agents_md: Option<String>,
-    /// The body of the workspace Memory document. `None` disables the
+    /// The connected Subject's resident Memory context. `None` disables the
     /// resident summary section; empty strings are ignored by the trailing-section
     /// formatter.
     pub resident_summary: Option<&'a str>,
@@ -141,7 +141,7 @@ impl<'a> SystemPromptContext<'a> {
             Value::from(self.now.to_rfc3339_opts(SecondsFormat::Secs, true)),
         );
         // A singular template cwd is meaningful only with one attachment. Never
-        // substitute the local Profile/Memory discovery directory for a session cwd.
+        // substitute the local Profile discovery directory for a session cwd.
         let cwd = self
             .workdir_sessions
             .only_session()
@@ -169,9 +169,6 @@ impl<'a> SystemPromptContext<'a> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ToolCapabilities {
-    memory_query: bool,
-    memory_read_document: bool,
-    memory_update_document: bool,
     sub_worker_spawn: bool,
     sub_worker_send: bool,
     sub_worker_stop: bool,
@@ -184,9 +181,6 @@ impl ToolCapabilities {
         let mut capabilities = Self::default();
         for name in names {
             match name.as_str() {
-                "MemoryQuery" => capabilities.memory_query = true,
-                "MemoryReadDocument" => capabilities.memory_read_document = true,
-                "MemoryUpdateDocument" => capabilities.memory_update_document = true,
                 "SubWorkerSpawn" => capabilities.sub_worker_spawn = true,
                 _ => {}
             }
@@ -204,18 +198,6 @@ impl ToolCapabilities {
         capabilities
     }
 
-    fn memory_records(self) -> bool {
-        self.memory_query || self.memory_read_document || self.memory_update_document
-    }
-
-    fn memory_any(self) -> bool {
-        self.memory_records()
-    }
-
-    fn memory_mutation(self) -> bool {
-        self.memory_update_document
-    }
-
     fn sub_worker_management(self) -> bool {
         self.sub_worker_spawn
             || self.sub_worker_send
@@ -226,18 +208,6 @@ impl ToolCapabilities {
 
     fn to_minijinja_value(self) -> Value {
         let mut map: BTreeMap<&'static str, Value> = BTreeMap::new();
-        map.insert("memory_any", Value::from(self.memory_any()));
-        map.insert("memory_records", Value::from(self.memory_records()));
-        map.insert("memory_query", Value::from(self.memory_query));
-        map.insert(
-            "memory_read_document",
-            Value::from(self.memory_read_document),
-        );
-        map.insert(
-            "memory_update_document",
-            Value::from(self.memory_update_document),
-        );
-        map.insert("memory_mutation", Value::from(self.memory_mutation()));
         map.insert(
             "sub_worker_management",
             Value::from(self.sub_worker_management()),
@@ -321,7 +291,7 @@ pub(crate) fn workdir_environment_section(
          Restrictions retain additional provider or ancestor ceilings, including deny rules. \
          Capabilities and command availability are session ceilings, not new grants. \
          Resolved targets remain subject to scope, symlink and command authorization. \
-         SubWorker scope declarations remain Workdir-root-relative; other Scope declarations and Profile/Memory roots retain their own meaning and are not rebased by session cwd.\n\n\
+         SubWorker scope declarations remain Workdir-root-relative; other Scope declarations and Profile roots retain their own meaning and are not rebased by session cwd.\n\n\
          ```json\n{json}\n```"
     ))
 }

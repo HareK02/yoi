@@ -1447,7 +1447,8 @@ impl WorkspaceApi {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
+
             // Journal Jobs use their independent frozen Job Host grant, not the
             // main-Subject/Memory attachment or its resident/extraction policy.
             feature_connections: Default::default(),

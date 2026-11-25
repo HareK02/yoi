@@ -43,7 +43,14 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 20;
+pub(crate) const SCHEMA_VERSION: u32 = 21;
+const STOP_HISTORY_SCHEMA_VERSION: u32 = 20;
+
+#[path = "fs_store_memory_retirement.rs"]
+mod memory_retirement;
+#[cfg(test)]
+#[path = "fs_store_memory_retirement_tests.rs"]
+mod memory_retirement_tests;
 const RECEIPT_SEQUENCE_SCHEMA_VERSION: u32 = 19;
 const LIFECYCLE_SCHEMA_VERSION: u32 = 18;
 const ATTACHMENT_AUTHORITY_SCHEMA_VERSION: u32 = 17;
@@ -958,11 +965,12 @@ fn plan_runtime_store_migration(
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
             | LIFECYCLE_SCHEMA_VERSION
             | RECEIPT_SEQUENCE_SCHEMA_VERSION
+            | STOP_HISTORY_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, {LIFECYCLE_SCHEMA_VERSION}, {RECEIPT_SEQUENCE_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, {LIFECYCLE_SCHEMA_VERSION}, {RECEIPT_SEQUENCE_SCHEMA_VERSION}, {STOP_HISTORY_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1305,6 +1313,7 @@ fn migrate_worker_record(
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
             | LIFECYCLE_SCHEMA_VERSION
             | RECEIPT_SEQUENCE_SCHEMA_VERSION
+            | STOP_HISTORY_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -2141,7 +2150,7 @@ fn migrate_worker_aggregate_document(
             )
         })?
         .to_string();
-    let migrated = actual_name != expected_name;
+    let mut migrated = actual_name != expected_name;
     if migrated {
         let legacy_worker_id = actual_name
             .strip_prefix("worker-runtime-")
@@ -2176,6 +2185,27 @@ fn migrate_worker_aggregate_document(
         .get_mut("resolved_manifest_snapshot")
         .filter(|snapshot| !snapshot.is_null())
     {
+        match memory_retirement::retire_disabled_memory(snapshot) {
+            memory_retirement::Retirement::Disabled => migrated = true,
+            memory_retirement::Retirement::Unavailable(_) => {
+                // Keep unavailable policy intact. It is never converted to an executable
+                // current Manifest; the normal reader rejects it and Runtime records a
+                // specific diagnostic without changing lifecycle/request history.
+                let saved_name = snapshot
+                    .get("manifest")
+                    .unwrap_or(snapshot)
+                    .pointer("/worker/name")
+                    .and_then(serde_json::Value::as_str);
+                if saved_name != Some(actual_name.as_str()) {
+                    return Err(runtime_store_corrupt(
+                        metadata_path,
+                        "retired Worker manifest identity does not match metadata".into(),
+                    ));
+                }
+                return Ok((document, migrated));
+            }
+            memory_retirement::Retirement::Unchanged => {}
+        }
         let mut manifest = manifest::read_persisted_worker_manifest_snapshot(snapshot.clone())
             .map_err(|error| {
                 runtime_store_corrupt(
@@ -2332,6 +2362,7 @@ fn migrate_runtime_document(
             | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
             | LIFECYCLE_SCHEMA_VERSION
             | RECEIPT_SEQUENCE_SCHEMA_VERSION
+            | STOP_HISTORY_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2800,6 +2831,7 @@ fn migrate_runtime_store_in_place(
         )
     })?;
 
+    let mut retired_workers = Vec::new();
     for planned_worker in &planned_workers {
         let source_dir = &planned_worker.source_dir;
         let source_snapshot_path = source_dir.join(WORKER_FILE);
@@ -2834,16 +2866,24 @@ fn migrate_runtime_store_in_place(
         let metadata = if metadata_path.is_file() {
             let metadata: serde_json::Value =
                 read_json(&metadata_path, "read Worker aggregate metadata")?;
-            Some(
-                migrate_worker_aggregate_document(
-                    metadata,
-                    planned_worker,
-                    runtime_id,
-                    &metadata_path,
-                )?
-                .0,
-            )
+            if let Some(reason) =
+                memory_retirement::unavailable_reason(&metadata, &aggregate.profile)
+            {
+                retired_workers.push((aggregate.worker_ref.clone(), reason));
+            }
+            Some(migrate_worker_aggregate_document(
+                metadata,
+                planned_worker,
+                runtime_id,
+                &metadata_path,
+            )?)
         } else {
+            if memory_retirement::legacy_profile(&aggregate.profile) {
+                retired_workers.push((
+                    aggregate.worker_ref.clone(),
+                    "removed Workspace Memory profile",
+                ));
+            }
             None
         };
 
@@ -2872,19 +2912,21 @@ fn migrate_runtime_store_in_place(
             }
         }
         // Schema 11/12 metadata was validated above but needs no conversion.
-        if let Some(metadata) = metadata
-            && !matches!(
-                plan.current_schema_version,
-                SOURCE_SCHEMA_VERSION
-                    | RESTORE_ADMISSION_SCHEMA_VERSION
-                    | RESTORE_DECISION_SCHEMA_VERSION
-                    | RESTORE_REPAIR_SCHEMA_VERSION
-                    | SESSION_ARCHIVE_SCHEMA_VERSION
-                    | ATTACHMENT_SET_SCHEMA_VERSION
-                    | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
-                    | LIFECYCLE_SCHEMA_VERSION
-                    | RECEIPT_SEQUENCE_SCHEMA_VERSION
-            )
+        if let Some((metadata, changed)) = metadata
+            && (changed
+                || !matches!(
+                    plan.current_schema_version,
+                    SOURCE_SCHEMA_VERSION
+                        | RESTORE_ADMISSION_SCHEMA_VERSION
+                        | RESTORE_DECISION_SCHEMA_VERSION
+                        | RESTORE_REPAIR_SCHEMA_VERSION
+                        | SESSION_ARCHIVE_SCHEMA_VERSION
+                        | ATTACHMENT_SET_SCHEMA_VERSION
+                        | ATTACHMENT_AUTHORITY_SCHEMA_VERSION
+                        | LIFECYCLE_SCHEMA_VERSION
+                        | RECEIPT_SEQUENCE_SCHEMA_VERSION
+                        | STOP_HISTORY_SCHEMA_VERSION
+                ))
         {
             atomic_write_json(
                 &migrated_dir.join(WORKER_METADATA_FILE),
@@ -2907,12 +2949,13 @@ fn migrate_runtime_store_in_place(
     // A Runtime schema bump says nothing about the retained Session schema.
     // Session Store owns versioned conversion, including v4 -> generic v5.
     crate::retention::migrate_staged_sessions(root)?;
-    let (document, _) = migrate_runtime_document(
+    let (mut document, _) = migrate_runtime_document(
         document,
         plan.current_schema_version,
         &plan.mappings,
         &runtime_path,
     )?;
+    memory_retirement::record_unavailable_workers(&mut document, retired_workers, &runtime_path)?;
     atomic_write_json(
         &runtime_path,
         &document,
@@ -3891,7 +3934,7 @@ fn sync_directory(path: &Path, operation: &'static str) -> Result<(), RuntimeErr
 mod tests {
     use super::*;
 
-    fn write_empty_schema_v8_store(root: &Path) {
+    pub(super) fn write_empty_schema_v8_store(root: &Path) {
         fs::create_dir_all(root.join(WORKERS_DIR)).unwrap();
         fs::write(
             root.join(RUNTIME_FILE),
@@ -5123,7 +5166,7 @@ mod tests {
         document
     }
 
-    fn canonical_worker_store() -> (
+    pub(super) fn canonical_worker_store() -> (
         tempfile::TempDir,
         FsRuntimeStore,
         PersistedWorkerRecord,

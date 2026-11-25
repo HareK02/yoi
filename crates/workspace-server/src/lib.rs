@@ -18,8 +18,6 @@ pub mod feature_storage;
 pub mod grant_cleanup_operation;
 pub mod hosts;
 pub mod launch_policy;
-pub mod memory_backend;
-pub mod memory_staging;
 pub mod observation;
 pub mod plugin_binding;
 pub mod plugin_catalog;
@@ -75,7 +73,6 @@ pub mod workspace_signing_identity;
 mod workspace_subscription;
 
 pub use authority::{
-    InternalMemoryStagingEntry, MemoryAuthority, MemoryDocument, MemoryStagingResolution,
     ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketSourceCommitResolver,
     WorkspaceAuthority,
 };

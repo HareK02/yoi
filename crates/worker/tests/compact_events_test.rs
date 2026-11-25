@@ -2993,7 +2993,7 @@ impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
     fn stage_candidate(
         &self,
         _: &worker::subjektiv::SubjektivHostContext,
-        _: memory::backend::MemoryStageCandidateOperation,
+        _: memory::subject::MemoryStageCandidateOperation,
     ) -> Result<server_api::SubjektivStageCandidateResponse, worker::subjektiv::SubjektivHostError>
     {
         Err(worker::subjektiv::SubjektivHostError::Unavailable(
@@ -3013,8 +3013,8 @@ impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
     fn request_consolidation(
         &self,
         _: &worker::subjektiv::SubjektivHostContext,
-        _: memory::backend::MemoryConsolidateStagingOperation,
-    ) -> Result<memory::backend::MemoryConsolidationOutput, worker::subjektiv::SubjektivHostError>
+        _: memory::subject::MemoryConsolidateStagingOperation,
+    ) -> Result<memory::subject::MemoryConsolidationOutput, worker::subjektiv::SubjektivHostError>
     {
         Err(worker::subjektiv::SubjektivHostError::Unavailable(
             "not used".into(),

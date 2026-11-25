@@ -270,10 +270,7 @@ impl ControllerFixture {
                 workspace_id: "local".into(),
                 base_url: "http://127.0.0.1:1".into(),
             }),
-            memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "local".into(),
-                language: "English".into(),
-            }),
+            memory_settings: None,
             feature_initialization: Default::default(),
             backend_job: None,
         };

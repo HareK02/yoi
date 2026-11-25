@@ -227,7 +227,7 @@ mod startup_binding_tests {
         manifest
             .feature
             .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "startup-binding-workspace".into(),
                 language: "English".into(),
             })
@@ -465,7 +465,7 @@ mod startup_binding_tests {
         });
         request.feature_initialization =
             crate::catalog::test_subject_initialization("adapter-test", "subject-test");
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        request.memory_settings = Some(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "adapter-test".into(),
             language: "English".into(),
         });

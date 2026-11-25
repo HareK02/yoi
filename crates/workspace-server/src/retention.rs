@@ -2464,13 +2464,8 @@ mod tests {
         allocation: &str,
         singleton: Option<&str>,
     ) -> (WorkerRemovalPlanRequest, WorkerRetentionInventory) {
-        store.with_conn(|conn| {
-            conn.execute("INSERT OR IGNORE INTO workspace_memory_settings(workspace_id,language,created_at,updated_at) VALUES('w','English','created','observed')", [])?;
-            Ok(())
-        }).unwrap();
-        let memory = store.get_workspace_memory_settings("w").unwrap();
         let reservation = store
-            .reserve_worker_create("w", "r", allocation, allocation, singleton, &memory)
+            .reserve_worker_create("w", "r", allocation, allocation, singleton)
             .unwrap();
         store
             .complete_worker_create_reservation("w", reservation.worker_id)
@@ -3013,7 +3008,6 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: p.session_disposition,
             diagnostics_disposition: p.diagnostics_disposition,
@@ -3036,7 +3030,6 @@ mod tests {
                 content_bytes: 1,
                 content_file_count: 1,
                 policy_id: p.policy_id.clone(),
-
                 operation_id: p.operation_id.clone(),
                 input_fingerprint: p.input_fingerprint.clone(),
             }),
@@ -3495,7 +3488,6 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
@@ -3575,7 +3567,6 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
@@ -3642,7 +3633,6 @@ mod tests {
         let r = WorkerRetentionExecutionResult {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: SessionDisposition::Purge,
             diagnostics_disposition: DiagnosticsDisposition::Purge,
@@ -3849,7 +3839,6 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: SessionDisposition::Purge,
             diagnostics_disposition: DiagnosticsDisposition::Purge,
@@ -3927,7 +3916,6 @@ mod tests {
         let mut result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
@@ -4021,7 +4009,6 @@ mod tests {
         let mut runtime_result = WorkerRetentionExecutionResult {
             operation_id: prepared.plan.operation_id.clone(),
             input_fingerprint: prepared.plan.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: prepared.plan.session_disposition,
             diagnostics_disposition: prepared.plan.diagnostics_disposition,
@@ -4277,7 +4264,6 @@ mod tests {
         let runtime_result = WorkerRetentionExecutionResult {
             operation_id: prepared.plan.operation_id.clone(),
             input_fingerprint: prepared.plan.input_fingerprint.clone(),
-
             worker_id: worker_id(),
             session_disposition: prepared.plan.session_disposition,
             diagnostics_disposition: prepared.plan.diagnostics_disposition,
@@ -4300,7 +4286,6 @@ mod tests {
                 content_bytes: 1,
                 content_file_count: 1,
                 policy_id: prepared.plan.policy_id.clone(),
-
                 operation_id: prepared.plan.operation_id.clone(),
                 input_fingerprint: prepared.plan.input_fingerprint.clone(),
             }),

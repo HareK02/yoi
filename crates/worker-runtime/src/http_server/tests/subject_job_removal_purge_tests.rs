@@ -79,7 +79,6 @@ impl Fixture {
     fn independent_worker(&self) -> WorkerRef {
         let mut request = task_request("independent Worker");
         request.config_bundle = None;
-        request.memory_settings.as_mut().unwrap().workspace_id = self.scope.workspace_id.clone();
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: self.scope.workspace_id.clone(),
             base_url: "https://backend.test".into(),

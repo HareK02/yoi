@@ -4,7 +4,6 @@ declare const Deno: {
 
 import {
   createSubjektivSubject,
-  parseMemoryStagingListResponse,
   parseSubjektivMemoryListChangesResponse,
   parseSubjektivMemoryQueryResponse,
   parseSubjektivMemoryReadResponse,
@@ -819,65 +818,4 @@ Deno.test("Behavior saves with mismatched response text have unknown outcome and
     expected_behavior_md: "Prefer explicit evidence.", behavior_md: "Replacement",
   }), "unknown_outcome", "could not be confirmed");
   assertEquals(calls, 1);
-});
-
-Deno.test("Legacy staging parser remains strict for deprecated compatibility", () => {
-  const origin = { kind: "worker_input", worker_id: "worker-1" };
-  const response = {
-    limit: 100,
-    returned_count: 1,
-    total_valid_count: 1,
-    invalid_count: 0,
-    truncated: false,
-    order: "imported_at_desc_candidate_id_asc",
-    record_authority: "sqlite_workspace_authority.memory_staging",
-    items: [{
-      id: "candidate-1",
-      byte_len: 128,
-      record: {
-        schema_version: 2,
-        id: "candidate-1",
-        extract_run_id: "extract-run-1",
-        source: { segment_id: "segment-1", range: [10, 20] },
-        kind: "decision",
-        claim: "Keep provenance typed.",
-        why_useful: "Prevents origin loss.",
-        staleness: null,
-        evidence: [{
-          id: "evidence-1",
-          kind: "message",
-          entry_range: [10, 10],
-          origin,
-          excerpt: null,
-          summary: "bounded summary",
-        }],
-        source_refs: [{
-          session_id: "session-1",
-          segment_id: "segment-1",
-          entry_range: [10, 10],
-          evidence_id: "evidence-1",
-          origin,
-          evidence_kind: "message",
-          label: "source",
-          summary: null,
-        }],
-      },
-    }],
-    diagnostics: [],
-  };
-  assertEquals(parseMemoryStagingListResponse(response), response);
-  assertThrows(
-    () =>
-      parseMemoryStagingListResponse({
-        ...response,
-        items: [{
-          ...response.items[0],
-          record: {
-            ...response.items[0].record,
-            source: { segment_id: "segment-1", range: [20, 10] },
-          },
-        }],
-      }),
-    "must be ordered",
-  );
 });

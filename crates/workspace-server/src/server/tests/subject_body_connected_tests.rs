@@ -279,6 +279,22 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
         .await;
     assert_ne!(saved["delivery"]["state"], "accepted");
 
+    let settings_store = f.connected.api.config_store.clone();
+    let set_language = |language: &str| {
+        let changed = settings_store
+            .with_conn(|conn| {
+                Ok(conn.execute(
+                    "UPDATE subjektiv_memory_settings SET language=?2 WHERE workspace_id=?1",
+                    rusqlite::params![TEST_WORKSPACE_ID, language],
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            changed, 1,
+            "cold Workspace bootstrap must seed Subjektiv settings"
+        );
+    };
+    set_language("日本語");
     let start = absent_start("body-concurrent-same");
     let path = format!("{}/start", body_path(&subject));
     let (left, right) = tokio::join!(
@@ -340,6 +356,27 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
     assert!(input.contains("BODY_CANONICAL_SESSION_MARKER"), "{input}");
     body_idle(&mut events, &worker).await;
     let root = f.connected.runtime_root.join("workers").join(&worker);
+    let saved_settings = || {
+        let name = format!("worker-runtime-{worker}");
+        let metadata = session_store::WorkerAggregateStore::open_read_only(&root, &name)
+            .unwrap()
+            .read_read_only()
+            .unwrap()
+            .expect("real Controller must persist Worker metadata");
+        manifest::read_persisted_worker_manifest_snapshot(
+            metadata
+                .resolved_manifest_snapshot
+                .expect("resolved manifest"),
+        )
+        .unwrap()
+        .feature
+        .subjektiv
+        .workspace_settings()
+        .expect("Subject connection must persist its frozen language")
+    };
+    let initial_settings = saved_settings();
+    assert_eq!(initial_settings.workspace_id, TEST_WORKSPACE_ID);
+    assert_eq!(initial_settings.language, "日本語");
     let history = session_store::read_retained_session_snapshot(
         &root,
         &format!("worker-runtime-{worker}"),
@@ -422,6 +459,10 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
         outcome["outcome"], "stopped",
         "only exact outcome resolves the lost ACK: {outcome}"
     );
+    // Change only current configuration. A stopped Subject restores its saved
+    // manifest, not today's language or a newly defaulted Workspace snapshot.
+    set_language("Français");
+    assert_eq!(saved_settings(), initial_settings);
     let restore = intent("body-restore-same-generation", &stopped);
     let restored = f.mutate(&subject, "/start", restore.clone()).await;
     assert_eq!(
@@ -431,6 +472,7 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
         f.connected.runtime_errors.lock().unwrap()
     );
     assert_eq!(restored["body"]["current"], current);
+    assert_eq!(saved_settings(), initial_settings);
     assert_ne!(
         restored["body"]["observation"]["worker"]["state"],
         "stopped"

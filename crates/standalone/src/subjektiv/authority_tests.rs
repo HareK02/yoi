@@ -106,7 +106,7 @@ fn consolidation_service_reads_bound_candidate_but_rejects_foreign_attempt_conte
         job.memory(
             &bound,
             SubjektivMemoryBackendOperation::ResidentContext(
-                memory::backend::MemoryResidentSummaryOperation {}
+                memory::subject::MemoryResidentSummaryOperation {}
             )
         ),
         Err(SubjektivHostError::PermissionDenied(_))
@@ -432,7 +432,7 @@ fn new_subject_shared_assignment_and_normal_read_survive_reopen_and_same_body_re
     };
     let resident = || {
         SubjektivMemoryBackendOperation::ResidentContext(
-            memory::backend::MemoryResidentSummaryOperation {},
+            memory::subject::MemoryResidentSummaryOperation {},
         )
     };
     assert!(first.host.memory(&context, resident()).is_ok());

@@ -5,14 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
-lint-common = { workspace = true }
-agen = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }

@@ -176,7 +176,7 @@ fn saved_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
 
 // Explicit canonical tail: schema 132 has no registered migration. Keep this
 // expectation independent of published_plan and the production migration list.
-fn expected_published_tail() -> [(i64, &'static str); 21] {
+fn expected_published_tail() -> [(i64, &'static str); 22] {
     [
         (122, crate::config_adoption::MIGRATION_NAME),
         (123, super::super::backend_job_upgrade::MIGRATION_NAME),
@@ -226,6 +226,7 @@ fn expected_published_tail() -> [(i64, &'static str); 21] {
         (141, super::super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME),
         (142, super::super::feature_initialization::MIGRATION_NAME),
         (143, super::super::feature_worker_launch::MIGRATION_NAME),
+        (144, super::super::memory_retirement::MIGRATION_NAME),
     ]
 }
 

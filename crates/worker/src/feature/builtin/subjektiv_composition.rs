@@ -6,22 +6,6 @@ use agen::llm_client::client::LlmClient;
 use session_store::{Store, WorkerMetadataStore};
 use std::sync::Arc;
 
-fn validate_memory_lifecycle_targets(
-    memory: &manifest::MemoryFeatureProfileConfig,
-    subjektiv: &manifest::SubjektivFeatureProfileConfig,
-) -> std::io::Result<()> {
-    let legacy_lifecycle =
-        memory.enabled && (memory.extraction.enabled || memory.consolidation.request_enabled);
-    let subjektiv_lifecycle = subjektiv.enabled && subjektiv.extraction.enabled;
-    if legacy_lifecycle && subjektiv_lifecycle {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Workspace Memory and subjektiv lifecycles cannot both be enabled for one Worker",
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn compose<C, St>(
     worker: &mut Worker<C, St>,
     feature_registry: &mut FeatureRegistryBuilder,
@@ -36,12 +20,6 @@ where
     let spawner_workspace_context = worker.workspace_context_handle();
     let prompts = worker.prompts().clone();
     let subjektiv_host = worker.subjektiv_host_connection()?;
-    if subjektiv_host.is_some() {
-        validate_memory_lifecycle_targets(
-            &worker.manifest().feature.memory.profile,
-            &worker.manifest().feature.subjektiv.profile,
-        )?;
-    }
     let mut feature_prompt_contribution = None;
     let subjektiv_consolidation_plan =
         crate::feature::builtin::memory::SubjektivConsolidationFeatureInstallPlan::prepare(
@@ -221,30 +199,4 @@ where
         feature_registry.add_module(result_feature);
     }
     Ok(feature_registry)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn legacy_and_subjektiv_lifecycles_are_mutually_exclusive() {
-        let mut memory = manifest::MemoryFeatureProfileConfig::default();
-        memory.enabled = true;
-        memory.extraction.enabled = true;
-        let mut subjektiv = manifest::SubjektivFeatureProfileConfig::default();
-        subjektiv.enabled = true;
-        subjektiv.extraction.enabled = true;
-
-        let error = validate_memory_lifecycle_targets(&memory, &subjektiv).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("cannot both be enabled"));
-
-        memory.extraction.enabled = false;
-        assert!(
-            validate_memory_lifecycle_targets(&memory, &subjektiv).is_err(),
-            "legacy consolidation still installs the legacy lifecycle"
-        );
-        memory.consolidation.request_enabled = false;
-        validate_memory_lifecycle_targets(&memory, &subjektiv).unwrap();
-    }
 }

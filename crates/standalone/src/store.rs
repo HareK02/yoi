@@ -25,7 +25,22 @@ const LEASE_FILE: &str = "lease.json";
 const LEASE_LOCK_FILE: &str = "lease.lock";
 const SESSIONS_DIR: &str = "sessions";
 const WORKER_DIR: &str = "worker";
-const SCHEMA_VERSION: u32 = 2;
+// Schema 3 retires disabled Workspace Memory execution snapshots on disk.
+const SCHEMA_VERSION: u32 = 3;
+
+mod memory_retirement;
+
+/// Read-only ownership evidence, deliberately not an executable Worker record.
+/// Historical Session sources need their saved binding, not today's manifest codec.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StandaloneSessionOwnership {
+    schema_version: u32,
+    pub worker_id: WorkerId,
+    pub subject: Option<crate::subjektiv::StandaloneSubjectBinding>,
+    // Validate the historical lifecycle representation without interpreting policy.
+    #[serde(rename = "status")]
+    _status: StandaloneWorkerStatus,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandaloneCwdIdentity {
@@ -248,10 +263,53 @@ impl StandaloneWorkerStore {
                 supported: SCHEMA_VERSION,
             });
         }
-        if record.schema_version != SCHEMA_VERSION || record.worker_id != id {
+        if !matches!(record.schema_version, 2 | SCHEMA_VERSION) || record.worker_id != id {
             return Err(StandaloneStoreError::InvalidRecord(id));
         }
         Ok(record)
+    }
+
+    /// Observational authorization projection for original/retained Session reads.
+    /// No decoder fallback, migration, lease acquisition, archive or history write.
+    pub(crate) fn load_session_ownership(
+        &self,
+        id: WorkerId,
+    ) -> Result<StandaloneSessionOwnership, StandaloneStoreError> {
+        let dir = self.worker_dir(id);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StandaloneStoreError::WorkerNotFound(id));
+            }
+            Err(error) => return Err(StandaloneStoreError::Io(error)),
+            _ => return Err(StandaloneStoreError::InvalidRecord(id)),
+        }
+        if dir.join(COMMIT_MARKER).exists() {
+            return Err(StandaloneStoreError::IncompleteCommit(id));
+        }
+        let path = dir.join(RECORD_FILE);
+        let meta = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                StandaloneStoreError::WorkerNotFound(id)
+            } else {
+                StandaloneStoreError::Io(error)
+            }
+        })?;
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err(StandaloneStoreError::InvalidRecord(id));
+        }
+        let bytes = fs::read(path).map_err(StandaloneStoreError::Io)?;
+        let ownership: StandaloneSessionOwnership = serde_json::from_slice(&bytes)
+            .map_err(|source| StandaloneStoreError::CorruptRecord { id, source })?;
+        if !matches!(ownership.schema_version, 1 | 2 | SCHEMA_VERSION)
+            || ownership.worker_id != id
+            || ownership.subject.as_ref().is_some_and(|binding| {
+                binding.scope_id.trim().is_empty() || binding.subject_id.trim().is_empty()
+            })
+        {
+            return Err(StandaloneStoreError::InvalidRecord(id));
+        }
+        Ok(ownership)
     }
 
     pub fn list(
@@ -548,6 +606,14 @@ impl StandaloneWorkerLease {
         }
         let parent = self.path.parent().expect("lease parent");
         let _guard = LeaseMutationGuard::acquire(parent)?;
+        self.verify_current_locked()
+    }
+
+    /// Caller holds the lease mutation guard until its storage operation ends.
+    fn verify_current_locked(&self) -> Result<Uuid, StandaloneStoreError> {
+        if self.released {
+            return Err(StandaloneStoreError::LeaseOwnershipLost);
+        }
         let metadata = fs::symlink_metadata(&self.path).map_err(StandaloneStoreError::Io)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(StandaloneStoreError::LeaseOwnershipLost);
@@ -816,6 +882,8 @@ pub enum StandaloneStoreError {
     IncompleteCommit(WorkerId),
     #[error("standalone Worker {0} has invalid metadata")]
     InvalidRecord(WorkerId),
+    #[error("standalone Worker {id} is unavailable: {reason}")]
+    WorkspaceMemoryRetirement { id: WorkerId, reason: &'static str },
     #[error("standalone Worker {id} metadata is corrupt")]
     CorruptRecord {
         id: WorkerId,
@@ -881,7 +949,7 @@ permission = "write"
     }
 
     #[test]
-    fn standalone_record_uses_versioned_manifest_adapter_for_legacy_memory() {
+    fn standalone_record_roundtrip_uses_current_manifest_envelope() {
         let worker_id = "01a05782-d5dd-78f1-b9cd-ce37535bdb9d".parse().unwrap();
         let manifest = test_manifest();
         let record = StandaloneWorkerRecord {
@@ -903,15 +971,8 @@ permission = "write"
             updated_at_unix_ms: 2,
             shutdown_reason: None,
         };
-        let mut legacy = serde_json::to_value(&record).unwrap();
-        legacy["manifest"]["feature"]["memory"] = serde_json::json!({
-            "enabled": false,
-            "staging": false,
-        });
-
-        let decoded =
-            decode_worker_record(worker_id, &serde_json::to_vec(&legacy).unwrap()).unwrap();
-        assert!(!decoded.manifest.feature.memory.profile.enabled);
+        let serialized = serde_json::to_vec(&record).unwrap();
+        let decoded = decode_worker_record(worker_id, &serialized).unwrap();
 
         let mut persisted = Vec::new();
         write_worker_record(&mut persisted, &decoded).unwrap();
@@ -922,10 +983,7 @@ permission = "write"
             persisted["manifest"]["schema_version"],
             current_manifest["schema_version"]
         );
-        assert_eq!(
-            persisted["manifest"]["manifest"]["feature"]["memory"]["profile"]["enabled"],
-            false
-        );
+        assert_eq!(persisted["manifest"], current_manifest);
     }
 
     #[test]

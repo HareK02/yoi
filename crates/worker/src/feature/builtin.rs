@@ -8,8 +8,6 @@ mod backend_diagnostic;
 pub(crate) mod backend_job_input;
 pub mod backend_job_result;
 pub(crate) mod bash;
-pub(crate) mod initialization;
-pub(crate) mod memory_composition;
 pub(crate) mod subjektiv_composition;
 pub(crate) mod subjektiv_initialization;
 

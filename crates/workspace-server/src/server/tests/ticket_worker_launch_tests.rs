@@ -451,7 +451,6 @@ impl LaunchFixture {
                 public_key: runtime_identity.public_key.clone(),
                 public_key_fingerprint: String::new(),
                 binding_id: "binding-launch-test".to_string(),
-
                 authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
 
                 created_at: TEST_CREATED_AT.into(),

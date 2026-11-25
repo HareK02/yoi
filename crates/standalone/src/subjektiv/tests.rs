@@ -988,7 +988,7 @@ fn closed_capabilities_and_foreign_worker_context_are_rejected() {
         session_id: session_store::SessionId::now_v7().to_string(),
     };
     let read = SubjektivMemoryBackendOperation::ResidentContext(
-        memory::backend::MemoryResidentSummaryOperation {},
+        memory::subject::MemoryResidentSummaryOperation {},
     );
     assert!(port.memory(&foreign, read.clone()).is_err());
     let owner = SubjektivHostContext {

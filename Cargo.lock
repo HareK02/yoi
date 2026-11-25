@@ -3025,15 +3025,9 @@ dependencies = [
 name = "memory"
 version = "0.1.0"
 dependencies = [
- "agen",
- "async-trait",
- "chrono",
- "lint-common",
  "schemars",
  "serde",
  "serde_json",
- "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -7449,6 +7443,7 @@ dependencies = [
  "server-api",
  "session-store",
  "sha2 0.11.0",
+ "subjektiv-api",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

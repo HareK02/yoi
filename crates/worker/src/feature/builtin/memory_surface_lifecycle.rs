@@ -909,7 +909,7 @@ permission = "write"
         manifest
             .feature
             .subjektiv
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-1".into(),
 
                 language: "English".into(),

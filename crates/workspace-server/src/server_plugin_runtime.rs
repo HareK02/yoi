@@ -126,6 +126,7 @@ impl WorkspaceApi {
                     params![fingerprint, self.workspace_id(), runtime, reservation.worker_id.to_string(), reservation.create_fingerprint])?;
                 if updated != 1 { return Err(Error::WorkspaceConfigConflict("Plugin launch reservation changed".into())); }
                 tx.execute("INSERT INTO worker_plugin_launches(workspace_id,runtime_id,worker_id,plan_id) VALUES(?1,?2,?3,?4)", params![self.workspace_id(), runtime, reservation.worker_id.to_string(), saved.plan_id])?;
+                crate::store::refresh_worker_create_evidence(tx, self.workspace_id(), &worker_runtime::identity::RuntimeWorkerRef::new(runtime, reservation.worker_id.to_string()))?;
                 runtime_api::PluginExecutionSnapshot { plan_id: saved.plan_id, fingerprint: saved.fingerprint, plan: saved.plan }
             };
             let fingerprint: String = tx.query_row("SELECT create_fingerprint FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='reserved'",

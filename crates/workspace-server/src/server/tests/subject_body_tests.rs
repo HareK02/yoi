@@ -77,11 +77,6 @@ impl BodyFixture {
                 "failed-body-create",
                 &"f".repeat(64),
                 Some(&key),
-                &self
-                    .api
-                    .config_store
-                    .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-                    .unwrap(),
             )
             .unwrap();
         self.api
@@ -105,11 +100,6 @@ impl BodyFixture {
                 "body-start-reservation",
                 &"f".repeat(64),
                 Some(&key),
-                &self
-                    .api
-                    .config_store
-                    .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-                    .unwrap(),
             )
             .unwrap()
             .singleton

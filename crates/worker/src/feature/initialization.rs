@@ -12,7 +12,7 @@ use crate::{BackendJobExecutionBinding, Worker, WorkerError};
 pub struct InitializationContext<'a> {
     pub data: &'a FeatureInitializations,
     pub workspace_id: Option<&'a str>,
-    pub memory_settings: Option<&'a manifest::WorkspaceMemorySettingsSnapshot>,
+    pub memory_settings: Option<&'a manifest::SubjektivMemorySettingsSnapshot>,
     pub backend_job: Option<&'a BackendJobExecutionBinding>,
 }
 
@@ -219,8 +219,7 @@ where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
 {
-    FeatureInitializationRegistry::new(vec![
-        Box::new(super::builtin::initialization::MemoryInitialization),
-        Box::new(super::builtin::subjektiv_initialization::SubjektivInitialization),
-    ])
+    FeatureInitializationRegistry::new(vec![Box::new(
+        super::builtin::subjektiv_initialization::SubjektivInitialization,
+    )])
 }

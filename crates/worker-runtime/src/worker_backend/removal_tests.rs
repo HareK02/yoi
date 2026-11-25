@@ -184,10 +184,6 @@ fn removal_freezes_real_stopped_owner_captures_all_sessions_and_survives_reopen(
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://backend.test".into(),
         });
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
-        });
         let worker = runtime
             .create_worker_scoped(&scope, request.clone())
             .unwrap();
@@ -646,10 +642,6 @@ fn stopped_source_with_inputs(
     request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://backend.test".into(),
-    });
-    request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
     });
     let worker = runtime.create_worker_scoped(&scope, request).unwrap();
     runtime
@@ -1216,10 +1208,6 @@ impl ReleaseFixture {
         create.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://backend.test".into(),
-        });
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
         });
         let worker = runtime.create_worker_scoped(&scope, create).unwrap();
         runtime

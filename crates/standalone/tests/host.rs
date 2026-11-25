@@ -575,6 +575,116 @@ async fn standalone_restore_rejects_lease_with_missing_start_marker() -> TestRes
 }
 
 #[tokio::test]
+async fn restore_migrates_disabled_memory_only_after_acquiring_its_execution_lease() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let state_dir = temp.path().join("state");
+    let launch = StandaloneLaunchConfig::new(
+        temp.path(),
+        &state_dir,
+        manifest::ProfileSelector::Default,
+        "standalone-retirement-test",
+    )
+    .resolve()?;
+    let host =
+        StandaloneHost::start_with_model_client(launch, ScriptedClient::new(Vec::new())).await?;
+    let worker_id = host.worker_id();
+    let storage_key = host.record().storage_key.clone();
+    host.shutdown().await?;
+    let store = StandaloneWorkerStore::open_existing(&state_dir)?;
+    let worker_dir = state_dir.join(worker_id.to_string());
+    let record_path = worker_dir.join("record.json");
+    let metadata_path = worker_dir
+        .join("worker")
+        .join(&storage_key)
+        .join("metadata.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path)?)?;
+    let mut metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path)?)?;
+    record["schema_version"] = serde_json::json!(2);
+    record["manifest"]["manifest"]["feature"]["memory"] =
+        serde_json::json!({"profile":{"enabled":false}});
+    let mut execution = record["manifest"].clone();
+    execution["manifest"]["worker"]["name"] = serde_json::json!(storage_key);
+    metadata["resolved_manifest_snapshot"] = execution;
+    let record_before = serde_json::to_vec_pretty(&record)?;
+    let metadata_before = serde_json::to_vec_pretty(&metadata)?;
+    std::fs::write(&record_path, &record_before)?;
+    std::fs::write(&metadata_path, &metadata_before)?;
+    assert!(store.load(worker_id).is_err());
+    let lease = store.acquire_lease(worker_id, StaleLeasePolicy::Reject)?;
+    assert!(matches!(
+        StandaloneHost::restore_with_model_client(
+            state_dir.clone(),
+            worker_id,
+            ScriptedClient::new(Vec::new())
+        )
+        .await,
+        Err(StandaloneStartupError::WorkerActive)
+    ));
+    assert_eq!(std::fs::read(&record_path)?, record_before);
+    assert_eq!(std::fs::read(&metadata_path)?, metadata_before);
+    lease.release()?;
+    let host = StandaloneHost::restore_with_model_client(
+        state_dir,
+        worker_id,
+        ScriptedClient::new(Vec::new()),
+    )
+    .await?;
+    assert_eq!(host.record().schema_version, 3);
+    assert_eq!(host.record().storage_key, storage_key);
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path)?)?;
+    assert!(
+        saved["resolved_manifest_snapshot"]["manifest"]["feature"]
+            .get("memory")
+            .is_none()
+    );
+    host.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_rejects_enabled_memory_without_selecting_a_replacement_profile() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let state_dir = temp.path().join("state");
+    let launch = StandaloneLaunchConfig::new(
+        temp.path(),
+        &state_dir,
+        manifest::ProfileSelector::Default,
+        "standalone-retired-profile-test",
+    )
+    .resolve()?;
+    let host =
+        StandaloneHost::start_with_model_client(launch, ScriptedClient::new(Vec::new())).await?;
+    let worker_id = host.worker_id();
+    host.shutdown().await?;
+    let record_path = state_dir.join(worker_id.to_string()).join("record.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path)?)?;
+    record["schema_version"] = serde_json::json!(2);
+    record["manifest"]["manifest"]["feature"]["memory"] =
+        serde_json::json!({"profile":{"enabled":true}});
+    let before = serde_json::to_vec_pretty(&record)?;
+    std::fs::write(&record_path, &before)?;
+    let error = StandaloneHost::restore_with_model_client(
+        state_dir,
+        worker_id,
+        ScriptedClient::new(Vec::new()),
+    )
+    .await
+    .err()
+    .expect("enabled legacy Profile must fail closed");
+    assert!(matches!(
+        error,
+        StandaloneStartupError::RetiredWorkspaceMemory(_)
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("select a new supported Profile explicitly")
+    );
+    assert_eq!(std::fs::read(&record_path)?, before);
+    Ok(())
+}
+
+#[tokio::test]
 async fn standalone_metadata_fails_closed_on_incomplete_or_newer_records() -> TestResult {
     let temp = tempfile::tempdir()?;
     let state_dir = temp.path().join("state");

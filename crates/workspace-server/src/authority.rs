@@ -1,4 +1,4 @@
-//! Projects Workspace Tickets, Objectives, and Memory from domain records to API resources.
+//! Projects Workspace Tickets and Objectives from domain records to API resources.
 //!
 //! Normal Backend reads use Workspace-scoped SQLite/domain authority, not a Ticket backend
 //! chosen from Worker cwd or legacy repository file layouts. The ticket crate owns case state,
@@ -44,9 +44,8 @@ use crate::records::{
     summarize_body, ticket_relation_view_from_domain, truncate_body,
 };
 use crate::store::{
-    ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
-    ObjectiveEventRecord, ObjectiveRecord, ObjectiveTicketLinkRecord, SqliteWorkspaceStore,
-    TicketAssignmentPrincipal, TicketAssignmentRole, WorkspaceResourceKind,
+    ControlPlaneStore, ObjectiveEventRecord, ObjectiveRecord, ObjectiveTicketLinkRecord,
+    SqliteWorkspaceStore, TicketAssignmentPrincipal, TicketAssignmentRole, WorkspaceResourceKind,
 };
 use crate::{Error, Result};
 
@@ -56,7 +55,6 @@ mod ticket_browse;
 const DETAIL_BODY_LIMIT: usize = 64 * 1024;
 const TICKET_EVENT_LIMIT: usize = 100;
 const TICKET_EVENT_BODY_LIMIT: usize = 16 * 1024;
-const DEFAULT_MEMORY_DOCUMENT_BODY: &str = "# Memory\n\n";
 const RECORD_SOURCE_WORKSPACE_SQLITE: &str = "workspace-sqlite";
 
 /// Workspace-scoped runtime authority for project resources.
@@ -64,9 +62,9 @@ const RECORD_SOURCE_WORKSPACE_SQLITE: &str = "workspace-sqlite";
 /// Normal Backend API handlers should depend on this authority abstraction, not
 /// on legacy filesystem layouts. Filesystem readers belong in explicitly
 /// temporary migration/repair tools and tests, not normal runtime authority paths.
-pub trait WorkspaceAuthority: ObjectiveAuthority + TicketAuthority + MemoryAuthority {}
+pub trait WorkspaceAuthority: ObjectiveAuthority + TicketAuthority {}
 
-impl<T> WorkspaceAuthority for T where T: ObjectiveAuthority + TicketAuthority + MemoryAuthority {}
+impl<T> WorkspaceAuthority for T where T: ObjectiveAuthority + TicketAuthority {}
 
 pub trait TicketAuthority {
     fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>>;
@@ -102,59 +100,6 @@ pub struct ObjectiveEditInput {
     pub old_string: Option<String>,
     pub new_string: Option<String>,
     pub replace_all: bool,
-}
-
-pub trait MemoryAuthority {
-    fn ensure_memory_document(&self) -> Result<MemoryDocument>;
-    fn memory_document(&self) -> Result<MemoryDocument>;
-    fn update_memory_document(&self, body_md: &str) -> Result<MemoryDocument>;
-    fn list_memory_staging_records(&self, limit: usize) -> Result<Vec<InternalMemoryStagingEntry>>;
-    fn memory_staging_record(&self, candidate_id: &str) -> Result<InternalMemoryStagingEntry>;
-    fn upsert_memory_staging_record(
-        &self,
-        candidate_id: &str,
-        raw_json: &str,
-        source_path: Option<&str>,
-    ) -> Result<InternalMemoryStagingEntry>;
-    fn close_memory_staging_record(
-        &self,
-        candidate_id: &str,
-        action: &str,
-        reason: &str,
-        affected_refs_json: &str,
-    ) -> Result<MemoryStagingResolution>;
-    fn list_memory_staging_resolutions(&self, limit: usize)
-    -> Result<Vec<MemoryStagingResolution>>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryDocument {
-    pub body_md: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub record_source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InternalMemoryStagingEntry {
-    pub candidate_id: String,
-    pub raw_json: String,
-    pub source_path: Option<String>,
-    pub imported_at: String,
-    pub record_source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryStagingResolution {
-    pub candidate_id: String,
-    pub action: String,
-    pub reason: String,
-    pub affected_refs_json: String,
-    pub staging_raw_json: String,
-    pub source_path: Option<String>,
-    pub imported_at: String,
-    pub resolved_at: String,
-    pub record_source: String,
 }
 
 #[derive(Clone)]
@@ -1696,124 +1641,6 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
     }
 }
 
-impl MemoryAuthority for SqliteWorkspaceAuthority {
-    fn ensure_memory_document(&self) -> Result<MemoryDocument> {
-        let now = now_rfc3339();
-        self.store
-            .ensure_memory_document(&self.workspace_id, DEFAULT_MEMORY_DOCUMENT_BODY, &now)
-            .map(memory_document_from_record)
-    }
-
-    fn memory_document(&self) -> Result<MemoryDocument> {
-        self.store
-            .get_memory_document(&self.workspace_id)?
-            .map(memory_document_from_record)
-            .ok_or_else(|| Error::Store("workspace memory document is not initialized".to_string()))
-    }
-
-    fn update_memory_document(&self, body_md: &str) -> Result<MemoryDocument> {
-        let existing = self.ensure_memory_document()?;
-        let updated_at = now_rfc3339();
-        let record = MemoryDocumentRecord {
-            workspace_id: self.workspace_id.clone(),
-            body_md: body_md.to_string(),
-            created_at: existing.created_at,
-            updated_at,
-        };
-        self.store.upsert_memory_document(&record)?;
-        Ok(memory_document_from_record(record))
-    }
-
-    fn list_memory_staging_records(&self, limit: usize) -> Result<Vec<InternalMemoryStagingEntry>> {
-        self.store
-            .list_memory_staging_records(&self.workspace_id, limit)
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(memory_staging_from_record)
-                    .collect()
-            })
-    }
-
-    fn memory_staging_record(&self, candidate_id: &str) -> Result<InternalMemoryStagingEntry> {
-        validate_memory_candidate_id(candidate_id)?;
-        self.store
-            .get_memory_staging_record(&self.workspace_id, candidate_id)?
-            .map(memory_staging_from_record)
-            .ok_or_else(|| {
-                Error::Store(format!("unknown memory staging candidate '{candidate_id}'"))
-            })
-    }
-
-    fn upsert_memory_staging_record(
-        &self,
-        candidate_id: &str,
-        raw_json: &str,
-        source_path: Option<&str>,
-    ) -> Result<InternalMemoryStagingEntry> {
-        validate_memory_candidate_id(candidate_id)?;
-        validate_json_object(raw_json, "raw_json")?;
-        let imported_at = now_rfc3339();
-        let record = MemoryStagingRecord {
-            workspace_id: self.workspace_id.clone(),
-            candidate_id: candidate_id.to_string(),
-            raw_json: raw_json.to_string(),
-            source_path: source_path.map(str::to_string),
-            imported_at,
-        };
-        self.store.upsert_memory_staging_record(&record)?;
-        Ok(memory_staging_from_record(record))
-    }
-
-    fn close_memory_staging_record(
-        &self,
-        candidate_id: &str,
-        action: &str,
-        reason: &str,
-        affected_refs_json: &str,
-    ) -> Result<MemoryStagingResolution> {
-        validate_memory_candidate_id(candidate_id)?;
-        validate_non_empty(action, "action")?;
-        validate_non_empty(reason, "reason")?;
-        validate_json_array(affected_refs_json, "affected_refs_json")?;
-        let staging = self
-            .store
-            .get_memory_staging_record(&self.workspace_id, candidate_id)?
-            .ok_or_else(|| {
-                Error::Store(format!("unknown memory staging candidate '{candidate_id}'"))
-            })?;
-        let record = MemoryStagingResolutionRecord {
-            workspace_id: self.workspace_id.clone(),
-            candidate_id: staging.candidate_id,
-            action: action.trim().to_string(),
-            reason: reason.trim().to_string(),
-            affected_refs_json: affected_refs_json.to_string(),
-            staging_raw_json: staging.raw_json,
-            source_path: staging.source_path,
-            imported_at: staging.imported_at,
-            resolved_at: now_rfc3339(),
-        };
-        self.store.insert_memory_staging_resolution(&record)?;
-        self.store
-            .delete_memory_staging_record(&self.workspace_id, candidate_id)?;
-        Ok(memory_resolution_from_record(record))
-    }
-
-    fn list_memory_staging_resolutions(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<MemoryStagingResolution>> {
-        self.store
-            .list_memory_staging_resolutions(&self.workspace_id, limit)
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(memory_resolution_from_record)
-                    .collect()
-            })
-    }
-}
-
 #[derive(Clone, Copy)]
 enum TicketQuerySort {
     Relevance,
@@ -2862,18 +2689,6 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn validate_memory_candidate_id(candidate_id: &str) -> Result<()> {
-    validate_non_empty(candidate_id, "candidate_id")
-}
-
-fn validate_non_empty(value: &str, field: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        Err(Error::Store(format!("memory {field} must not be empty")))
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_objective_title(title: &str) -> Result<()> {
     if title.trim().is_empty() {
         Err(invalid_objective_error("objective title must not be empty"))
@@ -2903,61 +2718,6 @@ fn unknown_objective_error(id: &str) -> Error {
         runtime_id: "workspace-authority".to_string(),
         code: "unknown_objective".to_string(),
         message: format!("unknown objective `{id}`"),
-    }
-}
-
-fn validate_json_object(raw_json: &str, field: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(raw_json)
-        .map_err(|err| Error::Store(format!("memory {field} must be valid JSON: {err}")))?;
-    if value.is_object() {
-        Ok(())
-    } else {
-        Err(Error::Store(format!(
-            "memory {field} must be a JSON object"
-        )))
-    }
-}
-
-fn validate_json_array(raw_json: &str, field: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(raw_json)
-        .map_err(|err| Error::Store(format!("memory {field} must be valid JSON: {err}")))?;
-    if value.is_array() {
-        Ok(())
-    } else {
-        Err(Error::Store(format!("memory {field} must be a JSON array")))
-    }
-}
-
-fn memory_document_from_record(record: MemoryDocumentRecord) -> MemoryDocument {
-    MemoryDocument {
-        body_md: record.body_md,
-        created_at: record.created_at,
-        updated_at: record.updated_at,
-        record_source: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
-    }
-}
-
-fn memory_staging_from_record(record: MemoryStagingRecord) -> InternalMemoryStagingEntry {
-    InternalMemoryStagingEntry {
-        candidate_id: record.candidate_id,
-        raw_json: record.raw_json,
-        source_path: record.source_path,
-        imported_at: record.imported_at,
-        record_source: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
-    }
-}
-
-fn memory_resolution_from_record(record: MemoryStagingResolutionRecord) -> MemoryStagingResolution {
-    MemoryStagingResolution {
-        candidate_id: record.candidate_id,
-        action: record.action,
-        reason: record.reason,
-        affected_refs_json: record.affected_refs_json,
-        staging_raw_json: record.staging_raw_json,
-        source_path: record.source_path,
-        imported_at: record.imported_at,
-        resolved_at: record.resolved_at,
-        record_source: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
     }
 }
 
@@ -4151,37 +3911,6 @@ VALUES ('workspace-test', 'ticket', 4);
                 .snippet
                 .as_deref()
                 .is_some_and(|snippet| snippet.contains("Deep objective marker"))
-        );
-        let memory = authority.ensure_memory_document().unwrap();
-        assert_eq!(memory.body_md, DEFAULT_MEMORY_DOCUMENT_BODY);
-        let updated = authority
-            .update_memory_document("# Memory\n\n- Durable fact.\n")
-            .unwrap();
-        assert!(updated.body_md.contains("Durable fact"));
-
-        let staging = authority
-            .upsert_memory_staging_record(
-                "candidate-1",
-                r#"{"claim":"Candidate"}"#,
-                Some("memory/_staging/candidate-1.json"),
-            )
-            .unwrap();
-        assert_eq!(staging.record_source, "workspace-sqlite");
-        assert_eq!(authority.list_memory_staging_records(20).unwrap().len(), 1);
-        let resolution = authority
-            .close_memory_staging_record("candidate-1", "apply", "accepted", r#"["memory"]"#)
-            .unwrap();
-        assert_eq!(resolution.action, "apply");
-        assert_eq!(resolution.reason, "accepted");
-        assert!(
-            authority
-                .list_memory_staging_records(20)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            authority.list_memory_staging_resolutions(20).unwrap().len(),
-            1
         );
     }
 

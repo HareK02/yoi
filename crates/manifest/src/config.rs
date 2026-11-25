@@ -11,11 +11,10 @@ use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
-    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConsolidationProfileConfig,
-    MemoryExtractionProfileConfig, MemoryFeatureProfileConfig, MemoryResidentProfileConfig,
-    MergeRequestFeatureConfig, ResolvedMemoryFeatureConfig, ResolvedSubjektivFeatureConfig,
-    ScopeConfig, SessionConfig, SkillsConfig, SubjektivFeatureProfileConfig, TicketFeatureConfig,
-    ToolOutputLimits, WebConfig, WorkerFeatureConfig, WorkerManifest, WorkerMeta,
+    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryExtractionProfileConfig,
+    MergeRequestFeatureConfig, ResolvedSubjektivFeatureConfig, ScopeConfig, SessionConfig,
+    SkillsConfig, SubjektivFeatureProfileConfig, TicketFeatureConfig, ToolOutputLimits, WebConfig,
+    WorkerFeatureConfig, WorkerManifest, WorkerMeta,
 };
 
 /// Merges partial configuration into a validated [`crate::WorkerManifest`].
@@ -81,8 +80,6 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub task: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
-    pub memory: Option<MemoryFeatureConfigPartial>,
-    #[serde(default)]
     pub subjektiv: Option<SubjektivFeatureConfigPartial>,
     #[serde(default)]
     pub web: Option<FeatureFlagConfigPartial>,
@@ -129,7 +126,6 @@ impl FeatureConfigPartial {
             ),
             bash: merge_option(self.bash, other.bash, FeatureFlagConfigPartial::merge),
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
-            memory: merge_option(self.memory, other.memory, MemoryFeatureConfigPartial::merge),
             subjektiv: merge_option(
                 self.subjektiv,
                 other.subjektiv,
@@ -271,30 +267,6 @@ impl From<WorkerFeatureConfigPartial> for WorkerFeatureConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[derive(config_schema_derive::ConfigSchema)]
-pub struct MemoryFeatureConfigPartial {
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub staging_tools: Option<bool>,
-    #[serde(default)]
-    pub resident: Option<MemoryResidentProfileConfigPartial>,
-    #[serde(default)]
-    pub extraction: Option<MemoryExtractionProfileConfigPartial>,
-    #[serde(default)]
-    pub consolidation: Option<MemoryConsolidationProfileConfigPartial>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[derive(config_schema_derive::ConfigSchema)]
-pub struct MemoryResidentProfileConfigPartial {
-    #[serde(default)]
-    pub inject_summary: Option<bool>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[derive(config_schema_derive::ConfigSchema)]
 pub struct MemoryExtractionProfileConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -306,14 +278,6 @@ pub struct MemoryExtractionProfileConfigPartial {
     pub threshold: Option<u64>,
     #[serde(default)]
     pub worker_max_turns: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[derive(config_schema_derive::ConfigSchema)]
-pub struct MemoryConsolidationProfileConfigPartial {
-    #[serde(default)]
-    pub request_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -341,38 +305,6 @@ impl SubjektivFeatureConfigPartial {
                 other.extraction,
                 MemoryExtractionProfileConfigPartial::merge,
             ),
-        }
-    }
-}
-
-impl MemoryFeatureConfigPartial {
-    fn merge(self, other: Self) -> Self {
-        Self {
-            enabled: other.enabled.or(self.enabled),
-            staging_tools: other.staging_tools.or(self.staging_tools),
-            resident: merge_option(
-                self.resident,
-                other.resident,
-                MemoryResidentProfileConfigPartial::merge,
-            ),
-            extraction: merge_option(
-                self.extraction,
-                other.extraction,
-                MemoryExtractionProfileConfigPartial::merge,
-            ),
-            consolidation: merge_option(
-                self.consolidation,
-                other.consolidation,
-                MemoryConsolidationProfileConfigPartial::merge,
-            ),
-        }
-    }
-}
-
-impl MemoryResidentProfileConfigPartial {
-    fn merge(self, other: Self) -> Self {
-        Self {
-            inject_summary: other.inject_summary.or(self.inject_summary),
         }
     }
 }
@@ -439,14 +371,6 @@ impl MergeRequestFeatureConfigPartial {
     }
 }
 
-impl MemoryConsolidationProfileConfigPartial {
-    fn merge(self, other: Self) -> Self {
-        Self {
-            request_enabled: other.request_enabled.or(self.request_enabled),
-        }
-    }
-}
-
 impl From<FeatureConfigPartial> for FeatureConfig {
     fn from(value: FeatureConfigPartial) -> Self {
         Self {
@@ -466,10 +390,6 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 enabled: value.bash.and_then(|flag| flag.enabled).unwrap_or(true),
             },
             task: value.task.map(FeatureFlagConfig::from).unwrap_or_default(),
-            memory: value
-                .memory
-                .map(ResolvedMemoryFeatureConfig::from)
-                .unwrap_or_default(),
             subjektiv: value
                 .subjektiv
                 .map(ResolvedSubjektivFeatureConfig::from)
@@ -546,58 +466,6 @@ impl From<WorkerFeatureConfig> for WorkerFeatureConfigPartial {
             enabled: Some(value.enabled),
             direct_spawn: Some(value.direct_spawn),
             self_read: Some(value.self_read),
-        }
-    }
-}
-
-impl From<MemoryFeatureConfigPartial> for ResolvedMemoryFeatureConfig {
-    fn from(value: MemoryFeatureConfigPartial) -> Self {
-        let resident = value.resident.unwrap_or_default();
-        let extraction = value.extraction.unwrap_or_default();
-        let consolidation = value.consolidation.unwrap_or_default();
-        Self {
-            profile: MemoryFeatureProfileConfig {
-                enabled: value.enabled.unwrap_or_default(),
-                staging_tools: value.staging_tools.unwrap_or_default(),
-                resident: MemoryResidentProfileConfig {
-                    inject_summary: resident.inject_summary.unwrap_or(true),
-                },
-                extraction: MemoryExtractionProfileConfig {
-                    enabled: extraction.enabled.unwrap_or(true),
-                    model: extraction.model,
-                    reasoning: extraction.reasoning,
-                    threshold: extraction.threshold.or(Some(50_000)),
-                    worker_max_turns: extraction
-                        .worker_max_turns
-                        .or(defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
-                },
-                consolidation: MemoryConsolidationProfileConfig {
-                    request_enabled: consolidation.request_enabled.unwrap_or(true),
-                },
-            },
-            workspace_settings: None,
-        }
-    }
-}
-
-impl From<ResolvedMemoryFeatureConfig> for MemoryFeatureConfigPartial {
-    fn from(value: ResolvedMemoryFeatureConfig) -> Self {
-        Self {
-            enabled: Some(value.profile.enabled),
-            staging_tools: Some(value.profile.staging_tools),
-            resident: Some(MemoryResidentProfileConfigPartial {
-                inject_summary: Some(value.profile.resident.inject_summary),
-            }),
-            extraction: Some(MemoryExtractionProfileConfigPartial {
-                enabled: Some(value.profile.extraction.enabled),
-                model: value.profile.extraction.model,
-                reasoning: value.profile.extraction.reasoning,
-                threshold: value.profile.extraction.threshold,
-                worker_max_turns: value.profile.extraction.worker_max_turns,
-            }),
-            consolidation: Some(MemoryConsolidationProfileConfigPartial {
-                request_enabled: Some(value.profile.consolidation.request_enabled),
-            }),
         }
     }
 }
@@ -701,7 +569,6 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             filesystem_write: Some(value.filesystem_write.into()),
             bash: Some(value.bash.into()),
             task: Some(value.task.into()),
-            memory: Some(value.memory.into()),
             subjektiv: Some(value.subjektiv.into()),
             web: Some(value.web.into()),
             image: Some(value.image.into()),
@@ -848,7 +715,16 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
     }
     if value.get("memory").is_some() {
         return Err(toml::de::Error::custom(
-            "unknown field in manifest: memory (removed; configure feature.memory)",
+            "unknown field in manifest: memory (Workspace Memory has been removed)",
+        ));
+    }
+    if value
+        .get("feature")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("memory"))
+    {
+        return Err(toml::de::Error::custom(
+            "unknown field in manifest: feature.memory (Workspace Memory has been removed)",
         ));
     }
     if value
@@ -2226,47 +2102,30 @@ prune_protected_turns = 3
     }
 
     #[test]
-    fn from_toml_accepts_memory_extraction_settings_only_under_feature_memory() {
-        let cfg = WorkerManifestConfig::from_toml(
-            r#"
-[feature.memory]
-enabled = true
-staging_tools = false
-
-[feature.memory.resident]
-inject_summary = false
-
-[feature.memory.extraction]
-enabled = true
-reasoning = "medium"
-threshold = 42000
-worker_max_turns = 2
-
-[feature.memory.extraction.model]
-ref = "codex-oauth/gpt-5.6-luna"
-
-[feature.memory.consolidation]
-request_enabled = false
-"#,
-        )
-        .unwrap();
-        let memory = cfg.feature.memory.unwrap();
-        assert_eq!(memory.enabled, Some(true));
-        assert_eq!(memory.staging_tools, Some(false));
-        assert_eq!(memory.resident.unwrap().inject_summary, Some(false));
-        assert_eq!(memory.consolidation.unwrap().request_enabled, Some(false));
-        let extraction = memory.extraction.unwrap();
-        assert_eq!(extraction.enabled, Some(true));
-        assert_eq!(
-            extraction.reasoning,
-            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
-        );
-        assert_eq!(
-            extraction.model.and_then(|model| model.ref_),
-            Some("codex-oauth/gpt-5.6-luna".to_string())
-        );
-        assert_eq!(extraction.threshold, Some(42_000));
-        assert_eq!(extraction.worker_max_turns, Some(2));
+    fn partial_config_rejects_removed_workspace_memory() {
+        for source in [
+            "[feature.memory]\n",
+            "[feature.memory]\nenabled = false\n",
+            "[feature.memory]\nenabled = true\n",
+            "[feature.memory.extraction]\nenabled = true\n",
+            "[feature.memory.profile]\nenabled = false\n",
+            "[memory]\nlanguage = \"Japanese\"\n",
+        ] {
+            let error = WorkerManifestConfig::from_toml(source).unwrap_err();
+            assert!(error.to_string().contains("memory"), "{error}");
+            assert!(toml::from_str::<WorkerManifestConfig>(source).is_err());
+        }
+        for memory in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": false}),
+            serde_json::Value::Null,
+        ] {
+            let error = serde_json::from_value::<WorkerManifestConfig>(serde_json::json!({
+                "feature": {"memory": memory}
+            }))
+            .unwrap_err();
+            assert!(error.to_string().contains("memory"), "{error}");
+        }
     }
 
     #[test]
@@ -2361,7 +2220,6 @@ worker_max_turns = 7
     fn opt_in_tool_features_default_disabled_except_read_only_workdir_catalog() {
         let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
         assert!(!manifest.feature.task.enabled);
-        assert!(!manifest.feature.memory.profile.enabled);
         assert!(!manifest.feature.web.enabled);
         assert!(!manifest.feature.sub_worker.enabled);
         assert!(!manifest.feature.objective.enabled);
@@ -2728,8 +2586,6 @@ enabled = false
             }
         );
         assert!(!manifest.feature.orchestration.enabled);
-        assert!(!manifest.feature.memory.profile.enabled);
-        assert!(!manifest.feature.memory.profile.staging_tools);
         assert!(!manifest.feature.objective.enabled);
     }
 
@@ -2737,7 +2593,7 @@ enabled = false
     fn feature_flags_merge_as_partial_profile_layers() {
         let base = WorkerManifestConfig::from_toml(
             r#"
-[feature.memory]
+[feature.subjektiv]
 enabled = true
 
 [feature.manage_workdir]
@@ -2773,8 +2629,8 @@ review = false
 [feature.orchestration]
 enabled = true
 
-[feature.memory]
-staging_tools = true
+[feature.subjektiv]
+consolidation_tools = true
 
 [feature.manage_workdir]
 enabled = true
@@ -2813,8 +2669,8 @@ enabled = true
             })
             .try_into()
             .unwrap();
-        assert!(manifest.feature.memory.profile.enabled);
-        assert!(manifest.feature.memory.profile.staging_tools);
+        assert!(manifest.feature.subjektiv.profile.enabled);
+        assert!(manifest.feature.subjektiv.profile.consolidation_tools);
         assert!(manifest.feature.manage_workdir.enabled);
         assert!(manifest.feature.ticket.enabled);
         assert!(!manifest.feature.ticket.authoring);
@@ -3059,6 +2915,10 @@ enabled = true
 enabled = true
 threshold = 321
 worker_max_turns = 7
+reasoning = "medium"
+
+[feature.subjektiv.extraction.model]
+ref = "codex-oauth/gpt-5.6-luna"
 "#,
         )
         .unwrap();
@@ -3070,6 +2930,19 @@ worker_max_turns = 7
         assert!(resolved.profile.enabled);
         assert_eq!(resolved.profile.extraction.threshold, Some(321));
         assert_eq!(resolved.profile.extraction.worker_max_turns, Some(7));
+        assert_eq!(
+            resolved.profile.extraction.reasoning,
+            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+        );
+        assert_eq!(
+            resolved
+                .profile
+                .extraction
+                .model
+                .as_ref()
+                .and_then(|model| model.ref_.as_deref()),
+            Some("codex-oauth/gpt-5.6-luna")
+        );
         let encoded = serde_json::to_value(SubjektivFeatureConfigPartial::from(resolved)).unwrap();
         assert!(encoded.get("subject_id").is_none());
         assert_eq!(encoded["enabled"], true);

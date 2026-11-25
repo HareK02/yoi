@@ -7,15 +7,8 @@ import type {
   Diagnostic,
   DiagnosticSeverity,
   MemoryCandidateKind,
-  MemoryDocumentResponse,
   MemoryEvidenceOrigin,
   MemoryEvidenceOriginKind,
-  MemorySourceEvidenceRef,
-  MemorySourceRef,
-  MemoryStagingEntry,
-  MemoryStagingEvidence,
-  MemoryStagingListResponse,
-  MemoryStagingRecord,
   SubjektivMemoryEvidence,
   SubjektivMemoryEvidenceCandidate,
   SubjektivMemoryListChangesResponse,
@@ -39,7 +32,6 @@ import type {
 } from "#lib/generated/memory-api.ts";
 import { parseWorkerLaunchWorkerSummary } from "#lib/workspace/api/workers.ts";
 
-const MAX_STAGING_ITEMS = MEMORY_API_LIMITS.maxCollectionItems;
 const MAX_EVIDENCE_PER_RECORD = MEMORY_API_LIMITS.maxCollectionItems;
 const MAX_SOURCE_REFS_PER_RECORD = MEMORY_API_LIMITS.maxCollectionItems;
 const MAX_ORIGIN_VALUE_LENGTH = MEMORY_API_LIMITS.maxIdentifierBytes;
@@ -381,193 +373,6 @@ async function subjektivSubjectCreateErrorMessage(
     // A rejected request still has a known outcome even when its body is invalid.
   }
   return `Subject request failed with HTTP ${response.status}.`;
-}
-
-export function parseMemoryDocumentResponse(
-  value: unknown,
-): MemoryDocumentResponse {
-  const record = strictRecord(
-    value,
-    ["body_md", "created_at", "updated_at", "bytes", "record_source"],
-    "Memory document response",
-  );
-  return {
-    body_md: requiredString(
-      record,
-      "body_md",
-      MEMORY_API_LIMITS.maxDocumentBytes,
-    ),
-    created_at: requiredString(record, "created_at"),
-    updated_at: requiredString(record, "updated_at"),
-    bytes: requiredNonNegativeInteger(record, "bytes"),
-    record_source: requiredString(record, "record_source"),
-  };
-}
-
-export function parseMemoryStagingListResponse(
-  value: unknown,
-): MemoryStagingListResponse {
-  const record = strictRecord(
-    value,
-    [
-      "limit",
-      "returned_count",
-      "total_valid_count",
-      "invalid_count",
-      "truncated",
-      "order",
-      "record_authority",
-      "items",
-      "diagnostics",
-    ],
-    "Memory staging list response",
-  );
-  const items = boundedArray(record.items, MAX_STAGING_ITEMS, "items").map(
-    parseStagingEntry,
-  );
-  const diagnostics = boundedArray(
-    record.diagnostics,
-    MAX_STAGING_ITEMS,
-    "diagnostics",
-  ).map(parseDiagnostic);
-  const returnedCount = requiredNonNegativeInteger(record, "returned_count");
-  if (returnedCount !== items.length) {
-    invalid("returned_count does not match items");
-  }
-  return {
-    limit: requiredNonNegativeInteger(record, "limit"),
-    returned_count: returnedCount,
-    total_valid_count: requiredNonNegativeInteger(record, "total_valid_count"),
-    invalid_count: requiredNonNegativeInteger(record, "invalid_count"),
-    truncated: requiredBoolean(record, "truncated"),
-    order: requiredString(record, "order"),
-    record_authority: requiredString(record, "record_authority"),
-    items,
-    diagnostics,
-  };
-}
-
-function parseStagingEntry(value: unknown): MemoryStagingEntry {
-  const record = strictRecord(
-    value,
-    ["id", "byte_len", "record"],
-    "Memory staging entry",
-  );
-  return {
-    id: requiredString(record, "id"),
-    byte_len: requiredNonNegativeInteger(record, "byte_len"),
-    record: parseStagingRecord(record.record),
-  };
-}
-
-function parseStagingRecord(value: unknown): MemoryStagingRecord {
-  const record = strictRecord(
-    value,
-    [
-      "schema_version",
-      "id",
-      "extract_run_id",
-      "source",
-      "kind",
-      "claim",
-      "why_useful",
-      "staleness",
-      "evidence",
-      "source_refs",
-    ],
-    "Memory staging record",
-  );
-  const kind = requiredString(record, "kind") as MemoryCandidateKind;
-  if (!candidateKinds.has(kind)) {
-    invalid("unknown Memory candidate kind");
-  }
-  return {
-    schema_version: requiredNonNegativeInteger(record, "schema_version"),
-    id: requiredString(record, "id"),
-    extract_run_id: requiredString(record, "extract_run_id"),
-    source: parseSourceRef(record.source),
-    kind,
-    claim: requiredString(record, "claim"),
-    why_useful: requiredString(record, "why_useful"),
-    staleness: nullableString(record, "staleness"),
-    evidence: boundedArray(
-      record.evidence,
-      MAX_EVIDENCE_PER_RECORD,
-      "evidence",
-    ).map(parseStagingEvidence),
-    source_refs: boundedArray(
-      record.source_refs,
-      MAX_SOURCE_REFS_PER_RECORD,
-      "source_refs",
-    ).map(parseSourceEvidenceRef),
-  };
-}
-
-function parseSourceRef(value: unknown): MemorySourceRef {
-  const record = strictRecord(
-    value,
-    ["segment_id", "range"],
-    "Memory source ref",
-  );
-  return {
-    segment_id: requiredString(record, "segment_id"),
-    range: parseEntryRange(record.range, "range"),
-  };
-}
-
-function parseStagingEvidence(value: unknown): MemoryStagingEvidence {
-  const record = strictRecord(
-    value,
-    ["id", "kind", "entry_range", "origin", "excerpt", "summary"],
-    "Memory staging evidence",
-    ["origin"],
-  );
-  const result: MemoryStagingEvidence = {
-    id: requiredString(record, "id"),
-    kind: requiredString(record, "kind"),
-    entry_range: parseNullableEntryRange(record.entry_range, "entry_range"),
-    excerpt: nullableString(record, "excerpt"),
-    summary: nullableString(record, "summary"),
-  };
-  if ("origin" in record) {
-    result.origin = record.origin === null
-      ? null
-      : parseEvidenceOrigin(record.origin);
-  }
-  return result;
-}
-
-function parseSourceEvidenceRef(value: unknown): MemorySourceEvidenceRef {
-  const record = strictRecord(
-    value,
-    [
-      "session_id",
-      "segment_id",
-      "entry_range",
-      "evidence_id",
-      "origin",
-      "evidence_kind",
-      "label",
-      "summary",
-    ],
-    "Memory source evidence ref",
-    ["origin"],
-  );
-  const result: MemorySourceEvidenceRef = {
-    session_id: nullableString(record, "session_id"),
-    segment_id: nullableString(record, "segment_id"),
-    entry_range: parseNullableEntryRange(record.entry_range, "entry_range"),
-    evidence_id: nullableString(record, "evidence_id"),
-    evidence_kind: nullableString(record, "evidence_kind"),
-    label: nullableString(record, "label"),
-    summary: nullableString(record, "summary"),
-  };
-  if ("origin" in record) {
-    result.origin = record.origin === null
-      ? null
-      : parseEvidenceOrigin(record.origin);
-  }
-  return result;
 }
 
 function parseEvidenceOrigin(value: unknown): MemoryEvidenceOrigin {

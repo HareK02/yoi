@@ -25,11 +25,6 @@ async fn worker_create_seals_plan_and_replay_retains_exact_snapshot_after_revoke
     let (allocation, request_fingerprint): (String, String) = f.api.config_store.with_conn(|conn| {
         Ok(conn.query_row("SELECT allocation_key,request_fingerprint FROM worker_create_reservations WHERE workspace_id=?1 AND worker_id=?2", rusqlite::params![TEST_WORKSPACE_ID, worker.worker_id], |row| Ok((row.get(0)?,row.get(1)?)))?)
     }).unwrap();
-    let settings = f
-        .api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reservation = f
         .api
         .config_store
@@ -39,7 +34,6 @@ async fn worker_create_seals_plan_and_replay_retains_exact_snapshot_after_revoke
             &allocation,
             &request_fingerprint,
             None,
-            &settings,
         )
         .unwrap();
     assert_eq!(
@@ -59,7 +53,6 @@ async fn worker_create_seals_plan_and_replay_retains_exact_snapshot_after_revoke
                 &allocation,
                 "different-plan",
                 None,
-                &settings
             )
             .is_err()
     );
@@ -175,11 +168,6 @@ async fn empty_plugin_selection_is_sealed_and_retained_on_exact_replay() {
     let (allocation, request_fingerprint): (String, String) = f.api.config_store.with_conn(|conn| {
         Ok(conn.query_row("SELECT allocation_key,request_fingerprint FROM worker_create_reservations WHERE workspace_id=?1 AND worker_id=?2", rusqlite::params![TEST_WORKSPACE_ID, worker.worker_id], |row| Ok((row.get(0)?,row.get(1)?)))?)
     }).unwrap();
-    let settings = f
-        .api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reservation = f
         .api
         .config_store
@@ -189,7 +177,6 @@ async fn empty_plugin_selection_is_sealed_and_retained_on_exact_replay() {
             &allocation,
             &request_fingerprint,
             None,
-            &settings,
         )
         .unwrap();
     let request = runtime.spawn_requests().pop().unwrap();

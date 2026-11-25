@@ -1928,11 +1928,6 @@ mod configuration_adoption_http_integration {
         )
         .unwrap();
         let bundle = bundle.unwrap();
-        let memory = f
-            .api
-            .config_store
-            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-            .unwrap();
         f.api
             .config_store
             .reserve_worker_create_with_core(
@@ -1942,7 +1937,6 @@ mod configuration_adoption_http_integration {
                 &operation.input_fingerprint,
                 &operation.input_fingerprint,
                 None,
-                &memory,
                 &grant.unwrap(),
                 &bundle,
             )

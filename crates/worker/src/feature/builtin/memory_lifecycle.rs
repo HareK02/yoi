@@ -1,8 +1,7 @@
 //! Memory extraction lifecycle using committed runs and a restricted Internal Worker.
 //!
-//! Worker core owns only generic hook/task/session plumbing; this Feature owns extraction targets,
-//! audit, and pointers. Workspace Memory and Subjektiv have separate pointer domains and are never
-//! simultaneous automatic extraction targets. Extraction uses the parent's committed capture and
+//! Worker core owns only generic hook/task/session plumbing; this Feature owns Subject extraction,
+//! lifecycle events and pointers. Extraction uses the parent's committed capture and
 //! resolved evidence, not uncommitted child Worker output.
 //!
 //! Pointers advance only on success with explicit FinishMemoryExtraction, not mere Engine completion.
@@ -18,7 +17,6 @@ use std::time::Duration;
 use agen::llm_client::LlmClient;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use memory::extract;
 use memory::schema::SourceRef;
 use tokio::sync::broadcast;
 
@@ -47,158 +45,32 @@ use crate::internal_worker::{
     InternalWorkerSpec, run_internal_worker_with_cancel_sender,
 };
 use crate::session_capture::SessionCapture;
-use crate::worker::{WorkerFilesystemAuthority, WorkerWorkspaceContext, WorkspaceClient};
+use crate::worker::{WorkerFilesystemAuthority, WorkerWorkspaceContext};
 use agen::token_counter::total_tokens_at;
 use manifest::WorkerManifest;
 use protocol::Event;
 
-const TASK_NAME: &str = "memory-lifecycle";
 const SUBJEKTIV_TASK_NAME: &str = "subjektiv-memory-lifecycle";
 const SUBJEKTIV_EXTRACT_DOMAIN: &str = "subjektiv.extract.v1";
 const TASK_TIMEOUT: Duration = Duration::from_secs(300);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExtractionTarget {
-    WorkspaceMemory,
-    Subjektiv,
-}
-
-#[derive(Clone)]
-struct LifecycleConfig {
-    extraction: manifest::MemoryExtractionProfileConfig,
-    consolidation_request_enabled: bool,
-    workspace_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
-}
-
-impl LifecycleConfig {
-    fn from_memory(config: manifest::ResolvedMemoryFeatureConfig) -> Self {
-        Self {
-            extraction: config.profile.extraction,
-            consolidation_request_enabled: config.profile.consolidation.request_enabled,
-            workspace_settings: config.workspace_settings,
-        }
-    }
-
-    fn from_subjektiv(config: manifest::ResolvedSubjektivFeatureConfig) -> Self {
-        Self {
-            extraction: config.profile.extraction,
-            consolidation_request_enabled: true,
-            workspace_settings: config.workspace_settings,
-        }
-    }
-
-    fn workspace_settings(&self) -> Option<manifest::WorkspaceMemorySettingsSnapshot> {
-        self.workspace_settings.clone()
-    }
-}
-
-/// Parent-Worker lifecycle Feature that observes committed runs and schedules
-/// bounded extraction work. It owns the Memory pointer, audit, restricted
-/// Internal Worker, and staging disposition; Worker core owns only generic
-/// hook/task/session plumbing.
-#[derive(Clone)]
-pub(crate) struct MemoryLifecycleFeature {
-    task: MemoryLifecycleTask,
-}
-
-/// Subject-scoped extraction is a distinct Feature module even though it reuses
-/// the mature committed-capture/extract/pointer lifecycle implementation.
+/// Subject-scoped extraction of committed parent runs through an explicit Host.
 #[derive(Clone)]
 pub(crate) struct SubjektivLifecycleFeature {
-    task: MemoryLifecycleTask,
+    task: SubjektivLifecycleTask,
 }
 
 #[derive(Clone)]
-struct MemoryLifecycleTask {
-    config: LifecycleConfig,
-    target: ExtractionTarget,
+struct SubjektivLifecycleTask {
+    config: manifest::MemoryExtractionProfileConfig,
     capture: CommittedSessionCaptureHandle,
     extensions: SessionExtensionHandle,
-    workspace_client: Arc<dyn WorkspaceClient>,
-    subjektiv_host: Option<crate::subjektiv::SubjektivHostConnection>,
+    host: crate::subjektiv::SubjektivHostConnection,
     manifest: WorkerManifest,
     client: Box<dyn LlmClient>,
     prompts: Arc<ArcSwap<PromptCatalog>>,
     workspace_context: WorkerWorkspaceContext,
     event_tx: Option<broadcast::Sender<Event>>,
-}
-
-fn memory_lifecycle_requested(
-    lifecycle_enabled: bool,
-    config: &manifest::ResolvedMemoryFeatureConfig,
-) -> bool {
-    lifecycle_enabled
-        && config.profile.enabled
-        && (config.profile.extraction.enabled || config.profile.consolidation.request_enabled)
-}
-
-impl MemoryLifecycleFeature {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_resolved_config(
-        lifecycle_enabled: bool,
-        config: manifest::ResolvedMemoryFeatureConfig,
-        capture: CommittedSessionCaptureHandle,
-        extensions: SessionExtensionHandle,
-        workspace_client: Arc<dyn WorkspaceClient>,
-        manifest: WorkerManifest,
-        client: Box<dyn LlmClient>,
-        prompts: Arc<ArcSwap<PromptCatalog>>,
-        workspace_context: WorkerWorkspaceContext,
-        event_tx: Option<broadcast::Sender<Event>>,
-    ) -> std::io::Result<Option<Self>> {
-        if !memory_lifecycle_requested(lifecycle_enabled, &config) {
-            return Ok(None);
-        }
-        config
-            .validate_execution()
-            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Memory extraction requires Backend Workspace API authority",
-            ));
-        }
-        Ok(Some(Self::new(
-            config,
-            capture,
-            extensions,
-            workspace_client,
-            manifest,
-            client,
-            prompts,
-            workspace_context,
-            event_tx,
-        )))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        config: manifest::ResolvedMemoryFeatureConfig,
-        capture: CommittedSessionCaptureHandle,
-        extensions: SessionExtensionHandle,
-        workspace_client: Arc<dyn WorkspaceClient>,
-        manifest: WorkerManifest,
-        client: Box<dyn LlmClient>,
-        prompts: Arc<ArcSwap<PromptCatalog>>,
-        workspace_context: WorkerWorkspaceContext,
-        event_tx: Option<broadcast::Sender<Event>>,
-    ) -> Self {
-        Self {
-            task: MemoryLifecycleTask {
-                config: LifecycleConfig::from_memory(config),
-                target: ExtractionTarget::WorkspaceMemory,
-                capture,
-                extensions,
-                workspace_client,
-                subjektiv_host: None,
-                manifest,
-                client,
-                prompts,
-                workspace_context,
-                event_tx,
-            },
-        }
-    }
 }
 
 impl SubjektivLifecycleFeature {
@@ -215,27 +87,21 @@ impl SubjektivLifecycleFeature {
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled
-            || !config.profile.enabled
-            || host.is_none()
-            || !config.profile.extraction.enabled
-        {
+        if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
             return Ok(None);
         }
+        let Some(host) = host else {
+            return Ok(None);
+        };
         config
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
         Ok(Some(Self {
-            task: MemoryLifecycleTask {
-                config: LifecycleConfig::from_subjektiv(config),
-                target: ExtractionTarget::Subjektiv,
+            task: SubjektivLifecycleTask {
+                config: config.profile.extraction,
                 capture,
                 extensions,
-                workspace_client: crate::unavailable_workspace_client(
-                    None,
-                    "subjektiv Host has no legacy Memory authority",
-                ),
-                subjektiv_host: host,
+                host,
                 manifest,
                 client,
                 prompts,
@@ -243,25 +109,6 @@ impl SubjektivLifecycleFeature {
                 event_tx,
             },
         }))
-    }
-}
-
-impl FeatureModule for MemoryLifecycleFeature {
-    fn descriptor(&self) -> FeatureDescriptor {
-        FeatureDescriptor::builtin("memory-lifecycle", "Memory Lifecycle")
-            .with_description(
-                "Observes terminal committed runs and schedules bounded Memory extraction and Backend consolidation requests.",
-            )
-            .with_background_task(BackgroundTaskDeclaration::worker_managed(
-                TASK_NAME,
-                "Extract provenance-preserving Memory candidates and request Backend consolidation after committed runs.",
-            ))
-    }
-
-    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        context
-            .background_tasks()
-            .register(memory_lifecycle_task_spec(), self.task.clone())
     }
 }
 
@@ -284,46 +131,27 @@ impl FeatureModule for SubjektivLifecycleFeature {
     }
 }
 
-fn memory_lifecycle_task_spec() -> BackgroundTaskSpec {
-    lifecycle_task_spec(
-        TASK_NAME,
-        "Extract provenance-preserving Memory candidates and request Backend consolidation after committed runs.",
-    )
-}
-
 fn subjektiv_lifecycle_task_spec() -> BackgroundTaskSpec {
-    lifecycle_task_spec(
+    let declaration = BackgroundTaskDeclaration::worker_managed(
         SUBJEKTIV_TASK_NAME,
         "Extract provenance-preserving candidates into subject-scoped staging after committed runs.",
-    )
-}
-
-fn lifecycle_task_spec(name: &'static str, description: &'static str) -> BackgroundTaskSpec {
-    let declaration = BackgroundTaskDeclaration::worker_managed(name, description);
+    );
     let mut spec = BackgroundTaskSpec::single_flight(declaration, TASK_TIMEOUT);
     spec.trigger = BackgroundTaskTrigger::RunCommitted;
     spec
 }
 
 #[derive(Clone)]
-struct MemoryExtractionAuthority {
-    workspace: Arc<dyn WorkspaceClient>,
-    subject: Option<crate::subjektiv::SubjektivHostConnection>,
+struct SubjektivExtractionAuthority {
+    host: crate::subjektiv::SubjektivHostConnection,
 }
 
-impl MemoryExtractionAuthority {
+impl SubjektivExtractionAuthority {
     fn authorize(&self, operation: &str) -> Result<(), HookError> {
-        let result = match &self.subject {
-            Some(host) => host
-                .host
-                .authorize_operation(&host.context, operation)
-                .map_err(|error| error.to_string()),
-            None => super::memory::authorize_workspace_memory_operation(
-                self.workspace.as_ref(),
-                operation,
-            )
-            .map_err(|error| error.to_string()),
-        };
+        let result = self
+            .host
+            .host
+            .authorize_operation(&self.host.context, operation);
         result.map_err(|error| {
             HookError::new(
                 HookErrorCategory::Dependency,
@@ -333,7 +161,7 @@ impl MemoryExtractionAuthority {
     }
 }
 
-impl FeatureModule for MemoryExtractionAuthority {
+impl FeatureModule for SubjektivExtractionAuthority {
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin("memory-extraction-authority", "Memory extraction authority")
             .with_hook(crate::feature::HookDeclaration::new(
@@ -357,7 +185,7 @@ impl FeatureModule for MemoryExtractionAuthority {
 }
 
 #[async_trait]
-impl crate::hook::Hook<crate::hook::PreLlmRequest> for MemoryExtractionAuthority {
+impl crate::hook::Hook<crate::hook::PreLlmRequest> for SubjektivExtractionAuthority {
     async fn call(
         &self,
         _context: &crate::hook::PreRequestContext,
@@ -368,7 +196,7 @@ impl crate::hook::Hook<crate::hook::PreLlmRequest> for MemoryExtractionAuthority
 }
 
 #[async_trait]
-impl crate::hook::Hook<crate::hook::PreToolCall> for MemoryExtractionAuthority {
+impl crate::hook::Hook<crate::hook::PreToolCall> for SubjektivExtractionAuthority {
     async fn call(
         &self,
         context: &crate::hook::ToolCallSummary,
@@ -384,27 +212,19 @@ impl crate::hook::Hook<crate::hook::PreToolCall> for MemoryExtractionAuthority {
     }
 }
 
-impl MemoryLifecycleTask {
-    fn authority(&self) -> MemoryExtractionAuthority {
-        MemoryExtractionAuthority {
-            workspace: Arc::clone(&self.workspace_client),
-            subject: self.subjektiv_host.clone(),
-        }
-    }
-
-    fn pointer_domain(&self) -> &'static str {
-        match self.target {
-            ExtractionTarget::WorkspaceMemory => extract::EXTRACT_DOMAIN,
-            ExtractionTarget::Subjektiv => SUBJEKTIV_EXTRACT_DOMAIN,
+impl SubjektivLifecycleTask {
+    fn authority(&self) -> SubjektivExtractionAuthority {
+        SubjektivExtractionAuthority {
+            host: self.host.clone(),
         }
     }
 
     fn extraction_manifest(&self) -> WorkerManifest {
         let mut manifest = self.manifest.clone();
-        if let Some(model) = self.config.extraction.model.clone() {
+        if let Some(model) = self.config.model.clone() {
             manifest.model = model;
         }
-        if let Some(reasoning) = self.config.extraction.reasoning.clone() {
+        if let Some(reasoning) = self.config.reasoning.clone() {
             manifest.engine.reasoning = Some(reasoning);
         }
         manifest
@@ -416,105 +236,55 @@ impl MemoryLifecycleTask {
         cancellation: BackgroundTaskCancellation,
     ) -> Result<(), HookError> {
         context.generation_fence.ensure_current()?;
-        let audit = WorkerAuditBase::new(
-            memory::audit::AuditWorker::MemoryExtract,
-            memory::audit::AuditTrigger::TokenThreshold,
-            self.config
-                .extraction
-                .model
-                .as_ref()
-                .or(Some(&self.manifest.model))
-                .map(model_audit_from_manifest),
-        )
-        .with_workspace_settings(self.config.workspace_settings.as_ref());
-        let audit = if self.target == ExtractionTarget::Subjektiv {
-            audit.without_legacy_backend()
-        } else {
-            audit
-        };
+        let events = MemoryWorkerEvents::extraction();
         self.authority().authorize("memory.extract.read")?;
         let capture = match self.capture.capture() {
             Ok(capture) => capture,
             Err(error) => {
-                audit
-                    .emit(
-                        self.workspace_client.as_ref(),
-                        self.event_tx.as_ref(),
-                        memory::audit::WorkerLifecycleStatus::Failed,
-                        format!("committed_session_capture_failed: {error}"),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                events.emit(
+                    self.event_tx.as_ref(),
+                    MemoryWorkerStatus::Failed,
+                    format!("committed_session_capture_failed: {error}"),
+                );
                 return Ok(());
             }
         };
         if !extraction_run_eligible(capture.run_exit) {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    format!("parent_run_not_finished: {:?}", capture.run_exit),
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+            events.emit(
+                self.event_tx.as_ref(),
+                MemoryWorkerStatus::Skipped,
+                format!("parent_run_not_finished: {:?}", capture.run_exit),
+            );
             return Ok(());
         }
-        let pointer = match extract_pointer(&capture, self.pointer_domain()) {
+        let pointer = match extract_pointer(&capture) {
             Ok(pointer) => pointer,
             Err(error) => {
-                audit
-                    .emit(
-                        self.workspace_client.as_ref(),
-                        self.event_tx.as_ref(),
-                        memory::audit::WorkerLifecycleStatus::Failed,
-                        format!("extract_pointer_invalid: {error}"),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                events.emit(
+                    self.event_tx.as_ref(),
+                    MemoryWorkerStatus::Failed,
+                    format!("extract_pointer_invalid: {error}"),
+                );
                 return Ok(());
             }
         };
-        let Some(threshold) = self
-            .config
-            .extraction
-            .threshold
-            .filter(|threshold| *threshold > 0)
-        else {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "token_threshold_disabled",
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+        let Some(threshold) = self.config.threshold.filter(|threshold| *threshold > 0) else {
+            events.emit(
+                self.event_tx.as_ref(),
+                MemoryWorkerStatus::Skipped,
+                "token_threshold_disabled",
+            );
             return Ok(());
         };
         let tokens_since = tokens_since_pointer(&capture, pointer.as_ref());
         if tokens_since < threshold {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    format!(
-                        "token_threshold_not_reached tokens_since={tokens_since} threshold={threshold}"
-                    ),
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+            events.emit(
+                self.event_tx.as_ref(),
+                MemoryWorkerStatus::Skipped,
+                format!(
+                    "token_threshold_not_reached tokens_since={tokens_since} threshold={threshold}"
+                ),
+            );
             return Ok(());
         }
 
@@ -525,22 +295,11 @@ impl MemoryLifecycleTask {
             .min(capture.history.len());
         let history_end = capture.history.len();
         if history_start >= history_end || capture.entry_count == 0 {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "no_new_committed_session_entries",
-                    None,
-                    Some(memory::audit::ExtractAudit {
-                        session_id: Some(capture.session_id.clone()),
-                        segment_id: Some(capture.segment_id.clone()),
-                        history_range: Some([history_start as u64, history_end as u64]),
-                        ..Default::default()
-                    }),
-                    None,
-                )
-                .await;
+            events.emit(
+                self.event_tx.as_ref(),
+                MemoryWorkerStatus::Skipped,
+                "no_new_committed_session_entries",
+            );
             return Ok(());
         }
         let view = SessionCapture::from_complete_history(
@@ -558,70 +317,29 @@ impl MemoryLifecycleTask {
             segment_id: capture.segment_id.clone(),
             range: [start_entry as u64, (capture.entry_count - 1) as u64],
         };
-        let extract_audit_base = memory::audit::ExtractAudit {
-            session_id: Some(capture.session_id.clone()),
-            segment_id: Some(capture.segment_id.clone()),
-            entry_range: Some([start_entry as u64, (capture.entry_count - 1) as u64]),
-            history_range: Some([history_start as u64, history_end as u64]),
-            ..Default::default()
-        };
-        audit
-            .emit(
-                self.workspace_client.as_ref(),
-                self.event_tx.as_ref(),
-                memory::audit::WorkerLifecycleStatus::Started,
-                "token_threshold_reached",
-                None,
-                Some(extract_audit_base.clone()),
-                None,
-            )
-            .await;
-        let output_state = match self.target {
-            ExtractionTarget::WorkspaceMemory => MemoryStagingOutputState::new(
-                view.clone(),
-                Arc::clone(&self.workspace_client),
-                source,
-                audit.run_id.to_string(),
-            ),
-            ExtractionTarget::Subjektiv => MemoryStagingOutputState::new_subjektiv(
-                view.clone(),
-                self.subjektiv_host
-                    .clone()
-                    .expect("subjektiv task has Host connection"),
-                source,
-                audit.run_id.to_string(),
-            ),
-        };
-        let client = if let Some(model) = self.config.extraction.model.as_ref() {
+        events.emit(
+            self.event_tx.as_ref(),
+            MemoryWorkerStatus::Started,
+            "token_threshold_reached",
+        );
+        let output_state = MemoryStagingOutputState::new_subjektiv(
+            view.clone(),
+            self.host.clone(),
+            source,
+            events.run_id.to_string(),
+        );
+        let client = if let Some(model) = self.config.model.as_ref() {
             match crate::model_client::build_client(model) {
                 Ok(client) => client,
                 Err(error) => {
-                    self.record_preparation_failure(&audit, &extract_audit_base, error.to_string())
-                        .await;
+                    self.record_preparation_failure(&events, error.to_string());
                     return Ok(());
                 }
             }
         } else {
             self.client.clone_boxed()
         };
-        let Some(memory_language) = self
-            .config
-            .workspace_settings()
-            .map(|snapshot| snapshot.language)
-            .or_else(|| {
-                self.subjektiv_host
-                    .as_ref()
-                    .map(|host| host.host.settings().language)
-            })
-        else {
-            self.record_preparation_failure(
-                &audit,
-                &extract_audit_base,
-                "Memory extraction requires a bound Workspace Memory settings snapshot",
-            )
-            .await;
-            return Ok(());
-        };
+        let memory_language = self.host.host.settings().language;
         let system_prompt = match self
             .prompts
             .load_full()
@@ -629,8 +347,7 @@ impl MemoryLifecycleTask {
         {
             Ok(prompt) => prompt,
             Err(error) => {
-                self.record_preparation_failure(&audit, &extract_audit_base, error.to_string())
-                    .await;
+                self.record_preparation_failure(&events, error.to_string());
                 return Ok(());
             }
         };
@@ -654,7 +371,7 @@ impl MemoryLifecycleTask {
             InternalWorkerSpec {
                 identity: InternalWorkerIdentity {
                     kind: "memory-extract",
-                    run_id: audit.run_id,
+                    run_id: events.run_id,
                 },
                 manifest,
                 client,
@@ -663,7 +380,6 @@ impl MemoryLifecycleTask {
                 cache_key: Some(capture.segment_id.clone()),
                 max_turns: self
                     .config
-                    .extraction
                     .worker_max_turns
                     .or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
                 compaction_budget: None,
@@ -687,77 +403,38 @@ impl MemoryLifecycleTask {
         )
         .await;
 
-        let usage_event = match &result {
-            Ok(run) => {
-                tracing::debug!(
-                    worker_kind = run.identity.kind,
-                    run_id = %run.identity.run_id,
-                    history_entries = run.history_entries,
-                    "memory extraction Internal Worker completed"
-                );
-                run.usage.as_ref()
-            }
-            Err(error) => error.usage.as_ref(),
-        };
-        let usage_audit = usage_event.map(|event| memory::audit::UsageAudit {
-            input_tokens: event.input_tokens,
-            output_tokens: event.output_tokens,
-            total_tokens: event.total_tokens,
-            cache_read_input_tokens: event.cache_read_input_tokens,
-            cache_creation_input_tokens: event.cache_creation_input_tokens,
-        });
-        let staging_ids = output_state.staged();
-        let pointer_staging_id = staging_ids.first().cloned().unwrap_or_default();
-        let extract_audit = Some(memory::audit::ExtractAudit {
-            staging_count: staging_ids.len(),
-            staging_paths: staging_ids,
-            ..extract_audit_base
-        });
+        if let Ok(run) = &result {
+            tracing::debug!(
+                worker_kind = run.identity.kind,
+                run_id = %run.identity.run_id,
+                history_entries = run.history_entries,
+                "Subjektiv extraction Internal Worker completed"
+            );
+        }
+        let pointer_staging_id = output_state.staged().first().cloned().unwrap_or_default();
 
         match extraction_disposition(&result, output_state.is_finished()) {
             ExtractionDisposition::Cancelled(reason) => {
-                audit
-                    .emit(
-                        self.workspace_client.as_ref(),
-                        self.event_tx.as_ref(),
-                        memory::audit::WorkerLifecycleStatus::Cancelled,
-                        reason,
-                        usage_audit,
-                        extract_audit,
-                        None,
-                    )
-                    .await;
+                events.emit(
+                    self.event_tx.as_ref(),
+                    MemoryWorkerStatus::Cancelled,
+                    reason,
+                );
                 return Ok(());
             }
             ExtractionDisposition::Failed(reason) => {
-                audit
-                    .emit(
-                        self.workspace_client.as_ref(),
-                        self.event_tx.as_ref(),
-                        memory::audit::WorkerLifecycleStatus::Failed,
-                        reason,
-                        usage_audit,
-                        extract_audit,
-                        None,
-                    )
-                    .await;
+                events.emit(self.event_tx.as_ref(), MemoryWorkerStatus::Failed, reason);
                 return Ok(());
             }
             ExtractionDisposition::Completed => {}
         }
 
         if cancellation.is_cancelled() {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Cancelled,
-                    "memory-extract cancelled before completion side effects",
-                    usage_audit,
-                    extract_audit,
-                    None,
-                )
-                .await;
+            events.emit(
+                self.event_tx.as_ref(),
+                MemoryWorkerStatus::Cancelled,
+                "memory-extract cancelled before completion side effects",
+            );
             return Ok(());
         }
 
@@ -769,17 +446,11 @@ impl MemoryLifecycleTask {
         };
         let payload = serde_json::to_value(&next_pointer).map_err(hook_internal)?;
         if cancellation.is_cancelled() {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Cancelled,
-                    "memory-extract cancelled before pointer commit",
-                    usage_audit,
-                    extract_audit,
-                    None,
-                )
-                .await;
+            events.emit(
+                self.event_tx.as_ref(),
+                MemoryWorkerStatus::Cancelled,
+                "memory-extract cancelled before pointer commit",
+            );
             return Ok(());
         }
         self.authority().authorize("memory.extract.commit")?;
@@ -792,97 +463,51 @@ impl MemoryLifecycleTask {
         }
         if !self
             .extensions
-            .append_if_current(&capture.location(), self.pointer_domain(), payload)
+            .append_if_current(&capture.location(), SUBJEKTIV_EXTRACT_DOMAIN, payload)
             .map_err(hook_internal)?
         {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Cancelled,
-                    "session changed before memory-extract pointer commit",
-                    usage_audit,
-                    extract_audit,
-                    None,
-                )
-                .await;
+            events.emit(
+                self.event_tx.as_ref(),
+                MemoryWorkerStatus::Cancelled,
+                "session changed before memory-extract pointer commit",
+            );
             return Ok(());
         }
-        audit
-            .emit(
-                self.workspace_client.as_ref(),
-                self.event_tx.as_ref(),
-                memory::audit::WorkerLifecycleStatus::Completed,
-                "memory-extract completed",
-                usage_audit,
-                extract_audit,
-                None,
-            )
-            .await;
+        events.emit(
+            self.event_tx.as_ref(),
+            MemoryWorkerStatus::Completed,
+            "memory-extract completed",
+        );
         Ok(())
     }
 }
 
 #[async_trait]
-impl FeatureBackgroundTask for MemoryLifecycleTask {
+impl FeatureBackgroundTask for SubjektivLifecycleTask {
     async fn run(
         &self,
         context: BackgroundTaskContext,
         cancellation: BackgroundTaskCancellation,
     ) -> Result<(), HookError> {
-        let extraction = if self.config.extraction.enabled {
-            self.run_extraction(context.clone(), cancellation.clone())
-                .await
-        } else {
-            Ok(())
-        };
-        extraction?;
+        self.run_extraction(context.clone(), cancellation.clone())
+            .await?;
         if !cancellation.is_cancelled() {
             context.generation_fence.ensure_current()?;
-            match self.target {
-                ExtractionTarget::WorkspaceMemory if self.config.consolidation_request_enabled => {
-                    self.request_consolidation(false).await?;
-                }
-                ExtractionTarget::Subjektiv => {
-                    self.request_consolidation(true).await?;
-                }
-                ExtractionTarget::WorkspaceMemory => {}
-            }
+            self.request_consolidation()?;
         }
         Ok(())
     }
 }
 
-impl MemoryLifecycleTask {
-    async fn request_consolidation(&self, subjektiv: bool) -> Result<(), HookError> {
+impl SubjektivLifecycleTask {
+    fn request_consolidation(&self) -> Result<(), HookError> {
         self.authority().authorize("memory.consolidation.request")?;
-        let audit = WorkerAuditBase::new(
-            memory::audit::AuditWorker::MemoryConsolidation,
-            memory::audit::AuditTrigger::StagingBacklog,
-            Some(model_audit_from_manifest(&self.manifest.model)),
-        )
-        .with_workspace_settings(self.config.workspace_settings.as_ref());
-        let operation = memory::backend::MemoryConsolidateStagingOperation { force: false };
-        let request = if subjektiv {
-            let host = self
-                .subjektiv_host
-                .as_ref()
-                .expect("subjektiv task has Host connection");
-            host.host
-                .request_consolidation(&host.context, operation)
-                .map_err(|error| {
-                    super::memory::WorkspaceMemoryBackendError::Backend(error.to_string())
-                })
-        } else {
-            self.workspace_client
-                .request_memory_staging_consolidation(operation)
-                .await
-        };
-        let audit = if subjektiv {
-            audit.without_legacy_backend()
-        } else {
-            audit
-        };
+        let events = MemoryWorkerEvents::consolidation();
+        let operation = memory::subject::MemoryConsolidateStagingOperation { force: false };
+        let request = self
+            .host
+            .host
+            .request_consolidation(&self.host.context, operation);
         match request {
             Ok(output) => {
                 tracing::debug!(
@@ -893,17 +518,11 @@ impl MemoryLifecycleTask {
             }
             Err(error) => {
                 tracing::warn!(%error, "request Backend Memory staging consolidation failed");
-                audit
-                    .emit(
-                        self.workspace_client.as_ref(),
-                        self.event_tx.as_ref(),
-                        memory::audit::WorkerLifecycleStatus::Skipped,
-                        "consolidation_backend_operation_failed",
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                events.emit(
+                    self.event_tx.as_ref(),
+                    MemoryWorkerStatus::Skipped,
+                    "consolidation_backend_operation_failed",
+                );
                 return Err(HookError::new(
                     HookErrorCategory::Dependency,
                     format!("Memory consolidation request not completed: {error}"),
@@ -913,23 +532,8 @@ impl MemoryLifecycleTask {
         Ok(())
     }
 
-    async fn record_preparation_failure(
-        &self,
-        audit: &WorkerAuditBase,
-        extract: &memory::audit::ExtractAudit,
-        reason: impl Into<String>,
-    ) {
-        audit
-            .emit(
-                self.workspace_client.as_ref(),
-                self.event_tx.as_ref(),
-                memory::audit::WorkerLifecycleStatus::Failed,
-                reason,
-                None,
-                Some(extract.clone()),
-                None,
-            )
-            .await;
+    fn record_preparation_failure(&self, events: &MemoryWorkerEvents, reason: impl Into<String>) {
+        events.emit(self.event_tx.as_ref(), MemoryWorkerStatus::Failed, reason);
     }
 }
 
@@ -947,7 +551,7 @@ fn extraction_disposition(
     match result {
         Err(error) => {
             // Preserve the Internal Worker result's immutable identity/history
-            // evidence for diagnostics even though the public audit reason is
+            // evidence for diagnostics even though the public event reason is
             // intentionally bounded to the typed source error.
             tracing::debug!(
                 worker_kind = error.identity.kind,
@@ -994,19 +598,18 @@ fn hook_internal(error: impl std::fmt::Display) -> HookError {
 
 fn extract_pointer(
     capture: &CommittedSessionCapture,
-    domain: &str,
 ) -> Result<Option<memory::ExtractPointerPayload>, HookError> {
     let pointer = capture
         .extensions
         .iter()
         .rev()
-        .find(|(candidate, _)| candidate == domain)
+        .find(|(candidate, _)| candidate == SUBJEKTIV_EXTRACT_DOMAIN)
         .and_then(|(_, payload)| serde_json::from_value(payload.clone()).ok());
     if pointer.is_none()
         && capture
             .extensions
             .iter()
-            .any(|(candidate, _)| candidate == domain)
+            .any(|(candidate, _)| candidate == SUBJEKTIV_EXTRACT_DOMAIN)
     {
         return Err(hook_internal(
             "latest committed Memory extraction pointer is malformed",
@@ -1041,7 +644,7 @@ fn tokens_since_pointer(
 fn extraction_threshold_reached(
     capture: &CommittedSessionCapture,
     pointer: Option<&memory::ExtractPointerPayload>,
-    config: &manifest::ResolvedMemoryFeatureConfig,
+    config: &manifest::ResolvedSubjektivFeatureConfig,
 ) -> bool {
     if capture.history.is_empty() {
         return false;
@@ -1057,111 +660,69 @@ fn extraction_threshold_reached(
     tokens_since_pointer(capture, pointer) >= threshold
 }
 
+/// Ephemeral UI events; candidate persistence belongs solely to the Subjektiv Host.
 #[derive(Clone)]
-struct WorkerAuditBase {
+struct MemoryWorkerEvents {
     run_id: uuid::Uuid,
-    worker: memory::audit::AuditWorker,
-    trigger: memory::audit::AuditTrigger,
-    memory_settings: Option<memory::audit::MemorySettingsAudit>,
-    model: Option<memory::audit::ModelAudit>,
-    persist_legacy_backend: bool,
+    worker: &'static str,
+    trigger: &'static str,
 }
 
-impl WorkerAuditBase {
-    fn new(
-        worker: memory::audit::AuditWorker,
-        trigger: memory::audit::AuditTrigger,
-        model: Option<memory::audit::ModelAudit>,
-    ) -> Self {
+enum MemoryWorkerStatus {
+    Started,
+    Completed,
+    Skipped,
+    Failed,
+    Cancelled,
+}
+
+impl MemoryWorkerStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Started => "running",
+            Self::Completed => "done",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl MemoryWorkerEvents {
+    fn extraction() -> Self {
         Self {
             run_id: uuid::Uuid::now_v7(),
-            worker,
-            trigger,
-            memory_settings: None,
-            model,
-            persist_legacy_backend: true,
+            worker: "extract",
+            trigger: "token_threshold",
         }
     }
 
-    fn without_legacy_backend(mut self) -> Self {
-        self.persist_legacy_backend = false;
-        self
+    fn consolidation() -> Self {
+        Self {
+            run_id: uuid::Uuid::now_v7(),
+            worker: "consolidation",
+            trigger: "staging_backlog",
+        }
     }
 
-    fn with_workspace_settings(
-        mut self,
-        settings: Option<&manifest::WorkspaceMemorySettingsSnapshot>,
-    ) -> Self {
-        self.memory_settings = settings.map(|snapshot| memory::audit::MemorySettingsAudit {
-            workspace_id: snapshot.workspace_id.clone(),
-
-            language: snapshot.language.clone(),
-        });
-        self
-    }
-
-    async fn emit(
+    fn emit(
         &self,
-        workspace_client: &dyn WorkspaceClient,
         event_tx: Option<&broadcast::Sender<Event>>,
-        status: memory::audit::WorkerLifecycleStatus,
+        status: MemoryWorkerStatus,
         reason: impl Into<String>,
-        usage: Option<memory::audit::UsageAudit>,
-        extract: Option<memory::audit::ExtractAudit>,
-        consolidation: Option<memory::audit::ConsolidationAudit>,
     ) {
         let reason = reason.into();
-        let payload = memory::audit::WorkerLifecycleAudit {
-            run_id: self.run_id,
-            worker: self.worker.clone(),
-            status,
-            trigger: self.trigger,
-            reason: reason.clone(),
-            memory_settings: self.memory_settings.clone(),
-            model: self.model.clone(),
-            usage,
-            extract,
-            consolidation,
-        };
-        if self.persist_legacy_backend {
-            if let Err(error) = workspace_client
-                .execute_memory_backend_operation(
-                    memory::backend::MemoryBackendOperation::AppendAudit(
-                        memory::backend::MemoryAppendAuditOperation {
-                            event: memory::audit::AuditEvent::new(
-                                memory::audit::AuditPayload::WorkerLifecycle(payload),
-                            ),
-                        },
-                    ),
-                )
-                .await
-            {
-                tracing::warn!(%error, "optional Memory audit not persisted");
-            }
-        }
         if let Some(tx) = event_tx {
             let _ = tx.send(Event::MemoryWorker(protocol::MemoryWorkerEvent {
-                worker: self.worker.label().to_string(),
+                worker: self.worker.to_string(),
                 status: status.label().to_string(),
                 run_id: self.run_id.to_string(),
-                trigger: self.trigger.label().to_string(),
+                trigger: self.trigger.to_string(),
                 reason: reason.clone(),
-                message: format!(
-                    "memory {} {}: {reason}",
-                    self.worker.label(),
-                    status.label()
-                ),
+                message: format!("memory {} {}: {reason}", self.worker, status.label()),
                 timestamp_ms: now_millis() as i64,
             }));
         }
-    }
-}
-
-fn model_audit_from_manifest(model: &manifest::ModelManifest) -> memory::audit::ModelAudit {
-    memory::audit::ModelAudit {
-        ref_: model.ref_.clone(),
-        scheme: model.scheme.map(|scheme| format!("{scheme:?}")),
-        model_id: model.model_id.clone(),
     }
 }
 
@@ -1182,15 +743,16 @@ mod tests {
     use crate::feature::session::CommittedSessionLocation;
     use crate::hook::HookInvocationContext;
     use crate::session_history::SessionHistoryMetadata;
+    use crate::worker::WorkspaceClient;
 
     #[derive(Debug, Default)]
-    struct RecordingWorkspaceClient {
+    struct RecordingSubjektivClient {
         denied: std::sync::atomic::AtomicBool,
         checks: Mutex<Vec<String>>,
         requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
     }
 
-    impl WorkspaceClient for RecordingWorkspaceClient {
+    impl WorkspaceClient for RecordingSubjektivClient {
         fn workspace_id(&self) -> Option<&str> {
             Some("workspace-1")
         }
@@ -1214,26 +776,25 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(check["operation"].as_str().unwrap().to_owned());
-                return Ok(crate::worker::WorkspaceResponse {
-                    content_type: None,
-                    status: if self.denied.load(Ordering::SeqCst) {
-                        403
+                return Ok(crate::subjektiv::test_subject_authorization_response(
+                    &request,
+                    "workspace-1",
+                    if self.denied.load(Ordering::SeqCst) {
+                        &[]
                     } else {
-                        200
+                        &[
+                            "memory.extract.read",
+                            "memory.extract.supply",
+                            "memory.extract.commit",
+                            "memory.staging.write",
+                            "memory.consolidation.request",
+                        ]
                     },
-                    body: "{}".into(),
-                });
+                )
+                .expect("Subject authorization request"));
             }
             let is_subjektiv_stage = request.path.ends_with("/subjektiv/staging");
             let is_subjektiv_consolidation = request.path.ends_with("/subjektiv/consolidation");
-            let is_stage_candidate = request
-                .body
-                .as_deref()
-                .is_some_and(|body| body.contains("stage_candidate"));
-            let is_append_audit = request
-                .body
-                .as_deref()
-                .is_some_and(|body| body.contains("append_audit"));
             self.requests.lock().unwrap().push(request);
             if is_subjektiv_consolidation {
                 return Ok(crate::worker::WorkspaceResponse {
@@ -1254,35 +815,6 @@ mod tests {
                     status: 200,
                     body: serde_json::to_string(&server_api::SubjektivStageCandidateResponse {
                         staging_id: "subject-candidate-1".to_string(),
-                    })
-                    .unwrap(),
-                });
-            }
-            if is_stage_candidate {
-                return Ok(crate::worker::WorkspaceResponse {
-                    content_type: None,
-                    status: 200,
-                    body: serde_json::to_string(&memory::backend::MemoryBackendHttpResponse::Ok {
-                        result: memory::backend::MemoryBackendOperationResult::StagingWritten(
-                            memory::backend::MemoryStagingWriteOutput {
-                                staging_count: 1,
-                                staging_ids: vec!["candidate-1".to_string()],
-                            },
-                        ),
-                    })
-                    .unwrap(),
-                });
-            }
-            if is_append_audit {
-                return Ok(crate::worker::WorkspaceResponse {
-                    content_type: None,
-                    status: 200,
-                    body: serde_json::to_string(&memory::backend::MemoryBackendHttpResponse::Ok {
-                        result: memory::backend::MemoryBackendOperationResult::Acknowledged(
-                            memory::backend::MemoryBackendAckOutput {
-                                summary: "audit recorded".to_string(),
-                            },
-                        ),
                     })
                     .unwrap(),
                 });
@@ -1316,7 +848,7 @@ mod tests {
 
     #[derive(Clone)]
     struct ScriptClient {
-        revoke_after_request: Option<Arc<RecordingWorkspaceClient>>,
+        revoke_after_request: Option<Arc<RecordingSubjektivClient>>,
         responses: Arc<Vec<Vec<LlmEvent>>>,
         calls: Arc<AtomicUsize>,
     }
@@ -1437,13 +969,13 @@ permission = "write"
         .unwrap()
     }
 
-    fn test_config() -> manifest::ResolvedMemoryFeatureConfig {
-        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
+    fn test_config() -> manifest::ResolvedSubjektivFeatureConfig {
+        let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
         config.profile.enabled = true;
         config.profile.extraction.enabled = true;
         config.profile.extraction.threshold = Some(1);
         config
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-1".to_string(),
 
                 language: "English".to_string(),
@@ -1452,33 +984,13 @@ permission = "write"
         config
     }
 
-    #[test]
-    fn resolved_subjektiv_consolidation_profile_does_not_install_global_memory_lifecycle() {
-        let workspace = tempfile::tempdir().unwrap();
-        let resolved = manifest::ProfileResolver::new()
-            .with_workspace_base(workspace.path())
-            .resolve(
-                &manifest::ProfileSelector::source_named(
-                    manifest::ProfileRegistrySource::Builtin,
-                    "subjektiv-memory-consolidation",
-                ),
-                manifest::ProfileResolveOptions::with_worker_name("subject-consolidator"),
-            )
-            .unwrap();
-
-        assert!(!memory_lifecycle_requested(
-            true,
-            &resolved.manifest.feature.memory
-        ));
-    }
-
     fn test_task(
         capture: CommittedSessionCapture,
         client: Box<dyn LlmClient>,
         extension_writes: Arc<Mutex<Vec<(CommittedSessionLocation, String, serde_json::Value)>>>,
         event_tx: broadcast::Sender<Event>,
         workspace_client: Arc<dyn WorkspaceClient>,
-    ) -> MemoryLifecycleTask {
+    ) -> SubjektivLifecycleTask {
         let capture_handle = CommittedSessionCaptureHandle::new(move || Ok(capture.clone()));
         let extensions = SessionExtensionHandle::new(move |location, domain, payload| {
             extension_writes
@@ -1487,29 +999,31 @@ permission = "write"
                 .push((location.clone(), domain.to_string(), payload));
             Ok(true)
         });
-        MemoryLifecycleTask {
-            config: LifecycleConfig::from_memory(test_config()),
-            target: ExtractionTarget::WorkspaceMemory,
-            capture: capture_handle,
+        SubjektivLifecycleFeature::from_resolved_config(
+            true,
+            test_config(),
+            capture_handle,
             extensions,
-            workspace_client,
-            subjektiv_host: None,
-            manifest: test_manifest(),
+            Some(crate::subjektiv::test_connection(workspace_client)),
+            test_manifest(),
             client,
-            prompts: Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
-            workspace_context: WorkerWorkspaceContext::no_workspace(),
-            event_tx: Some(event_tx),
-        }
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
+            WorkerWorkspaceContext::no_workspace(),
+            Some(event_tx),
+        )
+        .unwrap()
+        .unwrap()
+        .task
     }
 
     fn start_background_task(
-        task: MemoryLifecycleTask,
+        task: SubjektivLifecycleTask,
     ) -> crate::feature::background::FeatureBackgroundTaskRegistry {
         let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
         builder
             .register(
-                crate::feature::FeatureId::builtin("memory-lifecycle"),
-                memory_lifecycle_task_spec(),
+                crate::feature::FeatureId::builtin("subjektiv-memory-lifecycle"),
+                subjektiv_lifecycle_task_spec(),
                 task,
             )
             .unwrap();
@@ -1526,7 +1040,7 @@ permission = "write"
         registry
     }
 
-    async fn run_background_task(task: MemoryLifecycleTask) {
+    async fn run_background_task(task: SubjektivLifecycleTask) {
         let registry = start_background_task(task);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1607,7 +1121,7 @@ permission = "write"
         config.profile.extraction.enabled = true;
         config.profile.extraction.threshold = Some(1);
         config
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            .bind_workspace_settings(manifest::SubjektivMemorySettingsSnapshot {
                 workspace_id: "workspace-1".to_string(),
 
                 language: "English".to_string(),
@@ -1639,7 +1153,7 @@ permission = "write"
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(16);
         let workspace_client: Arc<dyn WorkspaceClient> =
-            Arc::new(RecordingWorkspaceClient::default());
+            Arc::new(RecordingSubjektivClient::default());
         let mut task = test_task(
             capture(2, 250),
             Box::new(client),
@@ -1647,11 +1161,11 @@ permission = "write"
             event_tx,
             workspace_client,
         );
-        task.config.extraction.model = Some(manifest::ModelManifest {
+        task.config.model = Some(manifest::ModelManifest {
             ref_: Some("codex-oauth/gpt-5.6-luna".to_string()),
             ..Default::default()
         });
-        task.config.extraction.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::Medium));
+        task.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::Medium));
 
         let manifest = task.extraction_manifest();
         assert_eq!(
@@ -1670,7 +1184,7 @@ permission = "write"
         let calls = Arc::clone(&client.calls);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(16);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
         workspace_client.denied.store(true, Ordering::SeqCst);
         let mut task = test_task(
             capture(2, 250),
@@ -1693,7 +1207,7 @@ permission = "write"
 
     #[tokio::test]
     async fn background_revocation_blocks_next_model_supply_and_pointer_commit() {
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
         let mut client =
             ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
         client.revoke_after_request = Some(workspace_client.clone());
@@ -1737,7 +1251,7 @@ permission = "write"
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(16);
         let workspace_client: Arc<dyn WorkspaceClient> =
-            Arc::new(RecordingWorkspaceClient::default());
+            Arc::new(RecordingSubjektivClient::default());
         run_background_task(test_task(
             capture(2, 250),
             Box::new(client),
@@ -1750,7 +1264,7 @@ permission = "write"
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let writes = extension_writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].1, extract::EXTRACT_DOMAIN);
+        assert_eq!(writes[0].1, SUBJEKTIV_EXTRACT_DOMAIN);
         let pointer: memory::ExtractPointerPayload =
             serde_json::from_value(writes[0].2.clone()).unwrap();
         assert_eq!(pointer.processed_through_history_len, 2);
@@ -1776,7 +1290,7 @@ permission = "write"
         let calls = Arc::clone(&client.calls);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, mut event_rx) = broadcast::channel(64);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
         run_background_task(test_task(
             source,
             Box::new(client),
@@ -1797,24 +1311,19 @@ permission = "write"
         );
         let pointer: memory::ExtractPointerPayload =
             serde_json::from_value(writes[0].2.clone()).unwrap();
-        assert_eq!(pointer.staging_id, "candidate-1");
+        assert_eq!(pointer.staging_id, "subject-candidate-1");
         assert!(
             workspace_client
                 .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|request| {
-                    request
-                        .body
-                        .as_deref()
-                        .is_some_and(|body| body.contains("stage_candidate"))
-                })
+                .any(|request| request.path.ends_with("/subjektiv/staging"))
         );
     }
 
     // Real background extraction -> common fixed selection -> StageMemoryCandidate
-    // -> typed backend operation and pointer write. Only model/backend transport
+    // -> Subject Host transport and pointer write. Only model/backend transport
     // are replaced; the second extraction uses the first run's saved pointer.
     #[tokio::test]
     async fn second_extraction_preserves_original_evidence_positions_after_nonzero_pointer() {
@@ -1828,7 +1337,7 @@ permission = "write"
             crate::SessionEntryRef::from_history_entry_id(&second.history[2].annotation.entry_id)
                 .to_string();
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
         let (event_tx, _) = broadcast::channel(64);
         run_background_task(test_task(
             first,
@@ -1868,16 +1377,13 @@ permission = "write"
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|request| {
-                request.body.as_deref().and_then(|body| {
-                    serde_json::from_str::<memory::backend::MemoryBackendOperation>(body).ok()
-                })
-            })
-            .filter_map(|operation| match operation {
-                memory::backend::MemoryBackendOperation::StageCandidate(operation) => {
-                    Some(operation)
-                }
-                _ => None,
+            .filter(|request| request.path.ends_with("/subjektiv/staging"))
+            .map(|request| {
+                serde_json::from_str::<server_api::SubjektivStageCandidateRequest>(
+                    request.body.as_deref().unwrap(),
+                )
+                .unwrap()
+                .operation
             })
             .collect::<Vec<_>>();
         assert_eq!(operations.len(), 1);
@@ -1916,19 +1422,14 @@ permission = "write"
         ]);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(64);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
-        let mut task = test_task(
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
+        let task = test_task(
             source,
             Box::new(client),
             Arc::clone(&extension_writes),
             event_tx,
             workspace_client.clone(),
         );
-        task.target = ExtractionTarget::Subjektiv;
-        task.subjektiv_host = Some(crate::subjektiv::test_connection(
-            task.workspace_client.clone(),
-        ));
-        task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
         let writes = extension_writes.lock().unwrap();
@@ -1973,19 +1474,14 @@ permission = "write"
         let client = ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(32);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
-        let mut task = test_task(
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
+        let task = test_task(
             capture(2, 250),
             Box::new(client),
             Arc::clone(&extension_writes),
             event_tx,
             workspace_client.clone(),
         );
-        task.target = ExtractionTarget::Subjektiv;
-        task.subjektiv_host = Some(crate::subjektiv::test_connection(
-            task.workspace_client.clone(),
-        ));
-        task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
         let writes = extension_writes.lock().unwrap();
@@ -2021,19 +1517,14 @@ permission = "write"
         let client = ScriptClient::new(vec![stage_candidate_events("stage-1", &entry_ref)]);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(32);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
-        let mut task = test_task(
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
+        let task = test_task(
             source,
             Box::new(client),
             Arc::clone(&extension_writes),
             event_tx,
             workspace_client.clone(),
         );
-        task.target = ExtractionTarget::Subjektiv;
-        task.subjektiv_host = Some(crate::subjektiv::test_connection(
-            task.workspace_client.clone(),
-        ));
-        task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
         assert!(extension_writes.lock().unwrap().is_empty());
@@ -2054,12 +1545,12 @@ permission = "write"
     }
 
     #[tokio::test]
-    async fn failed_extraction_emits_failure_event_and_durable_audit_without_pointer() {
+    async fn failed_extraction_emits_failure_event_without_pointer() {
         let client = ScriptClient::new(Vec::new());
         let calls = Arc::clone(&client.calls);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
         run_background_task(test_task(
             capture(2, 250),
             Box::new(client),
@@ -2077,59 +1568,10 @@ permission = "write"
         }));
         let requests = workspace_client.requests.lock().unwrap();
         assert!(
-            requests.iter().any(|request| {
-                request.body.as_deref().is_some_and(|body| {
-                    body.contains("append_audit")
-                        && body.contains("worker_lifecycle")
-                        && body.contains("failed")
-                })
-            }),
-            "recorded requests: {requests:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rewrite_barrier_cancels_active_extraction_and_emits_cancelled_without_pointer() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let client = PendingClient {
-            calls: Arc::clone(&calls),
-        };
-        let extension_writes = Arc::new(Mutex::new(Vec::new()));
-        let (event_tx, mut event_rx) = broadcast::channel(16);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
-        let registry = start_background_task(test_task(
-            capture(2, 250),
-            Box::new(client),
-            Arc::clone(&extension_writes),
-            event_tx,
-            workspace_client.clone(),
-        ));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while calls.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("extraction child should reach its first provider request");
-        let rewrite_guard = registry.begin_session_rewrite().await.unwrap();
-        drop(rewrite_guard);
-        registry.shutdown().await.unwrap();
-
-        assert!(extension_writes.lock().unwrap().is_empty());
-        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events.iter().any(|event| {
-            matches!(event, Event::MemoryWorker(event) if event.status == "cancelled")
-        }));
-        let requests = workspace_client.requests.lock().unwrap();
-        assert!(
-            requests.iter().any(|request| {
-                request.body.as_deref().is_some_and(|body| {
-                    body.contains("append_audit")
-                        && body.contains("worker_lifecycle")
-                        && body.contains("cancelled")
-                })
-            }),
-            "recorded requests: {requests:?}"
+            requests
+                .iter()
+                .all(|request| request.path.ends_with("/subjektiv/consolidation")),
+            "failed extraction must not stage candidates: {requests:?}"
         );
     }
 
@@ -2141,19 +1583,14 @@ permission = "write"
         };
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
-        let mut task = test_task(
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
+        let task = test_task(
             capture(2, 250),
             Box::new(client),
             Arc::clone(&extension_writes),
             event_tx,
             workspace_client.clone(),
         );
-        task.target = ExtractionTarget::Subjektiv;
-        task.subjektiv_host = Some(crate::subjektiv::test_connection(
-            task.workspace_client.clone(),
-        ));
-        task.config.consolidation_request_enabled = false;
         let registry = start_background_task(task);
         tokio::time::timeout(Duration::from_secs(5), async {
             while calls.load(Ordering::SeqCst) == 0 {
@@ -2185,7 +1622,7 @@ permission = "write"
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let workspace_client: Arc<dyn WorkspaceClient> =
-            Arc::new(RecordingWorkspaceClient::default());
+            Arc::new(RecordingSubjektivClient::default());
         let mut interrupted = capture(2, 250);
         interrupted.run_exit = CommittedRunExit::Interrupted;
         run_background_task(test_task(
@@ -2210,7 +1647,7 @@ permission = "write"
         let client = ScriptClient::new(Vec::new());
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(16);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let workspace_client = Arc::new(RecordingSubjektivClient::default());
         let mut interrupted = capture(2, 250);
         interrupted.run_exit = CommittedRunExit::Interrupted;
         let task = test_task(
@@ -2225,73 +1662,11 @@ permission = "write"
         let requests = workspace_client.requests.lock().unwrap();
         assert!(
             requests.iter().any(|request| {
-                request.path.contains("memory")
+                request.path.ends_with("/subjektiv/consolidation")
                     && request
                         .body
                         .as_deref()
                         .is_some_and(|body| body == "{\"force\":false}")
-            }),
-            "recorded requests: {requests:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_task_does_not_request_consolidation_when_profile_disables_it() {
-        let client = ScriptClient::new(Vec::new());
-        let extension_writes = Arc::new(Mutex::new(Vec::new()));
-        let (event_tx, _) = broadcast::channel(16);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
-        let mut interrupted = capture(2, 250);
-        interrupted.run_exit = CommittedRunExit::Interrupted;
-        let mut task = test_task(
-            interrupted,
-            Box::new(client),
-            extension_writes,
-            event_tx,
-            workspace_client.clone(),
-        );
-        task.config.consolidation_request_enabled = false;
-        run_background_task(task).await;
-
-        let requests = workspace_client.requests.lock().unwrap();
-        assert!(
-            !requests.iter().any(|request| {
-                request
-                    .body
-                    .as_deref()
-                    .is_some_and(|body| body == "{\"force\":false}")
-            }),
-            "recorded requests: {requests:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_task_requests_consolidation_when_extraction_is_disabled() {
-        let client = ScriptClient::new(Vec::new());
-        let extension_writes = Arc::new(Mutex::new(Vec::new()));
-        let (event_tx, _) = broadcast::channel(16);
-        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
-        let mut interrupted = capture(2, 250);
-        interrupted.run_exit = CommittedRunExit::Interrupted;
-        let mut task = test_task(
-            interrupted,
-            Box::new(client),
-            extension_writes.clone(),
-            event_tx,
-            workspace_client.clone(),
-        );
-        task.config.extraction.enabled = false;
-        task.config.consolidation_request_enabled = true;
-        run_background_task(task).await;
-
-        assert!(extension_writes.lock().unwrap().is_empty());
-        let requests = workspace_client.requests.lock().unwrap();
-        assert!(
-            requests.iter().any(|request| {
-                request
-                    .body
-                    .as_deref()
-                    .is_some_and(|body| body == "{\"force\":false}")
             }),
             "recorded requests: {requests:?}"
         );
@@ -2377,7 +1752,7 @@ permission = "write"
 
     #[test]
     fn task_scope_cancels_and_joins_before_rewrite_and_shutdown() {
-        let spec = memory_lifecycle_task_spec();
+        let spec = subjektiv_lifecycle_task_spec();
         assert_eq!(spec.trigger, BackgroundTaskTrigger::RunCommitted);
         assert_eq!(spec.max_concurrency, 1);
         assert_eq!(spec.rewrite, BackgroundTaskRewritePolicy::CancelAndWait);
@@ -2387,7 +1762,7 @@ permission = "write"
     #[test]
     fn threshold_uses_committed_usage_after_pointer() {
         let capture = capture(2, 250);
-        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
+        let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
         config.profile.extraction.threshold = Some(1);
         assert!(extraction_threshold_reached(
             &capture,
@@ -2415,19 +1790,16 @@ permission = "write"
         };
         capture.extensions = vec![
             (
-                extract::EXTRACT_DOMAIN.to_string(),
+                SUBJEKTIV_EXTRACT_DOMAIN.to_string(),
                 serde_json::to_value(&first).unwrap(),
             ),
             ("other.feature".to_string(), serde_json::json!({})),
             (
-                extract::EXTRACT_DOMAIN.to_string(),
+                SUBJEKTIV_EXTRACT_DOMAIN.to_string(),
                 serde_json::to_value(&latest).unwrap(),
             ),
         ];
-        assert_eq!(
-            extract_pointer(&capture, extract::EXTRACT_DOMAIN).unwrap(),
-            Some(latest)
-        );
+        assert_eq!(extract_pointer(&capture).unwrap(), Some(latest));
     }
 
     #[test]
@@ -2435,7 +1807,7 @@ permission = "write"
         let mut capture = capture(2, 250);
         capture.extensions = vec![
             (
-                extract::EXTRACT_DOMAIN.to_string(),
+                SUBJEKTIV_EXTRACT_DOMAIN.to_string(),
                 serde_json::to_value(memory::ExtractPointerPayload {
                     processed_through_entry: 1,
                     processed_through_history_len: 1,
@@ -2444,11 +1816,11 @@ permission = "write"
                 .unwrap(),
             ),
             (
-                extract::EXTRACT_DOMAIN.to_string(),
+                SUBJEKTIV_EXTRACT_DOMAIN.to_string(),
                 serde_json::json!({"invalid": true}),
             ),
         ];
-        assert!(extract_pointer(&capture, extract::EXTRACT_DOMAIN).is_err());
+        assert!(extract_pointer(&capture).is_err());
     }
 
     #[test]
@@ -2466,21 +1838,12 @@ permission = "write"
                 "Worker core still contains removed extraction scheduler symbol {removed}"
             );
         }
-        let controller_source = include_str!("../../controller.rs");
-        assert!(controller_source.contains("MemoryFeatureInstallPlan::prepare"));
-        assert!(controller_source.contains("MemoryLifecycleFeature::from_resolved_config"));
-        let worker_production = worker_source.split("#[cfg(test)]").next().unwrap();
-        assert!(!worker_production.contains(".feature.memory"));
-        let lifecycle_source = include_str!("memory_lifecycle.rs");
-        assert!(lifecycle_source.contains("request_memory_staging_consolidation"));
-        let internal_worker_source = include_str!("../../internal_worker.rs");
-        assert!(!internal_worker_source.contains("manifest.memory = None"));
     }
 
     #[test]
     fn empty_capture_never_schedules_extraction() {
         let capture = capture(0, 500);
-        let mut config = manifest::ResolvedMemoryFeatureConfig::default();
+        let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
         config.profile.extraction.threshold = Some(1);
         assert!(!extraction_threshold_reached(&capture, None, &config));
     }

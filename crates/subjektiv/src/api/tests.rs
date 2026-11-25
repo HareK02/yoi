@@ -64,7 +64,7 @@ fn neutral_scope_reopen_and_context_attenuation() {
         execute(
             &store,
             &consolidation,
-            Op::ResidentSummary(memory::backend::MemoryResidentSummaryOperation {})
+            Op::ResidentSummary(memory::subject::MemoryResidentSummaryOperation {})
         )
         .is_err()
     );
@@ -217,14 +217,14 @@ fn shared_surface_empty_snapshot_is_ready_not_missing() {
     let Response::ResidentSummary(resident) = execute(
         &store,
         &body,
-        Op::ResidentSummary(memory::backend::MemoryResidentSummaryOperation {}),
+        Op::ResidentSummary(memory::subject::MemoryResidentSummaryOperation {}),
     )
     .unwrap() else {
         panic!()
     };
     assert_eq!(
         resident.availability,
-        memory::backend::MemoryResidentSummaryAvailability::Ready
+        memory::subject::MemoryResidentSummaryAvailability::Ready
     );
     assert_eq!(resident.content, None);
 }

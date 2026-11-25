@@ -1617,13 +1617,8 @@ where
     }
     feature_registry
         .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
-    let mut feature_prompt_contribution =
-        crate::feature::builtin::memory_composition::compose(worker, &mut feature_registry)?;
-    if let Some(contribution) =
-        crate::feature::builtin::subjektiv_composition::compose(worker, &mut feature_registry)?
-    {
-        feature_prompt_contribution = Some(contribution);
-    }
+    let feature_prompt_contribution =
+        crate::feature::builtin::subjektiv_composition::compose(worker, &mut feature_registry)?;
     if sub_worker_enabled && !runtime_worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(

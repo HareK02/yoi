@@ -9831,18 +9831,18 @@ fn validate_create_workspace_scope(
             )));
         }
     }
-    let snapshot = request.memory_settings.as_ref().ok_or_else(|| {
-        RuntimeError::InvalidRequest(
-            "Workspace-scoped Worker create requires a bound Memory settings snapshot".to_string(),
-        )
-    })?;
+    // Ordinary Workspace Workers do not need Memory settings. A host-bound
+    // Subjektiv attachment requires its snapshot through its initialization adapter.
+    let Some(snapshot) = request.memory_settings.as_ref() else {
+        return Ok(());
+    };
     if snapshot.workspace_id != workspace_id {
         return Err(RuntimeError::InvalidRequest(format!(
-            "Memory settings workspace_id {} does not match Runtime auth workspace_id {workspace_id}",
+            "Subjektiv Memory settings workspace_id {} does not match Runtime auth workspace_id {workspace_id}",
             snapshot.workspace_id
         )));
     }
-    if !manifest::is_normalized_workspace_memory_language(&snapshot.language) {
+    if !manifest::is_normalized_subjektiv_memory_language(&snapshot.language) {
         return Err(RuntimeError::InvalidRequest(
             "Memory settings language must be a normalized bounded UTF-8 value".to_string(),
         ));
@@ -10642,10 +10642,7 @@ mod tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
-            memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "local".to_string(),
-                language: "English".to_string(),
-            }),
+            memory_settings: None,
             feature_initialization: Default::default(),
             backend_job: None,
         }
@@ -11105,30 +11102,50 @@ mod tests {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
         });
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: workspace_id.to_string(),
-            language: "English".to_string(),
-        });
+        request.memory_settings = None;
         request
     }
 
     #[test]
-    fn workspace_create_requires_matching_normalized_memory_settings_snapshot() {
-        let mut request = scoped_task_request("memory-snapshot", "workspace-a");
-        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_ok());
-        request.memory_settings.as_mut().unwrap().language = "Français".to_string();
+    fn workspace_create_does_not_require_subjektiv_settings() {
+        let (runtime, backend) = runtime_and_backend();
+        let request = scoped_task_request("ordinary-worker", "workspace-a");
+        let scope = scope("workspace-a", "server-a");
+        let created = runtime.create_worker_scoped(&scope, request).unwrap();
+        assert_eq!(created.workspace_id.as_deref(), Some("workspace-a"));
+        assert_eq!(created.status, WorkerStatus::Idle);
+        assert!(
+            backend
+                .contexts
+                .lock()
+                .unwrap()
+                .contains_key(&created.worker_ref.worker_id)
+        );
+        assert_eq!(
+            runtime
+                .worker_detail_scoped(&scope, &created.worker_ref)
+                .unwrap()
+                .worker_ref,
+            created.worker_ref
+        );
+    }
+
+    #[test]
+    fn workspace_create_checks_supplied_subjektiv_settings() {
+        let mut request = scoped_task_request("subjektiv-snapshot", "workspace-a");
+        request.memory_settings = Some(manifest::SubjektivMemorySettingsSnapshot {
+            workspace_id: "workspace-a".to_string(),
+            language: "Français".to_string(),
+        });
         assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_ok());
 
-        request.memory_settings = None;
-        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
-
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        request.memory_settings = Some(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-b".to_string(),
             language: "English".to_string(),
         });
         assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
 
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        request.memory_settings = Some(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-a".to_string(),
             language: " english ".to_string(),
         });

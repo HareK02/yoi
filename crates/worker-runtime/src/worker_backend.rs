@@ -1435,6 +1435,56 @@ impl ProfileRuntimeWorkerFactory {
         Self::runtime_profile_for_request(&request.request)
     }
 
+    fn reject_retired_memory_profile(request: &CreateWorkerRequest) -> Result<(), String> {
+        if matches!(
+            Self::runtime_profile_for_request(request).as_ref(),
+            "builtin:memory-consolidation" | "memory-consolidation"
+        ) {
+            return Err("The retired Workspace memory-consolidation Profile cannot execute; create a replacement Worker with a supported Profile".into());
+        }
+        Ok(())
+    }
+
+    fn reject_retired_memory_snapshot(snapshot: &serde_json::Value) -> Result<(), String> {
+        let saved = if snapshot.get("schema_version").is_some() {
+            snapshot.get("manifest")
+        } else {
+            Some(snapshot)
+        };
+        if saved
+            .and_then(|saved| saved.pointer("/profile/source/name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "memory-consolidation" | "builtin:memory-consolidation"
+                )
+            })
+        {
+            // The immutable request selector need not describe the saved
+            // resolved Profile. Reject its retired provenance independently,
+            // matching Runtime storage migration's unavailable classification.
+            return Err("Saved Worker has retired Workspace memory-consolidation Profile provenance that cannot execute; create a replacement Worker with a supported Profile".into());
+        }
+        if let Some(memory) = saved
+            .and_then(|saved| saved.get("feature"))
+            .and_then(|features| features.get("memory"))
+        {
+            // Only the owner-locked Runtime storage migration may remove an
+            // explicitly disabled policy. Never repair execution authority in
+            // the decoder/restore path, including for malformed legacy values.
+            if memory
+                .pointer("/profile/enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                return Err("Saved Worker contains retired feature.memory; disabled legacy snapshots require Runtime storage migration before restore".into());
+            }
+            return Err("Saved Worker contains retired feature.memory that cannot execute; create a replacement Worker with a supported Profile".into());
+        }
+        Ok(())
+    }
+
     fn restore_fallback_manifest(
         worker_name: &str,
     ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
@@ -1449,10 +1499,14 @@ impl ProfileRuntimeWorkerFactory {
         metadata: &session_store::WorkerMetadata,
         request: &CreateWorkerRequest,
     ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
+        Self::reject_retired_memory_profile(request)?;
         let (fallback, loader) = Self::restore_fallback_manifest(&metadata.worker_name)?;
         let manifest = match metadata.resolved_manifest_snapshot.clone() {
-            Some(snapshot) => manifest::read_persisted_worker_manifest_snapshot(snapshot)
-                .map_err(|error| format!("failed to read saved Worker Manifest: {error}"))?,
+            Some(snapshot) => {
+                Self::reject_retired_memory_snapshot(&snapshot)?;
+                manifest::read_persisted_worker_manifest_snapshot(snapshot)
+                    .map_err(|error| format!("failed to read saved Worker Manifest: {error}"))?
+            }
             None if request.workspace_api.is_some()
                 || !request.feature_initialization.is_empty() =>
             {
@@ -1462,7 +1516,8 @@ impl ProfileRuntimeWorkerFactory {
         };
         // Saved policy is execution authority. Rebinding current settings here
         // would hide content and attachment mismatches.
-        initializers.validate_manifest(&manifest, &feature_initialization_context(request))?;
+        initializers
+            .validate_manifest(&manifest, &restore_feature_initialization_context(request))?;
         Ok((manifest, loader))
     }
 
@@ -2050,6 +2105,25 @@ pub(crate) fn feature_initialization_context(
     }
 }
 
+// CreateWorkerRequest is an immutable receipt. Before Workspace Memory was
+// retired, ordinary Workers also saved memory_settings. Restore must not turn
+// that historical metadata into a new Subjektiv attachment or rewrite the
+// receipt. Explicit Subjektiv initialization (including invalid data) retains
+// the exact settings checks; normal creation uses the strict context above.
+fn restore_feature_initialization_context(
+    request: &CreateWorkerRequest,
+) -> worker::feature::initialization::InitializationContext<'_> {
+    let mut context = feature_initialization_context(request);
+    if request
+        .feature_initialization
+        .get(subjektiv_api::worker_initialization::FEATURE_ID)
+        .is_none()
+    {
+        context.memory_settings = None;
+    }
+    context
+}
+
 #[cfg(test)]
 fn bind_worker_initialization(
     manifest: &mut manifest::WorkerManifest,
@@ -2066,8 +2140,9 @@ fn validate_worker_initialization(
     feature_initializers().validate_manifest(manifest, &feature_initialization_context(request))
 }
 
-/// Read-only validation shared with the offline, feature-gated fixture installer.
-#[cfg(feature = "test-support")]
+/// Read-only validation shared with storage migration tests and the offline,
+/// feature-gated fixture installer. Neither entrypoint repairs saved authority.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn validate_fixture_restore_metadata(
     metadata: &session_store::WorkerMetadata,
     request: &CreateWorkerRequest,
@@ -2205,6 +2280,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         &self,
         request: WorkerExecutionSpawnRequest,
     ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+        Self::reject_retired_memory_profile(&request.request)?;
         let worker_name = Self::runtime_worker_name(&request);
         let profile = Self::runtime_profile(&request);
         let has_local_filesystem = request.workdir_attachments.len() == 1;
@@ -2789,9 +2865,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             self.initialization_registry
                 .validate_manifest(
                     candidate.manifest(),
-                    &feature_initialization_context(&request.request),
+                    &restore_feature_initialization_context(&request.request),
                 )
-                .map_err(|_| "saved memory settings mismatch")?;
+                .map_err(|_| "saved feature initialization mismatch")?;
             self.prepare_unpublished_restore(candidate, &request)
                 .await
                 .map(|candidate| Box::new(candidate) as Box<dyn RuntimeRestoreCandidate>)
@@ -8931,6 +9007,7 @@ mod tests {
 
     include!("subject_delete_backend_tests.rs");
     include!("worker_backend/startup_binding_tests.rs");
+    include!("worker_backend/memory_retirement_tests.rs");
     #[cfg(all(feature = "fs-store", feature = "ws-server"))]
     include!("worker_backend/initialization_tests.rs");
     #[cfg(all(feature = "fs-store", feature = "ws-server", feature = "http-server"))]
@@ -9230,8 +9307,6 @@ mod tests {
             permission = "read"
             recursive = true
             symlink_policy = "resolved"
-            [feature.memory.profile]
-            enabled = false
             [feature.subjektiv.profile]
             enabled = true
             [feature.subjektiv.profile.extraction]
@@ -9252,7 +9327,7 @@ mod tests {
             "workspace-saved-subjektiv",
             "saved-subject",
         );
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        request.memory_settings = Some(manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-saved-subjektiv".to_string(),
             language: "English".to_string(),
         });
@@ -13491,7 +13566,7 @@ mod tests {
             manifest.feature.subjektiv.profile.extraction.enabled = true;
             manifest
         };
-        let settings = manifest::WorkspaceMemorySettingsSnapshot {
+        let settings = manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-subject".to_string(),
             language: "English".to_string(),
         };
@@ -13500,7 +13575,6 @@ mod tests {
             workspace_id: settings.workspace_id.clone(),
             base_url: "http://workspace.invalid".to_string(),
         });
-        ordinary_request.memory_settings = Some(settings.clone());
         let mut ordinary = manifest();
         bind_worker_initialization(&mut ordinary, &ordinary_request).unwrap();
         assert!(ordinary.feature.subjektiv.profile.enabled);
@@ -13510,6 +13584,7 @@ mod tests {
         let mut attached_request = ordinary_request.clone();
         attached_request.feature_initialization =
             crate::catalog::test_subject_initialization("workspace-subject", "subject-test");
+        attached_request.memory_settings = Some(settings.clone());
         let mut attached = manifest();
         bind_worker_initialization(&mut attached, &attached_request).unwrap();
         assert!(attached.feature.subjektiv.execution_enabled());
@@ -15051,10 +15126,6 @@ mod tests {
             workspace_id: "workspace-restore".to_string(),
             base_url: "http://workspace.invalid".to_string(),
         });
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "workspace-restore".to_string(),
-            language: "English".to_string(),
-        });
         let identity = RuntimeIdentityMaterial::generate("runtime-restore").unwrap();
         let error = match ProfileRuntimeWorkerFactory::new(root.path())
             .with_runtime_store_dir(&runtime_store_dir)
@@ -16251,10 +16322,6 @@ mod tests {
         create.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "ws-test".into(),
             base_url: "http://127.0.0.1:3999".into(),
-        });
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: "ws-test".into(),
-            language: "English".into(),
         });
         let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "embedded-backend");
         let detail = runtime.create_worker_scoped(&scope, create).unwrap();

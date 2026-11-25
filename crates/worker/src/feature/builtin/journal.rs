@@ -1091,7 +1091,7 @@ mod tests {
         fn stage_candidate(
             &self,
             _: &crate::subjektiv::SubjektivHostContext,
-            _: memory::backend::MemoryStageCandidateOperation,
+            _: memory::subject::MemoryStageCandidateOperation,
         ) -> Result<server_api::SubjektivStageCandidateResponse, SubjektivHostError> {
             unreachable!()
         }
@@ -1105,8 +1105,8 @@ mod tests {
         fn request_consolidation(
             &self,
             _: &crate::subjektiv::SubjektivHostContext,
-            _: memory::backend::MemoryConsolidateStagingOperation,
-        ) -> Result<memory::backend::MemoryConsolidationOutput, SubjektivHostError> {
+            _: memory::subject::MemoryConsolidateStagingOperation,
+        ) -> Result<memory::subject::MemoryConsolidationOutput, SubjektivHostError> {
             unreachable!()
         }
     }

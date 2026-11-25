@@ -75,10 +75,6 @@ fn subject_delete_inflight_create(real_controller: bool) {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
     });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
     let creating = {
         let runtime = runtime.clone();
         let scope = scope.clone();

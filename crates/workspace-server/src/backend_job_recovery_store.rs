@@ -554,7 +554,7 @@ mod tests {
             SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
         store.with_conn(|conn| {
             conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('owner','user','owner','Owner','1','1'); INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('workspace','owner','Workspace','active','1','1');")?;
-            conn.execute("INSERT INTO workspace_memory_settings(workspace_id,language,created_at,updated_at) VALUES('workspace','en',?1,?1)",params![NOW])?;
+
             Ok(())
         }).unwrap();
         let request = BackendJobRequest {
@@ -1102,12 +1102,6 @@ mod tests {
     fn allocation_lookup_is_read_only_matches_create_fingerprint_and_never_resurrects_removed_worker()
      {
         let (_dir, store, reserved) = fixture();
-        let settings = WorkspaceMemorySettingsRecord {
-            workspace_id: "workspace".into(),
-            language: "en".into(),
-            created_at: NOW.into(),
-            updated_at: NOW.into(),
-        };
         let key = crate::backend_job::allocation_key(&reserved.attempt.attempt_id);
         assert!(
             store
@@ -1116,14 +1110,7 @@ mod tests {
                 .is_none()
         );
         let created = store
-            .reserve_worker_create(
-                "workspace",
-                "runtime",
-                &key,
-                "sha256:create-input",
-                None,
-                &settings,
-            )
+            .reserve_worker_create("workspace", "runtime", &key, "sha256:create-input", None)
             .unwrap();
         let found = store
             .lookup_backend_job_allocation("workspace", &reserved.job, &reserved.attempt)

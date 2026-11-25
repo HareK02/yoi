@@ -179,9 +179,11 @@ mod feature_initialization;
 #[path = "launch_policy_identity_migration.rs"]
 mod launch_policy_identity_migration;
 use protocol::feature_initialization::FeatureInitializations;
-const LATEST_SCHEMA_VERSION: i64 = 143;
+const LATEST_SCHEMA_VERSION: i64 = 144;
 #[path = "store/feature_worker_launch.rs"]
 mod feature_worker_launch;
+#[path = "store/memory_retirement.rs"]
+mod memory_retirement;
 pub(crate) use feature_worker_launch::SavedFeatureWorkerLaunch;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
@@ -676,6 +678,11 @@ const MIGRATIONS: &[Migration] = &[
         name: feature_worker_launch::MIGRATION_NAME,
         apply: feature_worker_launch::migrate,
     },
+    Migration {
+        version: 144,
+        name: memory_retirement::MIGRATION_NAME,
+        apply: memory_retirement::migrate,
+    },
 ];
 
 // Both schema-103 identities shipped. Keep the alternate implementation and accept
@@ -725,18 +732,10 @@ pub struct WorkspaceRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkspaceMemorySettingsRecord {
-    pub workspace_id: String,
-    pub language: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerCreateReservation {
     pub worker_id: WorkerId,
     pub create_fingerprint: String,
-    pub memory_settings: manifest::WorkspaceMemorySettingsSnapshot,
+    pub subjektiv_memory_settings: Option<manifest::SubjektivMemorySettingsSnapshot>,
     pub feature_initialization: FeatureInitializations,
     pub singleton: Option<WorkerSingletonLease>,
 }
@@ -1460,43 +1459,6 @@ pub struct ObjectiveResourceRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryDocumentRecord {
-    pub workspace_id: String,
-    pub body_md: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryStagingRecord {
-    pub workspace_id: String,
-    pub candidate_id: String,
-    pub raw_json: String,
-    pub source_path: Option<String>,
-    pub imported_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MemoryStagingResolutionRecord {
-    pub workspace_id: String,
-    pub candidate_id: String,
-    pub action: String,
-    pub reason: String,
-    pub affected_refs_json: String,
-    pub staging_raw_json: String,
-    pub source_path: Option<String>,
-    pub imported_at: String,
-    pub resolved_at: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LegacyMemoryResetCounts {
-    pub documents: usize,
-    pub staging_records: usize,
-    pub staging_resolutions: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlowSourceRecord {
     pub workspace_id: String,
     pub flow_id: String,
@@ -2097,41 +2059,6 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         objective_id: &str,
     ) -> Result<Vec<ObjectiveResourceRecord>>;
-    fn ensure_memory_document(
-        &self,
-        workspace_id: &str,
-        default_body_md: &str,
-        now: &str,
-    ) -> Result<MemoryDocumentRecord>;
-    fn get_memory_document(&self, workspace_id: &str) -> Result<Option<MemoryDocumentRecord>>;
-    fn upsert_memory_document(&self, record: &MemoryDocumentRecord) -> Result<()>;
-    fn upsert_memory_staging_record(&self, record: &MemoryStagingRecord) -> Result<()>;
-    fn list_memory_staging_records(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MemoryStagingRecord>>;
-    fn get_memory_staging_record(
-        &self,
-        workspace_id: &str,
-        candidate_id: &str,
-    ) -> Result<Option<MemoryStagingRecord>>;
-    fn delete_memory_staging_record(&self, workspace_id: &str, candidate_id: &str) -> Result<bool>;
-    fn count_memory_staging_records(&self, workspace_id: &str) -> Result<usize>;
-    fn insert_memory_staging_resolution(
-        &self,
-        record: &MemoryStagingResolutionRecord,
-    ) -> Result<()>;
-    fn list_memory_staging_resolutions(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MemoryStagingResolutionRecord>>;
-    /// Atomically removes only the legacy Workspace Memory document and legacy
-    /// staging rows. Subjektiv Feature storage and all other Workspace state are
-    /// outside this transaction's deletion set.
-    fn reset_legacy_memory(&self, workspace_id: &str) -> Result<LegacyMemoryResetCounts>;
-
     fn upsert_account(&self, record: &AccountRecord) -> Result<()>;
     fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>>;
     fn get_account_by_handle(&self, kind: &str, handle: &str) -> Result<Option<AccountRecord>>;
@@ -3829,41 +3756,6 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub(crate) fn get_workspace_memory_settings(
-        &self,
-        workspace_id: &str,
-    ) -> Result<WorkspaceMemorySettingsRecord> {
-        let record = self.with_conn(|conn| conn.query_row(
-            "SELECT workspace_id, language, created_at, updated_at FROM workspace_memory_settings WHERE workspace_id=?1",
-            [workspace_id], read_workspace_memory_settings,
-        ).optional()?.ok_or_else(|| Error::Store("Workspace Memory settings are missing".into())))?;
-        validate_workspace_memory_settings_record(&record, workspace_id)?;
-        Ok(record)
-    }
-
-    pub(crate) fn update_workspace_memory_settings(
-        &self,
-        workspace_id: &str,
-        expected_language: &str,
-        language: &str,
-    ) -> Result<WorkspaceMemorySettingsRecord> {
-        let language = normalize_workspace_memory_language(language)?;
-        self.with_conn_mut(|conn| {
-            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let current=tx.query_row("SELECT workspace_id,language,created_at,updated_at FROM workspace_memory_settings WHERE workspace_id=?1",[workspace_id],read_workspace_memory_settings)
-                .optional()?.ok_or_else(|| Error::Store("Workspace Memory settings are missing".into()))?;
-            validate_workspace_memory_settings_record(&current,workspace_id)?;
-            if current.language != expected_language {
-                return Err(Error::WorkspaceConfigConflict("Workspace Memory language changed".into()));
-            }
-            if current.language == language { tx.commit()?; return Ok(current); }
-            let now=chrono::Utc::now().to_rfc3339();
-            tx.execute("UPDATE workspace_memory_settings SET language=?2,updated_at=?3 WHERE workspace_id=?1",params![workspace_id,language,now])?;
-            tx.commit()?;
-            Ok(WorkspaceMemorySettingsRecord { language,updated_at:now,..current })
-        })
-    }
-
     pub(crate) fn reserve_worker_create(
         &self,
         workspace_id: &str,
@@ -3871,7 +3763,6 @@ impl SqliteWorkspaceStore {
         allocation_key: &str,
         request_fingerprint: &str,
         singleton_key: Option<&str>,
-        current_memory_settings: &WorkspaceMemorySettingsRecord,
     ) -> Result<WorkerCreateReservation> {
         self.reserve_worker_create_with_initialization(
             workspace_id,
@@ -3879,7 +3770,6 @@ impl SqliteWorkspaceStore {
             allocation_key,
             request_fingerprint,
             singleton_key,
-            current_memory_settings,
             &FeatureInitializations::default(),
         )
     }
@@ -3892,7 +3782,6 @@ impl SqliteWorkspaceStore {
         allocation_key: &str,
         request_fingerprint: &str,
         singleton_key: Option<&str>,
-        current_memory_settings: &WorkspaceMemorySettingsRecord,
         feature_initialization: &FeatureInitializations,
     ) -> Result<WorkerCreateReservation> {
         self.reserve_worker_create_with(
@@ -3901,14 +3790,13 @@ impl SqliteWorkspaceStore {
             allocation_key,
             request_fingerprint,
             singleton_key,
-            current_memory_settings,
             feature_initialization,
             |_| Ok(None),
             |_, _| Ok(()),
         )
     }
 
-    // Keep reservation validation, Memory binding and writes in one transaction. The
+    // Keep reservation validation, Feature binding and writes in one transaction. The
     // nondefault test-support module supplies fixed identity / offline catalog hooks;
     // ordinary creation always supplies a newly generated ID and no completion hook.
     #[allow(clippy::too_many_arguments)]
@@ -3919,7 +3807,6 @@ impl SqliteWorkspaceStore {
         allocation_key: &str,
         request_fingerprint: &str,
         singleton_key: Option<&str>,
-        current_memory_settings: &WorkspaceMemorySettingsRecord,
         feature_initialization: &FeatureInitializations,
         prepare: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<Option<WorkerId>>,
         complete: impl FnOnce(&rusqlite::Transaction<'_>, &WorkerCreateReservation) -> Result<()>,
@@ -3930,7 +3817,6 @@ impl SqliteWorkspaceStore {
             allocation_key,
             request_fingerprint,
             singleton_key,
-            current_memory_settings,
             feature_initialization,
             prepare,
             complete,
@@ -3949,7 +3835,6 @@ impl SqliteWorkspaceStore {
         allocation_key: &str,
         request_fingerprint: &str,
         singleton_key: Option<&str>,
-        current_memory_settings: &WorkspaceMemorySettingsRecord,
         feature_initialization: &FeatureInitializations,
         prepare: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<Option<WorkerId>>,
         complete: impl FnOnce(&rusqlite::Transaction<'_>, &WorkerCreateReservation) -> Result<()>,
@@ -3963,7 +3848,6 @@ impl SqliteWorkspaceStore {
         if let Some(key) = singleton_key {
             validate_worker_singleton_key(key)?;
         }
-        validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
         let initialization_json = serde_json::to_string(feature_initialization)
             .map_err(|_| Error::Store("Feature initialization could not be encoded".into()))?;
         self.with_conn_mut(|conn| {
@@ -3973,7 +3857,7 @@ impl SqliteWorkspaceStore {
             let existing = tx
                 .query_row(
                     "SELECT worker_id, runtime_id, request_fingerprint, create_fingerprint, \
-                            memory_language, state, singleton_key, \
+                            initialization_binding, state, singleton_key, \
                             singleton_generation, feature_initialization_json \
                      FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND allocation_key = ?2",
@@ -3993,7 +3877,7 @@ impl SqliteWorkspaceStore {
                     },
                 )
                 .optional()?;
-            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, language, state, stored_singleton_key, singleton_generation, saved_initialization)) = existing {
+            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, _binding, state, stored_singleton_key, singleton_generation, saved_initialization)) = existing {
                 if state == "removed" {
                     return Err(Error::InvalidInput(format!(
                         "Worker create allocation {allocation_key} was terminally removed"
@@ -4007,24 +3891,14 @@ impl SqliteWorkspaceStore {
                         "Worker create allocation {allocation_key} was already used with different input"
                     )));
                 }
-                let language = language.ok_or_else(|| {
-                    Error::InvalidInput(format!(
-                        "Worker create allocation {allocation_key} has no persisted Memory language"
-                    ))
-                })?;
                 let worker_id = worker_id.parse::<WorkerId>().map_err(|_| {
                     Error::Store(format!(
                         "Worker create allocation {allocation_key} has a non-UUIDv7 worker id"
                     ))
                 })?;
-                let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
-                    workspace_id: workspace_id.to_string(),
-                    language,
-                };
-                validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
                 let saved_initialization = feature_initialization::read_bound(
                     &tx, &RuntimeWorkerRef::new(runtime_id, worker_id.to_string()),
-                    saved_initialization.as_deref(), request_fingerprint, &snapshot, &create_fingerprint,
+                    saved_initialization.as_deref(), request_fingerprint, workspace_id, &create_fingerprint,
                 )?;
                 feature_initialization::require_same(&saved_initialization, feature_initialization)?;
                 let singleton = match (stored_singleton_key, singleton_generation) {
@@ -4050,7 +3924,7 @@ impl SqliteWorkspaceStore {
                 let reservation = WorkerCreateReservation {
                     worker_id,
                     create_fingerprint,
-                    memory_settings: snapshot,
+                    subjektiv_memory_settings: reserved_subjektiv_settings(&tx, workspace_id, &RuntimeWorkerRef::new(runtime_id, worker_id.to_string()))?,
                     feature_initialization: saved_initialization,
                     singleton,
                 };
@@ -4069,7 +3943,7 @@ impl SqliteWorkspaceStore {
                 let stored = tx
                     .query_row(
                         "SELECT allocation_key, request_fingerprint, create_fingerprint, \
-                                memory_language, singleton_key, \
+                                initialization_binding, singleton_key, \
                                 singleton_generation, state, feature_initialization_json \
                          FROM worker_create_reservations \
                          WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
@@ -4101,7 +3975,7 @@ impl SqliteWorkspaceStore {
                         owner.worker.runtime_id, owner.worker.worker_id
                     )));
                 }
-                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, language, stored_singleton_key, stored_generation, _, saved_initialization)) = stored
+                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, _binding, stored_singleton_key, stored_generation, _, saved_initialization)) = stored
                     && allocation_key.starts_with("manual:")
                     && stored_allocation_key.starts_with("manual:")
                     && owner.worker.runtime_id == runtime_id
@@ -4110,32 +3984,21 @@ impl SqliteWorkspaceStore {
                     && stored_generation.and_then(|generation| u64::try_from(generation).ok())
                         == Some(owner.generation)
                 {
-                        let language = language.ok_or_else(|| {
-                        Error::InvalidInput(format!(
-                            "Worker singleton reservation {}:{} has no persisted Memory language",
-                            owner.worker.runtime_id, owner.worker.worker_id
-                        ))
-                    })?;
                     let worker_id = owner.worker.worker_id.parse::<WorkerId>().map_err(|_| {
                         Error::Store(format!(
                             "Worker singleton reservation {}:{} has a non-UUIDv7 worker id",
                             owner.worker.runtime_id, owner.worker.worker_id
                         ))
                     })?;
-                    let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
-                        workspace_id: workspace_id.to_string(),
-                            language,
-                    };
-                    validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
                     let saved_initialization = feature_initialization::read_bound(
                         &tx, &RuntimeWorkerRef::new(runtime_id, worker_id.to_string()),
-                    saved_initialization.as_deref(), request_fingerprint, &snapshot, &create_fingerprint,
+                    saved_initialization.as_deref(), request_fingerprint, workspace_id, &create_fingerprint,
                     )?;
                     feature_initialization::require_same(&saved_initialization, feature_initialization)?;
                     let reservation = WorkerCreateReservation {
                         worker_id,
                         create_fingerprint,
-                        memory_settings: snapshot,
+                        subjektiv_memory_settings: reserved_subjektiv_settings(&tx, workspace_id, &RuntimeWorkerRef::new(runtime_id, worker_id.to_string()))?,
                         feature_initialization: saved_initialization,
                         singleton: Some(owner.clone()),
                     };
@@ -4149,29 +4012,9 @@ impl SqliteWorkspaceStore {
                 )));
             }
 
-            let authoritative_language = tx
-                .query_row(
-                    "SELECT language FROM workspace_memory_settings WHERE workspace_id = ?1",
-                    params![workspace_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))?;
-            if authoritative_language != current_memory_settings.language
-            {
-                return Err(Error::WorkspaceConfigConflict(
-                    "Workspace Memory settings changed while the Worker create reservation was being accepted"
-                        .to_string(),
-                ));
-            }
-
-            let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: workspace_id.to_string(),
-                language: authoritative_language,
-            };
-            validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
+            let subjektiv_memory_settings = if feature_initialization.get(subjektiv_api::worker_initialization::FEATURE_ID).is_some() { Some(read_subjektiv_settings(&tx,workspace_id)?) } else { None };
             let create_fingerprint =
-                bound_worker_create_fingerprint(request_fingerprint, &snapshot, &initialization_json);
+                bound_worker_create_fingerprint(request_fingerprint, workspace_id, subjektiv_memory_settings.as_ref(), &initialization_json);
             let worker_id = fixed_worker_id.unwrap_or_else(WorkerId::now_v7);
             let worker_id_text = worker_id.to_string();
             let now = chrono::Utc::now().to_rfc3339();
@@ -4201,8 +4044,8 @@ impl SqliteWorkspaceStore {
                 "INSERT INTO worker_create_reservations(\
                     workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,\
                     state, created_at, updated_at, request_fingerprint,\
-                    memory_language, singleton_key, singleton_generation, feature_initialization_json\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    initialization_binding, singleton_key, singleton_generation, feature_initialization_json, subjektiv_memory_language\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     workspace_id,
                     allocation_key,
@@ -4211,12 +4054,14 @@ impl SqliteWorkspaceStore {
                     create_fingerprint,
                     now,
                     request_fingerprint,
-                    snapshot.language,
+                    Option::<String>::None,
                     singleton_key,
                     singleton_generation.map(|generation| generation as i64),
                     initialization_json,
+                    subjektiv_memory_settings.as_ref().map(|s|s.language.as_str()),
                 ],
             )?;
+            refresh_worker_create_evidence(&tx, workspace_id, &RuntimeWorkerRef::new(runtime_id, worker_id_text.clone()))?;
             let singleton = singleton_key.zip(singleton_generation).map(|(key, generation)| {
                 WorkerSingletonLease {
                     key: key.to_string(),
@@ -4265,7 +4110,7 @@ impl SqliteWorkspaceStore {
             let reservation = WorkerCreateReservation {
                 worker_id,
                 create_fingerprint,
-                memory_settings: snapshot,
+                subjektiv_memory_settings,
                 feature_initialization: feature_initialization.clone(),
                 singleton,
             };
@@ -4559,8 +4404,8 @@ impl SqliteWorkspaceStore {
         job.load_executable_request()?;
         let key = crate::backend_job::allocation_key(&attempt.attempt_id);
         self.with_conn(|conn| {
-            let saved = conn.query_row("SELECT worker_id,runtime_id,request_fingerprint,create_fingerprint,memory_language,state,singleton_key,singleton_generation,feature_initialization_json FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2",params![workspace_id,key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,Option<String>>(8)?))).optional()?;
-            let Some((worker_id,runtime,request_fingerprint,create_fingerprint,language,state,singleton,generation,saved_initialization))=saved else { return Ok(None); };
+            let saved = conn.query_row("SELECT worker_id,runtime_id,request_fingerprint,create_fingerprint,initialization_binding,state,singleton_key,singleton_generation,feature_initialization_json FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2",params![workspace_id,key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,Option<String>>(8)?))).optional()?;
+            let Some((worker_id,runtime,request_fingerprint,create_fingerprint,_binding,state,singleton,generation,saved_initialization))=saved else { return Ok(None); };
             if state == "removed" || singleton.is_some() || generation.is_some() {
                 return Err(Error::RepositoryConflict("original Job allocation is removed or has different create intent".into()));
             }
@@ -4569,20 +4414,15 @@ impl SqliteWorkspaceStore {
             // today's Profile/default or issue any new execution grant.
             let request_fingerprint = request_fingerprint.filter(|fingerprint| !fingerprint.is_empty())
                 .ok_or_else(|| Error::Store("original Job create fingerprint missing".into()))?;
-            let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: workspace_id.into(),
-                language: language.ok_or_else(||Error::Store("Job allocation Memory snapshot missing".into()))?,
-            };
-            validate_workspace_memory_settings_snapshot(&snapshot,workspace_id)?;
             let feature_initialization = feature_initialization::read_bound(
                 conn, &RuntimeWorkerRef::new(&runtime, &worker_id),
-                saved_initialization.as_deref(), &request_fingerprint, &snapshot, &create_fingerprint,
+                saved_initialization.as_deref(), &request_fingerprint, workspace_id, &create_fingerprint,
             )?;
             let worker_id = worker_id.parse::<WorkerId>().map_err(|_|Error::Store("invalid original Job Worker identity".into()))?;
             if attempt.worker.as_ref().is_some_and(|worker| worker.runtime_id != runtime || worker.worker_id != worker_id.to_string()) {
                 return Err(Error::RepositoryConflict("Job allocation differs from saved execution binding".into()));
             }
-            Ok(Some((WorkerCreateReservation{worker_id,create_fingerprint,memory_settings:snapshot,feature_initialization,singleton:None},runtime)))
+            Ok(Some((WorkerCreateReservation{worker_id,create_fingerprint,subjektiv_memory_settings:reserved_subjektiv_settings(conn,workspace_id,&RuntimeWorkerRef::new(&runtime,worker_id.to_string()))?,feature_initialization,singleton:None},runtime)))
         })
     }
 
@@ -6179,12 +6019,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         ],
                     )?;
                     tx.execute(
-                        r#"INSERT OR IGNORE INTO workspace_memory_settings (
-                        workspace_id, language, created_at, updated_at
-                    ) VALUES (?1, 'English', ?2, ?3)"#,
-                        params![record.workspace_id, record.created_at, record.updated_at],
-                    )?;
-                    tx.execute(
                         r#"INSERT OR IGNORE INTO workspace_signing_identities (
                         workspace_id, key_id, algorithm, public_key, public_key_fingerprint,
                         private_material_ref, state, created_at, provisioned_at, updated_at
@@ -6195,6 +6029,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     )"#,
                         params![record.workspace_id, record.created_at, record.updated_at],
                     )?;
+                    tx.execute("INSERT OR IGNORE INTO subjektiv_memory_settings(workspace_id,language,created_at,updated_at) VALUES(?1,'English',?2,?3)",params![record.workspace_id,record.created_at,record.updated_at])?;
                     tx.commit()?;
                     Ok(())
                 })?;
@@ -6428,16 +6263,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         record.workspace.updated_at,
                     ],
                 )?;
-                tx.execute(
-                    r#"INSERT INTO workspace_memory_settings (
-                        workspace_id, language, created_at, updated_at
-                    ) VALUES (?1, 'English', ?2, ?3)"#,
-                    params![
-                        record.workspace.workspace_id,
-                        record.workspace.created_at,
-                        record.workspace.updated_at,
-                    ],
-                )?;
+                tx.execute("INSERT INTO subjektiv_memory_settings(workspace_id,language,created_at,updated_at) VALUES(?1,'English',?2,?3)",params![record.workspace.workspace_id,record.workspace.created_at,record.workspace.updated_at])?;
                 if let Some(repository) = &record.repository {
                 tx.execute(
                     r#"INSERT INTO repositories (
@@ -8059,225 +7885,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
-        })
-    }
-
-    fn ensure_memory_document(
-        &self,
-        workspace_id: &str,
-        default_body_md: &str,
-        now: &str,
-    ) -> Result<MemoryDocumentRecord> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT OR IGNORE INTO workspace_memory_documents (
-                    workspace_id, body_md, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?3)"#,
-                params![workspace_id, default_body_md, now],
-            )?;
-            conn.query_row(
-                r#"SELECT workspace_id, body_md, created_at, updated_at
-                   FROM workspace_memory_documents
-                   WHERE workspace_id = ?1"#,
-                params![workspace_id],
-                read_memory_document_record,
-            )
-            .map_err(Error::from)
-        })
-    }
-
-    fn get_memory_document(&self, workspace_id: &str) -> Result<Option<MemoryDocumentRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, body_md, created_at, updated_at
-                   FROM workspace_memory_documents
-                   WHERE workspace_id = ?1"#,
-                params![workspace_id],
-                read_memory_document_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
-    }
-
-    fn upsert_memory_document(&self, record: &MemoryDocumentRecord) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT INTO workspace_memory_documents (
-                    workspace_id, body_md, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(workspace_id) DO UPDATE SET
-                    body_md = excluded.body_md,
-                    updated_at = excluded.updated_at"#,
-                params![
-                    record.workspace_id,
-                    record.body_md,
-                    record.created_at,
-                    record.updated_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn upsert_memory_staging_record(&self, record: &MemoryStagingRecord) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT INTO memory_staging_records (
-                    workspace_id, candidate_id, raw_json, source_path, imported_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(workspace_id, candidate_id) DO UPDATE SET
-                    raw_json = excluded.raw_json,
-                    source_path = excluded.source_path,
-                    imported_at = excluded.imported_at"#,
-                params![
-                    record.workspace_id,
-                    record.candidate_id,
-                    record.raw_json,
-                    record.source_path,
-                    record.imported_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn list_memory_staging_records(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MemoryStagingRecord>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, candidate_id, raw_json, source_path, imported_at
-                   FROM memory_staging_records
-                   WHERE workspace_id = ?1
-                   ORDER BY imported_at DESC, candidate_id ASC
-                   LIMIT ?2"#,
-            )?;
-            let rows = stmt.query_map(
-                params![workspace_id, limit as i64],
-                read_memory_staging_record,
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)
-        })
-    }
-
-    fn get_memory_staging_record(
-        &self,
-        workspace_id: &str,
-        candidate_id: &str,
-    ) -> Result<Option<MemoryStagingRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, candidate_id, raw_json, source_path, imported_at
-                   FROM memory_staging_records
-                   WHERE workspace_id = ?1 AND candidate_id = ?2"#,
-                params![workspace_id, candidate_id],
-                read_memory_staging_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
-    }
-
-    fn delete_memory_staging_record(&self, workspace_id: &str, candidate_id: &str) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
-                "DELETE FROM memory_staging_records WHERE workspace_id = ?1 AND candidate_id = ?2",
-                params![workspace_id, candidate_id],
-            )?;
-            Ok(changed > 0)
-        })
-    }
-
-    fn count_memory_staging_records(&self, workspace_id: &str) -> Result<usize> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM memory_staging_records WHERE workspace_id = ?1",
-                params![workspace_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|count| count as usize)
-            .map_err(Error::from)
-        })
-    }
-
-    fn insert_memory_staging_resolution(
-        &self,
-        record: &MemoryStagingResolutionRecord,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT INTO memory_staging_resolutions (
-                    workspace_id, candidate_id, action, reason, affected_refs_json,
-                    staging_raw_json, source_path, imported_at, resolved_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-                params![
-                    record.workspace_id,
-                    record.candidate_id,
-                    record.action,
-                    record.reason,
-                    record.affected_refs_json,
-                    record.staging_raw_json,
-                    record.source_path,
-                    record.imported_at,
-                    record.resolved_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn list_memory_staging_resolutions(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MemoryStagingResolutionRecord>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, candidate_id, action, reason, affected_refs_json,
-                          staging_raw_json, source_path, imported_at, resolved_at
-                   FROM memory_staging_resolutions
-                   WHERE workspace_id = ?1
-                   ORDER BY resolved_at DESC, candidate_id ASC
-                   LIMIT ?2"#,
-            )?;
-            let rows = stmt.query_map(
-                params![workspace_id, limit as i64],
-                read_memory_staging_resolution_record,
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)
-        })
-    }
-
-    fn reset_legacy_memory(&self, workspace_id: &str) -> Result<LegacyMemoryResetCounts> {
-        validate_identifier("workspace_id", workspace_id)?;
-        self.with_conn_mut(|connection| {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Resolutions retain copies of staging rows, so remove them first;
-            // pending staging follows, then the singleton legacy document.
-            let staging_resolutions = transaction.execute(
-                "DELETE FROM memory_staging_resolutions WHERE workspace_id = ?1",
-                params![workspace_id],
-            )?;
-            let staging_records = transaction.execute(
-                "DELETE FROM memory_staging_records WHERE workspace_id = ?1",
-                params![workspace_id],
-            )?;
-            let documents = transaction.execute(
-                "DELETE FROM workspace_memory_documents WHERE workspace_id = ?1",
-                params![workspace_id],
-            )?;
-            transaction.commit()?;
-            Ok(LegacyMemoryResetCounts {
-                documents,
-                staging_records,
-                staging_resolutions,
-            })
         })
     }
 
@@ -14032,41 +13639,6 @@ fn read_objective_resource_record(
     })
 }
 
-fn read_memory_document_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryDocumentRecord> {
-    Ok(MemoryDocumentRecord {
-        workspace_id: row.get(0)?,
-        body_md: row.get(1)?,
-        created_at: row.get(2)?,
-        updated_at: row.get(3)?,
-    })
-}
-
-fn read_memory_staging_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryStagingRecord> {
-    Ok(MemoryStagingRecord {
-        workspace_id: row.get(0)?,
-        candidate_id: row.get(1)?,
-        raw_json: row.get(2)?,
-        source_path: row.get(3)?,
-        imported_at: row.get(4)?,
-    })
-}
-
-fn read_memory_staging_resolution_record(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<MemoryStagingResolutionRecord> {
-    Ok(MemoryStagingResolutionRecord {
-        workspace_id: row.get(0)?,
-        candidate_id: row.get(1)?,
-        action: row.get(2)?,
-        reason: row.get(3)?,
-        affected_refs_json: row.get(4)?,
-        staging_raw_json: row.get(5)?,
-        source_path: row.get(6)?,
-        imported_at: row.get(7)?,
-        resolved_at: row.get(8)?,
-    })
-}
-
 // The receipt/disposition commit precedes physical cleanup. An error here is
 // safely retried with the same expected digest/reason, not a new execution.
 fn reclaim_backend_job_input_storage(conn: &Connection) -> Result<()> {
@@ -18424,55 +17996,6 @@ fn collect_reference_diagnostics(
     Ok(())
 }
 
-fn read_workspace_memory_settings(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<WorkspaceMemorySettingsRecord> {
-    Ok(WorkspaceMemorySettingsRecord {
-        workspace_id: row.get(0)?,
-        language: row.get(1)?,
-        created_at: row.get(2)?,
-        updated_at: row.get(3)?,
-    })
-}
-
-fn validate_workspace_memory_settings_snapshot(
-    snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
-    expected_workspace_id: &str,
-) -> Result<()> {
-    if snapshot.workspace_id != expected_workspace_id
-        || !manifest::is_normalized_workspace_memory_language(&snapshot.language)
-    {
-        return Err(Error::Store(
-            "Workspace Memory settings are corrupt or belong to another Workspace".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_workspace_memory_settings_record(
-    record: &WorkspaceMemorySettingsRecord,
-    expected_workspace_id: &str,
-) -> Result<()> {
-    validate_workspace_memory_settings_snapshot(
-        &manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: record.workspace_id.clone(),
-            language: record.language.clone(),
-        },
-        expected_workspace_id,
-    )
-}
-
-fn normalize_workspace_memory_language(language: &str) -> Result<String> {
-    let language = language.trim();
-    if !manifest::is_normalized_workspace_memory_language(language) {
-        return Err(Error::InvalidInput(format!(
-            "Workspace Memory language must be a non-empty UTF-8 string of at most {} characters without control characters",
-            manifest::MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS
-        )));
-    }
-    Ok(language.to_string())
-}
-
 pub(crate) fn validate_worker_singleton_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(Error::InvalidInput(
@@ -18601,16 +18124,22 @@ fn require_current_worker_singleton_lease(
 
 fn bound_worker_create_fingerprint(
     request_fingerprint: &str,
-    snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
+    workspace_id: &str,
+    subjektiv_settings: Option<&manifest::SubjektivMemorySettingsSnapshot>,
     initialization_json: &str,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"workspace-worker-create-v4\0");
+    digest.update(b"workspace-worker-create-v5\0");
     digest.update(request_fingerprint.as_bytes());
     digest.update(b"\0");
-    digest.update(snapshot.workspace_id.as_bytes());
+    digest.update(workspace_id.as_bytes());
     digest.update(b"\0");
-    digest.update(snapshot.language.as_bytes());
+    digest.update(
+        subjektiv_settings
+            .map(|s| s.language.as_str())
+            .unwrap_or("")
+            .as_bytes(),
+    );
     digest.update(b"\0");
     digest.update(initialization_json.as_bytes());
     let encoded = digest
@@ -18619,6 +18148,77 @@ fn bound_worker_create_fingerprint(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("sha256:{encoded}")
+}
+
+/// Seals generic immutable create evidence, including any pinned Plugin plan.
+pub(crate) fn refresh_worker_create_evidence(
+    conn: &Connection,
+    workspace: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<()> {
+    let (request,create,initialization): (Option<String>,String,Option<String>) = conn.query_row(
+        "SELECT request_fingerprint,create_fingerprint,feature_initialization_json FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+        params![workspace,worker.runtime_id,worker.worker_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let binding = match initialization {
+        Some(initialization) => {
+            let parsed: FeatureInitializations =
+                serde_json::from_str(&initialization).map_err(|e| Error::Store(e.to_string()))?;
+            let canonical =
+                serde_json::to_string(&parsed).map_err(|e| Error::Store(e.to_string()))?;
+            Some(memory_retirement::evidence_fingerprint(
+                conn,
+                workspace,
+                worker,
+                &request.ok_or_else(|| {
+                    Error::Store("saved create request fingerprint missing".into())
+                })?,
+                &create,
+                &canonical,
+            )?)
+        }
+        None => None,
+    };
+    conn.execute("UPDATE worker_create_reservations SET initialization_binding=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace,worker.runtime_id,worker.worker_id,binding])?;
+    Ok(())
+}
+
+fn read_subjektiv_settings(
+    conn: &Connection,
+    workspace: &str,
+) -> Result<manifest::SubjektivMemorySettingsSnapshot> {
+    let language: String = conn.query_row(
+        "SELECT language FROM subjektiv_memory_settings WHERE workspace_id=?1",
+        [workspace],
+        |r| r.get(0),
+    )?;
+    if !manifest::is_normalized_subjektiv_memory_language(&language) {
+        return Err(Error::Store("Subjektiv Memory language is invalid".into()));
+    }
+    Ok(manifest::SubjektivMemorySettingsSnapshot {
+        workspace_id: workspace.into(),
+        language,
+    })
+}
+
+fn reserved_subjektiv_settings(
+    conn: &Connection,
+    workspace: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<Option<manifest::SubjektivMemorySettingsSnapshot>> {
+    let language: Option<String> = conn.query_row("SELECT subjektiv_memory_language FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace,worker.runtime_id,worker.worker_id],|r|r.get(0))?;
+    language
+        .map(|language| {
+            if !manifest::is_normalized_subjektiv_memory_language(&language) {
+                return Err(Error::Store(
+                    "saved Subjektiv Memory language is invalid".into(),
+                ));
+            }
+            Ok(manifest::SubjektivMemorySettingsSnapshot {
+                workspace_id: workspace.into(),
+                language,
+            })
+        })
+        .transpose()
 }
 
 fn current_schema_version(conn: &Connection) -> Result<i64> {
@@ -20327,6 +19927,10 @@ mod tests {
                     WorkspaceSchemaMigrationStep {
                         version: 143,
                         name: feature_worker_launch::MIGRATION_NAME.into(),
+                    },
+                    WorkspaceSchemaMigrationStep {
+                        version: 144,
+                        name: memory_retirement::MIGRATION_NAME.into()
                     }
                 ]
             );
@@ -22512,6 +22116,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("schema_equivalence_tests.rs");
     include!("schema_convergence_tests.rs");
     include!("store/feature_initialization_tests.rs");
+    include!("store/memory_retirement_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
     include!("ticket_plan_retirement_tests.rs");
@@ -23079,6 +22684,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             WorkspaceSchemaMigrationStep {
                 version: 143,
                 name: feature_worker_launch::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 144,
+                name: memory_retirement::MIGRATION_NAME.into(),
             },
         ]
     }
@@ -23738,7 +23347,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         store
             .delete_worker_registry("workspace-a", &legacy)
             .unwrap();
-        let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+
         let replacement = store
             .reserve_worker_create(
                 "workspace-a",
@@ -23746,7 +23355,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "replacement-operation",
                 "sha256:replacement",
                 Some("workspace-orchestrator"),
-                &memory,
             )
             .unwrap();
         assert_eq!(replacement.singleton.unwrap().generation, 2);
@@ -24926,58 +24534,22 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             .await
             .unwrap();
 
-        let memory_settings = store.get_workspace_memory_settings("workspace-a").unwrap();
-        assert_eq!(memory_settings.language, "English");
         let reserved = store
-            .reserve_worker_create(
-                "workspace-a",
-                "arcadia",
-                "operation-1",
-                "sha256:one",
-                None,
-                &memory_settings,
-            )
+            .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:one", None)
             .unwrap();
         assert_eq!(
             reserved.worker_id.as_uuid().get_version(),
             Some(uuid::Version::SortRand)
         );
-        assert_eq!(reserved.memory_settings.language, "English");
         let reserved_worker = RuntimeWorkerRef::new("arcadia", reserved.worker_id.to_string());
         assert!(
             store
                 .has_active_worker_create_reservation("workspace-a", &reserved_worker)
                 .unwrap()
         );
-        let unchanged_memory_settings = store
-            .update_workspace_memory_settings("workspace-a", "English", " English ")
-            .unwrap();
-        assert_eq!(unchanged_memory_settings, memory_settings);
-        let updated_memory_settings = store
-            .update_workspace_memory_settings("workspace-a", "English", " Français ")
-            .unwrap();
-        assert_eq!(updated_memory_settings.language, "Français");
-        assert!(matches!(
-            store.update_workspace_memory_settings("workspace-a", "English", "Japanese"),
-            Err(Error::WorkspaceConfigConflict(_))
-        ));
         assert_eq!(
             store
-                .get_workspace_memory_settings("workspace-a")
-                .unwrap()
-                .language,
-            "Français"
-        );
-        assert_eq!(
-            store
-                .reserve_worker_create(
-                    "workspace-a",
-                    "arcadia",
-                    "operation-1",
-                    "sha256:one",
-                    None,
-                    &updated_memory_settings,
-                )
+                .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:one", None,)
                 .unwrap(),
             reserved
         );
@@ -24989,7 +24561,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     "operation-1",
                     "sha256:different",
                     None,
-                    &updated_memory_settings,
                 )
                 .is_err()
         );
@@ -25007,14 +24578,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             Some(reserved_worker.clone())
         );
         let second = store
-            .reserve_worker_create(
-                "workspace-a",
-                "arcadia",
-                "operation-2",
-                "sha256:two",
-                None,
-                &updated_memory_settings,
-            )
+            .reserve_worker_create("workspace-a", "arcadia", "operation-2", "sha256:two", None)
             .unwrap();
         assert_eq!(
             store
@@ -25159,58 +24723,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
         assert!(
             store
-                .reserve_worker_create(
-                    "workspace-a",
-                    "arcadia",
-                    "operation-1",
-                    "sha256:one",
-                    None,
-                    &updated_memory_settings,
-                )
+                .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:one", None,)
                 .is_err()
         );
-
-        store
-            .with_conn(|conn| {
-                conn.execute(
-                    "UPDATE workspace_memory_settings SET language = ' English ' \
-                     WHERE workspace_id = 'workspace-a'",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.get_workspace_memory_settings("workspace-a").is_err());
-        assert!(
-            store
-                .update_workspace_memory_settings("workspace-a", "Français", "Spanish")
-                .is_err()
-        );
-        let mut corrupt = updated_memory_settings.clone();
-        corrupt.language = " English ".to_string();
-        assert!(
-            store
-                .reserve_worker_create(
-                    "workspace-a",
-                    "arcadia",
-                    "operation-corrupt",
-                    "sha256:corrupt",
-                    None,
-                    &corrupt,
-                )
-                .is_err()
-        );
-
-        store
-            .with_conn(|conn| {
-                conn.execute(
-                    "DELETE FROM workspace_memory_settings WHERE workspace_id = 'workspace-a'",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.get_workspace_memory_settings("workspace-a").is_err());
     }
 
     #[tokio::test]
@@ -25229,7 +24744,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             })
             .await
             .unwrap();
-        let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+
         let request = |relative_cwd: Option<&str>| crate::hosts::WorkerSpawnRequest {
             requested_worker_name: Some("Subject Worker".to_string()),
             singleton_key: Some("subjektiv:restart-retry".to_string()),
@@ -25252,6 +24767,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 },
             ],
             resolved_config_bundle: None,
+            resolved_subjektiv_memory_settings: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
@@ -25259,7 +24775,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             authorization: None,
             resolved_core_execution_grant: None,
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
         };
@@ -25275,7 +24790,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "manual:lost-before-dispatch",
                 &stable_fingerprint,
                 Some("subjektiv:restart-retry"),
-                &memory,
             )
             .unwrap();
         drop(store);
@@ -25288,7 +24802,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "manual:new-after-restart",
                 &stable_fingerprint,
                 Some("subjektiv:restart-retry"),
-                &memory,
             )
             .unwrap();
         assert_eq!(retried, reserved);
@@ -25311,7 +24824,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "manual:different-request",
                 &changed_workdir_fingerprint,
                 Some("subjektiv:restart-retry"),
-                &memory,
             )
             .unwrap_err();
         assert!(matches!(
@@ -25336,7 +24848,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "manual:retry-after-terminal-failure",
                 &stable_fingerprint,
                 Some("subjektiv:restart-retry"),
-                &memory,
             )
             .unwrap_err();
         assert!(matches!(conflict, Error::RepositoryConflict(message)
@@ -25381,7 +24892,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         }
         // Generic singleton lifecycle; Subject-prefixed keys have a separate explicit release contract.
         let key = "fixture:主体 id/?!";
-        let memory_a = store.get_workspace_memory_settings("workspace-a").unwrap();
+
         let first = store
             .reserve_worker_create(
                 "workspace-a",
@@ -25389,7 +24900,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "operation-a1",
                 "sha256:a1",
                 Some(key),
-                &memory_a,
             )
             .unwrap();
         let first_lease = first.singleton.clone().unwrap();
@@ -25403,7 +24913,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     "operation-a1",
                     "sha256:a1",
                     Some(key),
-                    &memory_a,
                 )
                 .unwrap(),
             first
@@ -25415,7 +24924,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "operation-a2",
                 "sha256:a2",
                 Some(key),
-                &memory_a,
             )
             .unwrap_err();
         assert!(
@@ -25423,7 +24931,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         );
 
         // The same opaque key is independent in another Workspace.
-        let memory_b = store.get_workspace_memory_settings("workspace-b").unwrap();
+
         let other_workspace = store
             .reserve_worker_create(
                 "workspace-b",
@@ -25431,7 +24939,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "operation-b1",
                 "sha256:b1",
                 Some(key),
-                &memory_b,
             )
             .unwrap();
         assert_eq!(other_workspace.singleton.unwrap().generation, 1);
@@ -25459,7 +24966,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "operation-a3",
                 "sha256:a3",
                 Some(key),
-                &memory_a,
             )
             .unwrap();
         let replacement_lease = replacement.singleton.clone().unwrap();
@@ -25628,7 +25134,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 })
                 .await
                 .unwrap();
-            let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+
             let key = "subjektiv:failed-create";
             let first = store
                 .reserve_worker_create(
@@ -25637,7 +25143,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     "manual:first",
                     "sha256:first",
                     Some(key),
-                    &memory,
                 )
                 .unwrap();
             let lease = first.singleton.unwrap();
@@ -25737,7 +25242,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                         "manual:retry",
                         "sha256:first",
                         Some(key),
-                        &memory
                     )
                     .is_err()
             );
@@ -25871,7 +25375,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     "manual:next",
                     "sha256:next",
                     Some(key),
-                    &memory,
                 )
                 .unwrap();
             let next_lease = next.singleton.unwrap();
@@ -25982,7 +25485,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             })
             .await
             .unwrap();
-        let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+
         let key = "subjektiv:subject-a";
         let first = store
             .reserve_worker_create(
@@ -25991,7 +25494,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 "first",
                 "sha256:first",
                 Some(key),
-                &memory,
             )
             .unwrap();
         let lease = first.singleton.unwrap();
@@ -26017,7 +25519,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                     "early",
                     "sha256:early",
                     Some(key),
-                    &memory
                 )
                 .is_err()
         );
@@ -26078,14 +25579,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .is_none()
         );
         let replacement = reopened
-            .reserve_worker_create(
-                "workspace-a",
-                "runtime-b",
-                "next",
-                "sha256:next",
-                Some(key),
-                &memory,
-            )
+            .reserve_worker_create("workspace-a", "runtime-b", "next", "sha256:next", Some(key))
             .unwrap();
         assert_eq!(
             replacement.singleton.unwrap().generation,
@@ -26136,7 +25630,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let store = SqliteWorkspaceStore::open_for_test(database).unwrap();
-                    let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+
                     barrier.wait();
                     store.reserve_worker_create(
                         "workspace-a",
@@ -26144,7 +25638,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                         &format!("operation-{index}"),
                         &format!("sha256:{index}"),
                         Some("shared-key"),
-                        &memory,
                     )
                 })
             })
@@ -28954,246 +28447,6 @@ INSERT INTO worker_registry (
                 .get_repository("other-workspace", "other-main")
                 .unwrap(),
             Some(other_repository)
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_authority_records_round_trip_and_close_staging() {
-        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), LATEST_SCHEMA_VERSION);
-        let workspace = WorkspaceRecord {
-            workspace_id: "local-dev".to_string(),
-            owner_account_id: "owner-account".to_string(),
-            display_name: "Local Dev".to_string(),
-            state: "active".to_string(),
-            created_at: "1".to_string(),
-            updated_at: "1".to_string(),
-        };
-        store.upsert_workspace(&workspace).await.unwrap();
-
-        let document = store
-            .ensure_memory_document("local-dev", "# Memory\n", "2")
-            .unwrap();
-        assert_eq!(document.body_md, "# Memory\n");
-        let updated = MemoryDocumentRecord {
-            workspace_id: "local-dev".to_string(),
-            body_md: "# Memory\n\n- fact\n".to_string(),
-            created_at: document.created_at.clone(),
-            updated_at: "3".to_string(),
-        };
-        store.upsert_memory_document(&updated).unwrap();
-        assert_eq!(
-            store.get_memory_document("local-dev").unwrap(),
-            Some(updated)
-        );
-
-        let staging = MemoryStagingRecord {
-            workspace_id: "local-dev".to_string(),
-            candidate_id: "candidate-a".to_string(),
-            raw_json: r#"{"claim":"candidate"}"#.to_string(),
-            source_path: Some("memory/_staging/candidate-a.json".to_string()),
-            imported_at: "4".to_string(),
-        };
-        store.upsert_memory_staging_record(&staging).unwrap();
-        assert_eq!(
-            store
-                .get_memory_staging_record("local-dev", "candidate-a")
-                .unwrap(),
-            Some(staging.clone())
-        );
-        assert_eq!(
-            store.list_memory_staging_records("local-dev", 10).unwrap(),
-            vec![staging.clone()]
-        );
-
-        let resolution = MemoryStagingResolutionRecord {
-            workspace_id: "local-dev".to_string(),
-            candidate_id: staging.candidate_id.clone(),
-            action: "apply".to_string(),
-            reason: "accepted".to_string(),
-            affected_refs_json: r#"["summary"]"#.to_string(),
-            staging_raw_json: staging.raw_json.clone(),
-            source_path: staging.source_path.clone(),
-            imported_at: staging.imported_at.clone(),
-            resolved_at: "5".to_string(),
-        };
-        store.insert_memory_staging_resolution(&resolution).unwrap();
-        assert!(
-            store
-                .delete_memory_staging_record("local-dev", "candidate-a")
-                .unwrap()
-        );
-        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 0);
-        assert_eq!(
-            store
-                .list_memory_staging_resolutions("local-dev", 10)
-                .unwrap(),
-            vec![resolution]
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_memory_reset_is_atomic_scoped_idempotent_and_exact() {
-        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
-        for (workspace_id, display_name) in [
-            ("local-dev", "Local Dev"),
-            ("other-workspace", "Other Workspace"),
-        ] {
-            store
-                .upsert_workspace(&WorkspaceRecord {
-                    workspace_id: workspace_id.to_string(),
-                    owner_account_id: "owner-account".to_string(),
-                    display_name: display_name.to_string(),
-                    state: "active".to_string(),
-                    created_at: "1".to_string(),
-                    updated_at: "1".to_string(),
-                })
-                .await
-                .unwrap();
-            store
-                .ensure_memory_document(workspace_id, "# Legacy Memory\n", "2")
-                .unwrap();
-            store
-                .upsert_memory_staging_record(&MemoryStagingRecord {
-                    workspace_id: workspace_id.to_string(),
-                    candidate_id: format!("candidate-{workspace_id}"),
-                    raw_json: r#"{"claim":"legacy"}"#.to_string(),
-                    source_path: None,
-                    imported_at: "3".to_string(),
-                })
-                .unwrap();
-            store
-                .insert_memory_staging_resolution(&MemoryStagingResolutionRecord {
-                    workspace_id: workspace_id.to_string(),
-                    candidate_id: format!("resolved-{workspace_id}"),
-                    action: "discarded".to_string(),
-                    reason: "fixture".to_string(),
-                    affected_refs_json: "[]".to_string(),
-                    staging_raw_json: r#"{"claim":"resolved"}"#.to_string(),
-                    source_path: None,
-                    imported_at: "3".to_string(),
-                    resolved_at: "4".to_string(),
-                })
-                .unwrap();
-        }
-
-        let unrelated_counts = |store: &SqliteWorkspaceStore| {
-            store
-                .with_conn(|connection| {
-                    let mut tables = connection.prepare(
-                        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                    )?;
-                    let names = tables
-                        .query_map([], |row| row.get::<_, String>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    drop(tables);
-                    let mut counts = std::collections::BTreeMap::new();
-                    for name in names {
-                        if matches!(
-                            name.as_str(),
-                            "workspace_memory_documents"
-                                | "memory_staging_records"
-                                | "memory_staging_resolutions"
-                        ) {
-                            continue;
-                        }
-                        let quoted = name.replace('"', "\"\"");
-                        let count = connection.query_row(
-                            &format!("SELECT COUNT(*) FROM \"{quoted}\""),
-                            [],
-                            |row| row.get::<_, i64>(0),
-                        )?;
-                        counts.insert(name, count);
-                    }
-                    Ok(counts)
-                })
-                .unwrap()
-        };
-        let before = unrelated_counts(&store);
-        assert_eq!(
-            store
-                .get_workspace_memory_settings("local-dev")
-                .unwrap()
-                .language,
-            "English"
-        );
-
-        // A failure after resolution deletion must roll the entire operation back.
-        store
-            .with_conn(|connection| {
-                connection.execute_batch(
-                    "CREATE TRIGGER fail_legacy_memory_reset
-                     BEFORE DELETE ON memory_staging_records
-                     WHEN OLD.workspace_id = 'local-dev'
-                     BEGIN SELECT RAISE(ABORT, 'reset failure fixture'); END;",
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.reset_legacy_memory("local-dev").is_err());
-        assert!(store.get_memory_document("local-dev").unwrap().is_some());
-        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 1);
-        assert_eq!(
-            store
-                .list_memory_staging_resolutions("local-dev", 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        store
-            .with_conn(|connection| {
-                connection.execute_batch("DROP TRIGGER fail_legacy_memory_reset")?;
-                Ok(())
-            })
-            .unwrap();
-
-        assert_eq!(
-            store.reset_legacy_memory("local-dev").unwrap(),
-            LegacyMemoryResetCounts {
-                documents: 1,
-                staging_records: 1,
-                staging_resolutions: 1,
-            }
-        );
-        assert_eq!(
-            store.reset_legacy_memory("local-dev").unwrap(),
-            LegacyMemoryResetCounts::default()
-        );
-        assert!(store.get_memory_document("local-dev").unwrap().is_none());
-        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 0);
-        assert!(
-            store
-                .list_memory_staging_resolutions("local-dev", 10)
-                .unwrap()
-                .is_empty()
-        );
-
-        assert!(
-            store
-                .get_memory_document("other-workspace")
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            store
-                .count_memory_staging_records("other-workspace")
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            store
-                .list_memory_staging_resolutions("other-workspace", 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(unrelated_counts(&store), before);
-        assert_eq!(
-            store
-                .get_workspace_memory_settings("local-dev")
-                .unwrap()
-                .language,
-            "English"
         );
     }
 

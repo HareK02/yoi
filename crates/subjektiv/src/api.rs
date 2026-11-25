@@ -67,29 +67,29 @@ struct SubjektivEvidenceCursor {
 
 pub fn resident_summary_output(
     resident: crate::ResidentSurface,
-) -> memory::backend::MemoryResidentSummaryOutput {
+) -> memory::subject::MemoryResidentSummaryOutput {
     let (availability, content) = match resident.availability {
         crate::SurfaceAvailability::Ready => {
             let snapshot = resident.snapshot.expect("ready surface has a snapshot");
             (
-                memory::backend::MemoryResidentSummaryAvailability::Ready,
+                memory::subject::MemoryResidentSummaryAvailability::Ready,
                 (!snapshot.body_md.is_empty()).then_some(snapshot.body_md),
             )
         }
         crate::SurfaceAvailability::Ungenerated => (
-            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
             None,
         ),
         crate::SurfaceAvailability::Stale => (
-            memory::backend::MemoryResidentSummaryAvailability::Stale,
+            memory::subject::MemoryResidentSummaryAvailability::Stale,
             None,
         ),
         crate::SurfaceAvailability::Failed => (
-            memory::backend::MemoryResidentSummaryAvailability::Failed,
+            memory::subject::MemoryResidentSummaryAvailability::Failed,
             None,
         ),
     };
-    memory::backend::MemoryResidentSummaryOutput {
+    memory::subject::MemoryResidentSummaryOutput {
         availability,
         content,
     }

@@ -34,10 +34,6 @@ fn subject_delete_running_controller_confirms_shutdown_and_preserves_history() {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
     });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())
         .unwrap();
@@ -369,10 +365,6 @@ fn subject_delete_terminal_release_history_consumes_prior_canonical_stop() {
         runtime.store_config_bundle(test_bundle()).unwrap();
         let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "server-test");
         let mut create = create_request("prior Stop Subject deletion");
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
-        });
         create.workspace_api = Some(WorkspaceApiRef {
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://workspace.invalid".into(),
@@ -575,10 +567,6 @@ fn subject_delete_termination_survives_cold_resource_cleanup_without_stop_resume
         create.workspace_api = Some(WorkspaceApiRef {
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://workspace.invalid".into(),
-        });
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
         });
         let worker = runtime
             .create_worker_scoped(&scope, create.clone())
@@ -807,10 +795,6 @@ fn subject_delete_first_stop_saves_original_child_and_reconciles_interrupted_com
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://workspace.invalid".into(),
         });
-        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: scope.workspace_id.clone(),
-            language: "English".into(),
-        });
         let worker = runtime
             .create_worker_scoped(&scope, create.clone())
             .unwrap();
@@ -923,10 +907,6 @@ fn subject_delete_cold_settled_state_rejects_replacement_without_rechecking_stop
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
     });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())
         .unwrap();
@@ -970,12 +950,6 @@ fn subject_delete_cold_settled_state_rejects_replacement_without_rechecking_stop
                 request.workspace_scope.as_mut().unwrap().workspace_id = "foreign-workspace".into();
                 request.request.workspace_api.as_mut().unwrap().workspace_id =
                     "foreign-workspace".into();
-                request
-                    .request
-                    .memory_settings
-                    .as_mut()
-                    .unwrap()
-                    .workspace_id = "foreign-workspace".into();
             }
             let operation_id = request.operation_id;
             assert!(matches!(
@@ -1243,10 +1217,6 @@ fn subject_delete_confirmed_removal_retries_warm_and_cold_without_new_stop() {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
     });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())
         .unwrap();
@@ -1371,10 +1341,6 @@ fn subject_delete_removal_first_accepts_missing_shutdown_and_rechecks_cold_remov
     create.workspace_api = Some(WorkspaceApiRef {
         workspace_id: scope.workspace_id.clone(),
         base_url: "https://workspace.invalid".into(),
-    });
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
     });
     let worker = runtime
         .create_worker_scoped(&scope, create.clone())

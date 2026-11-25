@@ -630,7 +630,7 @@ pub struct CreateWorkerRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_api: Option<WorkspaceApiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    pub memory_settings: Option<manifest::SubjektivMemorySettingsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_execution: Option<PluginExecutionSnapshot>,
     /// Host-resolved, versioned Feature connections. Owners validate their saved

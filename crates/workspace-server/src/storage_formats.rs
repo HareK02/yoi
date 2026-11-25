@@ -439,6 +439,7 @@ impl FailureTail {
         tail.push((141, super::EXTERNAL_WORKDIR_SESSION_MIGRATION_NAME));
         tail.push((142, super::feature_initialization::MIGRATION_NAME));
         tail.push((143, super::feature_worker_launch::MIGRATION_NAME));
+        tail.push((144, super::memory_retirement::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -542,6 +543,9 @@ fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
     static WITHOUT_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
     static WITH_INITIALIZATION: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
     static INITIALIZATION_ONLY: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static RETIRED: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let retired =
+        super::column_exists(conn, "worker_create_reservations", "initialization_binding")?;
     let initialized = super::column_exists(
         conn,
         "worker_create_reservations",
@@ -553,12 +557,12 @@ fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
             .filter(|(_, object)| object.1 == "worker_create_reservations")
             .collect()
     };
-    let expected = match (present, initialized) {
+    let expected = if retired { &RETIRED } else { match (present, initialized) {
         (true, false) => &WITH_RESULT,
         (false, false) => &WITHOUT_RESULT,
         (true, true) => &WITH_INITIALIZATION,
         (false, true) => &INITIALIZATION_ONLY,
-    }
+    }}
     .get_or_init(|| {
         (|| -> Result<Shape> {
             let reference = reference_base()?;
@@ -568,6 +572,7 @@ fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
             if initialized {
                 reference.execute_batch(super::feature_initialization::COLUMN_SCHEMA)?;
             }
+            if retired { reference.execute_batch("ALTER TABLE worker_create_reservations ADD COLUMN initialization_binding TEXT; ALTER TABLE worker_create_reservations ADD COLUMN subjektiv_memory_language TEXT; ALTER TABLE worker_create_reservations DROP COLUMN memory_language;")?; }
             Ok(select(snapshot(&reference)?))
         })()
         .map_err(|error| error.to_string())
@@ -621,8 +626,57 @@ fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
     )))
 }
 
+fn verify_memory_retirement_shape(conn: &Connection, current: i64) -> Result<()> {
+    let retired = current >= 144;
+    for column in ["initialization_binding", "subjektiv_memory_language"] {
+        if super::column_exists(conn, "worker_create_reservations", column)? != retired {
+            return Err(invalid(
+                "Memory retirement reservation receipt/shape mismatch",
+            ));
+        }
+    }
+    if super::table_exists(conn, "subjektiv_memory_settings")? != retired {
+        return Err(invalid("Subjektiv settings receipt/shape mismatch"));
+    }
+    if !retired {
+        return Ok(());
+    }
+    for table in [
+        "workspace_memory_settings",
+        "workspace_memory_documents",
+        "memory_staging_records",
+        "memory_staging_resolutions",
+    ] {
+        if super::table_exists(conn, table)? {
+            return Err(invalid(
+                "retired Workspace Memory content table still exists",
+            ));
+        }
+    }
+    if super::column_exists(conn, "worker_create_reservations", "memory_language")? {
+        return Err(invalid(
+            "retired Workspace Memory reservation settings still exist",
+        ));
+    }
+    let reference = reference_base()?;
+    reference.execute_batch(
+        "ALTER TABLE workspace_memory_settings RENAME TO subjektiv_memory_settings;",
+    )?;
+    let settings = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(_, object)| object.1 == "subjektiv_memory_settings")
+            .collect()
+    };
+    if settings(snapshot(conn)?) != settings(snapshot(&reference)?) {
+        return Err(invalid("Subjektiv settings physical schema mismatch"));
+    }
+    Ok(())
+}
+
 // Run only for the saved version, not recursively against historical prefixes.
 fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> Result<()> {
+    verify_memory_retirement_shape(conn, current)?;
     let initialized = super::column_exists(
         conn,
         "worker_create_reservations",
@@ -1639,7 +1693,7 @@ mod failure_format_tests {
     // The registered tail is not a contiguous integer range: it excludes 132.
     const CURRENT_TAIL: &[i64] = &[
         124, 125, 126, 127, 128, 129, 130, 131, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
-        143,
+        143, 144,
     ];
 
     #[test]

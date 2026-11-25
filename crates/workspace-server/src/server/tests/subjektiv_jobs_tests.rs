@@ -701,7 +701,7 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
                 SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE,
             )),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_worker_observation_enabled: false,

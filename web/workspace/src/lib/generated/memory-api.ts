@@ -19,25 +19,11 @@ export type DiagnosticSeverity = "info" | "warning" | "error";
 
 export type Diagnostic = { code: string, severity: DiagnosticSeverity, message: string, };
 
-export type MemoryDocumentResponse = { body_md: string, created_at: string, updated_at: string, bytes: number, record_source: string, };
-
 export type MemoryCandidateKind = "preference" | "working_assumption" | "constraint" | "decision" | "open_question" | "lesson";
 
 export type MemoryEvidenceOriginKind = "human_input" | "worker_input" | "flow_instruction" | "backend_instruction" | "model_output" | "tool_output" | "derived_summary" | "legacy_unknown";
 
 export type MemoryEvidenceOrigin = { kind: MemoryEvidenceOriginKind, account_id?: string | null, workspace_id?: string | null, runtime_id?: string | null, worker_id?: string | null, flow_selector?: string | null, flow_definition_id?: string | null, flow_definition_fingerprint?: number | null, };
-
-export type MemorySourceRef = { segment_id: string, range: [number, number], };
-
-export type MemoryStagingEvidence = { id: string, kind: string, entry_range: [number, number] | null, origin?: MemoryEvidenceOrigin | null, excerpt: string | null, summary: string | null, };
-
-export type MemorySourceEvidenceRef = { session_id: string | null, segment_id: string | null, entry_range: [number, number] | null, evidence_id: string | null, origin?: MemoryEvidenceOrigin | null, evidence_kind: string | null, label: string | null, summary: string | null, };
-
-export type MemoryStagingRecord = { schema_version: number, id: string, extract_run_id: string, source: MemorySourceRef, kind: MemoryCandidateKind, claim: string, why_useful: string, staleness: string | null, evidence: Array<MemoryStagingEvidence>, source_refs: Array<MemorySourceEvidenceRef>, };
-
-export type MemoryStagingEntry = { id: string, byte_len: number, record: MemoryStagingRecord, };
-
-export type MemoryStagingListResponse = { limit: number, returned_count: number, total_valid_count: number, invalid_count: number, truncated: boolean, order: string, record_authority: string, items: Array<MemoryStagingEntry>, diagnostics: Array<Diagnostic>, };
 
 export type PermissionResource = { "kind": "plugin_installation", workspace_id: string, installation_id: string, } | { "kind": "job", workspace_id: string, job_id: string, } | { "kind": "ticket", workspace_id: string, ticket_id: string, } | { "kind": "objective", workspace_id: string, objective_id: string, } | { "kind": "merge_request", workspace_id: string, merge_request_id: string, } | { "kind": "subject", workspace_id: string, subject_id: string, } | { "kind": "drive_entry", workspace_id: string, node_id: string, } | { "kind": "drive_request", workspace_id: string, request_id: string, } | { "kind": "repository", workspace_id: string, repository_key: string, } | { "kind": "workdir_attachment", workspace_id: string, connection_id: string, } | { "kind": "workspace_config", workspace_id: string, path: string, recursive: boolean, } | { "kind": "network", url: string, } | { "kind": "feature" } | { "kind": "workspace", workspace_id: string, } | { "kind": "workdir", working_directory_id: string, path: string, recursive: boolean, } | { "kind": "worker_operation", workspace_id: string, } | { "kind": "worker", runtime_id: string, worker_id: string, };
 

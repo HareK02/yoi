@@ -2273,8 +2273,6 @@ fn profile_restore_missing_committed_system_prompt_rolls_back_and_replays_classi
         [engine]
         instruction = "default"
         max_tokens = 100
-        [feature.memory.profile]
-        enabled = false
         "#,
     )
     .unwrap();

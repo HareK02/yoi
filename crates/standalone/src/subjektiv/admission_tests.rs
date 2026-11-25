@@ -248,7 +248,7 @@ async fn capacity_only_release(restore: bool) {
                     worker_id: fixture.body.host.worker_key.clone(),
                     session_id: session_store::new_session_id().to_string(),
                 },
-                memory::backend::MemoryConsolidateStagingOperation { force: true },
+                memory::subject::MemoryConsolidateStagingOperation { force: true },
             )
             .unwrap();
         assert_eq!(result.status, "started");

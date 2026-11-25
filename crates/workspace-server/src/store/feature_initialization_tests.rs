@@ -14,7 +14,6 @@ mod reservation_initialization {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
         store: SqliteWorkspaceStore,
-        memory: WorkspaceMemorySettingsRecord,
     }
 
     impl Fixture {
@@ -33,12 +32,10 @@ mod reservation_initialization {
                 })
                 .await
                 .unwrap();
-            let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
             Self {
                 _dir: dir,
                 path,
                 store,
-                memory,
             }
         }
 
@@ -55,7 +52,6 @@ mod reservation_initialization {
                 key,
                 input,
                 singleton,
-                &self.memory,
                 data,
             )
         }
@@ -125,23 +121,13 @@ mod reservation_initialization {
             assert_eq!(serde_json::from_str::<FeatureInitializations>(&saved.1).unwrap(), data);
             Ok(())
         }).unwrap();
-        let Fixture {
-            store,
-            _dir,
-            path,
-            memory,
-        } = fixture;
+        let Fixture { store, _dir, path } = fixture;
         drop(store);
         fixture = Fixture {
             store: SqliteWorkspaceStore::open_for_test(&path).unwrap(),
             _dir,
             path,
-            memory,
         };
-        fixture.memory = fixture
-            .store
-            .update_workspace_memory_settings("workspace-a", "English", "Japanese")
-            .unwrap();
         let replay = fixture.reserve("create", "intent", None, &data).unwrap();
         assert_eq!(replay, first);
         assert_eq!(
@@ -159,7 +145,6 @@ mod reservation_initialization {
                 .version(),
             7
         );
-        assert_eq!(replay.memory_settings.language, "English");
         assert!(matches!(
             fixture.reserve("create", "changed-intent", None, &data),
             Err(Error::InvalidInput(_))
@@ -187,10 +172,13 @@ mod reservation_initialization {
                 &initialization(8, "stable-ref"),
             )
             .unwrap();
-        let same_memory = fixture
-            .reserve("same-memory", "intent", None, &data)
+        let same_initialization = fixture
+            .reserve("same-initialization", "intent", None, &data)
             .unwrap();
-        assert_ne!(same_memory.create_fingerprint, other.create_fingerprint);
+        assert_ne!(
+            same_initialization.create_fingerprint,
+            other.create_fingerprint
+        );
         assert_eq!(
             fixture.reserve("create", "intent", None, &data).unwrap(),
             first
@@ -246,7 +234,6 @@ mod reservation_initialization {
                     "intent",
                     "caller-input",
                     None,
-                    &fixture.memory,
                     &grant,
                     &bundle,
                     data,
@@ -264,7 +251,6 @@ mod reservation_initialization {
                     "intent",
                     "caller-input",
                     None,
-                    &fixture.memory,
                     &grant,
                     &bundle,
                     &data,
@@ -325,8 +311,7 @@ mod reservation_initialization {
     }
 
     #[tokio::test]
-    async fn failed_core_grant_binding_rolls_back_initialization_memory_resource_key_and_singleton()
-    {
+    async fn failed_core_grant_binding_rolls_back_initialization_resource_key_and_singleton() {
         let fixture = Fixture::new().await;
         let (mut grant, bundle) = launch("refused-core");
         grant.source = CoreWorkerGrantSource::Account {
@@ -342,7 +327,6 @@ mod reservation_initialization {
                     "intent",
                     "caller",
                     Some("subjektiv:test"),
-                    &fixture.memory,
                     &grant,
                     &bundle,
                     &initialization(1, "ref"),
@@ -410,7 +394,7 @@ mod reservation_initialization {
             "SELECT allocation_key,request_fingerprint,create_fingerprint FROM worker_create_reservations ORDER BY allocation_key",
         );
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
-        assert_eq!(plan.migrations.len(), 2);
+        assert_eq!(plan.migrations.len(), 3);
         assert!(
             !column_exists(
                 &conn,
@@ -421,7 +405,6 @@ mod reservation_initialization {
         );
         drop(conn);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
-        let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
         for (key, singleton) in [
             ("legacy-subject", Some("subjektiv:legacy")),
             ("legacy-ordinary", None),
@@ -433,7 +416,6 @@ mod reservation_initialization {
                     key,
                     "old-intent",
                     singleton,
-                    &memory,
                     &FeatureInitializations::default(),
                 )
                 .unwrap_err();
@@ -478,6 +460,8 @@ mod reservation_initialization {
         feature_initialization::migrate(&conn).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 142);
         feature_worker_launch::migrate(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 143);
+        memory_retirement::migrate(&conn).unwrap();
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
@@ -518,7 +502,6 @@ mod reservation_initialization {
             .unwrap();
         upgraded.upsert_workspace(&workspace).await.unwrap();
         for store in [&fresh.store, &upgraded] {
-            let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
             let data = initialization(1, "resolved");
             store
                 .reserve_worker_create_with_initialization(
@@ -527,7 +510,6 @@ mod reservation_initialization {
                     "probe",
                     "intent",
                     None,
-                    &memory,
                     &data,
                 )
                 .unwrap();

@@ -45,14 +45,14 @@ pub(super) fn read_saved(
     allocation: &str,
 ) -> Result<Option<FeatureInitializations>> {
     let saved = conn.query_row(
-        "SELECT request_fingerprint,create_fingerprint,memory_language,feature_initialization_json,state,runtime_id,worker_id
+        "SELECT request_fingerprint,create_fingerprint,initialization_binding,feature_initialization_json,state,runtime_id,worker_id
          FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2",
         params![workspace, allocation],
         |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?,
             row.get::<_, String>(5)?, row.get::<_, String>(6)?)),
     ).optional()?;
-    let Some((request, create, language, initialization, state, runtime, worker)) = saved else {
+    let Some((request, create, _binding, initialization, state, runtime, worker)) = saved else {
         return Ok(None);
     };
     if state == "removed" {
@@ -62,18 +62,12 @@ pub(super) fn read_saved(
     }
     let request = request
         .ok_or_else(|| Error::Store("original Worker create request fingerprint missing".into()))?;
-    let memory = manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: workspace.into(),
-        language: language
-            .ok_or_else(|| Error::Store("original Worker create Memory snapshot missing".into()))?,
-    };
-    validate_workspace_memory_settings_snapshot(&memory, workspace)?;
     read_bound(
         conn,
         &RuntimeWorkerRef::new(runtime, worker),
         initialization.as_deref(),
         &request,
-        &memory,
+        workspace,
         &create,
     )
     .map(Some)
@@ -84,7 +78,7 @@ pub(super) fn read_bound(
     worker: &RuntimeWorkerRef,
     saved: Option<&str>,
     request_fingerprint: &str,
-    memory: &manifest::WorkspaceMemorySettingsSnapshot,
+    workspace: &str,
     create_fingerprint: &str,
 ) -> Result<FeatureInitializations> {
     let saved = saved.ok_or_else(|| Error::RepositoryConflict(
@@ -95,21 +89,19 @@ pub(super) fn read_bound(
     let canonical = serde_json::to_string(&initialization).map_err(|_| {
         Error::Store("saved Worker Feature initialization could not be encoded".into())
     })?;
-    let base = bound_worker_create_fingerprint(request_fingerprint, memory, &canonical);
-    // Plugin pinning seals an additional immutable layer on the same reservation.
-    // Reuse that saved layer; never reselect a plan from current configuration.
-    let bound = match crate::plugin_plan::worker_launch_plan(
+    let expected = memory_retirement::evidence_fingerprint(
         conn,
-        &memory.workspace_id,
-        &worker.runtime_id,
-        &worker.worker_id,
-    )? {
-        Some(plan) => crate::plugin_plan::worker_launch_fingerprint(&base, &plan.fingerprint)?,
-        None => base,
-    };
-    if bound != create_fingerprint {
+        workspace,
+        worker,
+        request_fingerprint,
+        create_fingerprint,
+        &canonical,
+    )?;
+    let binding: Option<String> = conn.query_row("SELECT initialization_binding FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace,worker.runtime_id,worker.worker_id],|r|r.get(0))?;
+    if binding.as_deref() != Some(expected.as_str()) {
         return Err(Error::RepositoryConflict(
-            "saved Worker create fingerprint does not bind its resolved Feature initialization and Memory snapshot".into(),
+            "saved Worker create fingerprint does not bind its resolved Feature initialization"
+                .into(),
         ));
     }
     Ok(initialization)

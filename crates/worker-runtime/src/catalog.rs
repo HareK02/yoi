@@ -353,9 +353,9 @@ pub struct CreateWorkerRequest {
     pub worker_observation_grants: Vec<RuntimeWorkerRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_api: Option<WorkspaceApiRef>,
-    /// Backend-authored immutable Workspace Memory settings snapshot.
+    /// Backend-authored immutable settings for a host-bound Subjektiv attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    pub memory_settings: Option<manifest::SubjektivMemorySettingsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_execution: Option<runtime_api::PluginExecutionSnapshot>,
     /// Durable Feature-owned initialization expectations.

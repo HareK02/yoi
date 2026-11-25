@@ -366,7 +366,6 @@ async fn attachment_operation_http_signed_scope_binds_worker_workspace_operation
         workspace_id: "workspace-a".into(),
         base_url: "https://backend.test".into(),
     });
-    create.memory_settings.as_mut().unwrap().workspace_id = "workspace-a".into();
     runtime
         .store_config_bundle(test_bundle(create.profile.clone()))
         .unwrap();

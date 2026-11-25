@@ -128,10 +128,7 @@ fn request() -> CreateWorkerRequest {
         workdir_attachments: Vec::new(),
         worker_observation_enabled: false,
         worker_observation_grants: Vec::new(),
-        memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: WORKSPACE.into(),
-            language: "en".into(),
-        }),
+        memory_settings: None,
         feature_initialization: Default::default(),
         backend_job: None,
     }
@@ -766,17 +763,14 @@ fn supported_settled_templates_install_current_aggregate_without_rewriting_sessi
 }
 
 #[test]
-fn fresh_manifest_and_memory_settings_are_required() {
+fn fresh_manifest_and_matching_workspace_are_required() {
     let (_source, _, template) = source();
     let (_target, options) = destination(&template);
     let mut manifest = resolved();
     manifest.worker.name = "wrong-worker".into();
     assert!(template.install(&options, request(), &manifest).is_err());
     let mut binding = request();
-    binding.memory_settings = None;
-    assert!(template.install(&options, binding, &resolved()).is_err());
-    let mut binding = request();
-    binding.memory_settings.as_mut().unwrap().workspace_id = "other-workspace".into();
+    binding.workspace_api.as_mut().unwrap().workspace_id = "other-workspace".into();
     assert!(template.install(&options, binding, &resolved()).is_err());
     assert_fresh(&options);
 }
@@ -1043,7 +1037,6 @@ fn approved_lab_extract_install() {
     let mut bind = request();
     bind.worker_id = template.worker_id();
     bind.workspace_api.as_mut().unwrap().workspace_id = template.workspace_id().into();
-    bind.memory_settings.as_mut().unwrap().workspace_id = template.workspace_id().into();
     let mut manifest = resolved();
     manifest.worker.name = template.worker_name();
     template.install(&options, bind, &manifest).unwrap();

@@ -736,11 +736,6 @@ mod service_connection {
         // request verifier first requires registered/reserved Worker membership.
         // Use a real owner reservation so Denied proves the immutable consumer
         // identity fence, rather than an earlier proof/transport rejection.
-        let memory = f
-            .api
-            .config_store
-            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-            .unwrap();
         let foreign_reservation = f
             .api
             .config_store
@@ -750,7 +745,6 @@ mod service_connection {
                 "foreign-service-observer",
                 "sha256:foreign-service-observer",
                 None,
-                &memory,
             )
             .unwrap();
         let (foreign, foreign_server) = remote_owner_for(

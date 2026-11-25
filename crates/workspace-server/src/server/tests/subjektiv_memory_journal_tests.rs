@@ -299,10 +299,6 @@ impl Fixture {
     }
 
     fn body_worker(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRef {
-        let memory = api
-            .config_store
-            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-            .unwrap();
         let key = crate::subjektiv::subject_worker_singleton_key(subject).unwrap();
         let reservation = api
             .config_store
@@ -312,7 +308,6 @@ impl Fixture {
                 &format!("body-{subject}"),
                 &format!("body-input-{subject}"),
                 Some(&key),
-                &memory,
             )
             .unwrap();
         let worker = RuntimeWorkerRef::new(RUNTIME, reservation.worker_id.to_string());

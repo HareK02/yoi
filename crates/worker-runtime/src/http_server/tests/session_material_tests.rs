@@ -57,7 +57,6 @@ impl Fixture {
         let scope = RuntimeWorkspaceScope::new("workspace-a", "https://backend.test");
         let mut request = task_request("canonical Session fixture");
         request.config_bundle = None;
-        request.memory_settings.as_mut().unwrap().workspace_id = scope.workspace_id.clone();
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: scope.workspace_id.clone(),
             base_url: "https://backend.test".into(),

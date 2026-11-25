@@ -21,7 +21,6 @@ mod public_feature_operation {
                 caller,
                 intent,
                 singleton,
-                &self.memory,
                 "builtin:coder",
                 bundle,
                 data,
@@ -138,24 +137,15 @@ mod public_feature_operation {
                 "full-input",
                 "semantic",
                 None,
-                &fixture.memory,
                 "builtin:reviewer",
                 &bundle,
                 &data,
             ),
             Err(Error::RepositoryConflict(_))
         ));
-        let Fixture {
-            store,
-            _dir,
-            path,
-            memory: _,
-        } = fixture;
+        let Fixture { store, _dir, path } = fixture;
         drop(store);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
-        store
-            .update_workspace_memory_settings("workspace-a", "English", "Japanese")
-            .unwrap();
         let launch = saved(&store, "human-worker:owner:create", "full-input")
             .unwrap()
             .unwrap();
@@ -175,14 +165,12 @@ mod public_feature_operation {
                 "full-input",
                 "semantic",
                 None,
-                &store.get_workspace_memory_settings("workspace-a").unwrap(),
                 &launch.profile,
                 &launch.bundle,
                 &launch.initialization,
             )
             .unwrap();
         assert_eq!(replay, first);
-        assert_eq!(replay.memory_settings.language, "English");
         assert_eq!(
             store
                 .saved_feature_worker_launch(
@@ -246,11 +234,29 @@ mod public_feature_operation {
             first
         );
         let reopened = SqliteWorkspaceStore::open_for_test(&fixture.path).unwrap();
-        for identity in ["human-worker:first", "human-worker:second", "manual:human-worker:first"] {
-            assert_eq!(reopened.reserved_worker_create_runtime("workspace-a", identity).unwrap(), Some("runtime-a".into()));
-            assert!(!reopened.worker_create_allocation_removed("workspace-a", identity).unwrap());
+        for identity in [
+            "human-worker:first",
+            "human-worker:second",
+            "manual:human-worker:first",
+        ] {
+            assert_eq!(
+                reopened
+                    .reserved_worker_create_runtime("workspace-a", identity)
+                    .unwrap(),
+                Some("runtime-a".into())
+            );
+            assert!(
+                !reopened
+                    .worker_create_allocation_removed("workspace-a", identity)
+                    .unwrap()
+            );
         }
-        assert_eq!(reopened.reserved_worker_create_runtime("workspace-a", "missing").unwrap(), None);
+        assert_eq!(
+            reopened
+                .reserved_worker_create_runtime("workspace-a", "missing")
+                .unwrap(),
+            None
+        );
         assert_eq!(
             saved(&reopened, "human-worker:second", "caller-second")
                 .unwrap()
@@ -340,9 +346,19 @@ mod public_feature_operation {
             .unwrap();
         assert_ne!(next.worker_id, first.worker_id);
         for identity in ["first", "alias", "manual:first"] {
-            assert!(fixture.store.worker_create_allocation_removed("workspace-a", identity).unwrap());
+            assert!(
+                fixture
+                    .store
+                    .worker_create_allocation_removed("workspace-a", identity)
+                    .unwrap()
+            );
         }
-        assert!(!fixture.store.worker_create_allocation_removed("workspace-a", "replacement").unwrap());
+        assert!(
+            !fixture
+                .store
+                .worker_create_allocation_removed("workspace-a", "replacement")
+                .unwrap()
+        );
         assert!(matches!(
             saved(&fixture.store, "alias", "caller-alias"),
             Err(Error::RepositoryConflict(_))
@@ -497,7 +513,7 @@ mod public_feature_operation {
         let data = initialization(1, "resolved");
         let reserve = |key: &str, fail: bool| {
             fixture.store.reserve_worker_create_with_binding(
-                "workspace-a", "runtime-a", key, "semantic", Some("subjektiv:a"), &fixture.memory, &data,
+                "workspace-a", "runtime-a", key, "semantic", Some("subjektiv:a"), &data,
                 |_| Ok(None), |_, _| Ok(()),
                 |tx, _| {
                     tx.execute("UPDATE workspaces SET display_name=display_name || '+' WHERE workspace_id='workspace-a'", [])?;
@@ -554,7 +570,6 @@ mod public_feature_operation {
                 caller,
                 "semantic",
                 None,
-                &fixture.memory,
                 "builtin:coder",
                 &bundle,
                 &data,
@@ -690,14 +705,33 @@ mod public_feature_operation {
         configure_sqlite(&conn).unwrap();
         feature_initialization::migrate(&conn).unwrap();
         let rows = stored_fixture_rows(&conn, "worker_create_reservations");
+        // The full upgrade retires only the historical Memory column and adds
+        // generic evidence. Compare every other reservation field unchanged.
+        let retained_columns = table_columns(&conn, "worker_create_reservations")
+            .unwrap()
+            .into_iter()
+            .filter(|column| column != "memory_language")
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let retained_query = format!(
+            "SELECT {retained_columns} FROM worker_create_reservations ORDER BY allocation_key"
+        );
+        let retained_rows = fixture_query_rows(&conn, &retained_query);
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 142);
         assert_eq!(
             plan.migrations,
-            vec![WorkspaceSchemaMigrationStep {
-                version: 143,
-                name: feature_worker_launch::MIGRATION_NAME.into()
-            }]
+            vec![
+                WorkspaceSchemaMigrationStep {
+                    version: 143,
+                    name: feature_worker_launch::MIGRATION_NAME.into()
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 144,
+                    name: memory_retirement::MIGRATION_NAME.into()
+                }
+            ]
         );
         assert_eq!(current_schema_version(&conn).unwrap(), 142);
         assert!(!table_exists(&conn, "worker_create_operation_bindings").unwrap());
@@ -712,7 +746,7 @@ mod public_feature_operation {
             None
         );
         store.with_conn(|conn| {
-            assert_eq!(stored_fixture_rows(conn, "worker_create_reservations"), rows);
+            assert_eq!(fixture_query_rows(conn, &retained_query), retained_rows);
             for table in ["worker_create_operation_bindings", "core_worker_execution_grants"] {
                 assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0))?, 0);
             }
@@ -779,7 +813,6 @@ mod public_feature_operation {
         let bundle = frozen_bundle();
         let bundle_json = serde_json::to_string(&bundle).unwrap();
         for store in [&fresh.store, &upgraded] {
-            let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
             store
                 .reserve_feature_worker_launch(
                     "workspace-a",
@@ -788,7 +821,6 @@ mod public_feature_operation {
                     "caller",
                     "semantic",
                     None,
-                    &memory,
                     "builtin:coder",
                     &bundle,
                     &initialization(1, "resolved"),

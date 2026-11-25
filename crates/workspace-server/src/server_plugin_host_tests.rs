@@ -143,11 +143,6 @@ async fn delegate_plugin_fixture_with_permissions(
     )
     .unwrap()
     .unwrap();
-    let memory = f
-        .api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reserved = f
         .api
         .config_store
@@ -157,7 +152,6 @@ async fn delegate_plugin_fixture_with_permissions(
             "delegated-child",
             "sha256:delegated-child",
             None,
-            &memory,
         )
         .unwrap();
     subject_authorization::bind_reserved_grant(&f.api, &grant, &reserved.worker_id.to_string())
@@ -1753,11 +1747,6 @@ async fn canonical_reserved_child_identity_and_prepare_match_live_owner_and_fenc
     )
     .unwrap()
     .unwrap();
-    let memory = f
-        .api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reserved = f
         .api
         .config_store
@@ -1767,7 +1756,6 @@ async fn canonical_reserved_child_identity_and_prepare_match_live_owner_and_fenc
             "prepare-child",
             "sha256:reserved-child",
             None,
-            &memory,
         )
         .unwrap();
     assert!(
@@ -1860,11 +1848,6 @@ async fn canonical_reserved_child_identity_and_prepare_match_live_owner_and_fenc
 #[tokio::test]
 async fn reserved_job_without_canonical_job_binding_cannot_fall_back_to_ordinary_identity() {
     let f = Fixture::new(None).await;
-    let memory = f
-        .api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reserved = f
         .api
         .config_store
@@ -1874,7 +1857,6 @@ async fn reserved_job_without_canonical_job_binding_cannot_fall_back_to_ordinary
             &crate::backend_job::allocation_key("not-bound-attempt"),
             "sha256:unbound-job",
             None,
-            &memory,
         )
         .unwrap();
     assert!(

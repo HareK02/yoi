@@ -70,6 +70,8 @@ pub enum StandaloneSubjectDisconnectError {
 pub enum StandaloneStartupError {
     #[error("the standalone state store could not be opened or validated")]
     StateStore,
+    #[error("persisted standalone Worker/Profile is unavailable: {0}")]
+    RetiredWorkspaceMemory(String),
     #[error("local Subject connection rejected: {0}")]
     Subject(String),
     #[error("the standalone Worker is already active")]
@@ -368,13 +370,18 @@ impl StandaloneHost {
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, StandaloneStartupError> {
         let store = StandaloneWorkerStore::open(state_dir).map_err(classify_store_startup_error)?;
+        // Only the execution lease owner may migrate persisted execution policy.
+        // Ordinary load/list and the manifest decoder remain observational/rejecting.
+        let lease = store
+            .acquire_lease(worker_id, StaleLeasePolicy::Recover)
+            .map_err(classify_store_startup_error)?;
+        store
+            .migrate_disabled_workspace_memory(worker_id, &lease)
+            .map_err(classify_store_startup_error)?;
         let record = store
             .load(worker_id)
             .map_err(classify_store_startup_error)?;
         record.cwd.verify().map_err(classify_store_startup_error)?;
-        let lease = store
-            .acquire_lease(worker_id, StaleLeasePolicy::Recover)
-            .map_err(classify_store_startup_error)?;
         let mut subject = record
             .subject
             .as_ref()
@@ -933,6 +940,9 @@ async fn stop_started_worker(started: BootstrappedWorker) {
 fn classify_store_startup_error(error: StandaloneStoreError) -> StandaloneStartupError {
     match error {
         StandaloneStoreError::WorkerLeased(_) => StandaloneStartupError::WorkerActive,
+        StandaloneStoreError::WorkspaceMemoryRetirement { reason, .. } => {
+            StandaloneStartupError::RetiredWorkspaceMemory(reason.into())
+        }
         StandaloneStoreError::LeaseLivenessUnknown(_) => {
             StandaloneStartupError::LeaseLivenessUnknown
         }

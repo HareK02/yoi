@@ -1,6 +1,5 @@
-//! Common frontmatter helpers and shared types.
+//! Shared source and evidence snapshots.
 
-use lint_common::RecordLintError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -12,10 +11,7 @@ pub struct MemoryJsonSafeU64(#[schemars(range(min = 0, max = 9_007_199_254_740_9
 
 pub type JsonSafeU64Pair = [MemoryJsonSafeU64; 2];
 
-pub use lint_common::Frontmatter;
-
-/// Reference to a session-store entry range. Stored in `sources` /
-/// `last_sources` arrays for traceability back to raw session logs.
+/// Reference to a Session entry range for candidate and Memory traceability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SourceRef {
     pub segment_id: String,
@@ -148,11 +144,6 @@ pub struct SourceEvidenceRef {
     pub summary: Option<String>,
 }
 
-/// Split a markdown document into `(yaml_frontmatter, body)`.
-pub fn split_frontmatter(content: &str) -> Result<(&str, &str), RecordLintError> {
-    lint_common::split_frontmatter(content)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,32 +173,5 @@ mod tests {
                 .get("flow_definition_fingerprint")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn splits_simple() {
-        let doc = "---\nfoo: 1\n---\nbody here\n";
-        let (y, b) = split_frontmatter(doc).unwrap();
-        assert_eq!(y, "foo: 1\n");
-        assert_eq!(b, "body here\n");
-    }
-
-    #[test]
-    fn no_leading_delim_errors() {
-        let err = split_frontmatter("hello").unwrap_err();
-        assert!(matches!(err, RecordLintError::MissingFrontmatter));
-    }
-
-    #[test]
-    fn no_closing_delim_errors() {
-        let err = split_frontmatter("---\nfoo: 1\nno close\n").unwrap_err();
-        assert!(matches!(err, RecordLintError::MalformedFrontmatter(_)));
-    }
-
-    #[test]
-    fn handles_empty_body() {
-        let doc = "---\nfoo: 1\n---\n";
-        let (_, b) = split_frontmatter(doc).unwrap();
-        assert_eq!(b, "");
     }
 }

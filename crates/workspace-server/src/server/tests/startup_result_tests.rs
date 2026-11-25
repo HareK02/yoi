@@ -87,10 +87,6 @@ fn reserve(api: &WorkspaceApi) -> RuntimeWorkerRef {
 }
 
 fn reserve_for_runtime(api: &WorkspaceApi, runtime_id: &str) -> RuntimeWorkerRef {
-    let settings = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
     let reservation = api
         .config_store
         .reserve_worker_create(
@@ -99,7 +95,6 @@ fn reserve_for_runtime(api: &WorkspaceApi, runtime_id: &str) -> RuntimeWorkerRef
             "manual:startup-result-fixture",
             "sha256:startup-result-fixture",
             None,
-            &settings,
         )
         .unwrap();
     RuntimeWorkerRef {
@@ -503,7 +498,7 @@ async fn assert_publication_fault_retains_committed_worker(query_failure: bool) 
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,

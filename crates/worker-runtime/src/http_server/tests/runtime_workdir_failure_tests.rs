@@ -276,7 +276,6 @@ async fn signed_http_session_open_preserves_runtime_availability_and_owner_failu
         let (owned, backend) = FailingBackend::runtime(FailureAt::Lookup, "must_not_reach_backend");
         let mut request = task_request("bind owner");
         request.config_bundle = None;
-        request.memory_settings.as_mut().unwrap().workspace_id = "workspace-a".into();
         owned
             .create_worker_scoped(
                 &RuntimeWorkspaceScope::new("workspace-a", "private-owner-marker"),
@@ -396,7 +395,6 @@ async fn signed_http_session_open_rejects_bad_capability_scope_and_owner_binding
             FailingBackend::runtime(FailureAt::Open, "working_directory_record_invalid");
         let mut request = task_request("foreign workspace binding");
         request.config_bundle = None;
-        request.memory_settings.as_mut().unwrap().workspace_id = "other-workspace".into();
         let foreign_worker = runtime
             .create_worker_scoped(
                 &RuntimeWorkspaceScope::new("other-workspace", "https://backend.test"),

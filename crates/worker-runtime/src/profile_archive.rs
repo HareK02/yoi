@@ -788,7 +788,7 @@ mod tests {
             "worker": { "mode": "wip" },
             "feature": {
                 "task": { "enabled": true },
-                "memory": { "enabled": true },
+                "subjektiv": { "enabled": true },
                 "sub_worker": { "enabled": true }
             }
         })
@@ -823,7 +823,7 @@ mod tests {
         assert_eq!(manifest.worker.name, "evaluated-worker");
         assert_eq!(json["worker"]["mode"], "wip");
         assert_eq!(json["feature"]["task"]["enabled"], true);
-        assert_eq!(json["feature"]["memory"]["profile"]["enabled"], true);
+        assert_eq!(json["feature"]["subjektiv"]["profile"]["enabled"], true);
         assert_eq!(json["feature"]["sub_worker"]["enabled"], true);
     }
 

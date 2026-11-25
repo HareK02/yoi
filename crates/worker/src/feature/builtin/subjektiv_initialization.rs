@@ -59,6 +59,9 @@ fn validate_binding(
             return Err("Subjektiv settings Workspace mismatch".into());
         }
     }
+    if resolved.is_none() && context.memory_settings.is_some() {
+        return Err("Memory settings require an explicit Subjektiv connection".into());
+    }
     Ok(resolved)
 }
 
@@ -87,6 +90,12 @@ where
         FeatureDescriptor::builtin("subjektiv", "Subjektiv initialization")
     }
     fn validate_transport(&self, context: &InitializationContext<'_>) -> Result<(), String> {
+        if let Some(binding) = context.backend_job {
+            binding.validate().map_err(str::to_owned)?;
+            if context.workspace_id.is_none() {
+                return Err("Backend Job capability requires Workspace authority".into());
+            }
+        }
         validate_binding(context).map(|_| ())
     }
     fn bind_manifest(
@@ -568,9 +577,9 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_memory_job_has_no_subjektiv_initialization_or_subject_fallback() {
+    fn ordinary_job_has_no_subjektiv_initialization_or_subject_fallback() {
         let binding = crate::BackendJobExecutionBinding {
-            job_id: "ordinary-memory-job".into(),
+            job_id: "ordinary-job".into(),
             attempt_id: "attempt".into(),
             input_digest: Some("input".into()),
             subjektiv_consolidation: false,
@@ -593,6 +602,26 @@ mod tests {
     }
 
     #[test]
+    fn memory_settings_without_a_subject_connection_are_rejected() {
+        let data = FeatureInitializations::default();
+        let settings = manifest::SubjektivMemorySettingsSnapshot {
+            workspace_id: "workspace-a".into(),
+            language: "English".into(),
+        };
+        let context = InitializationContext {
+            data: &data,
+            workspace_id: Some("workspace-a"),
+            memory_settings: Some(&settings),
+            backend_job: None,
+        };
+        assert!(
+            validate_binding(&context)
+                .unwrap_err()
+                .contains("explicit Subjektiv connection")
+        );
+    }
+
+    #[test]
     fn consolidation_payload_requires_the_independent_job_binding_and_never_body_identity() {
         use protocol::feature_initialization::FeatureInitialization;
         let binding = crate::BackendJobExecutionBinding {
@@ -602,7 +631,7 @@ mod tests {
             subjektiv_consolidation: true,
             subjektiv_journal: false,
         };
-        let settings = manifest::WorkspaceMemorySettingsSnapshot {
+        let settings = manifest::SubjektivMemorySettingsSnapshot {
             workspace_id: "workspace-a".into(),
             language: "English".into(),
         };

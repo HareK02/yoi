@@ -303,7 +303,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       sidebar.includes("TicketsNavSection") &&
       sidebar.includes("MergeRequestsNavSection") &&
       sidebar.lastIndexOf("MergeRequestsNavSection") <
-        sidebar.lastIndexOf("MemoryNavSection") &&
+        sidebar.lastIndexOf("SubjectsNavSection") &&
       sidebar.includes("WorkersNavSection") &&
       sidebarCss.includes("gap: var(--space-1)") &&
       sidebarCss.includes(".sidebar-nav-section--category > .sidebar-link") &&
@@ -432,10 +432,7 @@ Deno.test("workspace Tickets surface provides query list and lifecycle controls"
   );
 });
 
-Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async () => {
-  const memoryNav = await Deno.readTextFile(
-    new URL("../sidebar/MemoryNavSection.svelte", import.meta.url),
-  );
+Deno.test("Subject Memory surfaces use scoped Subjektiv APIs", async () => {
   const subjectIndexLoad = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/subjektiv/+page.ts",
@@ -473,10 +470,6 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
     ),
   );
 
-  assert(
-    memoryNav.includes('"/memory/staging"') && !memoryNav.includes('>Subjects</a>'),
-    "Memory navigation keeps staging separate from Subjects",
-  );
   assert(
     subjectIndexLoad.includes('"/subjektiv/subjects"') &&
       subjectIndexLoad.includes("parseSubjektivSubjectListResponse") &&

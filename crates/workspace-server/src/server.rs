@@ -104,10 +104,7 @@ use chrono::{Duration, SecondsFormat, Utc};
 use config_source::ConfigTreeSnapshot;
 use flow::{FlowSourceKind, FlowSourceResolveRequest, ResolvedFlowSource};
 use futures::{SinkExt, StreamExt};
-use memory::backend::{
-    MemoryBackendHttpResponse, MemoryBackendOperation, MemoryConsolidateStagingOperation,
-    MemoryConsolidationOutput,
-};
+use memory::subject::{MemoryConsolidateStagingOperation, MemoryConsolidationOutput};
 use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
@@ -126,19 +123,19 @@ use server_api::{
     DeviceLoginPollResponse, DeviceLoginPollStatus, DeviceLoginStartRequest,
     DeviceLoginStartResponse, ExecuteRuntimeCleanupRequest, ExternalWorkdirGrantCreateRequest,
     ExternalWorkdirGrantResponse, GenerateRepositorySshCredentialRequest, LogoutResponse,
-    LogoutStatus, MemoryDocumentResponse, MemoryStagingListResponse, ObjectiveCreateRequest,
-    ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest,
-    PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest, PasskeyLoginOptionsResponse,
-    PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsRequest,
-    PasskeyRegistrationOptionsResponse, ProfileSettingsResponse, PutRepositorySshHostTrustRequest,
-    RemoveRuntimeRequest, RepositoryAccessProjection, RepositoryDetailResponse,
-    RepositoryListResponse, RepositoryLogResponse, RepositorySshConnectionProbeRequest,
-    RepositorySshConnectionProbeResponse, RepositorySshConnectionTrustState,
-    RepositorySshCredential, RepositorySshHostKeyCandidate, RepositorySshHostTrust,
-    RepositorySshPublicKey, RequestActor, RotateRepositorySshCredentialRequest,
-    RuntimeCleanupExecutionResponse, RuntimeCleanupExecutionResult, RuntimeCleanupPlanResponse,
-    RuntimeConnectionTestFailureKind, RuntimeConnectionTestResponse, RuntimeConnectionTestStatus,
-    RuntimeManagementSummary, RuntimeRemovalOperationResponse,
+    LogoutStatus, ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
+    ObjectiveStateRequest, PasskeyLoginCompleteRequest, PasskeyLoginOptionsRequest,
+    PasskeyLoginOptionsResponse, PasskeyRegistrationCompleteRequest,
+    PasskeyRegistrationOptionsRequest, PasskeyRegistrationOptionsResponse, ProfileSettingsResponse,
+    PutRepositorySshHostTrustRequest, RemoveRuntimeRequest, RepositoryAccessProjection,
+    RepositoryDetailResponse, RepositoryListResponse, RepositoryLogResponse,
+    RepositorySshConnectionProbeRequest, RepositorySshConnectionProbeResponse,
+    RepositorySshConnectionTrustState, RepositorySshCredential, RepositorySshHostKeyCandidate,
+    RepositorySshHostTrust, RepositorySshPublicKey, RequestActor,
+    RotateRepositorySshCredentialRequest, RuntimeCleanupExecutionResponse,
+    RuntimeCleanupExecutionResult, RuntimeCleanupPlanResponse, RuntimeConnectionTestFailureKind,
+    RuntimeConnectionTestResponse, RuntimeConnectionTestStatus, RuntimeManagementSummary,
+    RuntimeRemovalOperationResponse,
     RuntimeRemovalOperationState as ApiRuntimeRemovalOperationState, RuntimeTrustAuditAction,
     RuntimeTrustAuditEntry, RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState,
     RuntimeTrustKeyStatus, UpdateRemoteRuntimeRequest, UpdateWorkspaceMetadataRequest,
@@ -217,8 +214,8 @@ use crate::auth::{
     token_hash,
 };
 use crate::authority::{
-    MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
-    SqliteWorkspaceAuthority, TicketAuthority, TicketSourceCommitResolver, merge_request_summary,
+    ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput, SqliteWorkspaceAuthority,
+    TicketAuthority, TicketSourceCommitResolver, merge_request_summary,
 };
 use crate::backend_job::{
     ABSOLUTE_MAX_CONCURRENT_JOBS, BackendJobAttemptRecord, BackendJobAttemptState,
@@ -244,10 +241,6 @@ use crate::hosts::{
     WorkerTicketAssignmentRequest, WorkspaceRuntimeAuthorization,
     is_disallowed_remote_runtime_address, is_loopback_runtime_origin,
     worker_spawn_create_fingerprint, workspace_worker_summary,
-};
-use crate::memory_backend::execute_memory_backend_operation_with_authority;
-use crate::memory_staging::{
-    list_memory_staging_from_authority, memory_staging_backlog_from_authority,
 };
 use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationSource,
@@ -2242,7 +2235,6 @@ pub struct WorkspaceApi {
     pub(crate) worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
     resource_broker: BackendResourceBroker,
     workdir_sessions: Arc<Mutex<WorkdirSessionRegistry>>,
-    memory_operation_lock: Arc<Mutex<()>>,
     external_workdir_providers: Arc<Mutex<ExternalProviderRegistry>>,
     external_workdir_expiry_tasks: Arc<Mutex<HashMap<String, ExternalWorkdirExpiryTask>>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
@@ -4019,7 +4011,7 @@ async fn authorize_scoped_workspace_request(
         }
     }
     // The Journal browser uses POST only to carry bounded typed read selectors. Its
-    // action set is read-only and follows the same user read authority as Memory GET.
+    // action set is read-only and follows the same user read authority as Subject GET.
     if (mutating && !subjektiv_journal_browser::is_read_path(&request_path, workspace_id))
         || request.headers().contains_key(axum::http::header::UPGRADE)
     {
@@ -5180,7 +5172,6 @@ impl WorkspaceApi {
             worker_projection,
             resource_broker,
             workdir_sessions: Arc::new(Mutex::new(WorkdirSessionRegistry::default())),
-            memory_operation_lock: Arc::new(Mutex::new(())),
             external_workdir_providers: Arc::new(Mutex::new(ExternalProviderRegistry::default())),
             external_workdir_expiry_tasks: Arc::new(Mutex::new(HashMap::new())),
             workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -6522,9 +6513,6 @@ impl WorkspaceApi {
         let request_fingerprint = worker_spawn_create_fingerprint(&request)
             .map_err(|message| Error::Config(message.to_string()))?;
         let singleton_key = request.singleton_key.clone();
-        let current_memory_settings = self
-            .config_store
-            .get_workspace_memory_settings(&self.config.workspace_id)?;
         let allocation_key = request
             .resolved_control_operation
             .as_ref()
@@ -6575,7 +6563,6 @@ impl WorkspaceApi {
                             &operation.input_fingerprint,
                             &operation.input_fingerprint,
                             singleton_key.as_deref(),
-                            &current_memory_settings,
                             grant,
                             bundle,
                             &request.resolved_feature_initialization,
@@ -6597,7 +6584,6 @@ impl WorkspaceApi {
                         &operation.input_fingerprint,
                         &request_fingerprint,
                         singleton_key.as_deref(),
-                        &current_memory_settings,
                         profile,
                         bundle,
                         &request.resolved_feature_initialization,
@@ -6609,7 +6595,6 @@ impl WorkspaceApi {
                         &allocation_key,
                         &request_fingerprint,
                         singleton_key.as_deref(),
-                        &current_memory_settings,
                         &request.resolved_feature_initialization,
                     )
                 };
@@ -6656,6 +6641,7 @@ impl WorkspaceApi {
             reservation: &reservation,
         })?;
         request.resolved_feature_initialization = reservation.feature_initialization.clone();
+        request.resolved_subjektiv_memory_settings = reservation.subjektiv_memory_settings.clone();
         if request.resolved_control_operation.is_some()
             && !self
                 .store
@@ -6702,7 +6688,6 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error, diagnostics));
             }
         };
-        request.resolved_memory_settings = Some(reservation.memory_settings);
         let reservation_fingerprint = create_binding.create_fingerprint.clone();
         *reserved_identity = Some(reserved_worker.clone());
         let compensation_context = WorkerSpawnCompensationContext {
@@ -8105,10 +8090,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::workspace_signing_identity_provision(service.clone()))
-        .merge(server_api::server_api_axum::workspace_memory_settings(
-            service.clone(),
-        ))
-        .merge(server_api::server_api_axum::workspace_memory_settings_update(service.clone()))
         .merge(server_api::server_api_axum::repository_access_projection(
             service.clone(),
         ))
@@ -8158,19 +8139,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::flow_put(service.clone()))
         .merge(server_api::server_api_axum::flow_resolve(service.clone()))
         .merge(server_api::server_api_axum::flow_get(service.clone()))
-        .merge(server_api::server_api_axum::memory_document(
-            service.clone(),
-        ))
-        .merge(server_api::server_api_axum::legacy_memory_reset(
-            service.clone(),
-        ))
-        .merge(server_api::server_api_axum::memory_staging_list(
-            service.clone(),
-        ))
-        .merge(server_api::server_api_axum::memory_backend(service.clone()))
-        .merge(server_api::server_api_axum::memory_consolidation(
-            service.clone(),
-        ))
         .merge(server_api::server_api_axum::operation_authorize(
             service.clone(),
         ))
@@ -8802,7 +8770,7 @@ fn worker_spawn_request_from_api(
         resolved_workdir_attachments: Vec::new(),
         resolved_config_bundle: None,
         resolved_workspace_api: None,
-        resolved_memory_settings: None,
+        resolved_subjektiv_memory_settings: None,
         feature_connections: Default::default(),
         resolved_feature_initialization: Default::default(),
         resolved_worker_observation_enabled: false,
@@ -9864,36 +9832,6 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
-    async fn workspace_memory_settings(
-        &self,
-        workspace_id: String,
-    ) -> std::result::Result<server_api::WorkspaceMemorySettings, server_api::RepositoryApiError>
-    {
-        scoped_get_workspace_memory_settings(
-            State(self.workspace_api()?.clone()),
-            AxumPath(workspace_id),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn workspace_memory_settings_update(
-        &self,
-        workspace_id: String,
-        request: server_api::UpdateWorkspaceMemorySettingsRequest,
-    ) -> std::result::Result<server_api::WorkspaceMemorySettings, server_api::RepositoryApiError>
-    {
-        scoped_update_workspace_memory_settings(
-            State(self.workspace_api()?.clone()),
-            AxumPath(workspace_id),
-            Json(request),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
-    }
-
     async fn repository_access_projection(
         &self,
         actor: RequestActor,
@@ -10308,95 +10246,6 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| flow_source_record_to_api(response))
-        .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn memory_document(
-        &self,
-        workspace_id: String,
-    ) -> std::result::Result<MemoryDocumentResponse, server_api::RepositoryApiError> {
-        scoped_get_memory_document(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn legacy_memory_reset(
-        &self,
-        actor: RequestActor,
-        workspace_id: String,
-        request: server_api::LegacyMemoryResetRequest,
-    ) -> std::result::Result<server_api::LegacyMemoryResetResponse, server_api::RepositoryApiError>
-    {
-        scoped_reset_legacy_memory(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-            Extension(actor),
-            Json(request),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn memory_staging_list(
-        &self,
-        workspace_id: String,
-        query: server_api::MemoryStagingQuery,
-    ) -> std::result::Result<MemoryStagingListResponse, server_api::RepositoryApiError> {
-        scoped_list_memory_staging(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-            Query(query),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn memory_backend(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        request: server_api::MemoryBackendRequest,
-    ) -> std::result::Result<server_api::MemoryBackendResponse, server_api::RepositoryApiError>
-    {
-        scoped_memory_backend_operation(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-            context,
-            Json(request.0),
-        )
-        .await
-        .map(|Json(response)| server_api::MemoryBackendResponse(response))
-        .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn memory_consolidation(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        request: server_api::MemoryConsolidateStagingRequest,
-    ) -> std::result::Result<server_api::MemoryConsolidationResponse, server_api::RepositoryApiError>
-    {
-        scoped_memory_consolidation(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-            context,
-            Json(MemoryConsolidateStagingOperation {
-                force: request.force,
-            }),
-        )
-        .await
-        .map(|Json(response)| server_api::MemoryConsolidationResponse {
-            status: response.status,
-            summary: response.summary,
-            candidate_count: response.candidate_count,
-            total_bytes: response.total_bytes,
-        })
         .map_err(ApiError::into_repository_api_error)
     }
 
@@ -16547,51 +16396,6 @@ async fn scoped_get_prompt_projection(
                 .prompt_projection_cache
                 .resolve(&path.workspace_id, &state)?;
             Ok(Json(projection.as_ref().clone()))
-        })
-        .await
-}
-
-async fn scoped_get_workspace_memory_settings(
-    State(api): State<WorkspaceApi>,
-    AxumPath(workspace_id): AxumPath<String>,
-) -> ApiResult<Json<server_api::WorkspaceMemorySettings>> {
-    api.store
-        .db_executor()
-        .run(move || {
-            validate_workspace_scope(&api, &workspace_id)?;
-            let settings = api
-                .config_store
-                .get_workspace_memory_settings(&workspace_id)
-                .map_err(ApiError::from)?;
-            Ok(Json(server_api::WorkspaceMemorySettings {
-                workspace_id: settings.workspace_id,
-                language: settings.language,
-            }))
-        })
-        .await
-}
-
-async fn scoped_update_workspace_memory_settings(
-    State(api): State<WorkspaceApi>,
-    AxumPath(workspace_id): AxumPath<String>,
-    Json(request): Json<server_api::UpdateWorkspaceMemorySettingsRequest>,
-) -> ApiResult<Json<server_api::WorkspaceMemorySettings>> {
-    api.store
-        .db_executor()
-        .run(move || {
-            validate_workspace_scope(&api, &workspace_id)?;
-            let settings = api
-                .config_store
-                .update_workspace_memory_settings(
-                    &workspace_id,
-                    &request.expected_language,
-                    &request.language,
-                )
-                .map_err(ApiError::from)?;
-            Ok(Json(server_api::WorkspaceMemorySettings {
-                workspace_id: settings.workspace_id,
-                language: settings.language,
-            }))
         })
         .await
 }
@@ -24805,109 +24609,6 @@ fn is_dedicated_workspace_orchestrator(worker: &InternalWorkerSummary, workspace
         && worker.tags.iter().any(|tag| tag == "singleton")
 }
 
-async fn scoped_get_memory_document(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<MemoryDocumentResponse>> {
-    api.store
-        .db_executor()
-        .run(move || {
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            let document = api.authority.memory_document()?;
-            Ok(Json(MemoryDocumentResponse {
-                bytes: document.body_md.len(),
-                body_md: document.body_md,
-                created_at: document.created_at,
-                updated_at: document.updated_at,
-                record_source: document.record_source,
-            }))
-        })
-        .await
-}
-
-async fn scoped_reset_legacy_memory(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Extension(actor): Extension<RequestActor>,
-    Json(request): Json<server_api::LegacyMemoryResetRequest>,
-) -> ApiResult<Json<server_api::LegacyMemoryResetResponse>> {
-    require_workspace_owner(
-        &api,
-        &path.workspace_id,
-        &actor,
-        "Legacy Workspace Memory reset",
-    )
-    .await?;
-    let expected = format!("RESET LEGACY MEMORY {}", path.workspace_id);
-    if request.confirmation != expected {
-        return Err(Error::InvalidInput(format!(
-            "legacy Memory reset confirmation must exactly equal `{expected}`"
-        ))
-        .into());
-    }
-    api.store
-        .db_executor()
-        .run(move || {
-            let counts = api.store.reset_legacy_memory(&path.workspace_id)?;
-            Ok(Json(server_api::LegacyMemoryResetResponse {
-                workspace_id: path.workspace_id,
-                documents_deleted: counts.documents,
-                staging_records_deleted: counts.staging_records,
-                staging_resolutions_deleted: counts.staging_resolutions,
-            }))
-        })
-        .await
-}
-
-async fn scoped_list_memory_staging(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Query(query): Query<server_api::MemoryStagingQuery>,
-) -> ApiResult<Json<MemoryStagingListResponse>> {
-    api.store
-        .db_executor()
-        .run(move || {
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            Ok(Json(list_memory_staging_from_authority(
-                &api.authority,
-                query.limit.map(usize::try_from).transpose().map_err(|_| {
-                    Error::InvalidInput(
-                        "Memory staging limit exceeds this host's usize range".to_string(),
-                    )
-                })?,
-            )?))
-        })
-        .await
-}
-
-async fn scoped_memory_backend_operation(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    _context: server_api::ServerRequestContext,
-    Json(operation): Json<MemoryBackendOperation>,
-) -> ApiResult<Json<MemoryBackendHttpResponse>> {
-    api.store
-        .db_executor()
-        .run(move || {
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            // The legacy memory document edit is a read/replace/write across store
-            // calls. Keep that resource atomic without serializing unrelated requests.
-            let _memory_guard = api
-                .memory_operation_lock
-                .lock()
-                .expect("Memory operation lock poisoned");
-            let result = execute_memory_backend_operation_with_authority(&api.authority, operation);
-            let response = match result {
-                Ok(result) => MemoryBackendHttpResponse::Ok { result },
-                Err(error) => MemoryBackendHttpResponse::Error {
-                    message: sanitize_backend_error(&error.to_string()),
-                },
-            };
-            Ok(Json(response))
-        })
-        .await
-}
-
 const SUBJEKTIV_SINGLETON_PREFIX: &str = crate::subjektiv::SUBJECT_WORKER_SINGLETON_PREFIX;
 const SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX: &str =
     crate::hosts::SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX;
@@ -27516,9 +27217,6 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
     }
 }
 
-const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
-const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
-
 async fn scoped_subjektiv_memory_consolidation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -27702,346 +27400,6 @@ async fn start_subjektiv_staging_consolidation(
             subjektiv_job::dispatch(&api, &subject, source_worker, candidate_count, total_bytes)
         })
         .await
-}
-
-async fn scoped_memory_consolidation(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    context: server_api::ServerRequestContext,
-    Json(operation): Json<MemoryConsolidateStagingOperation>,
-) -> ApiResult<Json<MemoryConsolidationOutput>> {
-    let headers =
-        contract_request_headers(&context).map_err(|error| Error::Config(error.message))?;
-    let requester = if let Some(source) = authenticated_ticket_worker_source(&headers, &context)? {
-        MemoryConsolidationRequester::Worker(source)
-    } else {
-        let actor = subject_authorization::administration_actor(&context)?.clone();
-        require_workspace_owner(
-            &api,
-            &path.workspace_id,
-            &actor,
-            "Workspace Memory consolidation",
-        )
-        .await?;
-        MemoryConsolidationRequester::Owner(actor.account_id)
-    };
-    api.host_executors
-        .host()?
-        .run(move || {
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            Ok(Json(start_memory_staging_consolidation(
-                api, operation, &requester,
-            )?))
-        })
-        .await
-}
-
-enum MemoryConsolidationRequester {
-    Owner(String),
-    Worker(RuntimeWorkerRef),
-}
-
-fn start_memory_staging_consolidation(
-    api: WorkspaceApi,
-    operation: MemoryConsolidateStagingOperation,
-    requester: &MemoryConsolidationRequester,
-) -> ApiResult<MemoryConsolidationOutput> {
-    let (source, owner_account_id) = match requester {
-        MemoryConsolidationRequester::Owner(account_id) => {
-            api.config_store.with_conn(|conn| {
-                crate::launch_policy::require_owner(conn, api.workspace_id(), account_id)
-            })?;
-            (None, Some(account_id.as_str()))
-        }
-        MemoryConsolidationRequester::Worker(worker) => {
-            subject_authorization::authorize(
-                &api,
-                worker,
-                &server_api::authorization::OperationAuthorizationRequest {
-                    operation: "memory.consolidation.request".into(),
-                    resource: server_api::authorization::PermissionResource::Workspace {
-                        workspace_id: api.workspace_id().into(),
-                    },
-                },
-            )?;
-            (Some(worker), None)
-        }
-    };
-    let backlog = memory_staging_backlog_from_authority(&api.authority)?;
-    let candidate_count = backlog.candidate_count;
-    let total_bytes = backlog.total_bytes;
-    if candidate_count == 0 {
-        return Ok(MemoryConsolidationOutput {
-            status: "skipped_empty".to_string(),
-            summary: "No Memory staging candidates are pending.".to_string(),
-            candidate_count,
-            total_bytes,
-        });
-    }
-    const CONSOLIDATION_THRESHOLD_FILES: usize = 5;
-    const CONSOLIDATION_THRESHOLD_BYTES: u64 = 50_000;
-    let reached_files = candidate_count >= CONSOLIDATION_THRESHOLD_FILES;
-    let reached_bytes = total_bytes >= CONSOLIDATION_THRESHOLD_BYTES;
-    if !operation.force && !reached_files && !reached_bytes {
-        return Ok(MemoryConsolidationOutput {
-            status: "skipped_below_threshold".to_string(),
-            summary: format!(
-                "Memory staging backlog has {candidate_count} candidate(s), {total_bytes} byte(s), below Backend policy threshold."
-            ),
-            candidate_count,
-            total_bytes,
-        });
-    }
-
-    let runtime_id = select_memory_consolidation_runtime(&api)?;
-    let input_content = memory_consolidation_input_content(candidate_count, total_bytes);
-    if let Some(output) = try_reuse_memory_consolidation_worker(
-        &api,
-        &runtime_id,
-        &input_content,
-        candidate_count,
-        total_bytes,
-    )? {
-        return Ok(output);
-    }
-
-    // This fixed internal consumer still needs an explicit ordinary-Worker
-    // grant. Never turn its Profile or singleton name into execution authority.
-    let profile = format!(
-        "builtin:{}",
-        MEMORY_CONSOLIDATION_PROFILE
-            .strip_prefix("builtin:")
-            .unwrap_or(MEMORY_CONSOLIDATION_PROFILE)
-    );
-    let profile_selector = ProfileSelector::Builtin(profile.clone());
-    let config = api.current_workspace_config()?;
-    let projection = crate::profile_settings::project_profiles_from_workspace_config(
-        api.workspace_id(),
-        &config,
-    )?;
-    let bundle = crate::profile_settings::build_virtual_profile_config_bundle(
-        &projection,
-        &config,
-        api.workspace_id(),
-        &api.config.workspace_created_at,
-        &profile,
-    )?
-    .ok_or_else(|| Error::Config("Memory consolidation Profile bundle is unavailable".into()))?;
-    let authorization = server_api::launch_policy::WorkerCreationAuthorization::Assignment {
-        assignment: Some(feature_permissions::PermissionAssignment {
-            grants: vec![feature_permissions::PermissionReference::Namespace(
-                feature_permissions::NamespacePermissions {
-                    namespace: feature_permissions::NamespaceId::parse("memory")
-                        .map_err(Error::Config)?,
-                    keys: [
-                        "memory.query",
-                        "memory.resident.read",
-                        "memory.staging.list",
-                        "memory.staging.read",
-                        "memory.document.read",
-                        "memory.document.update",
-                        "memory.audit.append",
-                        "memory.staging.close",
-                    ]
-                    .into_iter()
-                    .map(feature_permissions::PermissionKey::parse)
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Error::Config)?,
-                },
-            )],
-            ..Default::default()
-        }),
-    };
-    let creation = WorkerControlOperation {
-        operation_id: Uuid::now_v7().to_string(),
-        input_fingerprint: format!(
-            "sha256:{}",
-            Sha256::digest(
-                serde_json::to_vec(&(
-                    api.workspace_id(),
-                    &runtime_id,
-                    &profile,
-                    &authorization,
-                    &input_content
-                ))
-                .map_err(|error| Error::Store(error.to_string()))?
-            )
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-        ),
-    };
-    let grant = core_worker_creation::resolve_core_creation_grant(
-        &api,
-        source,
-        owner_account_id,
-        &authorization,
-        &runtime_id,
-        &profile,
-        &bundle,
-        &creation,
-    )?;
-    let initial_submit = vec![Segment::text(input_content)];
-    let result = api.spawn_workspace_worker(
-        &runtime_id,
-        WorkerSpawnRequest {
-            requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
-            singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
-            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 1,
-            },
-            profile: profile_selector,
-            initial_submit,
-            workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle: Some(bundle),
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: Vec::new(),
-            resolved_workspace_api: None,
-            resolved_memory_settings: None,
-            feature_connections: Default::default(),
-            resolved_feature_initialization: Default::default(),
-            resolved_control_operation: Some(creation),
-            resolved_execution_grant: None,
-            authorization: Some(authorization),
-            resolved_core_execution_grant: Some(grant),
-        },
-    )?;
-    if result.state != InternalWorkerOperationState::Accepted {
-        return Ok(MemoryConsolidationOutput {
-            status: "skipped_spawn_rejected".to_string(),
-            summary: "Runtime rejected Memory consolidater spawn.".to_string(),
-            candidate_count,
-            total_bytes,
-        });
-    }
-    let Some(worker) = result.worker else {
-        return Ok(MemoryConsolidationOutput {
-            status: "skipped_spawn_missing_worker".to_string(),
-            summary:
-                "Runtime accepted Memory consolidater spawn without returning a Worker summary."
-                    .to_string(),
-            candidate_count,
-            total_bytes,
-        });
-    };
-    Ok(MemoryConsolidationOutput {
-        status: "started".to_string(),
-        summary: format!(
-            "Started Memory consolidater '{}' for {candidate_count} staging candidate(s).",
-            worker.worker.worker_id
-        ),
-        candidate_count,
-        total_bytes,
-    })
-}
-
-fn try_reuse_memory_consolidation_worker(
-    api: &WorkspaceApi,
-    _runtime_id: &str,
-    input_content: &str,
-    candidate_count: usize,
-    total_bytes: u64,
-) -> ApiResult<Option<MemoryConsolidationOutput>> {
-    let Some(owner) = api.store.current_worker_singleton_owner(
-        &api.config.workspace_id,
-        MEMORY_CONSOLIDATION_SINGLETON_KEY,
-    )?
-    else {
-        return Ok(None);
-    };
-    let mut worker = api
-        .runtime
-        .worker(&owner.worker)
-        .map_err(|error| error.into_error())?;
-    worker.singleton_key = Some(owner.key);
-    if worker.state != "idle" {
-        return Ok(Some(MemoryConsolidationOutput {
-            status: "skipped_existing_not_idle".to_string(),
-            summary: format!(
-                "Existing Memory consolidater '{}' is '{}', not confirmed idle.",
-                worker.worker.worker_id, worker.state
-            ),
-            candidate_count,
-            total_bytes,
-        }));
-    }
-    subject_authorization::authorize(
-        api,
-        &worker.worker,
-        &server_api::authorization::OperationAuthorizationRequest {
-            operation: "memory.document.update".into(),
-            resource: server_api::authorization::PermissionResource::Workspace {
-                workspace_id: api.workspace_id().into(),
-            },
-        },
-    )?;
-    let input = api
-        .runtime
-        .send_input(
-            &worker.worker,
-            WorkerInputRequest {
-                source: None,
-                kind: WorkerInputKind::User,
-                content: input_content.to_string(),
-                submission_request_id: None,
-                segments: None,
-            },
-        )
-        .map_err(|err| err.into_error())?;
-    if input.state != InternalWorkerOperationState::Accepted {
-        return Ok(Some(MemoryConsolidationOutput {
-            status: "skipped_existing_input_rejected".to_string(),
-            summary: format!(
-                "Existing idle Memory consolidater '{}' rejected the new consolidation input.",
-                worker.worker.worker_id
-            ),
-            candidate_count,
-            total_bytes,
-        }));
-    }
-    Ok(Some(MemoryConsolidationOutput {
-        status: "reused".to_string(),
-        summary: format!(
-            "Reused Memory consolidater '{}' for {candidate_count} staging candidate(s).",
-            worker.worker.worker_id
-        ),
-        candidate_count,
-        total_bytes,
-    }))
-}
-
-fn memory_consolidation_input_content(candidate_count: usize, total_bytes: u64) -> String {
-    format!(
-        "Process pending Memory staging candidates through MemoryStagingList, MemoryStagingRead, Memory tools, and MemoryStagingClose. Current backlog: {candidate_count} candidate(s), {total_bytes} byte(s)."
-    )
-}
-
-fn select_memory_consolidation_runtime(api: &WorkspaceApi) -> ApiResult<String> {
-    let runtimes = api.runtime.list_runtimes(100);
-    if let Some(runtime) = runtimes
-        .items
-        .iter()
-        .find(|runtime| {
-            runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID && runtime.worker_creation_available
-        })
-        .or_else(|| {
-            runtimes
-                .items
-                .iter()
-                .find(|runtime| runtime.worker_creation_available)
-        })
-    {
-        return Ok(runtime.runtime_id.clone());
-    }
-    Err(Error::RuntimeOperationFailed {
-        runtime_id: "memory-consolidation".to_string(),
-        code: "memory_consolidation_runtime_unavailable".to_string(),
-        message: "No runtime capable of spawning the Memory consolidater is available".to_string(),
-    }
-    .into())
 }
 
 async fn scoped_list_skills(
@@ -29806,7 +29164,7 @@ async fn scoped_start_workspace_orchestrator(
             resolved_worker_observation_enabled: true,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
@@ -36360,7 +35718,7 @@ async fn create_workspace_worker_authenticated_on_host(
         authorization: Some(authorization),
         resolved_core_execution_grant,
         resolved_workspace_api: None,
-        resolved_memory_settings: None,
+        resolved_subjektiv_memory_settings: None,
         feature_connections,
         resolved_feature_initialization: resolved_feature_initialization.clone(),
     };
@@ -38978,7 +38336,6 @@ fn runtime_connection_test_response(
             workspace_id: workspace_id.to_string(),
             runtime_id: runtime_id.to_string(),
             binding_id: String::new(),
-
             checked_at,
             status: RuntimeConnectionTestStatus::Compatible,
             failure_kind: None,
@@ -39029,7 +38386,6 @@ fn runtime_connection_test_failure(
         workspace_id: workspace_id.to_string(),
         runtime_id: runtime_id.to_string(),
         binding_id: String::new(),
-
         checked_at,
         status: RuntimeConnectionTestStatus::Failed,
         failure_kind: Some(failure_kind),
@@ -42430,11 +41786,10 @@ mod tests {
         WorkerSpawnIntent,
     };
     use crate::store::{
-        AccountRecord, ApiTokenRecord, BrowserSessionRecord, MemoryDocumentRecord,
-        MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
-        SqliteWorkspaceStore, UserRecord, WorkerRegistryObservationRecord,
-        WorkerRegistryProjectionRecord, WorkerRegistryRecord, WorkspaceRecord,
-        WorkspaceRuntimeBinding,
+        AccountRecord, ApiTokenRecord, BrowserSessionRecord, ObjectiveRecord,
+        ObjectiveResourceRecord, ObjectiveTicketLinkRecord, SqliteWorkspaceStore, UserRecord,
+        WorkerRegistryObservationRecord, WorkerRegistryProjectionRecord, WorkerRegistryRecord,
+        WorkspaceRecord, WorkspaceRuntimeBinding,
     };
 
     fn valid_gif_with_len(target_len: usize) -> Vec<u8> {
@@ -42474,22 +41829,22 @@ mod tests {
 
         assert_eq!(
             output.availability,
-            memory::backend::MemoryResidentSummaryAvailability::Ready
+            memory::subject::MemoryResidentSummaryAvailability::Ready
         );
         assert_eq!(output.content, None);
 
         for (surface, expected) in [
             (
                 crate::subjektiv::SurfaceAvailability::Ungenerated,
-                memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
             ),
             (
                 crate::subjektiv::SurfaceAvailability::Stale,
-                memory::backend::MemoryResidentSummaryAvailability::Stale,
+                memory::subject::MemoryResidentSummaryAvailability::Stale,
             ),
             (
                 crate::subjektiv::SurfaceAvailability::Failed,
-                memory::backend::MemoryResidentSummaryAvailability::Failed,
+                memory::subject::MemoryResidentSummaryAvailability::Failed,
             ),
         ] {
             let output = resident_summary_output(crate::subjektiv::ResidentSurface {
@@ -43135,15 +42490,12 @@ mod tests {
                         output_collection: workdir::CommandOutputCollection::Complete,
                         status: workdir::CommandStatus::Cancelled,
                         exit_code: None,
-
                         stdout_bytes: 0,
 
                         stderr_bytes: 0,
-
                         stdout_delivered_bytes: 0,
 
                         stderr_delivered_bytes: 0,
-
                         truncation_reason: None,
                     }),
                 },
@@ -43242,15 +42594,12 @@ mod tests {
                         output_collection: workdir::CommandOutputCollection::Complete,
                         status: workdir::CommandStatus::Cancelled,
                         exit_code: None,
-
                         stdout_bytes: 0,
 
                         stderr_bytes: 0,
-
                         stdout_delivered_bytes: 0,
 
                         stderr_delivered_bytes: 0,
-
                         truncation_reason: None,
                     }),
                 },
@@ -44388,15 +43737,12 @@ mod tests {
                             output_collection: workdir::CommandOutputCollection::Complete,
                             status: workdir::CommandStatus::Cancelled,
                             exit_code: None,
-
                             stdout_bytes: 0,
 
                             stderr_bytes: 0,
-
                             stdout_delivered_bytes: 0,
 
                             stderr_delivered_bytes: 0,
-
                             truncation_reason: None,
                         }),
                     },
@@ -47376,14 +46722,6 @@ mod tests {
         }
     }
 
-    fn test_worker_memory_settings() -> manifest::WorkspaceMemorySettingsSnapshot {
-        manifest::WorkspaceMemorySettingsSnapshot {
-            workspace_id: TEST_WORKSPACE_ID.to_string(),
-
-            language: "English".to_string(),
-        }
-    }
-
     #[test]
     fn ticket_api_errors_preserve_http_status() {
         let not_found = ApiError::from(Error::Ticket(ticket::TicketError::NotFound(
@@ -48138,7 +47476,7 @@ mod tests {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
@@ -50190,7 +49528,7 @@ mod tests {
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -50422,143 +49760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_memory_reset_requires_owner_confirmation_and_preserves_subjektiv() {
-        let workspace = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
-        api.store
-            .upsert_memory_document(&crate::store::MemoryDocumentRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                body_md: "# Legacy Memory\n\nRetained until explicit reset.\n".to_string(),
-                created_at: "2026-10-02T00:00:00Z".to_string(),
-                updated_at: "2026-10-02T00:00:00Z".to_string(),
-            })
-            .unwrap();
-        api.store
-            .upsert_memory_staging_record(&crate::store::MemoryStagingRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                candidate_id: "legacy-pending".to_string(),
-                raw_json: r#"{"claim":"pending"}"#.to_string(),
-                source_path: None,
-                imported_at: "2026-10-02T00:00:00Z".to_string(),
-            })
-            .unwrap();
-        api.store
-            .insert_memory_staging_resolution(&crate::store::MemoryStagingResolutionRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                candidate_id: "legacy-resolved".to_string(),
-                action: "discarded".to_string(),
-                reason: "fixture".to_string(),
-                affected_refs_json: "[]".to_string(),
-                staging_raw_json: r#"{"claim":"resolved"}"#.to_string(),
-                source_path: None,
-                imported_at: "2026-10-02T00:00:00Z".to_string(),
-                resolved_at: "2026-10-02T00:01:00Z".to_string(),
-            })
-            .unwrap();
-
-        let subjektiv = open_subjektiv_store(&api).unwrap();
-        let subject = subjektiv
-            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
-            .unwrap();
-        let memory = subjektiv
-            .create_memory(
-                &subject.id,
-                crate::subjektiv::MemoryDraft::active(
-                    memory::extract::CandidateKind::Decision,
-                    "Preserve feature Memory",
-                    "This record is outside the legacy reset scope.",
-                    "Proves reset isolation",
-                    "fixture",
-                ),
-            )
-            .unwrap();
-
-        let incorrect = scoped_reset_legacy_memory(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            Extension(test_owner_actor()),
-            Json(server_api::LegacyMemoryResetRequest {
-                confirmation: "RESET LEGACY MEMORY wrong-workspace".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(incorrect.into_response().status(), StatusCode::BAD_REQUEST);
-        assert!(
-            api.store
-                .get_memory_document(TEST_WORKSPACE_ID)
-                .unwrap()
-                .is_some()
-        );
-
-        let mut non_owner = test_owner_actor();
-        non_owner.account_id = "another-account".to_string();
-        let forbidden = scoped_reset_legacy_memory(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            Extension(non_owner),
-            Json(server_api::LegacyMemoryResetRequest {
-                confirmation: format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(forbidden.into_response().status(), StatusCode::FORBIDDEN);
-
-        let Json(reset) = scoped_reset_legacy_memory(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            Extension(test_owner_actor()),
-            Json(server_api::LegacyMemoryResetRequest {
-                confirmation: format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(reset.documents_deleted, 1);
-        assert_eq!(reset.staging_records_deleted, 1);
-        assert_eq!(reset.staging_resolutions_deleted, 1);
-        assert!(
-            api.store
-                .get_memory_document(TEST_WORKSPACE_ID)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            subjektiv
-                .memory(&subject.id, &memory.id)
-                .unwrap()
-                .unwrap()
-                .change_id,
-            memory.change_id
-        );
-
-        let Json(repeated) = scoped_reset_legacy_memory(
-            State(api),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            Extension(test_owner_actor()),
-            Json(server_api::LegacyMemoryResetRequest {
-                confirmation: format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(repeated.documents_deleted, 0);
-        assert_eq!(repeated.staging_records_deleted, 0);
-        assert_eq!(repeated.staging_resolutions_deleted, 0);
-    }
-
-    #[tokio::test]
-    async fn subjektiv_browser_routes_enforce_router_auth_scope_and_owner_reset() {
+    async fn subjektiv_browser_routes_preserve_auth_scope_and_legacy_memory_routes_are_absent() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -50579,14 +49781,6 @@ mod tests {
                     "fixture",
                 ),
             )
-            .unwrap();
-        api.store
-            .upsert_memory_document(&crate::store::MemoryDocumentRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                body_md: "# Legacy reset fixture\n".to_string(),
-                created_at: "2026-10-02T00:00:00Z".to_string(),
-                updated_at: "2026-10-02T00:00:00Z".to_string(),
-            })
             .unwrap();
         let app = build_router(api.clone());
         let subject_root = format!(
@@ -50773,35 +49967,39 @@ mod tests {
             StatusCode::NOT_FOUND,
         )
         .await;
-        request_json_authenticated(
-            app.clone(),
-            "POST",
-            &format!("/api/w/{TEST_WORKSPACE_ID}/memory/reset"),
-            Some(serde_json::json!({
-                "confirmation": format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
-            })),
-            &non_owner_token,
-            StatusCode::FORBIDDEN,
-        )
-        .await;
-        assert!(
-            api.store
-                .get_memory_document(TEST_WORKSPACE_ID)
-                .unwrap()
-                .is_some()
-        );
-        let reset = request_json_authenticated(
-            app,
-            "POST",
-            &format!("/api/w/{TEST_WORKSPACE_ID}/memory/reset"),
-            Some(serde_json::json!({
-                "confirmation": format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
-            })),
-            &owner_token,
-            StatusCode::OK,
-        )
-        .await;
-        assert_eq!(reset["documents_deleted"], 1);
+        for token in [&owner_token, &non_owner_token] {
+            for (method, suffix, body) in [
+                ("GET", "memory", None),
+                ("GET", "memory/staging?limit=1", None),
+                ("GET", "settings/memory", None),
+                (
+                    "PUT",
+                    "settings/memory",
+                    Some(serde_json::json!({"language":"en"})),
+                ),
+                (
+                    "POST",
+                    "memory/reset",
+                    Some(serde_json::json!({"confirmation":"RESET LEGACY MEMORY"})),
+                ),
+                ("POST", "memory/backend", Some(serde_json::json!({}))),
+                (
+                    "POST",
+                    "memory/consolidation",
+                    Some(serde_json::json!({"force":true})),
+                ),
+            ] {
+                request_json_authenticated(
+                    app.clone(),
+                    method,
+                    &format!("/api/w/{TEST_WORKSPACE_ID}/{suffix}"),
+                    body,
+                    token,
+                    StatusCode::NOT_FOUND,
+                )
+                .await;
+            }
+        }
         assert_eq!(
             store
                 .scoped_memory(&subject.id, &memory.id)
@@ -51720,35 +50918,6 @@ mod tests {
             origin: None,
             transport_headers: Vec::new(),
         };
-        api.store
-            .upsert_memory_document(&MemoryDocumentRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                body_md: "# Legacy sentinel\n".to_string(),
-                created_at: "2026-10-02T00:00:00Z".to_string(),
-                updated_at: "2026-10-02T00:00:00Z".to_string(),
-            })
-            .unwrap();
-        let Json(legacy_resident) = scoped_memory_backend_operation(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            context.clone(),
-            Json(MemoryBackendOperation::ResidentSummary(Default::default())),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            legacy_resident,
-            MemoryBackendHttpResponse::Ok {
-                result: memory::backend::MemoryBackendOperationResult::ResidentSummary(
-                    memory::backend::MemoryResidentSummaryOutput {
-                        availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
-                        content: Some(ref body),
-                    }
-                )
-            } if body == "# Legacy sentinel\n"
-        ));
         let Json(resident) = scoped_subjektiv_memory_backend(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
@@ -51766,8 +50935,8 @@ mod tests {
         assert!(matches!(
             resident,
             server_api::SubjektivMemoryBackendResponse::ResidentSummary(
-                memory::backend::MemoryResidentSummaryOutput {
-                    availability: memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                memory::subject::MemoryResidentSummaryOutput {
+                    availability: memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
                     content: None,
                 }
             )
@@ -51791,8 +50960,8 @@ mod tests {
             server_api::SubjektivMemoryBackendResponse::ResidentContext(
                 server_api::SubjektivResidentContextOutput {
                     behavior_md,
-                    memory_surface: memory::backend::MemoryResidentSummaryOutput {
-                        availability: memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                    memory_surface: memory::subject::MemoryResidentSummaryOutput {
+                        availability: memory::subject::MemoryResidentSummaryAvailability::Ungenerated,
                         content: None,
                     },
                 }
@@ -51849,7 +51018,7 @@ mod tests {
         .unwrap();
         assert_eq!(verified_legacy, recorded_session);
 
-        let operation = memory::backend::MemoryStageCandidateOperation {
+        let operation = memory::subject::MemoryStageCandidateOperation {
             source: memory::schema::SourceRef {
                 segment_id: "segment-1".to_string(),
                 range: [0, 0],
@@ -52852,7 +52021,7 @@ mod tests {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_execution_grant: None,
@@ -52903,10 +52072,6 @@ mod tests {
             feature_initialization::CreationAuthority::Ordinary,
         )
         .unwrap();
-        let memory = api
-            .config_store
-            .get_workspace_memory_settings(&api.config.workspace_id)
-            .unwrap();
         let pre_crash_reservation = api
             .config_store
             .reserve_worker_create_with_core(
@@ -52916,7 +52081,6 @@ mod tests {
                 &restart_fingerprint,
                 &restart_fingerprint,
                 restart_request.singleton_key.as_deref(),
-                &memory,
                 grant.as_ref().unwrap(),
                 bundle.as_ref().unwrap(),
             )
@@ -53195,7 +52359,7 @@ mod tests {
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -53693,7 +52857,6 @@ mod tests {
                 },
                 display_name: Some("New label".to_string()),
                 endpoint: "https://8.8.4.4".to_string(),
-
                 expected_binding_id: Some(configured.binding_id.clone()),
             }),
         )
@@ -53731,7 +52894,6 @@ mod tests {
             },
             display_name: Some("Configured Runtime".to_string()),
             endpoint: "https://8.8.8.8".to_string(),
-
             expected_binding_id: None,
         };
         let mut non_owner = actor.clone();
@@ -53847,7 +53009,6 @@ mod tests {
                 },
                 display_name: None,
                 endpoint: "https://8.8.4.4".to_string(),
-
                 expected_binding_id: Some("binding-missing".to_string()),
             }),
         )
@@ -53891,7 +53052,6 @@ mod tests {
             },
             display_name: None,
             endpoint: "http://127.0.0.1:1".to_string(),
-
             expected_binding_id: None,
         };
         let (_, Json(created)) = create_remote_runtime(
@@ -53963,7 +53123,6 @@ mod tests {
             },
             display_name: Some("Team Runtime".to_string()),
             endpoint: "https://8.8.8.8".to_string(),
-
             expected_binding_id: None,
         };
         assert!(validate_runtime_connection_request(&ok).await.is_ok());
@@ -55346,7 +54505,7 @@ mod tests {
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -60198,276 +59357,6 @@ mod tests {
         assert_eq!(scoped_workspace_id("/api/workspace"), None);
     }
 
-    fn memory_staging_record_json(id: &str, claim: &str) -> String {
-        json!({
-            "schema_version": 1,
-            "id": id,
-            "extract_run_id": "extract-run-1",
-            "source": {
-                "segment_id": "segment-1",
-                "range": [0, 10],
-            },
-            "kind": "working_assumption",
-            "claim": claim,
-            "why_useful": "useful for future work",
-            "staleness": null,
-            "evidence": [],
-            "source_refs": [],
-        })
-        .to_string()
-    }
-
-    #[tokio::test]
-    async fn memory_consolidation_backlog_ignores_legacy_filesystem_staging() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
-        let legacy_staging_dir = dir.path().join(".yoi/memory/_staging");
-        fs::create_dir_all(&legacy_staging_dir).unwrap();
-        fs::write(
-            legacy_staging_dir.join("00000000001J4.json"),
-            memory_staging_record_json("00000000001J4", "legacy filesystem candidate"),
-        )
-        .unwrap();
-
-        let output = match start_memory_staging_consolidation(
-            api,
-            MemoryConsolidateStagingOperation { force: true },
-            &MemoryConsolidationRequester::Owner(test_owner_actor().account_id),
-        ) {
-            Ok(output) => output,
-            Err(_) => panic!("unexpected ApiError from memory consolidation trigger"),
-        };
-
-        assert_eq!(output.status, "skipped_empty");
-        assert_eq!(output.candidate_count, 0);
-        assert_eq!(output.total_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn workspace_memory_consolidation_checks_owner_at_the_http_boundary() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
-        let owner = seed_test_workspace_owner_token(api.store.as_ref(), "memory-owner").await;
-        let reader = seed_test_api_token(api.store.as_ref(), "memory-reader");
-        let app = build_router(api.clone());
-        let path = format!("/api/w/{TEST_WORKSPACE_ID}/memory/consolidation");
-        request_json_authenticated(
-            app.clone(),
-            "POST",
-            &path,
-            Some(json!({"force":true})),
-            &reader,
-            StatusCode::FORBIDDEN,
-        )
-        .await;
-        let accepted = request_json_authenticated(
-            app.clone(),
-            "POST",
-            &path,
-            Some(json!({"force":true})),
-            &owner,
-            StatusCode::OK,
-        )
-        .await;
-        assert_eq!(accepted["status"], "skipped_empty");
-        assert!(
-            api.store
-                .current_worker_singleton_owner(
-                    api.workspace_id(),
-                    MEMORY_CONSOLIDATION_SINGLETON_KEY
-                )
-                .unwrap()
-                .is_none()
-        );
-        api.authority
-            .upsert_memory_staging_record(
-                "00000000000000000000000001",
-                &memory_staging_record_json("00000000000000000000000001", "HTTP candidate"),
-                None,
-            )
-            .unwrap();
-        let started = request_json_authenticated(
-            app,
-            "POST",
-            &path,
-            Some(json!({"force":true})),
-            &owner,
-            StatusCode::OK,
-        )
-        .await;
-        assert_eq!(started["status"], "started");
-    }
-
-    #[tokio::test]
-    async fn memory_consolidation_reuses_existing_idle_worker() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
-        api.authority
-            .upsert_memory_staging_record(
-                "00000000000000000000000001",
-                &memory_staging_record_json("00000000000000000000000001", "first candidate"),
-                None,
-            )
-            .unwrap();
-
-        let below_threshold = start_memory_staging_consolidation(
-            api.clone(),
-            MemoryConsolidateStagingOperation { force: false },
-            &MemoryConsolidationRequester::Owner(test_owner_actor().account_id),
-        )
-        .unwrap();
-        assert_eq!(below_threshold.status, "skipped_below_threshold");
-        assert_eq!(below_threshold.candidate_count, 1);
-        assert!(below_threshold.summary.contains("Backend policy threshold"));
-
-        let resolved_config_bundle = Some(test_internal_builtin_profile_bundle(
-            &api,
-            MEMORY_CONSOLIDATION_PROFILE,
-        ));
-        let existing = spawn_workspace_worker_as_owner(
-            &api,
-            EMBEDDED_WORKER_RUNTIME_ID,
-            WorkerSpawnRequest {
-                requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
-                intent: WorkerSpawnIntent::WorkspaceOrchestrator,
-                singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
-                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                    expected_segments: 0,
-                },
-                profile: ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string()),
-                initial_submit: Vec::new(),
-                workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachments: Vec::new(),
-                resolved_config_bundle,
-                resolved_worker_observation_enabled: false,
-                resolved_worker_observation_grants: Vec::new(),
-                resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
-                resolved_memory_settings: Some(test_worker_memory_settings()),
-                feature_connections: Default::default(),
-                resolved_feature_initialization: Default::default(),
-                resolved_control_operation: None,
-                resolved_execution_grant: None,
-                authorization: None,
-                resolved_core_execution_grant: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            existing.state,
-            InternalWorkerOperationState::Accepted,
-            "diagnostics: {:?}",
-            existing.diagnostics
-        );
-        let worker_id = existing.worker.unwrap().worker.worker_id;
-        let worker = api
-            .runtime
-            .worker(&RuntimeWorkerRef::new(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                &worker_id,
-            ))
-            .unwrap();
-        assert_eq!(worker.state, "idle");
-        assert_eq!(worker.display_name, "Memory Consolidation");
-        assert_eq!(
-            worker.singleton_key.as_deref(),
-            Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
-        );
-        assert!(worker.tags.iter().any(|tag| tag == "memory"));
-        assert!(worker.tags.iter().any(|tag| tag == "consolidation"));
-
-        let second = match start_memory_staging_consolidation(
-            api.clone(),
-            MemoryConsolidateStagingOperation { force: true },
-            &MemoryConsolidationRequester::Worker(RuntimeWorkerRef::new(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                &worker_id,
-            )),
-        ) {
-            Ok(output) => output,
-            Err(_) => panic!("unexpected ApiError from second memory consolidation trigger"),
-        };
-        assert_eq!(second.status, "reused");
-        assert!(second.summary.contains(&worker_id));
-        let workers_after_second = api
-            .runtime
-            .list_workers_for_runtime(EMBEDDED_WORKER_RUNTIME_ID, 20)
-            .unwrap();
-        let consolidaters_after_second = workers_after_second
-            .items
-            .iter()
-            .filter(|worker| {
-                worker.singleton_key.as_deref() == Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(consolidaters_after_second.len(), 1);
-        assert_eq!(consolidaters_after_second[0].worker.worker_id, worker_id);
-
-        let singleton_worker = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id);
-        let stopped = api
-            .runtime
-            .stop_worker(
-                &singleton_worker,
-                WorkerLifecycleRequest {
-                    stop_intent: None,
-                    reason: Some("replace completed Memory singleton".to_string()),
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
-        let removed = api.runtime.delete_worker(&singleton_worker).unwrap();
-        assert!(removed.deleted);
-        api.store
-            .delete_worker_registry(&api.config.workspace_id, &singleton_worker)
-            .unwrap();
-        let replacement = start_memory_staging_consolidation(
-            api.clone(),
-            MemoryConsolidateStagingOperation { force: true },
-            &MemoryConsolidationRequester::Owner(test_owner_actor().account_id),
-        )
-        .unwrap();
-        assert_eq!(replacement.status, "started");
-        let owner = api
-            .store
-            .current_worker_singleton_owner(api.workspace_id(), MEMORY_CONSOLIDATION_SINGLETON_KEY)
-            .unwrap()
-            .unwrap();
-        for (operation, allowed) in [("memory.document.update", true), ("ticket.create", false)] {
-            let result = subject_authorization::authorize(
-                &api,
-                &owner.worker,
-                &server_api::authorization::OperationAuthorizationRequest {
-                    operation: operation.into(),
-                    resource: server_api::authorization::PermissionResource::Workspace {
-                        workspace_id: api.workspace_id().into(),
-                    },
-                },
-            );
-            assert_eq!(result.is_ok(), allowed, "{operation}: {result:?}");
-        }
-        assert!(
-            start_memory_staging_consolidation(
-                api.clone(),
-                MemoryConsolidateStagingOperation { force: true },
-                &MemoryConsolidationRequester::Owner("not-the-owner".into())
-            )
-            .is_err()
-        );
-        let replacement_owner = api
-            .store
-            .current_worker_singleton_owner(
-                &api.config.workspace_id,
-                MEMORY_CONSOLIDATION_SINGLETON_KEY,
-            )
-            .unwrap()
-            .unwrap();
-        assert_ne!(
-            replacement_owner.worker.worker_id, worker_id,
-            "removed singleton generation must be replaceable"
-        );
-    }
-
     fn init_clean_git_workspace(path: &std::path::Path) {
         for args in [
             vec!["init", "--initial-branch=develop"],
@@ -62117,7 +61006,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
-                    resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_memory_settings: None,
                     feature_connections: Default::default(),
                     resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
@@ -62220,7 +61109,7 @@ mod tests {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
-            resolved_memory_settings: Some(test_worker_memory_settings()),
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
@@ -62775,7 +61664,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
-                    resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_memory_settings: None,
                     feature_connections: Default::default(),
                     resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
@@ -62843,7 +61732,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
-                    resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_memory_settings: None,
                     feature_connections: Default::default(),
                     resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
@@ -64466,7 +63355,7 @@ mod tests {
                 resolved_worker_observation_enabled: true,
                 resolved_worker_observation_grants: vec![],
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -64862,32 +63751,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_settings_handlers_reject_foreign_workspace_path_scope() {
-        let temp = tempfile::tempdir().unwrap();
-        let api = test_api(temp.path()).await;
-        assert!(
-            scoped_get_workspace_memory_settings(
-                State(api.clone()),
-                AxumPath("workspace-foreign".to_string()),
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            scoped_update_workspace_memory_settings(
-                State(api),
-                AxumPath("workspace-foreign".to_string()),
-                Json(server_api::UpdateWorkspaceMemorySettingsRequest {
-                    expected_language: "English".to_string(),
-                    language: "English".to_string(),
-                }),
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
     async fn destructive_worker_remove_rejects_browser_and_legacy_source_headers() {
         let headers = HeaderMap::new();
         assert!(matches!(
@@ -65076,7 +63939,7 @@ mod tests {
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -65153,7 +64016,7 @@ mod tests {
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -65297,7 +64160,7 @@ mod tests {
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -69126,7 +67989,7 @@ mod tests {
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
-                resolved_memory_settings: None,
+                resolved_subjektiv_memory_settings: None,
                 feature_connections: Default::default(),
                 resolved_feature_initialization: Default::default(),
                 resolved_control_operation: None,
@@ -69731,9 +68594,6 @@ mod tests {
             worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
         configure_runtime_request_auth(&mut api, &identity, "runtime-test");
         let store = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
-        let memory_settings = store
-            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-            .unwrap();
         let reserved = store
             .reserve_worker_create(
                 TEST_WORKSPACE_ID,
@@ -69741,7 +68601,6 @@ mod tests {
                 "spawn-flow-race",
                 &"f".repeat(64),
                 None,
-                &memory_settings,
             )
             .unwrap();
         let worker_id = reserved.worker_id.to_string();
@@ -70328,8 +69187,6 @@ mod tests {
 
     fn runtime_create_request() -> worker_runtime::catalog::CreateWorkerRequest {
         let bundle = runtime_test_bundle();
-        let mut memory_settings = test_worker_memory_settings();
-        memory_settings.workspace_id = "local".to_owned();
         worker_runtime::catalog::CreateWorkerRequest {
             plugin_execution: None,
             worker_id: WorkerId::now_v7(),
@@ -70356,7 +69213,7 @@ mod tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
-            memory_settings: Some(memory_settings),
+            memory_settings: None,
             feature_initialization: Default::default(),
             backend_job: None,
         }
@@ -72487,30 +71344,6 @@ mod tests {
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             })
             .unwrap();
-        sqlite_store
-            .upsert_memory_document(&MemoryDocumentRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                body_md: "# Memory\n\n## Project facts\n\n- Frontend can read this document.\n"
-                    .to_string(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: "2026-01-02T00:00:00Z".to_string(),
-            })
-            .unwrap();
-        sqlite_store
-            .upsert_memory_staging_record(&MemoryStagingRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                candidate_id: "00000000001J4".to_string(),
-                raw_json: memory_staging_record_json("00000000001J4", "SQLite memory candidate"),
-                source_path: None,
-                imported_at: "2026-01-01T00:00:00Z".to_string(),
-            })
-            .unwrap();
-        assert_eq!(
-            sqlite_store
-                .count_memory_staging_records(TEST_WORKSPACE_ID)
-                .unwrap(),
-            1
-        );
         write_objective(
             dir.path(),
             "00000000001J5",
@@ -72685,39 +71518,6 @@ mod tests {
         .await;
         assert_eq!(shown_objective["linked_tickets"][0], ticket_id);
         assert!(shown_objective["event_page"]["returned"].is_number());
-
-        let memory_document =
-            get_json(app.clone(), &format!("/api/w/{TEST_WORKSPACE_ID}/memory")).await;
-        let _: server_api::MemoryDocumentResponse =
-            serde_json::from_value(memory_document.clone()).unwrap();
-        assert_eq!(memory_document["created_at"], "2026-01-01T00:00:00Z");
-        assert_eq!(memory_document["updated_at"], "2026-01-02T00:00:00Z");
-        assert_eq!(memory_document["bytes"], 63);
-        assert_eq!(memory_document["record_source"], "workspace-sqlite");
-        assert!(
-            memory_document["body_md"]
-                .as_str()
-                .unwrap()
-                .contains("Frontend can read this document.")
-        );
-
-        let memory_staging = get_json(
-            app.clone(),
-            &format!("/api/w/{TEST_WORKSPACE_ID}/memory/staging?limit=10"),
-        )
-        .await;
-        let _: server_api::MemoryStagingListResponse =
-            serde_json::from_value(memory_staging.clone()).unwrap();
-        assert_eq!(
-            memory_staging["record_authority"],
-            "sqlite_workspace_authority.memory_staging"
-        );
-        assert_eq!(memory_staging["total_valid_count"], 1);
-        assert_eq!(memory_staging["invalid_count"], 0);
-        assert_eq!(
-            memory_staging["items"][0]["record"]["claim"],
-            "SQLite memory candidate"
-        );
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
         let typed_repositories: server_api::RepositoryListResponse =
@@ -73053,7 +71853,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         "embedded-worker-runtime",
                     )),
-                    resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_memory_settings: None,
                     feature_connections: Default::default(),
                     resolved_feature_initialization: Default::default(),
                     resolved_control_operation: None,
@@ -74486,7 +73286,7 @@ mod tests {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,
@@ -75382,7 +74182,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
-            resolved_memory_settings: None,
+            resolved_subjektiv_memory_settings: None,
             feature_connections: Default::default(),
             resolved_feature_initialization: Default::default(),
             resolved_control_operation: None,

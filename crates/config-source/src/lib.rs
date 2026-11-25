@@ -3408,7 +3408,6 @@ mod tests {
             ("compaction", "req", "request"),
             ("compaction", "wor", "worker"),
             ("compaction", "compact_ret", "compact_retained_tokens"),
-            ("feature.memory.extraction", "reas", "reasoning"),
             ("feature.subjektiv.extraction", "reas", "reasoning"),
         ] {
             let marked = format!(
