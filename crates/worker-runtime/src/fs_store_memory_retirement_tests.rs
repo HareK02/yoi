@@ -106,6 +106,28 @@ fn fixture(memory: Value) -> (tempfile::TempDir, PathBuf, WorkerRef, Value, Valu
 }
 
 #[test]
+fn schema_v20_default_restore_guard_is_not_reinterpreted_as_pre_v20_stop_history() {
+    let (_temp, root, worker_ref, mut record, _) = fixture(json!({"profile":{"enabled":false}}));
+    let path = root
+        .join(WORKERS_DIR)
+        .join(worker_ref.worker_id.to_string())
+        .join(WORKER_FILE);
+    let request = record["execution_state"]["execution"]["request"].clone();
+    record.as_object_mut().unwrap().remove("restore_guard");
+    atomic_write_json(&path, &record, "write schema-20 default guard fixture").unwrap();
+    let opened = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
+    let restored = opened.store.read_worker_record(&worker_ref).unwrap();
+    let after: Value = read_json(&path, "read migrated default guard fixture").unwrap();
+    let guard = serde_json::to_value(&restored.restore_guard).unwrap();
+    assert!(uuid::Uuid::parse_str(guard["observation_token"].as_str().unwrap()).is_ok());
+    let mut expected = serde_json::to_value(crate::runtime::RestoreGuard::default()).unwrap();
+    expected["observation_token"] = after["restore_guard"]["observation_token"].clone();
+    assert_eq!(guard, expected);
+    assert_eq!(guard, after["restore_guard"]);
+    assert_eq!(after["execution_state"]["execution"]["request"], request);
+}
+
+#[test]
 fn schema_v20_disabled_memory_migrates_subject_snapshot_without_rewriting_create_evidence() {
     let (_temp, root, worker_ref, mut record, mut runtime) = fixture(json!({"profile":{
         "enabled":false, "staging_tools":false,

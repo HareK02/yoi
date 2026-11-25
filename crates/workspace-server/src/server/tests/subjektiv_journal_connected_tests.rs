@@ -1702,14 +1702,23 @@ struct ConnectedRestoreFixture {
     _dir: tempfile::TempDir,
 }
 
-async fn connected_restore_fixture() -> ConnectedRestoreFixture {
-    connected_restore_fixture_with_pending_head(false).await
+#[derive(Clone, Copy)]
+enum ConnectedRestoreSource {
+    Stopped,
+    PendingHead,
+    RetiredMemoryPendingHead,
 }
 
-async fn connected_restore_fixture_with_pending_head(
-    pending_head: bool,
+async fn connected_restore_fixture() -> ConnectedRestoreFixture {
+    connected_restore_fixture_with_source(ConnectedRestoreSource::Stopped).await
+}
+
+async fn connected_restore_fixture_with_source(
+    source: ConnectedRestoreSource,
 ) -> ConnectedRestoreFixture {
     use std::sync::atomic::Ordering::SeqCst;
+
+    let pending_head = !matches!(source, ConnectedRestoreSource::Stopped);
 
     // Guard the resolved global paths before factory/config/allocation access.
     // No Git or Workdir attachment is needed for this connected regression.
@@ -1830,6 +1839,42 @@ async fn connected_restore_fixture_with_pending_head(
     } else {
         None
     };
+    let migration_expected = if matches!(source, ConnectedRestoreSource::RetiredMemoryPendingHead) {
+        let (worker, _) = pending_worker.as_ref().unwrap();
+        let root = &config.embedded_runtime_store_root;
+        let aggregate = root.join("workers").join(&worker.worker_id);
+        let read = |path: &std::path::Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let write = |path: &std::path::Path, value: &Value| {
+            std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        };
+        // Only never-started fixture data is changed. The final Runtime owner
+        // performs its production ordered migration before connected Restore.
+        let mut runtime = read(&root.join("runtime.json"));
+        let mut record = read(&aggregate.join("worker.json"));
+        let metadata = read(&aggregate.join("metadata.json"));
+        let request = record["execution_state"]["execution"]["request"].clone();
+        assert!(!request["feature_initialization"].is_null());
+        assert!(!request["memory_settings"].is_null());
+        let mut old_metadata = metadata.clone();
+        old_metadata["resolved_manifest_snapshot"]["manifest"]["feature"]["memory"] = json!({"profile":{"enabled":false,"resident":{"inject_summary":true},
+                "extraction":{"enabled":true}}});
+        assert!(
+            manifest::read_persisted_worker_manifest_snapshot(
+                old_metadata["resolved_manifest_snapshot"].clone()
+            )
+            .is_err()
+        );
+        runtime["schema_version"] = json!(20);
+        record["schema_version"] = json!(20);
+        write(&root.join("runtime.json"), &runtime);
+        write(&aggregate.join("worker.json"), &record);
+        write(&aggregate.join("metadata.json"), &old_metadata);
+        Some((worker.clone(), request, metadata))
+    } else {
+        None
+    };
     let api = if pending_head {
         shutdown_workspace_feature_storage(&api).await.unwrap();
         drop(store);
@@ -1847,6 +1892,22 @@ async fn connected_restore_fixture_with_pending_head(
     } else {
         api
     };
+    if let Some((worker, request, metadata)) = migration_expected {
+        let root = &api.config.embedded_runtime_store_root;
+        let aggregate = root.join("workers").join(&worker.worker_id);
+        let read = |path: &std::path::Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        assert_eq!(read(&root.join("runtime.json"))["schema_version"], 21);
+        let record = read(&aggregate.join("worker.json"));
+        assert_eq!(record["schema_version"], 21);
+        assert_eq!(record["execution_state"]["execution"]["request"], request);
+        assert_eq!(
+            read(&aggregate.join("metadata.json")),
+            metadata,
+            "migration must remove only retired policy, preserving the complete frozen Subject snapshot and pending Session"
+        );
+    }
     seed_test_delivery_binding(&api);
     let requests = Arc::new(Mutex::new(Vec::new()));
     let observed = requests.clone();
@@ -2246,6 +2307,7 @@ async fn confirmed_restore_preserves_attribution_with_revoked_host_trust_but_pro
 enum ConnectedRepair {
     IncompleteAttribution,
     PendingHead,
+    RetiredMemoryPendingHead,
     RevokedAttribution,
 }
 
@@ -2260,6 +2322,11 @@ async fn explicit_repair_pending_head_creates_one_session_after_lost_real_host_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn retired_memory_migration_preserves_frozen_subject_through_connected_restore_and_repair() {
+    connected_explicit_repair(ConnectedRepair::RetiredMemoryPendingHead).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn explicit_repair_replay_rejects_revoked_real_host_trust_without_false_accepted() {
     connected_explicit_repair(ConnectedRepair::RevokedAttribution).await;
 }
@@ -2269,8 +2336,15 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
     use std::sync::atomic::Ordering::SeqCst;
     use worker_runtime::execution::WorkerExecutionBackend as _;
 
-    let pending = matches!(scenario, ConnectedRepair::PendingHead);
-    let fixture = connected_restore_fixture_with_pending_head(pending).await;
+    let source = match scenario {
+        ConnectedRepair::PendingHead => ConnectedRestoreSource::PendingHead,
+        ConnectedRepair::RetiredMemoryPendingHead => {
+            ConnectedRestoreSource::RetiredMemoryPendingHead
+        }
+        _ => ConnectedRestoreSource::Stopped,
+    };
+    let pending = !matches!(source, ConnectedRestoreSource::Stopped);
+    let fixture = connected_restore_fixture_with_source(source).await;
     let api = &fixture.api;
     let probe = &fixture.probe;
     let worker = &fixture.worker;

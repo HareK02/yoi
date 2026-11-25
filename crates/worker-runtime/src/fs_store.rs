@@ -1339,7 +1339,9 @@ fn migrate_worker_record(
         if source_schema_version < LIFECYCLE_SCHEMA_VERSION {
             migrate_v18_lifecycle(&mut identity_document, identity_path)?;
         }
-        migrate_v20_stop_history(&mut identity_document, identity_path)?;
+        if source_schema_version < STOP_HISTORY_SCHEMA_VERSION {
+            migrate_v20_stop_history(&mut identity_document, identity_path)?;
+        }
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let mut aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| runtime_store_corrupt(identity_path, error.to_string()))?;
