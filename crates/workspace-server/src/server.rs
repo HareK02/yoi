@@ -49967,7 +49967,7 @@ mod tests {
             StatusCode::NOT_FOUND,
         )
         .await;
-        for token in [&owner_token, &non_owner_token] {
+        for (token, owner) in [(&owner_token, true), (&non_owner_token, false)] {
             for (method, suffix, body) in [
                 ("GET", "memory", None),
                 ("GET", "memory/staging?limit=1", None),
@@ -49989,13 +49989,23 @@ mod tests {
                     Some(serde_json::json!({"force":true})),
                 ),
             ] {
+                // Missing GET routes reach the unchanged GET-only fallback;
+                // owner writes receive 405, while nonowner writes are denied
+                // by the existing mutation middleware before route dispatch.
+                let expected_status = if method == "GET" {
+                    StatusCode::NOT_FOUND
+                } else if owner {
+                    StatusCode::METHOD_NOT_ALLOWED
+                } else {
+                    StatusCode::FORBIDDEN
+                };
                 request_json_authenticated(
                     app.clone(),
                     method,
                     &format!("/api/w/{TEST_WORKSPACE_ID}/{suffix}"),
                     body,
                     token,
-                    StatusCode::NOT_FOUND,
+                    expected_status,
                 )
                 .await;
             }
