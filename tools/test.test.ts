@@ -8,6 +8,7 @@ import {
   parseRustListing,
   prepareTestIsolation,
   resultSummary,
+  rustBuildCommand,
   rustTestCommands,
   shardRustCommand,
 } from "./test.ts";
@@ -49,6 +50,90 @@ Deno.test("Cargo artifact selection retains every test target and deduplicates e
     commands.every((command) => command.args.length === 0),
     "no filtering or ignore flags",
   );
+});
+
+Deno.test("compile preparation inherits explicit or absent compiler caches without changing test isolation", async () => {
+  const checkout = await Deno.realPath(await Deno.makeTempDir());
+  try {
+    const isolation = await prepareTestIsolation(checkout, "compiler-cache");
+    const build = rustBuildCommand(checkout);
+    assert(build.command === "cargo");
+    assert(
+      build.args.join(" ") ===
+        "test --workspace --exclude yoi-e2e --no-run --message-format=json",
+    );
+    const keys = [
+      "HOME",
+      "RUSTC_WRAPPER",
+      "RUSTC_WORKSPACE_WRAPPER",
+      "SCCACHE_DISABLE",
+    ];
+    for (
+      const wrapper of [
+        "/caller/kache",
+        "/caller/custom-wrapper",
+        "",
+        undefined,
+      ]
+    ) {
+      const env = {
+        HOME: "/caller/home",
+        RUSTC_WRAPPER: wrapper,
+        RUSTC_WORKSPACE_WRAPPER: wrapper
+          ? "/caller/workspace-wrapper"
+          : wrapper,
+        SCCACHE_DISABLE: wrapper ? "0" : "1",
+        CARGO_BUILD_RUSTC_WRAPPER: "/caller/cargo-config-wrapper",
+      };
+      const task = await isolation.wrapCommand({
+        ...build,
+        command: Deno.execPath(),
+        args: [
+          "eval",
+          "console.log(JSON.stringify(Object.fromEntries(" +
+          JSON.stringify(keys) + ".map(key => [key, Deno.env.get(key)]))))",
+        ],
+        env,
+      }, "build");
+      const result = await execute(task, {
+        output: checkout,
+        label: `cache-${String(wrapper)}`.replaceAll("/", "-"),
+        timeoutMs: 10_000,
+      });
+      assert(result.code === 0, result.stderr);
+      const observed = JSON.parse(result.stdout);
+      for (const key of keys) {
+        assert(
+          observed[key] === env[key as keyof typeof env],
+          `${key} was overridden`,
+        );
+      }
+      assert(
+        task.env?.CARGO_BUILD_RUSTC_WRAPPER === env.CARGO_BUILD_RUSTC_WRAPPER,
+      );
+      assert(task.env?.YOI_HOME !== env.HOME);
+      assert(task.env?.GIT_CONFIG_GLOBAL === "/dev/null");
+      const test = rustTestCommands([{
+        reason: "compiler-artifact",
+        package_id: "pkg",
+        executable: "/test-binary",
+        profile: { test: true },
+        target: { name: "unit" },
+      }], [{
+        id: "pkg",
+        name: "pkg",
+        manifest_path: `${checkout}/Cargo.toml`,
+      }])[0];
+      const runtime = await isolation.wrapCommand({ ...test, env }, "test");
+      assert(runtime.compilerCache === undefined);
+      assert(runtime.env?.HOME !== env.HOME);
+      assert(runtime.env?.RUSTC_WRAPPER === "");
+      assert(runtime.env?.RUSTC_WORKSPACE_WRAPPER === "");
+      assert(runtime.env?.SCCACHE_DISABLE === "1");
+    }
+  } finally {
+    await Deno.remove(checkout, { recursive: true });
+  }
 });
 
 Deno.test("missing Cargo package or executables fails instead of claiming an empty suite passed", () => {

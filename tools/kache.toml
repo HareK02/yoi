@@ -1,0 +1,21 @@
+# repo専用cache以外のtarget回収・共有・remote接続を行わない。
+[cache]
+local_only = true
+local_max_size = "1GiB"
+min_store_compile_ms = 0
+auto_gc = false
+auto_recover_min_free_bytes = 0
+auto_recover_targets = false
+auto_clean_orphaned_targets = false
+auto_clean_idle_targets_days = 0
+auto_clean_unused_units_days = 0
+auto_clean_superseded_executables = 0
+auto_share_target_files = false
+seed_new_targets = false
+seed_incremental = false
+adaptive_incremental = false
+out_dir_alias = false
+daemon_publish = false
+daemon_idle_timeout_secs = 10
+trust_daemon_execution = false
+scheduler = false

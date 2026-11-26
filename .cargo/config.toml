@@ -1,0 +1,9 @@
+[build]
+rustc-wrapper = "kache"
+
+# Cargoの子プロセスだけに適用し、hostや別checkoutのcacheを変更しない。
+[env]
+KACHE_CONFIG = { value = "tools/kache.toml", relative = true, force = true }
+KACHE_HOST_CONFIG = { value = "", force = true }
+KACHE_CACHE_DIR = { value = ".kache.local/cache", relative = true, force = true }
+KACHE_RUNTIME_DIR = { value = ".kache.local/runtime", relative = true, force = true }

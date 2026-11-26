@@ -9,14 +9,13 @@ pkgs.mkShell {
     cargo
     lld
     rustfmt
-    pkgs.sccache
   ];
 
   PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
-  # Cache storage and limits belong to the host's sccache configuration.
-  RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+  # 導入済みのhost kacheを使用し、cacheのrepo分離は.cargo/config.tomlで行う。
+  RUSTC_WRAPPER = "kache";
 
   buildInputs = with pkgs; [
     pkg-config

@@ -463,6 +463,8 @@ export interface TestCommand {
   args: string[];
   cwd: string;
   env?: Record<string, string | undefined>;
+  // Only compile preparation may reuse the caller's compiler cache configuration.
+  compilerCache?: "inherit";
   // Exact link from each execution result into inventory.json, even when two
   // Cargo targets happen to share the same package/target display name.
   inventoryRef?: { binaryIndex: number; shardIndex: number };
@@ -593,8 +595,20 @@ export async function prepareTestIsolation(checkout: string, runId: string) {
         RUSTC_WORKSPACE_WRAPPER: "",
         SCCACHE_DISABLE: "1",
       });
-      // HOME is isolated, but toolchain/cache discovery must keep its ordinary
-      // host locations (these are compiler settings, not live product state).
+      if (task.compilerCache === "inherit") {
+        // Compiler wrappers locate their ordinary config/cache through HOME.
+        // Product state and Git remain isolated; test execution keeps the default
+        // empty wrappers, including tests that spawn their own compiler processes.
+        for (
+          const key of [
+            "HOME",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "SCCACHE_DISABLE",
+          ]
+        ) env[key] = inherited[key];
+      }
+      // Toolchain discovery keeps its ordinary host locations in both phases.
       for (const key of ["CARGO_HOME", "RUSTUP_HOME"] as const) {
         const fallback = key === "CARGO_HOME" ? ".cargo" : ".rustup";
         env[key] = inherited[key] ||
@@ -602,6 +616,23 @@ export async function prepareTestIsolation(checkout: string, runId: string) {
       }
       return { ...task, env };
     },
+  };
+}
+
+export function rustBuildCommand(checkout: string): TestCommand {
+  return {
+    name: "build",
+    command: "cargo",
+    args: [
+      "test",
+      "--workspace",
+      "--exclude",
+      "yoi-e2e",
+      "--no-run",
+      "--message-format=json",
+    ],
+    cwd: checkout,
+    compilerCache: "inherit",
   };
 }
 
@@ -733,19 +764,7 @@ async function main() {
       "Building all normal Rust test targets (separate from execution timing)…",
     );
     const build = await run(
-      {
-        name: "build",
-        command: "cargo",
-        args: [
-          "test",
-          "--workspace",
-          "--exclude",
-          "yoi-e2e",
-          "--no-run",
-          "--message-format=json",
-        ],
-        cwd: root,
-      },
+      rustBuildCommand(root),
       "build",
       BUILD_TIMEOUT_MS,
     );
