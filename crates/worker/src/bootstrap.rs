@@ -383,7 +383,7 @@ where
         worker.bind_worker_observation_provider(bindings.observation_provider);
         bindings
             .initialization_registry
-            .prepare_host(worker, &bindings.feature_initialization)
+            .prepare_restored_host(worker, &bindings.feature_initialization)
             .map_err(WorkerBootstrapError::Worker)?;
         let flow_enabled = worker.manifest().feature.flow.enabled;
         if flow_enabled {

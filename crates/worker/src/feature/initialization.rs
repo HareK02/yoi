@@ -40,10 +40,20 @@ where
         manifest: &manifest::WorkerManifest,
         context: &InitializationContext<'_>,
     ) -> Result<(), String>;
-    /// No canonical writes or external creation. Current operation checks may read
-    /// the Host; failures must not be interpreted as an unattached Worker.
+    /// Validate saved local state only: no Host reads, canonical writes or
+    /// external creation. Current authority belongs to protected operations.
     fn validate_saved_state(&self, _worker: &Worker<C, St>) -> Result<(), WorkerError> {
         Ok(())
+    }
+    /// Reconstruct process-local bindings from persisted initialization only.
+    /// Restore must not fetch data or verify current authority with the Host.
+    /// Deliberately does not default to the live `prepare_host` hook.
+    fn prepare_restored_host(
+        &self,
+        worker: &Worker<C, St>,
+        _data: &FeatureInitializations,
+    ) -> Result<(), WorkerError> {
+        self.validate_saved_state(worker)
     }
     fn prepare_host(
         &self,
@@ -54,9 +64,14 @@ where
         &self,
         worker: &Worker<C, St>,
         data: &FeatureInitializations,
-        _phase: InitializationPhase,
+        phase: InitializationPhase,
     ) -> Result<(), WorkerError> {
-        self.prepare_host(worker, data)
+        match phase {
+            InitializationPhase::Restored => self.prepare_restored_host(worker, data),
+            InitializationPhase::New | InitializationPhase::Recovery => {
+                self.prepare_host(worker, data)
+            }
+        }
     }
     fn apply(
         &self,
@@ -173,13 +188,13 @@ where
         Ok(())
     }
 
-    pub fn prepare_host(
+    pub fn prepare_restored_host(
         &self,
         worker: &Worker<C, St>,
         data: &FeatureInitializations,
     ) -> Result<(), WorkerError> {
         for adapter in self.ordered(data).map_err(WorkerError::FeatureLifecycle)? {
-            adapter.prepare_host(worker, data)?;
+            adapter.prepare_restored_host(worker, data)?;
         }
         Ok(())
     }

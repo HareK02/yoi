@@ -195,6 +195,80 @@ mod startup_binding_tests {
             })
         }
     }
+    #[tokio::test]
+    #[serial_test::serial(worker_allocation)]
+    async fn restored_effects_reject_attribution_without_attachment_or_on_journal_job_locally() {
+        require_restore_test_environment();
+        for journal_job in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let name = "startup-binding";
+            let store = WorkerAggregateStore::new(root.path(), name).unwrap();
+            let client = Arc::new(AttributionClient {
+                response: Response::Lost,
+                store: store.clone(),
+                name: name.into(),
+                calls: Default::default(),
+            });
+            let mut config = manifest::WorkerManifestConfig::resolution_defaults();
+            config.worker.name = Some(name.into());
+            config.model.model_id = Some("unused".into());
+            let llm: Box<dyn LlmClient> = Box::new(MockClient::new(Vec::new()));
+            let mut worker = Worker::new(
+                config.try_into().unwrap(),
+                Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+                    llm,
+                ),
+                CombinedStore::new(
+                    WorkerSessionStore::new(root.path().join("session")).unwrap(),
+                    store.clone(),
+                ),
+                WorkerWorkspaceContext::with_client(
+                    Some(WorkspaceId::new("startup-binding-workspace").unwrap()),
+                    client.clone(),
+                ),
+                WorkerFilesystemAuthority::None,
+                Scope::empty(),
+            )
+            .await
+            .unwrap();
+            worker.enable_worker_metadata_write_through().unwrap();
+            if journal_job {
+                worker
+                    .bind_backend_job(worker::BackendJobExecutionBinding {
+                        job_id: "saved-journal-job".into(),
+                        attempt_id: "saved-attempt".into(),
+                        input_digest: None,
+                        subjektiv_consolidation: false,
+                        subjektiv_journal: true,
+                    })
+                    .unwrap();
+            }
+            store
+                .update_by_name(name, |metadata| {
+                    metadata.subjektiv_session_attribution =
+                        Some(session_store::SubjektivSessionAttributionState::Confirmed {
+                            session_id: worker.session_id(),
+                            subject_id: "saved-subject".into(),
+                        });
+                })
+                .unwrap();
+            let before = store.read_by_name(name).unwrap().unwrap();
+            let error = feature_initializers()
+                .apply(
+                    &worker,
+                    &protocol::feature_initialization::FeatureInitializations::default(),
+                    worker::feature::initialization::InitializationPhase::Restored,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, WorkerError::SubjektivSessionAttribution { state, .. }
+                if state == if journal_job { "job_attribution_forbidden" } else { "attachment_missing" })
+            );
+            assert!(client.calls.lock().unwrap().is_empty());
+            assert_eq!(store.read_by_name(name).unwrap().unwrap(), before);
+        }
+    }
+
     async fn check_binding(response: Response) {
         require_restore_test_environment();
         let root = tempfile::tempdir().unwrap();

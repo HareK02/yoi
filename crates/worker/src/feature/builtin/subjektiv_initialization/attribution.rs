@@ -93,9 +93,9 @@ where
     /// Profiles and current singleton ownership are never historical identity.
     ///
     /// New Sessions persist `OutcomeUnknown` before create-if-missing network I/O.
-    /// A restore retries creation only for that durable state (or `Failed`). An
-    /// unmarked legacy restore is verification-only and persists `LegacyUnknown`,
-    /// so current ownership can never invent historical attribution.
+    /// Explicit source recovery retries creation only for that durable state (or
+    /// `Failed`). Legacy recovery is verification-only. Controller reconstruction
+    /// must use the local-only restored finalizer, not this repair-capable entry.
     pub fn finalize_subjektiv_session_attribution(
         &self,
         subjektiv_attached: bool,
@@ -104,6 +104,22 @@ where
         self.finalize_subjektiv_session_attribution_observed(
             subjektiv_attached,
             lifecycle,
+            true,
+            None,
+            &mut None,
+        )
+    }
+
+    /// Explicit local Hosts use the same no-repair contract as Runtime restore.
+    pub(crate) fn finalize_restored_subjektiv_session_attribution(
+        &self,
+        subjektiv_attached: bool,
+    ) -> Result<(), WorkerError> {
+        self.validate_saved_subjektiv_attribution()?;
+        self.finalize_subjektiv_session_attribution_observed(
+            subjektiv_attached,
+            SubjektivSessionAttributionLifecycle::RestoredSession,
+            false,
             None,
             &mut None,
         )
@@ -121,6 +137,7 @@ where
         self.finalize_subjektiv_session_attribution_observed(
             subjektiv_attached,
             lifecycle,
+            true,
             None,
             &mut expected,
         )
@@ -152,6 +169,7 @@ where
         let result = self.finalize_subjektiv_session_attribution_observed(
             connection.is_some(),
             lifecycle,
+            phase != InitializationPhase::Restored,
             expected_subject,
             &mut observed,
         );
@@ -171,6 +189,7 @@ where
         &self,
         subjektiv_attached: bool,
         lifecycle: SubjektivSessionAttributionLifecycle,
+        allow_source_repair: bool,
         expected_subject: Option<&str>,
         observation: &mut Option<session_store::worker_metadata::StartupFailureExpectation>,
     ) -> Result<(), WorkerError> {
@@ -282,6 +301,15 @@ where
             }
             None => matches!(lifecycle, SubjektivSessionAttributionLifecycle::NewSession),
         };
+        if !allow_source_repair {
+            // A restore may retain the local Journal pin above, but must never
+            // repair/register attribution or consult the Backend. This also
+            // fences a saved-state change between preparation and effects.
+            return Err(WorkerError::SubjektivSessionAttribution {
+                state: "publication_denied",
+                message: "restore requires separately confirmed Session attribution".into(),
+            });
+        }
         let initial_diagnostic = if create_if_missing {
             "attribution creation started; completion is not yet confirmed"
         } else {

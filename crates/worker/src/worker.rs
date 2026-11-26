@@ -13435,6 +13435,8 @@ status: 200,
         assert!(worker.backend_job().is_none());
     }
 
+    include!("worker_restore_attribution_tests.rs");
+
     #[tokio::test]
     async fn journal_attribution_protects_first_publication_before_any_admission_notification() {
         for enabled in [false, true] {

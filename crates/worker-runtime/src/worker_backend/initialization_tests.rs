@@ -22,6 +22,7 @@ mod initialization_tests {
     #[derive(Clone, Default)]
     struct Probe {
         bound: Arc<AtomicUsize>,
+        live_host_checks: Arc<AtomicUsize>,
         initialized: Arc<AtomicBool>,
         effects: Arc<Mutex<Vec<(session_store::SessionId, InitializationPhase)>>>,
     }
@@ -63,6 +64,7 @@ mod initialization_tests {
             worker: &TestWorker,
             data: &FeatureInitializations,
         ) -> Result<(), WorkerError> {
+            self.live_host_checks.fetch_add(1, Ordering::SeqCst);
             if worker.manifest().engine.max_tokens
                 != Some(
                     Self::decode(data)
@@ -183,6 +185,7 @@ mod initialization_tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("initial model dispatch after initialization");
         assert_eq!(probe.bound.load(Ordering::SeqCst), 1);
+        assert!(probe.live_host_checks.load(Ordering::SeqCst) > 0);
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&detail.worker_ref);
         let aggregate_root = runtime_root
@@ -224,6 +227,11 @@ mod initialization_tests {
             fresh_probe.bound.load(Ordering::SeqCst),
             0,
             "restore must not bind current configuration again"
+        );
+        assert_eq!(
+            fresh_probe.live_host_checks.load(Ordering::SeqCst),
+            0,
+            "neither restore preparation nor effects may default to live Host checks"
         );
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         let restored = metadata_store.read_by_name(&name).unwrap().unwrap();

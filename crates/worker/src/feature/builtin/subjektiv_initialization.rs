@@ -151,6 +151,56 @@ where
     fn validate_saved_state(&self, worker: &Worker<C, St>) -> Result<(), WorkerError> {
         worker.validate_saved_subjektiv_attribution()
     }
+    fn prepare_restored_host(
+        &self,
+        worker: &Worker<C, St>,
+        data: &FeatureInitializations,
+    ) -> Result<(), WorkerError> {
+        worker.validate_saved_subjektiv_attribution()?;
+        let Some(resolved) = connection(data).map_err(WorkerError::FeatureLifecycle)? else {
+            return Ok(());
+        };
+        // Bind a local client from the saved configuration, not from a current
+        // Backend response. This does not authorize any protected operation.
+        if worker.workspace_client().workspace_id() != Some(resolved.workspace_id.as_str()) {
+            return Err(binding_mismatch(&resolved));
+        }
+        let metadata = worker
+            .store()
+            .read_by_name(&worker.manifest().worker.name)?;
+        let metadata = metadata.ok_or_else(|| binding_mismatch(&resolved))?;
+        if metadata.worker_name != worker.manifest().worker.name
+            || metadata.workspace_id.as_deref() != Some(resolved.workspace_id.as_str())
+            || metadata.active.as_ref().map(|active| active.session_id) != Some(worker.session_id())
+        {
+            return Err(binding_mismatch(&resolved));
+        }
+        match resolved.kind {
+            WorkerConnectionKind::SubjectBody => match metadata.subjektiv_session_attribution {
+                Some(SubjektivSessionAttributionState::Confirmed { subject_id, .. })
+                    if resolved.subject_id.as_deref() == Some(subject_id.as_str()) => {}
+                _ => return Err(binding_mismatch(&resolved)),
+            },
+            WorkerConnectionKind::MemoryConsolidation
+                if metadata.subjektiv_session_attribution.is_some() =>
+            {
+                return Err(WorkerError::SubjektivSessionAttribution {
+                    state: "job_attribution_forbidden",
+                    message: "Subject maintenance Job execution must not carry subject-body Session attribution".into(),
+                });
+            }
+            WorkerConnectionKind::MemoryConsolidation => {}
+        }
+        worker
+            .subjektiv_host_connection()
+            .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?
+            .ok_or_else(|| {
+                WorkerError::FeatureLifecycle(
+                    "Subjektiv initialization requires its Host capability".into(),
+                )
+            })?;
+        Ok(())
+    }
     fn prepare_host(
         &self,
         worker: &Worker<C, St>,
@@ -205,7 +255,8 @@ where
             // endpoint to turn a create reservation into execution authority.
             // The Backend binds the accepted identity before supplying input;
             // the Job input hook and retained-input guard then reauthorize every
-            // protected model dispatch. Restore takes the current-Host path.
+            // protected model dispatch. Restore also binds locally and leaves
+            // current Job authorization to those operation-time boundaries.
             let resolved = connection(data)
                 .map_err(WorkerError::FeatureLifecycle)?
                 .expect("checked consolidation connection");
@@ -226,28 +277,9 @@ where
             return Ok(());
         }
         if phase == InitializationPhase::Restored {
-            if let Some(resolved) = connection(data).map_err(WorkerError::FeatureLifecycle)?
-                && resolved.kind == WorkerConnectionKind::SubjectBody
-            {
-                // A confirmed body reconstructs saved state, not current Host
-                // authority. Recheck local identity at effects; a changed or
-                // unconfirmed attribution must not become implicit repair.
-                // Recovery and Jobs retain live verification, and protected
-                // reads and supplies authorize against the Host per call.
-                worker.validate_saved_subjektiv_attribution()?;
-                let metadata = worker
-                    .store()
-                    .read_by_name(&worker.manifest().worker.name)?;
-                return match metadata.and_then(|metadata| metadata.subjektiv_session_attribution) {
-                    Some(SubjektivSessionAttributionState::Confirmed { subject_id, .. })
-                        if resolved.subject_id.as_deref() == Some(subject_id.as_str()) =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(binding_mismatch(&resolved)),
-                };
-            }
-            return self.prepare_host(worker, data);
+            // Both preparation and effects reconstruct saved state only. Live
+            // verification is reserved for New/Recovery and protected operations.
+            return self.prepare_restored_host(worker, data);
         }
         // Observe the same Worker/Session before the Host boundary. Never adopt a
         // replacement owner or a newly read attribution after a failed call.
@@ -282,6 +314,9 @@ where
         data: &FeatureInitializations,
         phase: InitializationPhase,
     ) -> Result<(), WorkerError> {
+        if phase == InitializationPhase::Restored {
+            self.prepare_restored_host(worker, data)?;
+        }
         let resolved = connection(data).map_err(WorkerError::FeatureLifecycle)?;
         worker.finalize_subjektiv_connection(resolved.as_ref(), phase)
     }
@@ -433,6 +468,9 @@ where
             .profile
             .consolidation_tools
     {
+        if phase == InitializationPhase::Restored {
+            return worker.finalize_restored_subjektiv_session_attribution(true);
+        }
         let lifecycle = match phase {
             InitializationPhase::New => SubjektivSessionAttributionLifecycle::NewSession,
             InitializationPhase::Restored | InitializationPhase::Recovery => {
