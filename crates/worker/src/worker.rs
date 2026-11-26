@@ -2,6 +2,10 @@
 #[path = "image_recovery_tests.rs"]
 mod image_recovery_tests;
 
+#[cfg(test)]
+#[path = "worker_flow_capture_tests.rs"]
+mod flow_capture_tests;
+
 use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::path::Path;
@@ -5569,8 +5573,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     ///
     /// The coordinator is already bound to the authenticated Workspace/Worker;
     /// model input cannot select an instance or Worker identity. The verifier uses
-    /// an immutable capture of the current committed segment and, for local
-    /// Workdirs, exposes only Read/Glob/Grep through a read-only session.
+    /// an immutable capture of the current committed Session and adopted ancestry
+    /// selected at evaluation time. Local Workdirs expose only Read/Glob/Grep
+    /// through a read-only session.
     pub fn install_flow_transition_feature(
         &mut self,
         coordinator: Arc<dyn crate::feature::builtin::flow_transition::FlowCoordinatorClient>,
@@ -5579,12 +5584,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         C: Clone + Send + Sync + 'static,
         St: Clone + Send + Sync + 'static,
     {
-        let location = self.segment_state.location();
-        let capture = crate::feature::builtin::flow_transition::StoreFlowParentCapture::new(
-            self.store.clone(),
-            location.session_id,
-            location.segment_id,
-        );
+        // Select the live location and its adopted ancestry under the same
+        // append fence as self observation, not the Feature installation location.
+        let capture = self.self_session_reader();
         let read_only_tools = tools::read_only_routed_builtin_tools(self.workdir_sessions());
         let client = self
             .engine

@@ -414,3 +414,60 @@ fn inconsistent_or_missing_ancestry_fails_without_scanning_other_sessions() {
         .unwrap();
     assert!(capture(&store, session, active).is_err());
 }
+
+#[test]
+fn adopted_prefix_matches_logical_identities_but_rejects_conflicting_duplicates() {
+    let session = SessionId::now_v7();
+    let first = message("first adopted proof");
+    let second = message("second adopted proof");
+    let suffix = message("unadopted proof");
+    let expected = vec![
+        first.metadata.entry_id.0.clone(),
+        second.metadata.entry_id.0.clone(),
+    ];
+    for batch in [false, true] {
+        let log = if batch {
+            vec![seed(
+                session,
+                vec![first.clone(), first.clone(), second.clone(), suffix.clone()],
+                None,
+                None,
+            )]
+        } else {
+            vec![
+                seed(session, vec![first.clone()], None, None),
+                LogEntry::AnnotatedAssistantItem {
+                    ts: 1,
+                    entry: first.clone(),
+                },
+                LogEntry::AnnotatedAssistantItem {
+                    ts: 2,
+                    entry: second.clone(),
+                },
+                LogEntry::AnnotatedAssistantItem {
+                    ts: 3,
+                    entry: suffix.clone(),
+                },
+            ]
+        };
+        let prefix = adopted_prefix(log, &expected).unwrap();
+        let restored =
+            crate::session_history::restore_history_entries(session, SegmentId::now_v7(), &prefix)
+                .unwrap();
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[2].annotation.entry_id, second.metadata.entry_id);
+        assert!(
+            !restored
+                .iter()
+                .any(|entry| entry.annotation.entry_id == suffix.metadata.entry_id)
+        );
+    }
+    let mut conflicting = first.clone();
+    conflicting.item = Item::user_message("changed body without a correction").into();
+    let error = adopted_prefix(
+        vec![seed(session, vec![first, conflicting, second], None, None)],
+        &expected,
+    )
+    .unwrap_err();
+    assert!(error.contains("conflicting content"), "{error}");
+}

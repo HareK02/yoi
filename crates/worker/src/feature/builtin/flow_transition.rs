@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::feature::builtin::worker_observation::self_session::SelfSessionReader;
 use agen::llm_client::client::LlmClient;
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
@@ -26,7 +27,6 @@ use flow::{
 use manifest::{Scope, WorkerManifest};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use session_store::{SegmentId, SessionId, Store};
 use uuid::Uuid;
 
 use crate::feature::builtin::session_explore::{SessionExploreFeature, SessionExploreState};
@@ -37,7 +37,6 @@ use crate::feature::{
 use crate::internal_worker::{
     InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec, run_internal_worker,
 };
-use crate::session_capture::SessionCapture;
 use crate::worker::{WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext};
 
 const REQUEST_FLOW_TRANSITION_DESCRIPTION: &str = "Request evaluation of the current Flow state's outgoing conditions. The host selects the active Flow instance and captures the current state; the caller supplies only a concise reason.";
@@ -442,66 +441,24 @@ impl Tool for FinishFlowVerificationTool {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct StoreFlowParentCapture<St>
-where
-    St: Store + Clone,
-{
-    store: St,
-    session_id: SessionId,
-    segment_id: SegmentId,
-}
-
-impl<St> StoreFlowParentCapture<St>
-where
-    St: Store + Clone,
-{
-    pub(crate) fn new(store: St, session_id: SessionId, segment_id: SegmentId) -> Self {
-        Self {
-            store,
-            session_id,
-            segment_id,
-        }
-    }
-
-    fn capture(&self) -> Result<SessionCapture, String> {
-        let entries = self
-            .store
-            .read_all(self.session_id, self.segment_id)
-            .map_err(|error| format!("read committed parent session: {error}"))?;
-        let history = crate::session_history::restore_history_entries(
-            self.session_id,
-            self.segment_id,
-            &entries,
-        )?;
-        Ok(SessionCapture::from_complete_history(
-            self.session_id.to_string(),
-            self.segment_id.to_string(),
-            history,
-        ))
-    }
-}
-
-pub(crate) struct WorkerBackedFlowVerifier<C, St>
+pub(crate) struct WorkerBackedFlowVerifier<C>
 where
     C: LlmClient + Clone,
-    St: Store + Clone,
 {
     client: C,
     manifest: WorkerManifest,
-    capture: StoreFlowParentCapture<St>,
+    capture: SelfSessionReader,
     read_only_tools: Vec<ToolDefinition>,
 }
 
-impl<C, St> WorkerBackedFlowVerifier<C, St>
+impl<C> WorkerBackedFlowVerifier<C>
 where
     C: LlmClient + Clone,
-    St: Store + Clone,
 {
     pub(crate) fn new(
         client: C,
         manifest: WorkerManifest,
-        capture: StoreFlowParentCapture<St>,
+        capture: SelfSessionReader,
         read_only_tools: Vec<ToolDefinition>,
     ) -> Self {
         Self {
@@ -514,16 +471,26 @@ where
 }
 
 #[async_trait]
-impl<C, St> FlowConditionVerifier for WorkerBackedFlowVerifier<C, St>
+impl<C> FlowConditionVerifier for WorkerBackedFlowVerifier<C>
 where
     C: LlmClient + Clone + Send + Sync + 'static,
-    St: Store + Clone + Send + Sync + 'static,
 {
     async fn verify(&self, attempt: &FlowTransitionAttempt) -> FlowVerifierOutcome {
         let capture = match self.capture.capture() {
             Ok(capture) => capture,
-            Err(message) => return FlowVerifierOutcome::Failed { message },
+            Err(message) => {
+                return FlowVerifierOutcome::Failed {
+                    message: format!("capture committed Flow parent Session: {message}"),
+                };
+            }
         };
+        // Boundary identifiers are diagnostic evidence, not authority or live
+        // handles. Keep this snapshot fixed throughout the verifier's run.
+        let parent_capture = serde_json::json!({
+            "session_id": capture.session_id(),
+            "active_segment_id": capture.segment_id(),
+            "capture_id": capture.capture_id(),
+        });
         let finish_state = FinishFlowVerificationState::new(attempt);
         let mut features = FeatureRegistryBuilder::new()
             .with_module(SessionExploreFeature::new(SessionExploreState::new(
@@ -557,6 +524,7 @@ where
             "current_state": attempt.from_state,
             "reason": attempt.reason,
             "transitions": attempt.transitions,
+            "parent_capture": parent_capture,
         })) {
             Ok(input) => input,
             Err(error) => {
@@ -1003,6 +971,21 @@ permission = "read"
         let session_id: SessionId = Uuid::now_v7();
         let segment_id: SegmentId = Uuid::now_v7();
         store
+            .create_segment(
+                session_id,
+                segment_id,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 0,
+                    session_id,
+                    system_prompt: None,
+                    config: Default::default(),
+                    history: vec![],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        store
             .append(
                 session_id,
                 segment_id,
@@ -1028,7 +1011,11 @@ permission = "read"
                 exploration_turns,
             },
             manifest,
-            StoreFlowParentCapture::new(store, session_id, segment_id),
+            SelfSessionReader::new(move || {
+                crate::feature::builtin::worker_observation::self_session::capture(
+                    &store, session_id, segment_id,
+                )
+            }),
             Vec::new(),
         );
         let outcome = verifier.verify(&attempt("attempt-worker-backed")).await;

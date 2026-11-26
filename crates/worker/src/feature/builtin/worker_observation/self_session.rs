@@ -151,9 +151,9 @@ pub(crate) fn capture(
 fn adopted_prefix(log: Vec<LogEntry>, expected: &[String]) -> Result<Vec<LogEntry>, String> {
     let mut consumed = 0;
     let mut prefix = Vec::new();
+    let mut seen = HashMap::<String, session_store::LoggedHistoryEntry>::new();
     for mut record in log {
-        // Preserve corrections and terminal records after the adopted identity
-        // prefix, but never consume the next history addition.
+        // Keep trailing corrections, but never cross the next history addition.
         if consumed == expected.len()
             && !prefix.is_empty()
             && matches!(
@@ -167,34 +167,48 @@ fn adopted_prefix(log: Vec<LogEntry>, expected: &[String]) -> Result<Vec<LogEntr
         {
             break;
         }
-        let ids: Vec<_> = match &record {
+        let additions = match &record {
             LogEntry::AnnotatedSegmentStart { history, .. }
-            | LogEntry::AnnotatedUserInput { history, .. } => history
-                .iter()
-                .map(|entry| entry.metadata.entry_id.0.as_str())
-                .collect(),
+            | LogEntry::AnnotatedUserInput { history, .. } => history.clone(),
             LogEntry::AnnotatedAssistantItem { entry, .. }
-            | LogEntry::AnnotatedToolResult { entry, .. } => {
-                vec![entry.metadata.entry_id.0.as_str()]
+            | LogEntry::AnnotatedToolResult { entry, .. } => vec![entry.clone()],
+            LogEntry::AnnotatedSystemItem { entry, .. } => vec![entry.to_history_entry()],
+            LogEntry::ToolResultCorrected { entry, .. } => {
+                if seen.contains_key(&entry.metadata.entry_id.0) {
+                    seen.insert(entry.metadata.entry_id.0.clone(), entry.clone());
+                }
+                Vec::new()
             }
-            LogEntry::AnnotatedSystemItem { entry, .. } => vec![entry.metadata.entry_id.0.as_str()],
             _ => Vec::new(),
         };
-        let take = ids.len().min(expected.len() - consumed);
-        if ids[..take]
-            .iter()
-            .copied()
-            .ne(expected[consumed..consumed + take]
-                .iter()
-                .map(String::as_str))
-        {
-            return Err("Self Session adopted history prefix does not match".into());
+        let mut truncate_at = None;
+        for (index, entry) in additions.into_iter().enumerate() {
+            let id = &entry.metadata.entry_id.0;
+            // A precommitted assistant item may also be logged at turn flush.
+            // Adoption names logical identities, not physical append count. Only
+            // exact duplicates can be skipped; changed bodies need correction records.
+            if let Some(previous) = seen.get(id) {
+                if previous != &entry {
+                    return Err(
+                        "Self Session repeated history identity has conflicting content".into(),
+                    );
+                }
+                continue;
+            }
+            if consumed == expected.len() {
+                truncate_at = Some(index);
+                break;
+            }
+            if id != &expected[consumed] {
+                return Err("Self Session adopted history prefix does not match".into());
+            }
+            consumed += 1;
+            seen.insert(id.clone(), entry);
         }
-        consumed += take;
-        if take < ids.len() {
+        if let Some(index) = truncate_at {
             match &mut record {
                 LogEntry::AnnotatedSegmentStart { history, .. }
-                | LogEntry::AnnotatedUserInput { history, .. } => history.truncate(take),
+                | LogEntry::AnnotatedUserInput { history, .. } => history.truncate(index),
                 _ => return Err("Self Session adopted history boundary is invalid".into()),
             }
         }
