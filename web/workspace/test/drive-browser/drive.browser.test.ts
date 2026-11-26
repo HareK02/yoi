@@ -135,6 +135,101 @@ async function safeFulfill(
   } catch { /* selection intentionally canceled this old request */ }
 }
 
+Deno.test("production Drive sidebar aligns with peer resource links", async (t) =>
+  await harness(async (origin, browser) => {
+    const stage = Deno.args.includes("--before") ? "before" : "after";
+    const output = join(root, "target/web-ux/drive-sidebar", stage);
+    await Deno.mkdir(output, { recursive: true });
+    for (const width of [1440, 768, 390]) {
+      await t.step(`${width}px`, async () => {
+        const page = await browser.newPage({
+          viewport: { width, height: 900 },
+          colorScheme: "light",
+          reducedMotion: "reduce",
+        });
+        const errors: string[] = [];
+        const requestFailures: string[] = [];
+        page.on("pageerror", (error) => errors.push(String(error)));
+        page.on("console", (message) => {
+          if (message.type() === "error") errors.push(message.text());
+        });
+        page.on("requestfailed", (request) =>
+          requestFailures.push(
+            `${request.method()} ${request.url()}: ${request.failure()?.errorText}`,
+          ));
+        try {
+          const response = await page.goto(`${origin}/w/home-owner/drive/3`);
+          await ready(page);
+          const showSidebar = button(page, "Show sidebar");
+          // Keyboard activation also works when an unrelated Worker-stream
+          // warning is overlaid by the shared HTTP fixture.
+          if (await showSidebar.isVisible()) await showSidebar.press("Enter");
+          const navigation = page.getByRole("navigation", {
+            name: "Workspace sections",
+            exact: true,
+          });
+          const drive = navigation.getByRole("link", {
+            name: "Drive",
+            exact: true,
+          });
+          await drive.waitFor();
+          const geometry = [];
+          for (
+            const name of ["Tickets", "Objectives", "Merge Requests", "Drive"]
+          ) {
+            const link = navigation.getByRole("link", { name, exact: true });
+            const box = await link.boundingBox();
+            assert(box, `${name} must be visible`);
+            geometry.push({ name, x: box.x, width: box.width });
+          }
+          const screenshot = await page.screenshot({
+            path: join(output, `${width}.png`),
+          });
+          const hash = new Uint8Array(
+            await crypto.subtle.digest("SHA-256", new Uint8Array(screenshot)),
+          );
+          await Deno.writeTextFile(
+            join(output, `${width}-review-context.json`),
+            JSON.stringify(
+              {
+                path: "/w/home-owner/drive/3",
+                actor: "synthetic owner",
+                width,
+                theme: "light",
+                documentStatus: response?.status(),
+                geometry,
+                errors,
+                requestFailures,
+                visibleAlerts: await page.getByRole("alert").allTextContents(),
+                accessibility: await navigation.ariaSnapshot(),
+                screenshotSha256: Array.from(
+                  hash,
+                  (byte) => byte.toString(16).padStart(2, "0"),
+                ).join(""),
+              },
+              null,
+              2,
+            ),
+          );
+          assertEquals(response?.status(), 200);
+          assertEquals(errors, []);
+          assertEquals(await drive.getAttribute("aria-current"), "page");
+          assertEquals(await drive.getAttribute("href"), "/w/home-owner/drive");
+          for (const link of geometry.slice(1)) {
+            assertEquals(link.x, geometry[0].x, `${link.name} left edge`);
+            assertEquals(
+              link.width,
+              geometry[0].width,
+              `${link.name} row width`,
+            );
+          }
+        } finally {
+          await page.close();
+        }
+      });
+    }
+  }));
+
 Deno.test("production Drive two tabs retain losing CAS draft and never retry with a newer observation", () =>
   harness(async (origin, browser) => {
     const context = await browser.newContext();
