@@ -43,8 +43,15 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 21;
+pub(crate) const SCHEMA_VERSION: u32 = 22;
+const MEMORY_RETIREMENT_SCHEMA_VERSION: u32 = 21;
 const STOP_HISTORY_SCHEMA_VERSION: u32 = 20;
+
+#[path = "fs_store_feature_initialization.rs"]
+mod feature_initialization_migration;
+#[cfg(test)]
+#[path = "fs_store_feature_initialization_tests.rs"]
+mod feature_initialization_migration_tests;
 
 #[path = "fs_store_memory_retirement.rs"]
 mod memory_retirement;
@@ -966,11 +973,12 @@ fn plan_runtime_store_migration(
             | LIFECYCLE_SCHEMA_VERSION
             | RECEIPT_SEQUENCE_SCHEMA_VERSION
             | STOP_HISTORY_SCHEMA_VERSION
+            | MEMORY_RETIREMENT_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, {LIFECYCLE_SCHEMA_VERSION}, {RECEIPT_SEQUENCE_SCHEMA_VERSION}, {STOP_HISTORY_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, {ATTACHMENT_AUTHORITY_SCHEMA_VERSION}, {LIFECYCLE_SCHEMA_VERSION}, {RECEIPT_SEQUENCE_SCHEMA_VERSION}, {STOP_HISTORY_SCHEMA_VERSION}, {MEMORY_RETIREMENT_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1211,6 +1219,7 @@ fn migrate_worker_document(
             ),
         ));
     }
+    feature_initialization_migration::migrate(&mut document, identity_path)?;
     let object = document.as_object_mut().ok_or_else(|| {
         runtime_store_corrupt(identity_path, "Worker record must be an object".to_string())
     })?;
@@ -1300,6 +1309,9 @@ fn migrate_worker_record(
     mapping: Option<&LegacyWorkerIdentityMapping>,
     identity_path: &Path,
 ) -> Result<WorkerAggregateRecord, RuntimeError> {
+    if source_schema_version <= MEMORY_RETIREMENT_SCHEMA_VERSION {
+        feature_initialization_migration::migrate(&mut identity_document, identity_path)?;
+    }
     migrate_v19_receipt_state_sequences(&mut identity_document, identity_path)?;
     if matches!(
         source_schema_version,
@@ -1314,6 +1326,7 @@ fn migrate_worker_record(
             | LIFECYCLE_SCHEMA_VERSION
             | RECEIPT_SEQUENCE_SCHEMA_VERSION
             | STOP_HISTORY_SCHEMA_VERSION
+            | MEMORY_RETIREMENT_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -1394,6 +1407,7 @@ fn migrate_worker_record(
         let execution_path = identity_path.with_file_name(WORKER_EXECUTION_FILE);
         let mut execution_document: serde_json::Value =
             read_bounded_json(&execution_path, "read schema-v8 Worker execution record")?;
+        feature_initialization_migration::migrate(&mut execution_document, identity_path)?;
         remove_legacy_job_input_counter(&mut execution_document);
         migrate_legacy_request_evidence(&mut execution_document)
             .map_err(|message| runtime_store_corrupt(&execution_path, message.into()))?;
@@ -2365,6 +2379,7 @@ fn migrate_runtime_document(
             | LIFECYCLE_SCHEMA_VERSION
             | RECEIPT_SEQUENCE_SCHEMA_VERSION
             | STOP_HISTORY_SCHEMA_VERSION
+            | MEMORY_RETIREMENT_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2834,6 +2849,7 @@ fn migrate_runtime_store_in_place(
     })?;
 
     let mut retired_workers = Vec::new();
+    let mut unresolved_subject_workers = Vec::new();
     for planned_worker in &planned_workers {
         let source_dir = &planned_worker.source_dir;
         let source_snapshot_path = source_dir.join(WORKER_FILE);
@@ -2854,6 +2870,9 @@ fn migrate_runtime_store_in_place(
             planned_worker.legacy_mapping.as_ref(),
             &source_snapshot_path,
         )?;
+        if feature_initialization_migration::has_unresolved_connection(&aggregate) {
+            unresolved_subject_workers.push(aggregate.worker_ref.clone());
+        }
         let migrated = aggregate.clone().validate(&source_snapshot_path)?;
         let bytes = worker_record_serialized_size(&migrated)?;
         if bytes > MAX_WORKER_RECORD_BYTES {
@@ -2928,6 +2947,7 @@ fn migrate_runtime_store_in_place(
                         | LIFECYCLE_SCHEMA_VERSION
                         | RECEIPT_SEQUENCE_SCHEMA_VERSION
                         | STOP_HISTORY_SCHEMA_VERSION
+                        | MEMORY_RETIREMENT_SCHEMA_VERSION
                 ))
         {
             atomic_write_json(
@@ -2958,6 +2978,11 @@ fn migrate_runtime_store_in_place(
         &runtime_path,
     )?;
     memory_retirement::record_unavailable_workers(&mut document, retired_workers, &runtime_path)?;
+    feature_initialization_migration::record_unavailable_workers(
+        &mut document,
+        unresolved_subject_workers,
+        &runtime_path,
+    )?;
     atomic_write_json(
         &runtime_path,
         &document,
@@ -4457,7 +4482,7 @@ mod tests {
         })
     }
 
-    fn schema_v6_worker_document(worker_id: WorkerId) -> serde_json::Value {
+    pub(super) fn schema_v6_worker_document(worker_id: WorkerId) -> serde_json::Value {
         let mut document = schema_v7_worker_document(worker_id);
         document["schema_version"] = serde_json::json!(OLDEST_SCHEMA_VERSION);
         document["execution"]["last_run_generation"] = serde_json::json!(7);
