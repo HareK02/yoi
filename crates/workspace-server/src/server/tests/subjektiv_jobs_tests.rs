@@ -272,6 +272,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
             server_api::SubjektivSurfaceFailureRequest {
                 generation_id: generation.id.clone(),
                 reason_code: "editor_failed".into(),
+                detail: None,
             },
         ),
     )
@@ -346,6 +347,15 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
 
 #[tokio::test]
 async fn dirty_consolidation_survives_owner_tick_and_recovers_same_attempt_terminal_receipt() {
+    assert_consolidation_waits_for_own_receipt(false).await;
+}
+
+#[tokio::test]
+async fn failed_previous_generation_cannot_complete_or_revoke_a_new_attempt() {
+    assert_consolidation_waits_for_own_receipt(true).await;
+}
+
+async fn assert_consolidation_waits_for_own_receipt(prior_failure: bool) {
     let dir = tempfile::tempdir().unwrap();
     let (api, execution) = test_api_with_recording_backend(dir.path()).await;
     let store = open_subjektiv_store(&api).unwrap();
@@ -359,6 +369,14 @@ async fn dirty_consolidation_survives_owner_tick_and_recovers_same_attempt_termi
             MemoryDraft::active(CandidateKind::Lesson, "lesson", "body", "reason", "change"),
         )
         .unwrap();
+    if prior_failure {
+        let old = store
+            .prepare_job_surface_generation(&subject.id, Some(("old-job", "old-attempt")))
+            .unwrap();
+        store
+            .fail_surface_generation(&subject.id, &old.id, "editor_failed")
+            .unwrap();
+    }
     let started = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
@@ -398,6 +416,15 @@ async fn dirty_consolidation_survives_owner_tick_and_recovers_same_attempt_termi
         BackendJobAttemptState::Dispatched
     );
     assert_eq!(resource(&api, &subject.id).state, BackendJobState::Pending);
+    assert!(
+        subjektiv_subject_scope(
+            &api,
+            TEST_WORKSPACE_ID,
+            &context(&api, attempt.worker.as_ref().unwrap())
+        )
+        .is_ok(),
+        "an old failure must not revoke the live editor's Job grant"
+    );
     store
         .fail_surface_generation(&subject.id, &generation.id, "model_failure")
         .unwrap();
@@ -510,7 +537,8 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
             server_api::SubjektivMemoryBackendOperation::FailSurface(
                 server_api::SubjektivSurfaceFailureRequest {
                     generation_id: generation.id.clone(),
-                    reason_code: "editor_failed".into()
+                    reason_code: "editor_failed".into(),
+                    detail: None,
                 }
             )
         )

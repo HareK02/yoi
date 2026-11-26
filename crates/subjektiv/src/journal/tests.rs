@@ -425,10 +425,13 @@ mod input_delivery {
             let manager = FeatureStorage::new(&root);
             let scope = manager.scope("input-delivery-upgrade").unwrap();
             let registration = scope
-                .register(feature_storage::FeatureRegistration::new(
-                    crate::SUBJEKTIV_FEATURE_ID,
-                    baseline,
-                ))
+                .register(
+                    feature_storage::FeatureRegistration::new(
+                        crate::SUBJEKTIV_FEATURE_ID,
+                        baseline,
+                    )
+                    .with_history_validation(crate::storage_formats::validate),
+                )
                 .unwrap();
             let store = SubjektivStore::open(&scope, &registration).unwrap();
             let subject = if baseline.last().unwrap().version() < 12 {

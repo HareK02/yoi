@@ -200,6 +200,22 @@ pub fn lookup_result(
         if saved_fingerprint != fingerprint || !matches!(status.as_str(), "ready" | "failed") {
             return Err(SubjektivError::InvalidRecord("consolidation terminal outcome is stale or inconsistent".into()));
         }
+        // Ready snapshots are reusable for identical Memory. Failed projections
+        // are not: only a receipt produced by this exact attempt can complete it.
+        let (generation_id, reason_code) = if status == "failed" {
+            let failure: Option<(String, String)> = tx.query_row(
+                "SELECT g.generation_id,f.reason_code FROM surface_generation_runs g
+                 JOIN surface_generation_failures f USING(subject_id,generation_id)
+                 WHERE g.subject_id=?1 AND g.job_id=?2 AND g.attempt_id=?3 AND g.memory_fingerprint=?4
+                 ORDER BY g.generation_id LIMIT 1",
+                params![subject_id, job_id, attempt_id, fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let Some((id, reason)) = failure else { return Ok(None) };
+            (id, Some(reason))
+        } else {
+            (generation_id, reason_code)
+        };
         if !complete { return Ok(None) }
         let mut surface = serde_json::json!({
             "availability": status, "generation_id": generation_id, "memory_fingerprint": fingerprint

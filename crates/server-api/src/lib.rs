@@ -6880,11 +6880,19 @@ pub struct SubjektivSurfacePublishRequest {
     pub points: Vec<SubjektivSurfacePoint>,
 }
 
+/// Maximum UTF-8 bytes in a restricted Resident context failure diagnostic.
+pub const SUBJEKTIV_SURFACE_FAILURE_DETAIL_MAX_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfaceFailureRequest {
     pub generation_id: String,
     pub reason_code: String,
+    /// Restricted diagnostic, not surface text. Do not include prompts, Memory
+    /// materials, model output, or credentials. Bounded by
+    /// SUBJEKTIV_SURFACE_FAILURE_DETAIL_MAX_BYTES UTF-8 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -12815,6 +12823,26 @@ mod skill_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_failure_request_detail_is_backward_compatible_and_roundtrips() {
+        let legacy = serde_json::json!({
+            "generation_id": "generation-1",
+            "reason_code": "editor_failed",
+        });
+        let mut request: SubjektivSurfaceFailureRequest =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(request.detail, None);
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
+
+        request.detail = Some("Internal: surface editor failed: diagnostic fixture".into());
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["detail"], request.detail.as_deref().unwrap());
+        assert_eq!(
+            serde_json::from_value::<SubjektivSurfaceFailureRequest>(encoded).unwrap(),
+            request
+        );
+    }
 
     #[test]
     fn subject_policy_operations_use_individual_subject_routes_and_typed_mutations() {

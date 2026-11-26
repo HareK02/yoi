@@ -304,6 +304,13 @@ fn every_subject_owned_table_has_old_and_new_sql_fences_and_retention_is_scoped(
                 assert!(c.execute("DELETE FROM subject_permission_enrollment_sources", []).is_err());
                 continue;
             }
+            if table == "surface_generation_failures" {
+                let guard: String = c.query_row("SELECT sql FROM sqlite_master WHERE name='surface_generation_failures_no_update'", [], |r|r.get(0))?;
+                assert!(guard.contains("BEFORE UPDATE") && !guard.contains("WHEN"), "failure receipts reject every update");
+                let fence: String = c.query_row("SELECT sql FROM sqlite_master WHERE name='surface_generation_failures_deletion_fence'", [], |r|r.get(0))?;
+                assert!(fence.contains("NEW.subject_id") && fence.contains("subject_deletions"));
+                continue;
+            }
             if table == "canonical_worker_execution_grants" { continue; }
             assert!(DIRECT.contains(&table.as_str()) || table == "journal_erased_sessions" || table == "chat_conversations", "unclassified Subject table: {table}");
         }

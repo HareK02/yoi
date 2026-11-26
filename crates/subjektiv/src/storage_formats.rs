@@ -77,12 +77,26 @@ fn recognize(applied: &[(u32, String)]) -> feature_storage::Result<Format> {
 
 /// Validates physical compatibility only. The caller owns identity/adoption and the transaction.
 /// Never relabel/delete original receipts, fill historical gaps, or append a domain receipt here.
-/// After success the engine may apply only the pending registered common migrations (1..17).
+/// After success the engine may apply pending common migrations, including 21.
+/// Historical extension gaps are retained, not backfilled or relabeled.
 pub(super) fn validate(
     tx: &Transaction<'_>,
     applied: &[(u32, String)],
 ) -> feature_storage::Result<()> {
-    let format = recognize(applied)?;
+    let has_failure_receipts = applied.last().is_some_and(|(version, name)| {
+        *version == 21 && name == crate::surface_failure::MIGRATION_NAME
+    });
+    let base = if has_failure_receipts {
+        &applied[..applied.len() - 1]
+    } else {
+        applied
+    };
+    let format = recognize(base)?;
+    if has_failure_receipts && matches!(format, Format::Common(count) if count != COMMON_COUNT) {
+        return Err(incompatible(
+            "surface failure receipt migration requires the complete common history",
+        ));
+    }
     let transfer = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='permission_source_transfer_receipt')",
         [], |row| row.get::<_, bool>(0),
@@ -92,7 +106,7 @@ pub(super) fn validate(
             "retired permission transfer storage is not supported",
         ));
     }
-    let expected = reference_shape(format)?;
+    let expected = reference_shape_with_failures(format, has_failure_receipts)?;
     let actual = domain_shape(tx)?;
     if actual != expected {
         let difference = actual
@@ -126,7 +140,10 @@ fn domain_shape(connection: &Connection) -> feature_storage::Result<Vec<SchemaOb
     Ok(shape)
 }
 
-fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>> {
+fn reference_shape_with_failures(
+    format: Format,
+    failures: bool,
+) -> feature_storage::Result<Vec<SchemaObject>> {
     // Cache reference shapes only; every target is reread under its caller's transaction.
     static SHAPES: [OnceLock<Vec<SchemaObject>>; 52] = [const { OnceLock::new() }; 52];
     let index = match format {
@@ -139,7 +156,7 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
         Format::Consolidation20 => 22,
         Format::Fixed20 => 23,
         Format::Cancellation20 => 24,
-    };
+    } + if failures { 26 } else { 0 };
     if let Some(shape) = SHAPES[index].get() {
         return Ok(shape.clone());
     }
@@ -196,6 +213,9 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
             tx.execute_batch(CANCELLATION_SQL)?;
             tx.execute_batch(CONSOLIDATION_SQL)?;
         }
+    }
+    if failures {
+        crate::surface_failure::migrate(&tx)?;
     }
     let shape = domain_shape(&tx)?;
     let _ = SHAPES[index].set(shape.clone());

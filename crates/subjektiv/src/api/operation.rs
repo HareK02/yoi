@@ -240,7 +240,12 @@ pub fn execute(
                     .map_err(subjektiv_store_error)?;
             }
             let memory_fingerprint = store
-                .fail_surface_generation(subject_id, &input.generation_id, &input.reason_code)
+                .fail_surface_generation_with_detail(
+                    subject_id,
+                    &input.generation_id,
+                    &input.reason_code,
+                    input.detail.as_deref(),
+                )
                 .map_err(subjektiv_store_error)?;
             let status = if let Some(job) = job {
                 store

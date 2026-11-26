@@ -91,7 +91,8 @@ impl FeatureStorageError {
 
 /// Feature-owned schema changes. Commits pending changes and history in one IMMEDIATE transaction.
 /// Failure rolls back both changes and history, allowing retry on the next open.
-/// Rejects stored versions/names that differ from the plan and schemas newer than the plan.
+/// By default, rejects stored versions/names that differ from the plan and newer schemas.
+/// See [`FeatureRegistration::with_history_validation`] for published history compatibility.
 #[derive(Clone, Copy)]
 pub struct FeatureMigration {
     version: u32,
@@ -139,8 +140,18 @@ impl FeatureRegistration {
     }
 
     /// Installs this Feature's finite published receipt/shape compatibility check.
-    /// The check must reject unknown histories; it grants neither adoption nor
-    /// domain authority. Known extension receipts are retained, never rewritten.
+    /// The check runs before migrations in the same transaction and receives saved
+    /// receipts ordered by version. It replaces the default prefix/newer-schema check
+    /// and must reject unknown histories and unsupported schema shapes, even for saved
+    /// versions above the plan. It grants neither adoption nor domain authority.
+    /// Saved names at registered versions must still match the plan.
+    ///
+    /// With this check, registered versions may have gaps but must be nonzero and
+    /// strictly increasing (otherwise they must be contiguous from 1). After success,
+    /// only registered versions above the highest saved version are applied, or all
+    /// on an empty history. Missing historical versions are not backfilled; accepted
+    /// extension receipts are retained, never rewritten. The check must also accept
+    /// the resulting history on subsequent opens.
     pub const fn with_history_validation(mut self, validate: FeatureHistoryValidation) -> Self {
         self.history_validation = Some(validate);
         self
@@ -406,7 +417,11 @@ impl FeatureStorage {
     /// Rejects duplicate and foreign-manager registrations, fixing the migration plan used on open.
     pub fn register(&self, registration: FeatureRegistration) -> Result<RegisteredFeature> {
         let feature_id = validate_identifier("Feature", registration.feature_id)?.to_string();
-        validate_migrations(&feature_id, registration.migrations)?;
+        validate_migrations(
+            &feature_id,
+            registration.migrations,
+            registration.history_validation.is_some(),
+        )?;
         let mut state = self.lock_state()?;
         ensure_running(&state)?;
         if state.registrations.contains_key(&feature_id) {
@@ -1552,10 +1567,24 @@ fn validate_identifier<'a>(kind: &'static str, value: &'a str) -> Result<&'a str
     Ok(value)
 }
 
-fn validate_migrations(feature: &str, migrations: &[FeatureMigration]) -> Result<()> {
+fn validate_migrations(
+    feature: &str,
+    migrations: &[FeatureMigration],
+    custom_history_validation: bool,
+) -> Result<()> {
+    let mut previous = 0;
     for (index, migration) in migrations.iter().enumerate() {
         let expected = (index + 1) as u32;
-        if migration.version != expected {
+        if custom_history_validation && migration.version <= previous {
+            return Err(FeatureStorageError::InvalidMigrationPlan {
+                feature: feature.to_string(),
+                detail: format!(
+                    "versions must be nonzero and strictly increasing; found {} after {previous}",
+                    migration.version
+                ),
+            });
+        }
+        if !custom_history_validation && migration.version != expected {
             return Err(FeatureStorageError::InvalidMigrationPlan {
                 feature: feature.to_string(),
                 detail: format!(
@@ -1567,9 +1596,10 @@ fn validate_migrations(feature: &str, migrations: &[FeatureMigration]) -> Result
         if migration.name.trim().is_empty() {
             return Err(FeatureStorageError::InvalidMigrationPlan {
                 feature: feature.to_string(),
-                detail: format!("migration {expected} has an empty name"),
+                detail: format!("migration {} has an empty name", migration.version),
             });
         }
+        previous = migration.version;
     }
     Ok(())
 }
@@ -1683,6 +1713,21 @@ CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
     drop(statement);
 
     if let Some(validate) = registration.history_validation {
+        for (version, name) in &applied {
+            if let Some(expected) = migrations
+                .iter()
+                .find(|migration| migration.version == *version)
+                && name != expected.name
+            {
+                return Err(FeatureStorageError::MigrationHistory {
+                    feature: feature_id.to_string(),
+                    detail: format!(
+                        "stored migration {version} (`{name}`) does not match expected name `{}`",
+                        expected.name
+                    ),
+                });
+            }
+        }
         validate(transaction, &applied)?;
     } else {
         let supported = migrations.last().map_or(0, |migration| migration.version);
@@ -1715,7 +1760,11 @@ CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
         }
     }
 
-    for migration in migrations.iter().skip(applied.len()) {
+    let saved_version = applied.last().map_or(0, |(version, _)| *version);
+    for migration in migrations
+        .iter()
+        .filter(|migration| migration.version > saved_version)
+    {
         if let Err(error) = (migration.apply)(&transaction) {
             return Err(FeatureStorageError::MigrationFailed {
                 feature: feature_id.to_string(),
@@ -1937,6 +1986,267 @@ mod tests {
 
     fn registration(feature_id: &'static str) -> FeatureRegistration {
         FeatureRegistration::new(feature_id, MIGRATIONS)
+    }
+
+    fn add_canonical(transaction: &Transaction<'_>) -> Result<()> {
+        transaction.execute_batch("CREATE TABLE canonical (id INTEGER PRIMARY KEY);")?;
+        Ok(())
+    }
+
+    const GAPPED_MIGRATIONS: &[FeatureMigration] = &[
+        MIGRATIONS[0],
+        MIGRATIONS[1],
+        FeatureMigration::new(5, "canonical", add_canonical),
+    ];
+
+    fn accept_published_history(_: &Transaction<'_>, applied: &[(u32, String)]) -> Result<()> {
+        let expected = [
+            (1, "create items"),
+            (2, "add audit"),
+            (3, "legacy three"),
+            (4, "legacy four"),
+            (5, "canonical"),
+        ];
+        if applied.len() <= expected.len()
+            && applied
+                .iter()
+                .zip(expected)
+                .all(|((version, name), (v, n))| *version == v && name == n)
+        {
+            Ok(())
+        } else {
+            Err(FeatureStorageError::operation("unknown published history"))
+        }
+    }
+
+    fn accept_any_history(_: &Transaction<'_>, _: &[(u32, String)]) -> Result<()> {
+        Ok(())
+    }
+
+    fn receipts(connection: &Connection) -> Result<Vec<(u32, String, String)>> {
+        Ok(connection
+            .prepare(&format!(
+                "SELECT version, name, applied_at FROM {MIGRATION_TABLE} ORDER BY version"
+            ))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    fn seed_published_history(root: &Path) -> Vec<(u32, String, String)> {
+        let manager = FeatureStorage::new(root);
+        let registered = manager.register(registration("test-feature")).unwrap();
+        let database = manager
+            .scope("workspace")
+            .unwrap()
+            .open(&registered)
+            .unwrap();
+        database
+            .transaction(|tx| {
+                tx.execute_batch(&format!(
+                    "INSERT INTO {MIGRATION_TABLE} (version, name) VALUES
+                     (3, 'legacy three'), (4, 'legacy four');
+                     UPDATE {MIGRATION_TABLE} SET applied_at = '2001-02-03 04:05:06';"
+                ))?;
+                Ok(())
+            })
+            .unwrap();
+        let saved = database.with_connection(receipts).unwrap();
+        manager.shutdown().unwrap();
+        saved
+    }
+
+    #[test]
+    fn custom_history_applies_above_saved_max_once_and_preserves_receipts_on_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = seed_published_history(temp.path());
+        let mut migrated = None;
+        for _ in 0..2 {
+            let manager = FeatureStorage::new(temp.path());
+            let registered = manager
+                .register(
+                    FeatureRegistration::new("test-feature", GAPPED_MIGRATIONS)
+                        .with_history_validation(accept_published_history),
+                )
+                .unwrap();
+            let database = manager
+                .scope("workspace")
+                .unwrap()
+                .open(&registered)
+                .unwrap();
+            assert_eq!(database.schema_version().unwrap(), 5);
+            let current = database.with_connection(receipts).unwrap();
+            assert_eq!(&current[..4], saved.as_slice());
+            assert_eq!(current.len(), 5);
+            assert_eq!((current[4].0, current[4].1.as_str()), (5, "canonical"));
+            if let Some(previous) = &migrated {
+                assert_eq!(&current, previous);
+            }
+            migrated = Some(current);
+            manager.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_history_does_not_backfill_missing_registered_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_published_history(temp.path());
+        let path = temp.path().join("workspace/features/test-feature.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                &format!("DELETE FROM {MIGRATION_TABLE} WHERE version = 2"),
+                [],
+            )
+            .unwrap();
+        let saved = receipts(&connection).unwrap();
+        drop(connection);
+        let manager = FeatureStorage::new(temp.path());
+        let registered = manager
+            .register(
+                FeatureRegistration::new("test-feature", GAPPED_MIGRATIONS)
+                    .with_history_validation(accept_any_history),
+            )
+            .unwrap();
+        let database = manager
+            .scope("workspace")
+            .unwrap()
+            .open(&registered)
+            .unwrap();
+        let current = database.with_connection(receipts).unwrap();
+        assert_eq!(&current[..3], saved.as_slice());
+        assert_eq!(
+            current.iter().map(|row| row.0).collect::<Vec<_>>(),
+            [1, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn custom_history_plan_requires_nonzero_increasing_versions() {
+        const ZERO: &[FeatureMigration] = &[FeatureMigration::new(0, "zero", create_items)];
+        const DUPLICATE: &[FeatureMigration] = &[MIGRATIONS[0], MIGRATIONS[0]];
+        const UNORDERED: &[FeatureMigration] = &[MIGRATIONS[1], MIGRATIONS[0]];
+        const EMPTY_NAME: &[FeatureMigration] = &[FeatureMigration::new(5, " ", create_items)];
+        for plan in [ZERO, DUPLICATE, UNORDERED, EMPTY_NAME] {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = FeatureStorage::new(temp.path());
+            assert!(matches!(
+                manager.register(
+                    FeatureRegistration::new("test-feature", plan)
+                        .with_history_validation(accept_any_history)
+                ),
+                Err(FeatureStorageError::InvalidMigrationPlan { .. })
+            ));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let manager = FeatureStorage::new(temp.path());
+        for plan in [GAPPED_MIGRATIONS, &GAPPED_MIGRATIONS[2..]] {
+            assert!(matches!(
+                manager.register(FeatureRegistration::new("test-feature", plan)),
+                Err(FeatureStorageError::InvalidMigrationPlan { .. })
+            ));
+        }
+        // Custom plans need not start at 1; an empty history applies the whole plan.
+        let registered = manager
+            .register(
+                FeatureRegistration::new("test-feature", &GAPPED_MIGRATIONS[2..])
+                    .with_history_validation(accept_any_history),
+            )
+            .unwrap();
+        let database = manager
+            .scope("workspace")
+            .unwrap()
+            .open(&registered)
+            .unwrap();
+        assert_eq!(database.schema_version().unwrap(), 5);
+    }
+
+    #[test]
+    fn custom_history_rejects_unknown_receipts_and_registered_name_mismatches() {
+        for (version, validator) in [
+            (3, accept_published_history as FeatureHistoryValidation),
+            (1, accept_any_history as FeatureHistoryValidation),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            seed_published_history(temp.path());
+            let path = temp.path().join("workspace/features/test-feature.sqlite");
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE {MIGRATION_TABLE} SET name = 'unknown' WHERE version = ?1"),
+                    [version],
+                )
+                .unwrap();
+            let saved = receipts(&connection).unwrap();
+            let manager = FeatureStorage::new(temp.path());
+            let registered = manager
+                .register(
+                    FeatureRegistration::new("test-feature", GAPPED_MIGRATIONS)
+                        .with_history_validation(validator),
+                )
+                .unwrap();
+            let result = manager.scope("workspace").unwrap().open(&registered);
+            if version == 1 {
+                assert!(matches!(
+                    result,
+                    Err(FeatureStorageError::MigrationHistory { .. })
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(FeatureStorageError::Operation(ref message))
+                    if message == "unknown published history")
+                );
+            }
+            assert_eq!(receipts(&connection).unwrap(), saved);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'canonical'",
+                        [],
+                        |row| row.get::<_, u32>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn custom_history_migration_failure_rolls_back_pending_schema_and_receipts() {
+        const PLAN: &[FeatureMigration] = &[
+            GAPPED_MIGRATIONS[0],
+            GAPPED_MIGRATIONS[1],
+            GAPPED_MIGRATIONS[2],
+            FeatureMigration::new(6, "fail", failing_migration),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let saved = seed_published_history(temp.path());
+        let manager = FeatureStorage::new(temp.path());
+        let registered = manager
+            .register(
+                FeatureRegistration::new("test-feature", PLAN)
+                    .with_history_validation(accept_published_history),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                manager.scope("workspace").unwrap().open(&registered),
+                Err(FeatureStorageError::MigrationFailed { version: 6, .. })
+            ));
+            let connection =
+                Connection::open(temp.path().join("workspace/features/test-feature.sqlite"))
+                    .unwrap();
+            assert_eq!(receipts(&connection).unwrap(), saved);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('canonical', 'partial')",
+                        [],
+                        |row| row.get::<_, u32>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[cfg(feature = "test-support")]

@@ -311,3 +311,90 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
     false_reason["surface"]["reason_code"] = serde_json::json!("invented");
     assert!(validate_result(&store, &subject.id, &batch, "job", "attempt", &false_reason).is_err());
 }
+
+#[test]
+fn prepared_attempt_cannot_inherit_another_generations_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = feature_storage::FeatureStorage::new(temp.path());
+    let scope = manager.scope("surface-failure-owner").unwrap();
+    let registration = SubjektivStore::register(&scope).unwrap();
+    let store = SubjektivStore::open(&scope, &registration).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("companion").unwrap())
+        .unwrap();
+    let old = store
+        .prepare_job_surface_generation(&subject.id, Some(("old-job", "old-attempt")))
+        .unwrap();
+    store
+        .fail_surface_generation(&subject.id, &old.id, "editor_failed")
+        .unwrap();
+    let fresh = store
+        .prepare_job_surface_generation(&subject.id, Some(("new-job", "new-attempt")))
+        .unwrap();
+    assert!(
+        lookup_result(&store, &subject.id, &[], "new-job", "new-attempt")
+            .unwrap()
+            .is_none(),
+        "preparing a generation is not a receipt of its failure"
+    );
+    let forged = serde_json::json!({"subject_id": subject.id, "candidate_ids": [],
+        "surface": {"availability": "failed", "generation_id": fresh.id,
+            "memory_fingerprint": fresh.memory_fingerprint, "reason_code": "editor_failed"}});
+    assert!(validate_result(&store, &subject.id, &[], "new-job", "new-attempt", &forged).is_err());
+    assert!(
+        lookup_result(&store, &subject.id, &[], "old-job", "old-attempt")
+            .unwrap()
+            .is_some()
+    );
+    // Once this exact generation fails, its result can be recovered. A later
+    // preparation in the same attempt must not steal the failure's identity.
+    store
+        .fail_surface_generation(&subject.id, &fresh.id, "editor_timeout")
+        .unwrap();
+    let _later = store
+        .prepare_job_surface_generation(&subject.id, Some(("new-job", "new-attempt")))
+        .unwrap();
+    let mut recovered = lookup_result(&store, &subject.id, &[], "new-job", "new-attempt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered["surface"]["generation_id"], fresh.id);
+    assert_eq!(recovered["surface"]["reason_code"], "editor_timeout");
+    let mut old_result = lookup_result(&store, &subject.id, &[], "old-job", "old-attempt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_result["surface"]["reason_code"], "editor_failed");
+    old_result
+        .as_object_mut()
+        .unwrap()
+        .remove("candidate_dispositions");
+    recovered
+        .as_object_mut()
+        .unwrap()
+        .remove("candidate_dispositions");
+    validate_result(
+        &store,
+        &subject.id,
+        &[],
+        "old-job",
+        "old-attempt",
+        &old_result,
+    )
+    .unwrap();
+    validate_result(
+        &store,
+        &subject.id,
+        &[],
+        "new-job",
+        "new-attempt",
+        &recovered,
+    )
+    .unwrap();
+    // Successful immutable snapshots for identical Memory remain reusable.
+    store
+        .publish_surface_generation(&subject.id, &fresh.id, vec![])
+        .unwrap();
+    let ready = lookup_result(&store, &subject.id, &[], "new-job", "new-attempt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready["surface"]["availability"], "ready");
+}

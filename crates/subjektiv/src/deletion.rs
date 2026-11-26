@@ -395,6 +395,10 @@ impl SubjektivStore {
             }
             tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
             crate::chat::erase_subject(tx, subject)?;
+            tx.execute(
+                "DELETE FROM surface_generation_failures WHERE subject_id=?1",
+                [subject],
+            )?;
             for (table, predicate) in INDIRECT {
                 tx.execute(
                     &format!(

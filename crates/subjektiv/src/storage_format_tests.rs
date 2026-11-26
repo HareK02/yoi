@@ -263,7 +263,7 @@ fn database_path(root: &Path) -> std::path::PathBuf {
 }
 
 #[test]
-fn published_families_reopen_without_changing_shapes_rows_or_original_receipts() {
+fn published_families_add_failure_receipts_without_changing_original_data() {
     for format in PUBLISHED {
         let temp = tempfile::tempdir().unwrap();
         published_fixture(temp.path(), format);
@@ -275,15 +275,36 @@ fn published_families_reopen_without_changing_shapes_rows_or_original_receipts()
         let saved_receipts = receipts(&original);
         drop(original);
 
-        // This goes through the real registered migration engine, not a test-only planner.
-        // There is intentionally no new storage/domain migration or convergence receipt.
+        // Only the common failure-receipt extension is added; published domain
+        // extensions and their original migration identities remain untouched.
         for _ in 0..2 {
             let (scope, database) = open(temp.path(), REGISTRATION);
             database
                 .with_connection(|connection| {
-                    assert_eq!(domain_shape(connection)?, saved_shape, "{format:?}");
-                    assert_eq!(all_rows(connection), saved_rows, "{format:?}");
-                    assert_eq!(receipts(connection), saved_receipts, "{format:?}");
+                    let shape = domain_shape(connection)?;
+                    assert_eq!(
+                        shape,
+                        reference_shape_with_failures(format, true)?,
+                        "{format:?}"
+                    );
+                    assert!(saved_shape.iter().all(|object| shape.contains(object)));
+                    let rows = all_rows(connection);
+                    for (table, saved) in &saved_rows {
+                        if table != HISTORY_TABLE {
+                            assert_eq!(
+                                &rows.iter().find(|(name, _)| name == table).unwrap().1,
+                                saved
+                            );
+                        }
+                    }
+                    let current = receipts(connection);
+                    assert_eq!(
+                        &current[..saved_receipts.len()],
+                        saved_receipts.as_slice(),
+                        "{format:?}"
+                    );
+                    assert_eq!(current.len(), saved_receipts.len() + 1);
+                    assert_eq!(current.last().unwrap().0, 21);
                     assert_foreign_keys(connection);
                     Ok(())
                 })
@@ -569,7 +590,7 @@ fn common_receipt_write_failure_rolls_back_in_sqlite_then_engine_retry_succeeds(
     db.with_connection(|connection| {
         assert_eq!(
             domain_shape(connection)?,
-            reference_shape(Format::Common(17))?
+            reference_shape_with_failures(Format::Common(17), true)?
         );
         assert_eq!(&receipts(connection)[..16], saved_receipts.as_slice());
         Ok(())

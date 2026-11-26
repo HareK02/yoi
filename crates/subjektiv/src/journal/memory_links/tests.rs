@@ -29,10 +29,10 @@ impl Fixture {
             .workspace(&format!("memory-journal-test-{}", Uuid::now_v7()))
             .unwrap();
         let registration = workspace
-            .register(feature_storage::FeatureRegistration::new(
-                crate::SUBJEKTIV_FEATURE_ID,
-                migrations,
-            ))
+            .register(
+                feature_storage::FeatureRegistration::new(crate::SUBJEKTIV_FEATURE_ID, migrations)
+                    .with_history_validation(crate::storage_formats::validate),
+            )
             .unwrap();
         let store = SubjektivStore::open(&workspace, &registration).unwrap();
         let subject = if migrations.last().unwrap().version() < 12 {
@@ -1131,10 +1131,13 @@ fn failed_link_migration_rolls_back_ddl_and_preserves_existing_data_for_retry() 
         let manager = FeatureStorage::new(f.temp.path().join("storage"));
         let workspace = manager.workspace(&f.host.scope_id).unwrap();
         let registration = workspace
-            .register(feature_storage::FeatureRegistration::new(
-                crate::SUBJEKTIV_FEATURE_ID,
-                FAILED_PLAN.as_slice(),
-            ))
+            .register(
+                feature_storage::FeatureRegistration::new(
+                    crate::SUBJEKTIV_FEATURE_ID,
+                    FAILED_PLAN.as_slice(),
+                )
+                .with_history_validation(crate::storage_formats::validate),
+            )
             .unwrap();
         assert!(matches!(
             SubjektivStore::open(&workspace, &registration),

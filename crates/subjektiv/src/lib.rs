@@ -13,6 +13,7 @@ pub mod permissions;
 pub use permissions::{CanonicalPermissionSource, DatabaseIdentity};
 mod schema;
 mod subject_creation;
+mod surface_failure;
 use legacy_migrations::{
     add_candidate_decision_receipts, add_subject_behavior, add_subject_session_attribution,
     add_surface_generation_state, add_surface_job_provenance, create_schema,
@@ -675,6 +676,12 @@ static MIGRATIONS: &[FeatureMigration] = &[
         17,
         "add stable conversation presentation references",
         chat::migrate_references,
+    ),
+    // 18..20 are published extension histories recognized by storage_formats.
+    FeatureMigration::new(
+        21,
+        surface_failure::MIGRATION_NAME,
+        surface_failure::migrate,
     ),
 ];
 
@@ -1662,9 +1669,19 @@ impl SubjektivStore {
                 [subject_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
             ).optional()?.ok_or_else(|| SubjektivError::InvalidRecord("surface generation has no terminal outcome".into()))?;
+            if availability == "failed" {
+                let saved_reason: Option<String> = connection.query_row(
+                    "SELECT reason_code FROM surface_generation_failures WHERE subject_id=?1 AND generation_id=?2",
+                    params![subject_id, generation_id], |row| row.get(0),
+                ).optional()?;
+                if saved_reason.is_none() || saved_reason.as_deref() != reason_code {
+                    return Err(SubjektivError::InvalidRecord("surface failure has no matching generation receipt".into()));
+                }
+            }
             if state.0 != memory_fingerprint || state.1 != availability
                 || !matches!(availability, "ready" | "failed")
-                || state.2.as_deref() != snapshot_id || state.3.as_deref() != reason_code {
+                || state.2.as_deref() != snapshot_id
+                || (availability == "ready" && state.3.as_deref() != reason_code) {
                 return Err(SubjektivError::InvalidRecord("surface claim differs from the persisted outcome".into()));
             }
             Ok(())
@@ -1764,6 +1781,18 @@ impl SubjektivStore {
         generation_id: &str,
         reason_code: &str,
     ) -> Result<String> {
+        self.fail_surface_generation_with_detail(subject_id, generation_id, reason_code, None)
+    }
+
+    /// Retains a bounded diagnostic against the exact generation, independently of
+    /// the current resident projection. It is never supplied as resident context.
+    pub fn fail_surface_generation_with_detail(
+        &self,
+        subject_id: &str,
+        generation_id: &str,
+        reason_code: &str,
+        detail: Option<&str>,
+    ) -> Result<String> {
         validate_label("surface generation id", generation_id)?;
         validate_label("surface failure reason", reason_code)?;
         self.memory_transaction(|transaction| {
@@ -1782,6 +1811,7 @@ impl SubjektivStore {
                         "unknown generation `{generation_id}` for subject `{subject_id}`"
                     ))
                 })?;
+            surface_failure::record(transaction, subject_id, generation_id, reason_code, detail)?;
             if generation_change == memory_fingerprint {
                 let ready = transaction
                     .query_row(
