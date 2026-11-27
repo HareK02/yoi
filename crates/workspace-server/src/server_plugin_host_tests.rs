@@ -25,7 +25,7 @@ use server_api::{
 };
 use yoi_plugin_runtime::host::{CancellationToken, Grants, InvocationContext};
 use yoi_plugin_runtime::owner::{OwnerHost, PluginHostOwner};
-use yoi_plugin_runtime::{CompiledTool, ExecutionError, Executor, Limits};
+use yoi_plugin_runtime::{ArtifactIdentity, CompiledTool, ExecutionError, Executor, Limits};
 
 const PROFILE: &str = "project:plugin-integration";
 const METHODS: &[PluginHttpMethod] = &[
@@ -370,8 +370,8 @@ impl Fixture {
     }
 
     // Host-boundary cases still upload/install the real package and authorize a
-    // real plan, but do not execute a guest. Compile only when a guest/context
-    // is actually needed; no component or mutable runtime is shared across tests.
+    // real plan, but do not execute a guest. Compile only for guest execution;
+    // no component or mutable runtime is shared across tests.
     fn execution(&self) -> &(Executor, CompiledTool) {
         self.execution.get_or_init(|| {
             let executor = Executor::new(Limits::default()).unwrap();
@@ -402,7 +402,13 @@ impl Fixture {
             plan: self.plan.plan_id.clone(),
             subject: self.plan.plan.execution().principal_id.clone(),
             invocation_id: String::new(),
-            artifact: self.component().identity().clone(),
+            // Admission needs the installed package's identity, not compiled code.
+            // Actual guest invocations still compile and check this identity.
+            artifact: ArtifactIdentity {
+                package_digest: self.package.package_digest.clone(),
+                artifact_digest: self.package.artifact_digest.clone(),
+                artifact_size: self.package.artifact_size,
+            },
             tool_name: self.tool.into(),
             grants: Grants {
                 logging: false,
