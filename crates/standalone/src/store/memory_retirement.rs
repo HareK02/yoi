@@ -79,7 +79,7 @@ impl<'de> Deserialize<'de> for UniqueValue {
     }
 }
 
-fn parse_document(text: &str) -> Result<Value, StandaloneStoreError> {
+pub(super) fn parse_document(text: &str) -> Result<Value, StandaloneStoreError> {
     serde_json::from_str::<UniqueValue>(text)
         .map(|value| value.0)
         .map_err(StandaloneStoreError::Json)
@@ -179,6 +179,36 @@ fn retire_snapshot(id: WorkerId, snapshot: &mut Value) -> Result<bool, Standalon
     }
     feature.remove("memory");
     Ok(true)
+}
+
+// Reuse the frozen storage eligibility rules without manufacturing an executable
+// Manifest. The consumed value is a private observation, never a replacement to save.
+// Full policy validation and the second snapshot remain the lease owner's responsibility.
+pub(super) fn listing_worker_name(
+    id: WorkerId,
+    record_schema: u32,
+    mut snapshot: Value,
+) -> Result<(String, Option<&'static str>), StandaloneStoreError> {
+    let blocker = match retire_snapshot(id, &mut snapshot) {
+        Ok(true) if record_schema == SCHEMA_VERSION => {
+            Some("schema-3 Worker contains removed Workspace Memory; no migration was applied")
+        }
+        Ok(_) => None,
+        // Keep unavailable Workers visible and diagnosable, never selectable for restore.
+        Err(StandaloneStoreError::WorkspaceMemoryRetirement { reason, .. }) => Some(reason),
+        Err(error) => return Err(error),
+    };
+    let manifest = if snapshot.get("schema_version").is_some() {
+        &snapshot["manifest"]
+    } else {
+        &snapshot
+    };
+    manifest
+        .get("worker")
+        .and_then(|worker| worker.get("name"))
+        .and_then(Value::as_str)
+        .map(|name| (name.to_owned(), blocker))
+        .ok_or(StandaloneStoreError::InvalidRecord(id))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

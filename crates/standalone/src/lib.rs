@@ -54,5 +54,6 @@ pub use launch::{ResolvedStandaloneLaunch, StandaloneLaunchConfig, StandaloneLau
 pub use protocol::WorkerId;
 pub use store::{
     StaleLeasePolicy, StandaloneCwdIdentity, StandaloneListScope, StandaloneShutdownReason,
-    StandaloneStoreError, StandaloneWorkerRecord, StandaloneWorkerStatus, StandaloneWorkerStore,
+    StandaloneStoreError, StandaloneWorkerListEntry, StandaloneWorkerRecord,
+    StandaloneWorkerStatus, StandaloneWorkerStore,
 };

@@ -28,7 +28,10 @@ const WORKER_DIR: &str = "worker";
 // Schema 3 retires disabled Workspace Memory execution snapshots on disk.
 const SCHEMA_VERSION: u32 = 3;
 
+mod listing;
 mod memory_retirement;
+
+pub use listing::StandaloneWorkerListEntry;
 
 /// Read-only ownership evidence, deliberately not an executable Worker record.
 /// Historical Session sources need their saved binding, not today's manifest codec.
@@ -317,7 +320,7 @@ impl StandaloneWorkerStore {
         cwd: impl AsRef<Path>,
         scope: StandaloneListScope,
         limit: usize,
-    ) -> Result<Vec<StandaloneWorkerRecord>, StandaloneStoreError> {
+    ) -> Result<Vec<StandaloneWorkerListEntry>, StandaloneStoreError> {
         let current_cwd = (scope == StandaloneListScope::CurrentCwd)
             .then(|| StandaloneCwdIdentity::capture(cwd))
             .transpose()?;
@@ -334,7 +337,7 @@ impl StandaloneWorkerStore {
             let Ok(id) = entry.file_name().to_string_lossy().parse() else {
                 continue;
             };
-            let record = self.load(id)?;
+            let record = self.load_list_entry(id)?;
             if current_cwd.as_ref().is_none_or(|cwd| &record.cwd == cwd) {
                 records.push(record);
             }

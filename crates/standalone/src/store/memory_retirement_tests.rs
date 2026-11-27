@@ -130,11 +130,15 @@ fn owner_migrates_both_snapshots_once_without_changing_other_data() {
     let record_before = regular_file(&f.record_path).unwrap();
     let metadata_before = regular_file(&f.metadata_path).unwrap();
     assert!(f.store.load(f.id()).is_err());
-    assert!(
-        f.store
-            .list(f._temp.path(), StandaloneListScope::All, 10)
-            .is_err()
-    );
+    let listed = f
+        .store
+        .list(f._temp.path(), StandaloneListScope::CurrentCwd, 10)
+        .expect("disabled legacy policy must not prevent selecting its migration target");
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].restore_blocker.is_none());
+    let selected = listed[0].worker_id;
+    assert_eq!(selected, f.id());
+    assert_eq!(listed[0].cwd, f.allocation.cwd);
     assert_eq!(regular_file(&f.record_path).unwrap(), record_before);
     assert_eq!(regular_file(&f.metadata_path).unwrap(), metadata_before);
     let archive = f
@@ -149,7 +153,9 @@ fn owner_migrates_both_snapshots_once_without_changing_other_data() {
     .unwrap();
     let session = f.store.sessions_dir(f.id()).join("history.jsonl");
     fs::write(&session, b"immutable historical request\n").unwrap();
-    f.migrate().unwrap();
+    f.store
+        .migrate_disabled_workspace_memory(selected, f.allocation.lease())
+        .unwrap();
     let mut expected_record: Value = serde_json::from_str(&record_before).unwrap();
     expected_record["schema_version"] = json!(3);
     expected_record["manifest"]["manifest"]["feature"]
@@ -374,4 +380,140 @@ fn current_schema_cannot_be_used_to_revive_removed_memory() {
         f.migrate(),
         Err(StandaloneStoreError::WorkspaceMemoryRetirement { .. })
     ));
+}
+
+#[test]
+fn listing_exposes_retired_policy_blockers_without_authority_or_writes() {
+    for memory in [
+        json!({"enabled":true}),
+        json!({"profile":{}}),
+        json!({"profile":{"enabled":false,"unknown":false}}),
+    ] {
+        let f = Fixture::new();
+        let mut raw = parse_document(&regular_file(&f.record_path).unwrap()).unwrap();
+        raw["manifest"]["manifest"]["feature"]["memory"] = memory;
+        let before = encode(&raw).unwrap();
+        fs::write(&f.record_path, &before).unwrap();
+        let listed = f
+            .store
+            .list(f._temp.path(), StandaloneListScope::All, 10)
+            .unwrap();
+        assert_eq!(listed[0].worker_id, f.id());
+        assert!(listed[0].restore_blocker.is_some());
+        assert!(
+            f.migrate().is_err(),
+            "discovery must not admit the blocked policy"
+        );
+        assert_eq!(regular_file(&f.record_path).unwrap(), before);
+        assert!(!f.record_path.parent().unwrap().join(COMMIT_MARKER).exists());
+    }
+}
+
+#[test]
+fn listing_rejects_malformed_unsupported_and_mismatched_storage_metadata() {
+    let f = Fixture::new();
+    let original = parse_document(&regular_file(&f.record_path).unwrap()).unwrap();
+    for (pointer, value) in [
+        ("/worker_id", json!(WorkerId::now_v7())),
+        ("/storage_key", json!("../escape")),
+        ("/active_session_id", json!("not-a-session-id")),
+        ("/worker_name", json!("different-name")),
+        ("/cwd/canonical_path", json!("relative/path")),
+        ("/schema_version", json!(0)),
+        ("/schema_version", json!(999)),
+    ] {
+        let mut raw = original.clone();
+        *raw.pointer_mut(pointer).unwrap() = value;
+        let before = encode(&raw).unwrap();
+        fs::write(&f.record_path, &before).unwrap();
+        assert!(
+            f.store
+                .list(f._temp.path(), StandaloneListScope::All, 10)
+                .is_err(),
+            "{pointer}"
+        );
+        assert_eq!(regular_file(&f.record_path).unwrap(), before);
+    }
+    for text in ["{", r#"{"worker_id":1,"worker_id":2}"#] {
+        fs::write(&f.record_path, text).unwrap();
+        assert!(matches!(
+            f.store.list(f._temp.path(), StandaloneListScope::All, 10),
+            Err(StandaloneStoreError::CorruptRecord { .. })
+        ));
+        assert_eq!(regular_file(&f.record_path).unwrap(), text);
+    }
+}
+
+#[test]
+fn discovery_never_promotes_unvalidated_execution_policy() {
+    let f = Fixture::new();
+    let mut raw = parse_document(&regular_file(&f.record_path).unwrap()).unwrap();
+    raw["schema_version"] = json!(1);
+    raw["manifest"]["manifest"]["unsupported_execution_policy"] = json!(true);
+    let before = encode(&raw).unwrap();
+    fs::write(&f.record_path, &before).unwrap();
+    let metadata_before = regular_file(&f.metadata_path).unwrap();
+    assert_eq!(
+        f.store
+            .list(f._temp.path(), StandaloneListScope::All, 10)
+            .unwrap()[0]
+            .worker_id,
+        f.id()
+    );
+    assert!(f.store.load(f.id()).is_err());
+    assert!(f.migrate().is_err());
+    assert_eq!(regular_file(&f.record_path).unwrap(), before);
+    assert_eq!(regular_file(&f.metadata_path).unwrap(), metadata_before);
+    assert!(!f.record_path.parent().unwrap().join(COMMIT_MARKER).exists());
+}
+
+#[test]
+fn listing_preserves_cwd_identity_sorting_and_limit_for_legacy_records() {
+    let f = Fixture::new();
+    let original = regular_file(&f.record_path).unwrap();
+    let mut raw = parse_document(&original).unwrap();
+    let other_id = WorkerId::now_v7();
+    let other_dir = f.store.worker_dir(other_id);
+    fs::create_dir(&other_dir).unwrap();
+    raw["worker_id"] = json!(other_id);
+    // Equal timestamps retain the stable descending WorkerId tie-break.
+    fs::write(other_dir.join(RECORD_FILE), encode(&raw).unwrap()).unwrap();
+    let mut ids = vec![f.id(), other_id];
+    ids.sort_by_key(|id| std::cmp::Reverse(id.to_string()));
+    let listed = f
+        .store
+        .list(f._temp.path(), StandaloneListScope::CurrentCwd, 1)
+        .unwrap();
+    assert_eq!(listed[0].worker_id, ids[0]);
+    let other_cwd = f._temp.path().join("other-cwd");
+    fs::create_dir(&other_cwd).unwrap();
+    assert!(
+        f.store
+            .list(&other_cwd, StandaloneListScope::CurrentCwd, 10)
+            .unwrap()
+            .is_empty()
+    );
+    raw["cwd"]["inode"] = json!(0);
+    fs::write(other_dir.join(RECORD_FILE), encode(&raw).unwrap()).unwrap();
+    assert_eq!(
+        f.store
+            .list(f._temp.path(), StandaloneListScope::CurrentCwd, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.store
+            .list(&other_cwd, StandaloneListScope::All, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        f.store
+            .list(f._temp.path(), StandaloneListScope::All, 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(regular_file(&f.record_path).unwrap(), original);
 }
