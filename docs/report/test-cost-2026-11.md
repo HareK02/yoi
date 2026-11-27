@@ -617,3 +617,24 @@ heavy build/testは約1,165秒（build/checkはBash秒単位、診断build/run�
 **Server候補はまだcompile成功・接続回帰を確認しておらず、正式レビュー/公開/統合は行わない。** 残る直近作業は同cacheでのServer lib build、host-only代表の前後反復と実guest/identity/current権限/receipt回帰、root check完走。見積はServer build 250–400秒、focused実行10–90秒、root check残120–300秒だが、これは今回の未完compileと過去のwarm実績を参考にした計画値であり、現sourceの完走実測ではない。最終候補には現行定義の標準suite全体とinventory照合も必要で、今回未実行の通常Rust全体/doctest/Web/component/tool/browser/E2Eを成功としない。標準suite全体の現在所要時間は未測定である。
 
 Journal/retained/Server起動の現行phase分布、全採用変更の同条件比較、古いnative browser失敗の失われた一次例外に関する証拠不足も引き続き残る。今回の局所的な候補は、それらを解消したことにはならない。
+
+### 継続枠の実結果：root成功、実binary比較は未到達
+
+続く35分/heavy900秒枠では旧1,165秒枠を封止し、HEAD `d09bc1a3230328b5e6d8a51418d8e2549015fde5` / tree `a365a393d4c634ff5f0ade66583ce46f805b5f0c` の候補を再読した。既存MRなし、originのtargetは114249f12、dirtyなし。コードを追加変更せず、同じ専用target/cache、kache、jobs1、Swap0、通常8GiB/Server lib12GiBで実行した。開始時のhost loadは1.61/2.01/2.68、空きにavailable約49GiBで、前枠と同一負荷とはしない。
+
+| 検証 | 実結果 | wall-clock |
+|---|---|---:|
+| 通常profile Server lib no-run | timeout124、Server compile中、実binary未取得 | 300秒 |
+| 診断profile Server lib no-run | timeout124、実binary未取得 | 210秒 |
+| root check → Server test-target check | root成功0を162秒で記録。後段checkは残り約158秒でtimeout、compound exit124 | 合計320秒 |
+| Server test-target checkの追加実行 | timeout124、Server test-target check中 | 55秒 |
+
+診断profileはCargoのcommand-line設定でServer packageだけ `opt-level=0, debug=0, codegen-units=256, incremental=false` とした。依存profile、assertion/overflow checkを変更せず、repository設定も書き換えていない。これは同条件のbaseline/finalを短いcompileで得るための方法変更だったが、binaryを得られず比較には進めなかった。通常profileの成功や改善としては計上しない。
+
+実コマンドは共通の `env -u RUSTC_WRAPPER CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=target` の下で `cargo test --locked --offline -p yoi-workspace-server --lib --no-run --message-format=json`、`cargo check --locked --offline`、`cargo check --locked --offline -p yoi-workspace-server --lib --tests`。診断profileの4設定は `cargo --config profile.test.package.yoi-workspace-server.<key>=<value>` で渡した。各commandはsystemd scopeとTERM/KILL付きtimeout内で回収した。
+
+新枠heavyは合計885秒。**root成功と、未完のServer test-target checkを混同しない。** 新たに成功したテストは0件で、baseline/finalの実接続比較、guest/owner/receiptの回帰、通常標準suiteは未実行。warningが出たことや多数のobjectが存在することをcompile完了・linkだけ残った証拠にはしない。timeoutはいずれも設定した上限による未完であり、特定の製品回帰・Cargo lock待ち・メモリ不足が原因と確定した記録ではない。
+
+前節のServer build250–400秒という計画値は、この環境での完走実測にはならなかった。特に非incremental診断compileでは未完の作業量が次回そのまま再開されると見積もれず、同じ短いtimeoutの反復で完走に近づく前提を置かない。次の実binary比較には、同じprofileで1回分のcompileを完走できる実行単位と、baseline/finalの2回分・実行・回収を合わせた枠が必要である。現在の証拠から残所要時間の確定値は出せない。
+
+証拠は `target/t871-cycle2/` の `final-build.{meta,stderr,jsonl}`、`final-fast-build.{meta,stderr,jsonl}`、`check.{meta,log}`、`test-check.{meta,log}`。root成功は `check.log` の `root_exit=0 root_wall_seconds=162` で確認できる。候補コードはf01660d17から不変であり、ここでの報告追記はコード検証を無効化しない。必要な実比較/契約回帰を終えたという前提での公開・独立レビューにはまだ進めず、MR作成・push・正式承認・統合は行っていない。Ticket全体の未達も保持する。
