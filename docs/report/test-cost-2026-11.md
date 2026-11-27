@@ -556,3 +556,64 @@ seededのhealth前処理は、config store/secrets約0.60、schema compose0.062�
 今回、主要移行の同一binary比較、Journal/retained/Serverの内訳と追加改善、明示E2Eのcase別時間を補完した。一方、過去に採用した変更すべての比較条件を統一した最終台帳（ConnectedChat Client再利用など）はまだ揃っていない。さらに上記の新しいgeneric失敗・診断失敗の証拠不足がある。**T-871はopenを維持し、今回の追加成果をもって再びCompletedとはしない。** 起動の残る観測/復旧コストの詳細化や比較証拠の残件と、物理機器/全platformという元からの範囲限界は区別する。push/merge/deploy、稼働サービス/DB・yoi-data変更なし。
 
 追加コードcommit: `160bddae3 refactor: reuse frozen SQLite bases for schema references`、`dcdb8c94f test: bound journal payloads and remove duplicate history checks`、`8386f29b3 fix: observe native auth responses outside Chromium buffers`。上記検証はcommit前の同一ソースで実施。採用した一時計測の常設化や診断用81経路の復活はしていない。
+
+## 2026-11-27: 最新sourceでの再分析と最初の改善候補（未検証の接続あり）
+
+**今回は初手の分析・候補実装であり、T-871全体の完了でも、統合可能な最終候補でもない。** 以前の時間・成功件数を現行sourceへ付け替えない。専用Workdir `t871`、branch `work/t871-current-test-cost` で、既存originの `hare/develop` を再読した。開始時は `f3d2abcdd74698ff55aebcfdd1671f27250eea94`、途中でテスト指針だけの `114249f1282185f8deea585d34e0ae8a803501be` を通常fetch/fast-forwardして原文を適用した。指針blobは `14abf38465308bec9237f03423437e8888f02279`、SHA256は `970ff8a220a573b717e76a3b5591f0485e878971703d087a6e7ffec292283fc5` と一致した。
+
+### 現行で確認したinventoryと採用状態
+
+`cargo metadata --no-deps --format-version=1` では47 package、default-members 46、integration-test target 91（通常84、明示E2E 7）。これは宣言のinventoryであり、feature選択後の実binary/ケース列挙ではない。旧131 binary/8,045名/399区分を現在の件数とはしない。今回の静的inventoryは `target/t871-current/{metadata.json,static-targets.json,static-entries.txt}` に保存した。
+
+標準入口は引き続き `deno task test`。現行 `tools/test.ts` は通常Rust全Workspace（yoi-e2e除外）のbuild・binary全名列挙、doctest、Web unit/component、Web UX unit、runner/命名tool unitを選ぶ。Worker/Runtime/Serverはprocess内直列、Serverは16ケース予算、他の大targetは36ケース予算で分割し、top-level既定最大8、suite上限180秒である。Web unitのprofile schema生成は内側のCargo実行を含む。今回は標準入口全体を実行していない。
+
+明示E2Eは現行で `auth_passkeys`、`panel`、`rewind`、`configuration_cli`、`command_isolation`、`worker_environment`、`worker_restore` の7 target。`e2e`、restore fixture/checkpointの追加featureはCargo定義に従う。Web/browser/API契約およびUXの明示入口は両deno.jsonの現物を `static-entries.txt` に保存し、今回すべて未実行として区別した。旧6 target/29 casesの成功は現行の成功ではない。
+
+旧変更の静的採用状態は次のとおり。実行時間は再測定していない。
+
+- storage historyの純粋matrixと物理schema migration/reopenの分離、共通reference基礎DBの独立backup、独立構築oracleは残っている。
+- retained Jobの64経路と破損reopen拒否は残り、helper末尾の重複history照合は除去済み。combined-failureの重複dry-run削減も存在する。これらを未実装の改善として再計上しない。
+- Journal fresh fixtureのPreparedFixture再利用と `repeat(10_000)`、Standalone Busyの仮想時計は存在する。Job/HTTP/保存checkpoint/実SQLiteの保証をさらに入力縮小だけで削る根拠は、今回得ていない。
+- test profileのSQLite 2、Server 1、sha2:0.11/decodal/serde_json 2は存在する。dev/releaseを今回変更しない。
+- Plugin fixtureのOnceLockは残るが、guestを実行しないcontext構築もcompileを起動していた。これを今回の優先改善に選んだ。T-849のmigration責務整理は重複実装しない。
+
+### 実測条件と候補の根拠
+
+Linux x86_64、rustc 1.99.1、Cargo表示1.99.0、Deno 2.9.8、kache 2.2.0。hostは約62GiB RAM、初回load average 4.57/2.96/2.75で、他Ticketの別targetのRust compileが同時に存在した。自身のCargo targetは専用checkoutの `target`、build jobs 1、systemd scopeでSwap 0、通常8GiB、必要なServer libだけ12GiB。共有target/稼働サービス/DBを借りず、cache cleanupも行わない。
+
+環境の `RUSTC_WRAPPER` は旧devshellのsccacheを指しており、リポジトリのkacheより優先する。今回のCargoはすべて `env -u RUSTC_WRAPPER CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=target` と `--locked --offline` で揃え、リポジトリ設定のkacheとcheckout-localのcacheを使った。初回target/cacheはcold。診断以後はwarm/部分cacheであり、build短縮率は比較しない。
+
+- 小さい候補の現況確認としてconfig-source libをbuild（168秒）、通常の隔離helperとlibtest JSON/report-timeで60件をprocess内1 threadで実行。60成功/失敗・ignored 0、0.189秒、最長0.0424秒。この測定からparserの入力表を削ることは初手の優先としない。RUSTC_BOOTSTRAPはJSON出力用の実行processだけで、compileには設定しない。
+- Plugin host-onlyの `Fixture::host → context → component().identity() → execution OnceLock → Executor::new/compile` が不要compile経路。例えばHTTP各methodのreceipt replay/conflicting-key試験はguestを呼ばないが、この経路を踏む。
+- 同じ正規package、実tool/HTTPS guestとproduction `Executor` を使う局所診断を作り、各3回測定した。tool compileは1.4850/1.5004/1.4944秒、HTTPSは1.5066/1.4990/1.5021秒。Executor作成は0.000036–0.000270秒、package準備は各種0.0862/0.0564秒で分離。packageからのidentity生成はsub-microsecondだが、この精度の倍率を速度指標にはしない。
+- 各反復でcompiled identityとpackage由来の3値の完全一致をassertした。これは同一process・同じ依存artifactでの局所比較であり、Server全fixtureの前後比較でもguest実行成功でもない。削れるcompile部分が約1.5秒であることを示すだけで、suite全体へ外挿しない。
+
+局所診断は `target/t871-current/context-cost.rs`。追加依存/永続benchmark targetを作らず、既にCargoがcompileしたmanifest/plugin-runtime/tempfileのrlibへ `rustc --edition=2024 -L dependency=target/debug/deps --extern ...` で接続した（diagnostic本体opt-level既定0、依存はtest profile）。選択plugin-runtime rlibのSHA256は `d09ac46e77c07c8fde26d649f8fe4529fff6965d77d0958bdbb9fa8bdf27e424`、診断binaryは `f89749d798e8d19a724047aba3a6a57988485be542f3f823ea1fa8990770456a`。compile＋診断実行は計16秒で、その外側2段のwall timeは分離測定していない。個別compile/準備の上記phase時間とは区別する。source/argvと結果は同directoryの `.rs`/`context-cost.log` と本作業Sessionに保持した。
+
+### 実装した候補と保証の分担
+
+変更は `server_plugin_host_tests.rs` のfixture helperだけ。contextのartifact identityを、compile結果からではなく、同じ正規packageのpackage digest/artifact digest/sizeから構築する。新しい製品API、共有compiled guest、認可結果cache、mock呼出順assertは追加しない。
+
+host-onlyでも正規package upload/install、実plan/current権限、owner、TLS、SQLite receipt・replay/conflictの接続は残す。これらは局所identity比較では検出できないため上位接続が必要であり、HTTP method表や拒否条件を削る変更ではない。実guestを呼ぶ既存の `component_https_result_uses_real_owner_and_durable_get_receipt` と `pure_component_still_requires_current_admission_and_result_publication` は従来のcompile/invokeをそのまま使い、Executorのcompiled/context identity照合も維持する。runtimeの別artifact/tool拒否は既存 `host_context_cannot_admit_another_artifact_or_tool` が所有する。型の3フィールドを別の定型テストで再検証するのではなく、この既存の接続回帰を完走させる必要がある。
+
+### 到達結果・未実行・次に必要な測定
+
+Server候補のdirty snapshotはHEAD `114249f12` ＋ patch SHA256 `a793b286976ccdb4cf5694dc4eefa025f3859c74bc696ce13a5190cbf52ead8e`。`target/t871-current/candidate.patch` に保存した。build/checkのtimeoutをテスト失敗・成功へ読み替えない。
+
+| コマンド/対象 | 実結果 | wall-clock |
+|---|---|---:|
+| config-source lib no-run | 成功 | 168秒 |
+| config-source lib、全60件 | 60成功、失敗/ignored 0 | 0.189秒 |
+| Server lib no-run、変更前 | timeout 124、依存compile中、テスト未開始 | 470秒 |
+| 局所context比較 | 2種×3反復のidentity一致、compiler phase上記 | build込み16秒 |
+| Server lib no-run、候補 | timeout 124、Server compileまで到達、テスト未開始 | 350秒 |
+| root cargo check、その後Server test-target checkの予定 | root check中timeout 124、後段未到達 | 160秒 |
+| Rust fmt/diff/状態契約命名 | 成功、634該当/未承認0/古い例外0 | 合計6秒 |
+
+heavy build/testは約1,165秒（build/checkはBash秒単位、診断build/runと0.189秒実行を含む）。全commandを回収込み570秒未満に制限し、1200秒枠の残りで大きいServer compileや全suiteを完走できるとは見込まない。全体wall-clockは並行した静的監査を含むため、この個別時間合計とは別である。
+
+今回のconfig-source型export testが生成したformat差分と新規bindingsは観測して除去し、候補へ混ぜていない。検証logは `target/t871-current/build-*.{meta,stderr,jsonl}`、`config-baseline*`、`context-cost*`、`check.{meta,log}`、`static.meta`、`{fmt,names,diff-check}.log`。全て専用Workdirのローカル証拠であり、Git外logの可用性と保存済み報告を区別する。
+
+**Server候補はまだcompile成功・接続回帰を確認しておらず、正式レビュー/公開/統合は行わない。** 残る直近作業は同cacheでのServer lib build、host-only代表の前後反復と実guest/identity/current権限/receipt回帰、root check完走。見積はServer build 250–400秒、focused実行10–90秒、root check残120–300秒だが、これは今回の未完compileと過去のwarm実績を参考にした計画値であり、現sourceの完走実測ではない。最終候補には現行定義の標準suite全体とinventory照合も必要で、今回未実行の通常Rust全体/doctest/Web/component/tool/browser/E2Eを成功としない。標準suite全体の現在所要時間は未測定である。
+
+Journal/retained/Server起動の現行phase分布、全採用変更の同条件比較、古いnative browser失敗の失われた一次例外に関する証拠不足も引き続き残る。今回の局所的な候補は、それらを解消したことにはならない。
