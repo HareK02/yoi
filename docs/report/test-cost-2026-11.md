@@ -638,3 +638,28 @@ Journal/retained/Server起動の現行phase分布、全採用変更の同条件�
 前節のServer build250–400秒という計画値は、この環境での完走実測にはならなかった。特に非incremental診断compileでは未完の作業量が次回そのまま再開されると見積もれず、同じ短いtimeoutの反復で完走に近づく前提を置かない。次の実binary比較には、同じprofileで1回分のcompileを完走できる実行単位と、baseline/finalの2回分・実行・回収を合わせた枠が必要である。現在の証拠から残所要時間の確定値は出せない。
 
 証拠は `target/t871-cycle2/` の `final-build.{meta,stderr,jsonl}`、`final-fast-build.{meta,stderr,jsonl}`、`check.{meta,log}`、`test-check.{meta,log}`。root成功は `check.log` の `root_exit=0 root_wall_seconds=162` で確認できる。候補コードはf01660d17から不変であり、ここでの報告追記はコード検証を無効化しない。必要な実比較/契約回帰を終えたという前提での公開・独立レビューにはまだ進めず、MR作成・push・正式承認・統合は行っていない。Ticket全体の未達も保持する。
+
+### 同一binaryの比較診断：host-onlyの削減とguestへの移動
+
+上記未完を受け、base `733cdbcb01d2d4b68c13a11a3b66f1ffecad0ccb` にfixture局所の旧/候補selector、共通scenario、phase timer、AB/BA driverを一時追加した。patch SHA256 `79a746b3ca69d852702a46af2bd8ea9365ffcd2ef6ce346ffa00bed050253e11`、dirty source SHA256 `5b30e5457774b9f817e0e29bcaa10a09262f742dfa3877cff1e88031ade4a89c`。各armのfixture/owner/OnceLockは独立、既assert・guest deadlineは維持した。診断patchは保存し、正式sourceから撤去した。恒久selectorやperf gateは追加しない。
+
+通常ccが選んだGNU ldでの一回は481.020秒でtimeout、比較未到達。実ld開始はbuild開始229.401秒後、250.578秒以上未完だった。CPU/RSS observerは権限拒否をnullへ落とす不備があり、全欠測。この後の正常なprobe値で過去資源を埋めない。GNU wrapperが補完するOpenSSL/glibc/GCCのRPATHを失わないよう、cc/CRT/native/safety flagsと実効RPATH順序を維持するleaf LLD条件へ切り替えた。repo/global linker設定や全依存RUSTFLAGSは変更していない。
+
+正式Cargoの `cargo rustc --locked --offline -p yoi-workspace-server --lib --profile test --message-format=json -- [leaf link args]` と既opt0 package4設定、同通常kache/jobs1/12GiB/Swap0/LLD threads1で診断binaryを得た。build228.492秒、実LLD link3.210秒、687依存artifact全fresh、実test cfg/64extern/feature/profileが一致した。ELFのloader/5CRT/438archives/安全flagsを照合。DT_RUNPATHは旧4列と同じ有効順序だが継承Project RPATHの末尾重複がある。旧GNU完成ELFはなく、DT_RPATH対DT_RUNPATHや完全自己完結性まで同値とはしない。GNUは未完baselineであり、この差から通常build/suite改善率を作らない。
+
+同binary SHA256 `516053f91c56ebf906a76f82d609d11ed3969c60e1523ebc3f631ec351e2f7b7` の全12armsを最初から独立AB/BA2pairsで実行し、libtest1件成功、失敗/ignored0、2508 filtered、64.42秒。command区間65.141秒、隔離probe/list/回収を含むlauncher70.450秒。前試行の55.119秒timeout/9arms部分到達や、shell補助のcompgen不備は旧ログに保持し、完走結果へ合算しない。完走時はenv列挙/unsetをfail-fast化し、ダミーGIT/proxyを除去する実隔離preflightと非null資源/final snapshotを確認した。
+
+| 同一binary・今回単独 | http methods | remote HTTPS guest | pure guest |
+|---|---:|---:|---:|
+| pair0 旧Compiled | 10.042953秒 | 4.517111秒 | 3.271937秒 |
+| pair0 候補Package | 7.005165秒 | 4.474315秒 | 3.303481秒 |
+| pair1 候補Package | 7.150612秒 | 4.956172秒 | 3.341615秒 |
+| pair1 旧Compiled | 8.526824秒 | 4.557920秒 | 3.264041秒 |
+
+host-only contextの先行compileは1.453/1.442秒から0回へ減り、identity構築は約0.84/0.88マイクロ秒だった。逆順pairのscenario全体は1.376秒短い。最初の旧fixtureは3.128秒、候補1.495秒とwarm-up差があり、最初の3.038秒差を全て候補効果にしない。25fixture×約1.5秒＝約37.5秒は直列phaseの仮説のままで、suite wall実績ではない。
+
+実guestではcompile1.416–1.468秒が初回invokeへ移るだけだった。remote invokeは旧約0.714–0.718秒、候補約2.172–2.195秒、pureの2呼出し合計は旧約0.146–0.148秒、候補約1.576–1.578秒。guest利用全体の同じ秒数削減はない。remote pair1の候補約0.398秒増にはfixture約0.394秒増が伴ったが、原因は未確定。phaseには包含関係があるため加算しない。2pairsの局所測定を統計的有意差や標準suite改善率へ外挿しない。
+
+診断buildのscope CPU228.614秒/group memory peak8.942GiB、sampled rustc RSS最大8,301,060KiB、観測HWM8,425,436KiB、OOM0。完走比較はscope CPU62.003秒/group peak142,794,752bytes、sampled test RSS351,772KiB/観測HWM351,988KiB、OOM0。RSSとgroup chargeは異なる量で、共有mappingやobserver overheadを含む。監視なしとのoverhead差は未測定。
+
+原証拠は専用Workdirの `target/t871-a/RESULTS.md`（GNU未完）、`target/t871-a/linker-diagnosis.md`、`target/t871-lld-shell/RESULTS.md`（LLD buildと最初の比較未完）、`target/t871-lld-final/RESULTS.md`/`analysis.json`/raw logs（独立完走）。これらはGit外の一次ログで、公開済みsourceの検証と同一視しない。診断撤去後の正式sourceでは別の有限build/通常影響テストを行い、その結果を追記する。全体inventory/標準測定、広い未選択の契約回帰、独立review/統合は未達であり、今回の局所候補受入とT-871全体完了を分ける。
