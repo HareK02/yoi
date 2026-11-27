@@ -663,3 +663,15 @@ host-only contextの先行compileは1.453/1.442秒から0回へ減り、identity
 診断buildのscope CPU228.614秒/group memory peak8.942GiB、sampled rustc RSS最大8,301,060KiB、観測HWM8,425,436KiB、OOM0。完走比較はscope CPU62.003秒/group peak142,794,752bytes、sampled test RSS351,772KiB/観測HWM351,988KiB、OOM0。RSSとgroup chargeは異なる量で、共有mappingやobserver overheadを含む。監視なしとのoverhead差は未測定。
 
 原証拠は専用Workdirの `target/t871-a/RESULTS.md`（GNU未完）、`target/t871-a/linker-diagnosis.md`、`target/t871-lld-shell/RESULTS.md`（LLD buildと最初の比較未完）、`target/t871-lld-final/RESULTS.md`/`analysis.json`/raw logs（独立完走）。これらはGit外の一次ログで、公開済みsourceの検証と同一視しない。診断撤去後の正式sourceでは別の有限build/通常影響テストを行い、その結果を追記する。全体inventory/標準測定、広い未選択の契約回帰、独立review/統合は未達であり、今回の局所候補受入とT-871全体完了を分ける。
+
+### 診断撤去後の正式source検証
+
+正式Rust sourceはf016のfixture最適化のみで、SHA256 `58d605370262ad302effdd7cd87abd73312aa3da19d724d2bb18283584395dba`。診断enum/timer/driverは撤去した。commit `b58cbf93facae3d9be92b940939c72c56eeb6f45` / tree `b709b5b1310e057681ace246e616774ab5287068` で別の正式Cargo leaf buildを実行し、236.512秒exit0、実LLD3.723秒、依存687件全fresh、実test cfg/64extern/feature/profile/native/ELFを再照合した。binary SHA256は `fb88548926864572756f897b4fae8a71066c49046ee6dcd698b0c11d12acc9c4`。上記診断binaryの成功をこのsourceへ付け替えていない。今回もleafのLLD/opt0は有限診断用であり、repository既定profile/linkerは変更していない。
+
+root `cargo check --locked --offline` は同通常kache/jobs1/専用targetで新規に成功、command区間1.004秒（warm cache）。fmt/diff/状態契約命名検査も新規成功、合計command区間7.017秒、命名634該当/未承認0/古い例外0。個別の内部時間は分離していない。最初のlistingへ誤って渡した非対応`--terse`は実行前エラーとして保存し、buildせず通常`--list`で訂正した。
+
+通常Plugin Host moduleのfilterは子moduleも含む75件を選択した。235.513秒の集約timeoutまでに35件成功、Runtime service-connection子suiteの1件が実行中で、suite全体は未完。この1件の単独failure/ハング/回帰やbaseline再現とは認定しない。同source/binary/隔離の成功済み10件を再利用し、直接fixtureを所有する24件中の未実行14件をexact選択して新規実行、14成功/失敗・ignored0、libtest43.37秒/command区間44.095秒だった。したがって直接所有24件は全て成功、今回のdistinct成功は49件。再帰module全75件成功やServer全体2508件成功とは呼ばず、残る子suite26件（実行中打切り1を含む）を未完として保持する。
+
+この選択は実guest/remote-embedded owner/全HTTP method/receipt replayとconflict/current認可/失効/cancel/DNS/publication withholding/restore prepareまでfixtureの影響を検証する。既純粋policy/別artifact拒否の主担当を重複実装せず、通常の既存テスト名と全assertを維持した。診断時のAB/BA比較は同じ式の局所効果の証拠としてのみ再利用し、正式sourceの75件未完を成功へ置換しない。
+
+buildのscope CPU232.995秒/group peak9,539,293,184bytes、OOM0。隔離probeとobserver/final snapshotは成功し、PID消滅raceは明記した。原コマンド・資源・全2508名と75選択名・結果・timeoutは `target/t871-formal/{source.meta,command.json,analysis.json,RESULTS.md}` とraw logsに保存。以後の本報告追記だけはRust/deps/lock/feature/生成物/共有初期化を変えないため、この検証証拠を参照する。標準入口`deno task test`全体（通常Rust全Workspace/doctest/Web/component/tool）は今回の親+Reviewer合計600秒の有限枠では実行しておらず、標準suite wall/全inventory照合は未達。browser/E2Eも新規未実行。この部分候補のreview/統合とT-871全体完了を分離する。
